@@ -1,0 +1,1 @@
+Scripts for processing and exploring different sensor datasets related to water quality in the Brusdalsvatnet drinking water reservoir, with the intention of developing data-driven methods of forecasting water quality parameters at the offtake for the treatment plant.
