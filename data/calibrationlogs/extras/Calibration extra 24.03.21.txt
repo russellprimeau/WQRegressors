@@ -1,0 +1,6 @@
+Temperature:
+Nist equipment	20,1
+Sonde		20,265
+
+Turbidity 1NTU (opened 09.11.20):
+Sonde measured	1,11 NTU

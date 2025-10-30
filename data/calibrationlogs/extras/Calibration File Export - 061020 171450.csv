@@ -1,0 +1,227 @@
+KorEXO Calibration File Export;;;;;KorEXO Calibration File Export;;;;;KorEXO Calibration File Export;;;;;KorEXO Calibration File Export;;;;;KorEXO Calibration File Export;;;;;KorEXO Calibration File Export;;;;KorEXO Calibration File Export;;;;;KorEXO Calibration File Export
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Last Calibration Time=,12/4/2019 11:38:13 AM;;;;;Last Calibration Time=,6/5/2020 2:35:39 PM;;;;;Last Calibration Time=,7/23/2020 1:57:14 PM;;;;;Last Calibration Time=,8/13/2020 1:31:24 PM;;;;;Last Calibration Time=,9/15/2020 10:07:41 AM;;;;;Last Calibration Time=,9/15/2020 11:14:30 AM;;;;Last Calibration Time=,10/8/2020 1:57:20 PM;;;;;Last Calibration Time=,11/9/2020 12:42:04 PM
+Calibration Start Time=,6/5/2020 2:26:20 PM;;;;;Calibration Start Time=,7/23/2020 1:46:32 PM;;;;;Calibration Start Time=,8/13/2020 12:37:05 PM;;;;;Calibration Start Time=,8/27/2020 1:23:10 PM;;;;;Calibration Start Time=,9/15/2020 10:16:03 AM;;;;;Calibration Start Time=,10/8/2020 1:49:40 PM;;;;Calibration Start Time=,11/9/2020 12:37:56 PM;;;;;Calibration Start Time=,12/8/2020 9:14:21 AM
+Calibration End Time=,6/5/2020 2:35:39 PM;;;;;Calibration End Time=,7/23/2020 1:57:14 PM;;;;;Calibration End Time=,8/13/2020 12:42:46 PM;;;;;Calibration End Time=,8/27/2020 1:23:36 PM;;;;;Calibration End Time=,9/15/2020 10:35:45 AM;;;;;Calibration End Time=,10/8/2020 1:57:20 PM;;;;Calibration End Time=,11/9/2020 12:42:04 PM;;;;;Calibration End Time=,12/8/2020 9:22:23 AM
+Calibration Status=,Completed;;;;;Calibration Status=,Completed;;;;;Calibration Status=,Completed;;;;;Calibration Status=,Completed;;;;;Calibration Status=,CompletedWithWarnings;;;;;Calibration Status=,Completed;;;;Calibration Status=,Completed;;;;;Calibration Status=,Completed
+QC Score=,Good;;;;;QC Score=,Good;;;;;QC Score=,Good;;;;;QC Score=,Good;;;;;QC Score=,Bad;;;;;QC Score=,Warning;;;;QC Score=,Warning;;;;;QC Score=,Warning
+Instrument Type=,EXO2;;;;;Instrument Type=,EXO2;;;;;Instrument Type=,EXO2;;;;;Instrument Type=,EXO2;;;;;Instrument Type=,EXO2;;;;;Instrument Type=,EXO2;;;;Instrument Type=,EXO2;;;;;Instrument Type=,EXO2
+Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539;;;;Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539
+Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539;;;;Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539
+Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73;;;;Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73
+Parameter Type=,Cond (µS/cm);;;;;Parameter Type=,Cond (µS/cm);;;;;Parameter Type=,Cond (µS/cm);;;;;Parameter Type=,DO (% Sat);;;;;Parameter Type=,pH;;;;;Parameter Type=,Turbidity (FNU);;;;Parameter Type=,Turbidity (FNU);;;;;Parameter Type=,Turbidity (FNU)
+Sensor Type=,Wiped Conductivity And Temperature;;;;;Sensor Type=,Wiped Conductivity And Temperature;;;;;Sensor Type=,Wiped Conductivity And Temperature;;;;;Sensor Type=,DO;;;;;Sensor Type=,pH;;;;;Sensor Type=,Turbidity;;;;Sensor Type=,Turbidity;;;;;Sensor Type=,Turbidity
+Sensor Serial Number=,19F100067;;;;;Sensor Serial Number=,19F100067;;;;;Sensor Serial Number=,19F100067;;;;;Sensor Serial Number=,19G101573;;;;;Sensor Serial Number=,19G103267;;;;;Sensor Serial Number=,19G100122;;;;Sensor Serial Number=,19G100122;;;;;Sensor Serial Number=,19G100122
+Sensor Firmware Version=,3.0.5;;;;;Sensor Firmware Version=,3.0.5;;;;;Sensor Firmware Version=,3.0.5;;;;;Sensor Firmware Version=,3.0.0;;;;;Sensor Firmware Version=,3.0.0;;;;;Sensor Firmware Version=,3.0.0;;;;Sensor Firmware Version=,3.0.0;;;;;Sensor Firmware Version=,3.0.0
+User ID=,<Unknown>;;;;;User ID=,<Unknown>;;;;;User ID=,<Unknown>;;;;;User ID=,<Unknown>;;;;;User ID=,<Unknown>;;;;;User ID=,<Unknown>;;;;User ID=,<Unknown>;;;;;User ID=,<Unknown>
+Cell Constant=,0.49;;;;;Cell Constant=,0.49;;;;;Cell Constant=,0.50;;;;;DO Cap Serial Number=,19F102932;;;;;Sensor Module Replacement Date=,9/15/2020 12:00:00 AM;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;DO Cap Replacement Date=,7/9/2019 2:51:37 PM;;;;;pH Range 4.00-7.00 Delta Slope=,154.2 mV;;;;;[Cal Point 1];;;;[Cal Point 1];;;;;[Cal Point 1]
+[Cal Point 1];;;;;[Cal Point 1];;;;;[Cal Point 1];;;;;DO Gain=,1.05;;;;;pH Range 4.00-7.00 mV per Decade=,51.39;;;;;Standard=,0.00 FNU;;;;Standard=,0.00 FNU;;;;;Standard=,0.00 FNU
+Standard=,1000.0 µS/cm;;;;;Standard=,1000.0 µS/cm;;;;;Standard=,1000.0 µS/cm;;;;;DO mg/L=,9.77 mg/L;;;;;pH Range 7.00-10.00 Delta Slope=,243.7 mV;;;;;Pre Calibration Value=,-1.13 FNU;;;;Pre Calibration Value=,-0.30 FNU;;;;;Pre Calibration Value=,-0.77 FNU
+Pre Calibration Value=,1029.7 µS/cm;;;;;Pre Calibration Value=,991.2 µS/cm;;;;;Pre Calibration Value=,982.9 µS/cm;;;;;;;;;;pH Range 7.00-10.00 mV per Decade=,81.22;;;;;Post Calibration Value=,0.00 FNU;;;;Post Calibration Value=,0.00 FNU;;;;;Post Calibration Value=,0.00 FNU
+Post Calibration Value=,1000.0 µS/cm;;;;;Post Calibration Value=,1000.0 µS/cm;;;;;Post Calibration Value=,1000.0 µS/cm;;;;;[Cal Point 1];;;;;;;;;;Raw Value=,0.00 FNU;;;;Raw Value=,0.00 FNU;;;;;Raw Value=,0.00 FNU
+Raw Value=,0.0 µS/cm;;;;;Raw Value=,0.0 µS/cm;;;;;Raw Value=,0.0 µS/cm;;;;;Standard=,100.0 % Sat;;;;;[Cal Point 1];;;;;Temperature=,21.288 °C;;;;Temperature=,21.270 °C;;;;;Temperature=,20.910 °C
+Temperature=,23.006 °C;;;;;Temperature=,22.607 °C;;;;;Temperature=,21.858 °C;;;;;Pre Calibration Value=,134.4 % Sat;;;;;Standard=,7.00 pH;;;;;Stability Achieved=,Yes;;;;Stability Achieved=,Yes;;;;;Stability Achieved=,Yes
+Stability Achieved=,Yes;;;;;Stability Achieved=,Yes;;;;;Stability Achieved=,Yes;;;;;Post Calibration Value=,99.3 % Sat;;;;;Pre Calibration Value=,8.28 pH;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;Raw Value=,0.0 % Sat;;;;;Post Calibration Value=,7.00 pH;;;;;[Cal Point 2];;;;[Cal Point 2];;;;;[Cal Point 2]
+----------;;;;;----------;;;;;----------;;;;;Temperature=,16.197 °C;;;;;Raw Value=,370.7 mV;;;;;Standard=,12.40 FNU;;;;Standard=,12.40 FNU;;;;;Standard=,12.40 FNU
+;;;;;;;;;;;;;;;Stability Achieved=,Yes;;;;;Temperature=,21.741 °C;;;;;Pre Calibration Value=,10.36 FNU;;;;Pre Calibration Value=,12.84 FNU;;;;;Pre Calibration Value=,11.03 FNU
+Last Calibration Time=,12/4/2019 2:03:28 PM;;;;;Last Calibration Time=,6/5/2020 3:04:10 PM;;;;;Last Calibration Time=,7/23/2020 2:12:07 PM;;;;;Barometer=,755.0 mmHg;;;;;Stability Achieved=,Yes;;;;;Post Calibration Value=,12.40 FNU;;;;Post Calibration Value=,12.40 FNU;;;;;Post Calibration Value=,12.40 FNU
+Calibration Start Time=,6/5/2020 2:46:37 PM;;;;;Calibration Start Time=,7/23/2020 2:06:10 PM;;;;;Calibration Start Time=,8/13/2020 12:52:08 PM;;;;;;;;;;;;;;;Raw Value=,0.00 FNU;;;;Raw Value=,0.00 FNU;;;;;Raw Value=,0.00 FNU
+Calibration End Time=,6/5/2020 3:04:10 PM;;;;;Calibration End Time=,7/23/2020 2:12:07 PM;;;;;Calibration End Time=,8/13/2020 1:00:19 PM;;;;;----------;;;;;[Cal Point 2];;;;;Temperature=,20.812 °C;;;;Temperature=,20.809 °C;;;;;Temperature=,20.623 °C
+Calibration Status=,Completed;;;;;Calibration Status=,Completed;;;;;Calibration Status=,Completed;;;;;;;;;;Standard=,4.00 pH;;;;;Stability Achieved=,Yes;;;;Stability Achieved=,Yes;;;;;Stability Achieved=,Yes
+QC Score=,Good;;;;;QC Score=,Good;;;;;QC Score=,Good;;;;;;;;;;Pre Calibration Value=,6.47 pH;;;;;;;;;;;;;;
+Instrument Type=,EXO2;;;;;Instrument Type=,EXO2;;;;;Instrument Type=,EXO2;;;;;;;;;;Post Calibration Value=,4.00 pH;;;;;----------;;;;----------;;;;;----------
+Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539;;;;;;;;;;Raw Value=,524.8 mV;;;;;;;;;;;;;;
+Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539;;;;;;;;;;Temperature=,22.014 °C;;;;;Last Calibration Time=,9/15/2020 11:17:50 AM;;;;Last Calibration Time=,10/8/2020 2:09:58 PM;;;;;Last Calibration Time=,11/9/2020 2:14:59 PM
+Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73;;;;;;;;;;Stability Achieved=,Yes;;;;;Calibration Start Time=,10/8/2020 2:06:25 PM;;;;Calibration Start Time=,11/9/2020 2:13:14 PM;;;;;Calibration Start Time=,12/8/2020 9:23:40 AM
+Parameter Type=,Turbidity (FNU);;;;;Parameter Type=,Turbidity (FNU);;;;;Parameter Type=,Turbidity (FNU);;;;;;;;;;;;;;;Calibration End Time=,10/8/2020 2:09:58 PM;;;;Calibration End Time=,11/9/2020 2:14:59 PM;;;;;Calibration End Time=,12/8/2020 9:26:25 AM
+Sensor Type=,Turbidity;;;;;Sensor Type=,Turbidity;;;;;Sensor Type=,Turbidity;;;;;;;;;;[Cal Point 3];;;;;Calibration Status=,Completed;;;;Calibration Status=,Completed;;;;;Calibration Status=,Completed
+Sensor Serial Number=,19G100122;;;;;Sensor Serial Number=,19G100122;;;;;Sensor Serial Number=,19G100122;;;;;;;;;;Standard=,10.00 pH;;;;;QC Score=,Good;;;;QC Score=,Good;;;;;QC Score=,Good
+Sensor Firmware Version=,3.0.0;;;;;Sensor Firmware Version=,3.0.0;;;;;Sensor Firmware Version=,3.0.0;;;;;;;;;;Pre Calibration Value=,11.14 pH;;;;;Instrument Type=,EXO2;;;;Instrument Type=,EXO2;;;;;Instrument Type=,EXO2
+User ID=,<Unknown>;;;;;User ID=,<Unknown>;;;;;User ID=,<Unknown>;;;;;;;;;;Post Calibration Value=,10.17 pH;;;;;Instrument Name=,Sonde 19G102539;;;;Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539
+;;;;;;;;;;;;;;;;;;;;Raw Value=,127.0 mV;;;;;Instrument Serial Number=,19G102539;;;;Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539
+[Cal Point 1];;;;;[Cal Point 1];;;;;[Cal Point 1];;;;;;;;;;Temperature=,22.016 °C;;;;;Instrument Firmware Version=,1.0.73;;;;Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73
+Standard=,0.00 FNU;;;;;Standard=,0.00 FNU;;;;;Standard=,0.00 FNU;;;;;;;;;;Stability Achieved=,Yes;;;;;Parameter Type=,Sp Cond (µS/cm);;;;Parameter Type=,Sp Cond (µS/cm);;;;;Parameter Type=,Sp Cond (µS/cm)
+Pre Calibration Value=,0.01 FNU;;;;;Pre Calibration Value=,1.73 FNU;;;;;Pre Calibration Value=,-0.86 FNU;;;;;;;;;;;;;;;Sensor Type=,Wiped Conductivity And Temperature;;;;Sensor Type=,Wiped Conductivity And Temperature;;;;;Sensor Type=,Wiped Conductivity And Temperature
+Post Calibration Value=,0.00 FNU;;;;;Post Calibration Value=,0.00 FNU;;;;;Post Calibration Value=,0.00 FNU;;;;;;;;;;----------;;;;;Sensor Serial Number=,19F100067;;;;Sensor Serial Number=,19F100067;;;;;Sensor Serial Number=,19F100067
+Raw Value=,0.00 FNU;;;;;Raw Value=,0.00 FNU;;;;;Raw Value=,0.00 FNU;;;;;;;;;;;;;;;Sensor Firmware Version=,3.0.5;;;;Sensor Firmware Version=,3.0.5;;;;;Sensor Firmware Version=,3.0.5
+Temperature=,23.200 °C;;;;;Temperature=,22.544 °C;;;;;Temperature=,22.437 °C;;;;;;;;;;Last Calibration Time=,8/13/2020 1:00:19 PM;;;;;User ID=,<Unknown>;;;;User ID=,<Unknown>;;;;;User ID=,<Unknown>
+Stability Achieved=,Yes;;;;;Stability Achieved=,Yes;;;;;Stability Achieved=,Yes;;;;;;;;;;Calibration Start Time=,9/15/2020 11:09:10 AM;;;;;Cell Constant=,0.47;;;;Cell Constant=,0.47;;;;;Cell Constant=,0.48
+;;;;;;;;;;;;;;;;;;;;Calibration End Time=,9/15/2020 11:14:30 AM;;;;;;;;;;;;;;
+[Cal Point 2];;;;;[Cal Point 2];;;;;[Cal Point 2];;;;;;;;;;Calibration Status=,Completed;;;;;[Cal Point 1];;;;[Cal Point 1];;;;;[Cal Point 1]
+Standard=,126.00 FNU;;;;;Standard=,124.00 FNU;;;;;Standard=,124.00 FNU;;;;;;;;;;QC Score=,Warning;;;;;Standard=,1000.0 µS/cm;;;;Standard=,1000.0 µS/cm;;;;;Standard=,1000.0 µS/cm
+Pre Calibration Value=,135.12 FNU;;;;;Pre Calibration Value=,126.41 FNU;;;;;Pre Calibration Value=,123.15 FNU;;;;;;;;;;Instrument Type=,EXO2;;;;;Pre Calibration Value=,1069.2 µS/cm;;;;Pre Calibration Value=,1003.2 µS/cm;;;;;Pre Calibration Value=,993.4 µS/cm
+Post Calibration Value=,126.00 FNU;;;;;Post Calibration Value=,124.00 FNU;;;;;Post Calibration Value=,124.00 FNU;;;;;;;;;;Instrument Name=,Sonde 19G102539;;;;;Post Calibration Value=,1000.0 µS/cm;;;;Post Calibration Value=,1000.0 µS/cm;;;;;Post Calibration Value=,1000.0 µS/cm
+Raw Value=,0.00 FNU;;;;;Raw Value=,0.00 FNU;;;;;Raw Value=,0.00 FNU;;;;;;;;;;Instrument Serial Number=,19G102539;;;;;Raw Value=,0.0 µS/cm;;;;Raw Value=,0.0 µS/cm;;;;;Raw Value=,0.0 µS/cm
+Temperature=,22.431 °C;;;;;Temperature=,22.553 °C;;;;;Temperature=,22.555 °C;;;;;;;;;;Instrument Firmware Version=,1.0.73;;;;;Temperature=,20.543 °C;;;;Temperature=,19.950 °C;;;;;Temperature=,19.841 °C
+Stability Achieved=,Yes;;;;;Stability Achieved=,Yes;;;;;Stability Achieved=,Yes;;;;;;;;;;Parameter Type=,Turbidity (FNU);;;;;Stability Achieved=,Yes;;;;Stability Achieved=,Yes;;;;;Stability Achieved=,Yes
+;;;;;;;;;;;;;;;;;;;;Sensor Type=,Turbidity;;;;;;;;;;;;;;
+----------;;;;;----------;;;;;----------;;;;;;;;;;Sensor Serial Number=,19G100122;;;;;----------;;;;----------;;;;;----------
+;;;;;;;;;;;;;;;;;;;;Sensor Firmware Version=,3.0.0;;;;;;;;;;;;;;
+Last Calibration Time=,12/4/2019 1:38:25 PM;;;;;Last Calibration Time=,6/5/2020 3:31:52 PM;;;;;Last Calibration Time=,8/13/2020 1:21:57 PM;;;;;;;;;;User ID=,<Unknown>;;;;;Last Calibration Time=,9/15/2020 11:40:37 AM;;;;Last Calibration Time=,10/9/2020 3:15:12 PM;;;;;Last Calibration Time=,11/9/2020 2:27:12 PM
+Calibration Start Time=,6/5/2020 3:04:28 PM;;;;;Calibration Start Time=,7/23/2020 2:18:25 PM;;;;;Calibration Start Time=,8/13/2020 1:27:46 PM;;;;;;;;;;;;;;;Calibration Start Time=,10/8/2020 2:42:44 PM;;;;Calibration Start Time=,11/9/2020 2:16:52 PM;;;;;Calibration Start Time=,12/8/2020 9:43:01 AM
+Calibration End Time=,6/5/2020 3:31:52 PM;;;;;Calibration End Time=,7/23/2020 2:37:20 PM;;;;;Calibration End Time=,8/13/2020 1:31:24 PM;;;;;;;;;;[Cal Point 1];;;;;Calibration End Time=,10/8/2020 2:48:45 PM;;;;Calibration End Time=,11/9/2020 2:27:12 PM;;;;;Calibration End Time=,12/8/2020 9:43:43 AM
+Calibration Status=,Completed;;;;;Calibration Status=,CompletedWithWarnings;;;;;Calibration Status=,CompletedWithWarnings;;;;;;;;;;Standard=,0.00 FNU;;;;;Calibration Status=,Completed;;;;Calibration Status=,Completed;;;;;Calibration Status=,Completed
+QC Score=,Good;;;;;QC Score=,Bad;;;;;QC Score=,Warning;;;;;;;;;;Pre Calibration Value=,1.25 FNU;;;;;QC Score=,Good;;;;QC Score=,Good;;;;;QC Score=,Good
+Instrument Type=,EXO2;;;;;Instrument Type=,EXO2;;;;;Instrument Type=,EXO2;;;;;;;;;;Post Calibration Value=,0.00 FNU;;;;;Instrument Type=,EXO2;;;;Instrument Type=,EXO2;;;;;Instrument Type=,EXO2
+Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539;;;;;;;;;;Raw Value=,0.00 FNU;;;;;Instrument Name=,Sonde 19G102539;;;;Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539
+Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539;;;;;;;;;;Temperature=,22.162 °C;;;;;Instrument Serial Number=,19G102539;;;;Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539
+Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73;;;;;;;;;;Stability Achieved=,Yes;;;;;Instrument Firmware Version=,1.0.73;;;;Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73
+Parameter Type=,pH;;;;;Parameter Type=,pH;;;;;Parameter Type=,DO (% Sat);;;;;;;;;;;;;;;Parameter Type=,fDOM (QSU);;;;Parameter Type=,DO (% Sat);;;;;Parameter Type=,DO (% Sat)
+Sensor Type=,pH;;;;;Sensor Type=,pH;;;;;Sensor Type=,DO;;;;;;;;;;[Cal Point 2];;;;;Sensor Type=,fDOM;;;;Sensor Type=,DO;;;;;Sensor Type=,DO
+Sensor Serial Number=,19G103267;;;;;Sensor Serial Number=,19G103267;;;;;Sensor Serial Number=,19G101573;;;;;;;;;;Standard=,12.40 FNU;;;;;Sensor Serial Number=,19F100722;;;;Sensor Serial Number=,19G101573;;;;;Sensor Serial Number=,19G101573
+Sensor Firmware Version=,3.0.0;;;;;Sensor Firmware Version=,3.0.0;;;;;Sensor Firmware Version=,3.0.0;;;;;;;;;;Pre Calibration Value=,14.01 FNU;;;;;Sensor Firmware Version=,3.0.0;;;;Sensor Firmware Version=,3.0.0;;;;;Sensor Firmware Version=,3.0.0
+User ID=,<Unknown>;;;;;User ID=,<Unknown>;;;;;User ID=,<Unknown>;;;;;;;;;;Post Calibration Value=,12.40 FNU;;;;;User ID=,<Unknown>;;;;User ID=,<Unknown>;;;;;User ID=,<Unknown>
+Sensor Module Replacement Date=,<Unknown>;;;;;Sensor Module Replacement Date=,<Unknown>;;;;;DO Cap Serial Number=,19F102932;;;;;;;;;;Raw Value=,0.00 FNU;;;;;;;;;DO Cap Serial Number=,19F102932;;;;;DO Cap Serial Number=,19F102932
+pH Range 4.00-7.02 Delta Slope=,171.7 mV;;;;;pH Range 4.00-7.02 Delta Slope=,0.0 mV;;;;;DO Cap Replacement Date=,7/9/2019 2:51:37 PM;;;;;;;;;;Temperature=,22.327 °C;;;;;[Cal Point 1];;;;DO Cap Replacement Date=,7/9/2019 2:51:37 PM;;;;;DO Cap Replacement Date=,7/9/2019 2:51:37 PM
+pH Range 4.00-7.02 mV per Decade=,56.85;;;;;pH Range 4.00-7.02 mV per Decade=,0.00;;;;;DO Gain=,1.42;;;;;;;;;;Stability Achieved=,Yes;;;;;Standard=,0.00 QSU;;;;DO Gain=,1.05;;;;;DO Gain=,1.04
+pH Range 7.02-10.06 Delta Slope=,183.1 mV;;;;;pH Range 7.02-10.03 Delta Slope=,0.0 mV;;;;;DO mg/L=,11.48 mg/L;;;;;;;;;;;;;;;Pre Calibration Value=,1.59 QSU;;;;DO mg/L=,9.20 mg/L;;;;;DO mg/L=,9.26 mg/L
+pH Range 7.02-10.06 mV per Decade=,60.24;;;;;pH Range 7.02-10.03 mV per Decade=,0.00;;;;;;;;;;;;;;;----------;;;;;Post Calibration Value=,0.00 QSU;;;;;;;;;
+;;;;;;;;;;[Cal Point 1];;;;;;;;;;;;;;;Raw Value=,0.00 QSU;;;;[Cal Point 1];;;;;[Cal Point 1]
+[Cal Point 1];;;;;[Cal Point 1];;;;;Standard=,100.0 % Sat;;;;;;;;;;Last Calibration Time=,8/13/2020 12:42:46 PM;;;;;Temperature=,20.934 °C;;;;Standard=,100.0 % Sat;;;;;Standard=,100.0 % Sat
+Standard=,7.02 pH;;;;;Standard=,7.02 pH;;;;;Pre Calibration Value=,133.2 % Sat;;;;;;;;;;Calibration Start Time=,9/15/2020 11:16:09 AM;;;;;Stability Achieved=,Yes;;;;Pre Calibration Value=,101.0 % Sat;;;;;Pre Calibration Value=,100.0 % Sat
+Pre Calibration Value=,7.29 pH;;;;;Pre Calibration Value=,-3.65 pH;;;;;Post Calibration Value=,133.2 % Sat;;;;;;;;;;Calibration End Time=,9/15/2020 11:17:50 AM;;;;;;;;;Post Calibration Value=,101.3 % Sat;;;;;Post Calibration Value=,99.6 % Sat
+Post Calibration Value=,7.02 pH;;;;;Post Calibration Value=,7.02 pH;;;;;Raw Value=,0.0 % Sat;;;;;;;;;;Calibration Status=,Completed;;;;;[Cal Point 2];;;;Raw Value=,0.0 % Sat;;;;;Raw Value=,0.0 % Sat
+Raw Value=,-15.8 mV;;;;;Raw Value=,607.2 mV;;;;;Temperature=,22.688 °C;;;;;;;;;;QC Score=,Good;;;;;Standard=,300.00 QSU;;;;Temperature=,20.086 °C;;;;;Temperature=,18.873 °C
+Temperature=,21.881 °C;;;;;Temperature=,22.712 °C;;;;;Stability Achieved=,Yes;;;;;;;;;;Instrument Type=,EXO2;;;;;Pre Calibration Value=,320.02 QSU;;;;Stability Achieved=,Yes;;;;;Stability Achieved=,Yes
+Stability Achieved=,Yes;;;;;Stability Achieved=,Yes;;;;;Barometer=,1012.0 mmHg;;;;;;;;;;Instrument Name=,Sonde 19G102539;;;;;Post Calibration Value=,300.00 QSU;;;;Barometer=,770.0 mmHg;;;;;Barometer=,757.0 mmHg
+;;;;;;;;;;;;;;;;;;;;Instrument Serial Number=,19G102539;;;;;Raw Value=,0.00 QSU;;;;;;;;;
+[Cal Point 2];;;;;[Cal Point 2];;;;;----------;;;;;;;;;;Instrument Firmware Version=,1.0.73;;;;;Temperature=,20.195 °C;;;;----------;;;;;----------
+Standard=,4.00 pH;;;;;Standard=,4.00 pH;;;;;;;;;;;;;;;Parameter Type=,Cond (µS/cm);;;;;Stability Achieved=,Yes;;;;;;;;;
+Pre Calibration Value=,4.33 pH;;;;;Pre Calibration Value=,-3.65 pH;;;;;Last Calibration Time=,7/23/2020 3:58:40 PM;;;;;;;;;;Sensor Type=,Wiped Conductivity And Temperature;;;;;;;;;Last Calibration Time=,10/8/2020 2:53:25 PM;;;;;Last Calibration Time=,11/9/2020 2:46:09 PM
+Post Calibration Value=,4.00 pH;;;;;Post Calibration Value=,NaN pH;;;;;Calibration Start Time=,8/13/2020 1:58:14 PM;;;;;;;;;;Sensor Serial Number=,19F100067;;;;;----------;;;;Calibration Start Time=,11/9/2020 2:41:29 PM;;;;;Calibration Start Time=,12/8/2020 10:01:17 AM
+Raw Value=,155.9 mV;;;;;Raw Value=,607.2 mV;;;;;Calibration End Time=,8/13/2020 2:05:39 PM;;;;;;;;;;Sensor Firmware Version=,3.0.5;;;;;;;;;Calibration End Time=,11/9/2020 2:46:09 PM;;;;;Calibration End Time=,12/8/2020 10:02:58 AM
+Temperature=,22.086 °C;;;;;Temperature=,22.809 °C;;;;;Calibration Status=,Completed;;;;;;;;;;User ID=,<Unknown>;;;;;Last Calibration Time=,9/15/2020 11:37:11 AM;;;;Calibration Status=,Completed;;;;;Calibration Status=,Completed
+Stability Achieved=,Yes;;;;;Stability Achieved=,Yes;;;;;QC Score=,Good;;;;;;;;;;Cell Constant=,0.51;;;;;Calibration Start Time=,10/8/2020 2:51:10 PM;;;;QC Score=,Good;;;;;QC Score=,Good
+;;;;;;;;;;Instrument Type=,EXO2;;;;;;;;;;;;;;;Calibration End Time=,10/8/2020 2:53:25 PM;;;;Instrument Type=,EXO2;;;;;Instrument Type=,EXO2
+[Cal Point 3];;;;;[Cal Point 3];;;;;Instrument Name=,Sonde 19G102539;;;;;;;;;;[Cal Point 1];;;;;Calibration Status=,Completed;;;;Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539
+Standard=,10.06 pH;;;;;Standard=,10.03 pH;;;;;Instrument Serial Number=,19G102539;;;;;;;;;;Standard=,1000.0 µS/cm;;;;;QC Score=,Good;;;;Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539
+Pre Calibration Value=,10.44 pH;;;;;Pre Calibration Value=,-3.66 pH;;;;;Instrument Firmware Version=,1.0.73;;;;;;;;;;Pre Calibration Value=,991.3 µS/cm;;;;;Instrument Type=,EXO2;;;;Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73
+Post Calibration Value=,10.09 pH;;;;;Post Calibration Value=,NaN pH;;;;;Parameter Type=,fDOM (RFU);;;;;;;;;;Post Calibration Value=,1000.0 µS/cm;;;;;Instrument Name=,Sonde 19G102539;;;;Parameter Type=,fDOM (RFU);;;;;Parameter Type=,fDOM (RFU)
+Raw Value=,-199.0 mV;;;;;Raw Value=,607.2 mV;;;;;Sensor Type=,fDOM;;;;;;;;;;Raw Value=,0.0 µS/cm;;;;;Instrument Serial Number=,19G102539;;;;Sensor Type=,fDOM;;;;;Sensor Type=,fDOM
+Temperature=,22.019 °C;;;;;Temperature=,22.634 °C;;;;;Sensor Serial Number=,19F100722;;;;;;;;;;Temperature=,21.991 °C;;;;;Instrument Firmware Version=,1.0.73;;;;Sensor Serial Number=,19F100722;;;;;Sensor Serial Number=,19F100722
+Stability Achieved=,Yes;;;;;Stability Achieved=,Yes;;;;;Sensor Firmware Version=,3.0.0;;;;;;;;;;Stability Achieved=,Yes;;;;;Parameter Type=,fDOM (RFU);;;;Sensor Firmware Version=,3.0.0;;;;;Sensor Firmware Version=,3.0.0
+;;;;;;;;;;User ID=,<Unknown>;;;;;;;;;;;;;;;Sensor Type=,fDOM;;;;User ID=,<Unknown>;;;;;User ID=,<Unknown>
+----------;;;;;----------;;;;;;;;;;;;;;;----------;;;;;Sensor Serial Number=,19F100722;;;;;;;;;
+;;;;;;;;;;[Cal Point 1];;;;;;;;;;;;;;;Sensor Firmware Version=,3.0.0;;;;[Cal Point 1];;;;;[Cal Point 1]
+Last Calibration Time=,6/5/2020 4:15:19 PM;;;;;Last Calibration Time=,6/5/2020 4:23:25 PM;;;;;Standard=,0.00 RFU;;;;;;;;;;Last Calibration Time=,8/13/2020 2:05:39 PM;;;;;User ID=,<Unknown>;;;;Standard=,0.00 RFU;;;;;Standard=,0.00 RFU
+Calibration Start Time=,6/5/2020 4:18:24 PM;;;;;Calibration Start Time=,7/23/2020 2:57:46 PM;;;;;Pre Calibration Value=,0.03 RFU;;;;;;;;;;Calibration Start Time=,9/15/2020 11:32:55 AM;;;;;;;;;Pre Calibration Value=,-0.02 RFU;;;;;Pre Calibration Value=,-0.01 RFU
+Calibration End Time=,6/5/2020 4:23:25 PM;;;;;Calibration End Time=,7/23/2020 3:15:52 PM;;;;;Post Calibration Value=,0.00 RFU;;;;;;;;;;Calibration End Time=,9/15/2020 11:37:11 AM;;;;;[Cal Point 1];;;;Post Calibration Value=,0.00 RFU;;;;;Post Calibration Value=,0.00 RFU
+Calibration Status=,CompletedWithWarnings;;;;;Calibration Status=,CompletedWithWarnings;;;;;Raw Value=,0.00 RFU;;;;;;;;;;Calibration Status=,Completed;;;;;Standard=,0.00 RFU;;;;Raw Value=,0.00 RFU;;;;;Raw Value=,0.00 RFU
+QC Score=,Warning;;;;;QC Score=,Warning;;;;;Temperature=,22.352 °C;;;;;;;;;;QC Score=,Good;;;;;Pre Calibration Value=,0.02 RFU;;;;Temperature=,20.458 °C;;;;;Temperature=,20.383 °C
+Instrument Type=,EXO2;;;;;Instrument Type=,EXO2;;;;;Stability Achieved=,Yes;;;;;;;;;;Instrument Type=,EXO2;;;;;Post Calibration Value=,0.00 RFU;;;;Stability Achieved=,Yes;;;;;Stability Achieved=,Yes
+Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539;;;;;;;;;;;;;;;Instrument Name=,Sonde 19G102539;;;;;Raw Value=,0.00 RFU;;;;;;;;;
+Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539;;;;;[Cal Point 2];;;;;;;;;;Instrument Serial Number=,19G102539;;;;;Temperature=,20.808 °C;;;;[Cal Point 2];;;;;[Cal Point 2]
+Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73;;;;;Standard=,100.00 RFU;;;;;;;;;;Instrument Firmware Version=,1.0.73;;;;;Stability Achieved=,Yes;;;;Standard=,100.00 RFU;;;;;Standard=,100.00 RFU
+Parameter Type=,DO (% Sat);;;;;Parameter Type=,DO (% Sat);;;;;Pre Calibration Value=,99.88 RFU;;;;;;;;;;Parameter Type=,fDOM (RFU);;;;;;;;;Pre Calibration Value=,82.96 RFU;;;;;Pre Calibration Value=,112.74 RFU
+Sensor Type=,DO;;;;;Sensor Type=,DO;;;;;Post Calibration Value=,100.00 RFU;;;;;;;;;;Sensor Type=,fDOM;;;;;[Cal Point 2];;;;Post Calibration Value=,100.00 RFU;;;;;Post Calibration Value=,100.00 RFU
+Sensor Serial Number=,19G101573;;;;;Sensor Serial Number=,19G101573;;;;;Raw Value=,0.00 RFU;;;;;;;;;;Sensor Serial Number=,19F100722;;;;;Standard=,100.00 RFU;;;;Raw Value=,0.00 RFU;;;;;Raw Value=,0.00 RFU
+Sensor Firmware Version=,3.0.0;;;;;Sensor Firmware Version=,3.0.0;;;;;Temperature=,21.858 °C;;;;;;;;;;Sensor Firmware Version=,3.0.0;;;;;Pre Calibration Value=,104.13 RFU;;;;Temperature=,19.646 °C;;;;;Temperature=,19.142 °C
+User ID=,<Unknown>;;;;;User ID=,<Unknown>;;;;;Stability Achieved=,Yes;;;;;;;;;;User ID=,<Unknown>;;;;;Post Calibration Value=,100.00 RFU;;;;Stability Achieved=,Yes;;;;;Stability Achieved=,Yes
+DO Cap Serial Number=,19F102932;;;;;DO Cap Serial Number=,19F102932;;;;;;;;;;;;;;;;;;;;Raw Value=,0.00 RFU;;;;;;;;;
+DO Cap Replacement Date=,7/9/2019 2:51:37 PM;;;;;DO Cap Replacement Date=,7/9/2019 2:51:37 PM;;;;;----------;;;;;;;;;;[Cal Point 1];;;;;Temperature=,20.105 °C;;;;----------;;;;;----------
+DO Gain=,1.45;;;;;DO Gain=,1.42;;;;;;;;;;;;;;;Standard=,0.00 RFU;;;;;Stability Achieved=,Yes;;;;;;;;;
+DO mg/L=,11.24 mg/L;;;;;DO mg/L=,11.50 mg/L;;;;;Last Calibration Time=,7/23/2020 3:51:13 PM;;;;;;;;;;Pre Calibration Value=,-0.04 RFU;;;;;;;;;Last Calibration Time=,10/8/2020 2:48:45 PM;;;;;Last Calibration Time=,11/9/2020 2:50:07 PM
+;;;;;;;;;;Calibration Start Time=,8/13/2020 2:08:12 PM;;;;;;;;;;Post Calibration Value=,0.00 RFU;;;;;----------;;;;Calibration Start Time=,11/9/2020 2:46:20 PM;;;;;Calibration Start Time=,12/8/2020 10:40:55 AM
+[Cal Point 1];;;;;[Cal Point 1];;;;;Calibration End Time=,8/13/2020 2:11:36 PM;;;;;;;;;;Raw Value=,0.00 RFU;;;;;;;;;Calibration End Time=,11/9/2020 2:50:07 PM;;;;;Calibration End Time=,12/8/2020 10:42:34 AM
+Standard=,100.0 % Sat;;;;;Standard=,100.0 % Sat;;;;;Calibration Status=,Completed;;;;;;;;;;Temperature=,21.478 °C;;;;;Last Calibration Time=,9/15/2020 1:38:56 PM;;;;Calibration Status=,Completed;;;;;Calibration Status=,Completed
+Pre Calibration Value=,129.9 % Sat;;;;;Pre Calibration Value=,135.1 % Sat;;;;;QC Score=,Good;;;;;;;;;;Stability Achieved=,Yes;;;;;Calibration Start Time=,10/9/2020 3:13:53 PM;;;;QC Score=,Good;;;;;QC Score=,Good
+Post Calibration Value=,130.0 % Sat;;;;;Post Calibration Value=,133.0 % Sat;;;;;Instrument Type=,EXO2;;;;;;;;;;;;;;;Calibration End Time=,10/9/2020 3:15:12 PM;;;;Instrument Type=,EXO2;;;;;Instrument Type=,EXO2
+Raw Value=,0.0 % Sat;;;;;Raw Value=,0.0 % Sat;;;;;Instrument Name=,Sonde 19G102539;;;;;;;;;;[Cal Point 2];;;;;Calibration Status=,Completed;;;;Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539
+Temperature=,22.409 °C;;;;;Temperature=,22.551 °C;;;;;Instrument Serial Number=,19G102539;;;;;;;;;;Standard=,100.00 RFU;;;;;QC Score=,Good;;;;Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539
+Stability Achieved=,Yes;;;;;Stability Achieved=,Yes;;;;;Instrument Firmware Version=,1.0.73;;;;;;;;;;Pre Calibration Value=,103.82 RFU;;;;;Instrument Type=,EXO2;;;;Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73
+Barometer=,988.0 mmHg;;;;;Barometer=,1010.0 mmHg;;;;;Parameter Type=,fDOM (QSU);;;;;;;;;;Post Calibration Value=,100.00 RFU;;;;;Instrument Name=,Sonde 19G102539;;;;Parameter Type=,fDOM (QSU);;;;;Parameter Type=,fDOM (QSU)
+;;;;;;;;;;Sensor Type=,fDOM;;;;;;;;;;Raw Value=,0.00 RFU;;;;;Instrument Serial Number=,19G102539;;;;Sensor Type=,fDOM;;;;;Sensor Type=,fDOM
+----------;;;;;----------;;;;;Sensor Serial Number=,19F100722;;;;;;;;;;Temperature=,21.206 °C;;;;;Instrument Firmware Version=,1.0.73;;;;Sensor Serial Number=,19F100722;;;;;Sensor Serial Number=,19F100722
+;;;;;;;;;;Sensor Firmware Version=,3.0.0;;;;;;;;;;Stability Achieved=,Yes;;;;;Parameter Type=,DO (% Sat);;;;Sensor Firmware Version=,3.0.0;;;;;Sensor Firmware Version=,3.0.0
+Last Calibration Time=,12/4/2019 2:59:19 PM;;;;;Last Calibration Time=,6/5/2020 5:04:29 PM;;;;;User ID=,<Unknown>;;;;;;;;;;;;;;;Sensor Type=,DO;;;;User ID=,<Unknown>;;;;;User ID=,<Unknown>
+Calibration Start Time=,6/5/2020 4:57:40 PM;;;;;Calibration Start Time=,7/23/2020 3:45:45 PM;;;;;;;;;;;;;;;----------;;;;;Sensor Serial Number=,19G101573;;;;;;;;;
+Calibration End Time=,6/5/2020 5:04:29 PM;;;;;Calibration End Time=,7/23/2020 3:51:13 PM;;;;;[Cal Point 1];;;;;;;;;;;;;;;Sensor Firmware Version=,3.0.0;;;;[Cal Point 1];;;;;[Cal Point 1]
+Calibration Status=,Completed;;;;;Calibration Status=,Completed;;;;;Standard=,0.00 QSU;;;;;;;;;;Last Calibration Time=,8/13/2020 2:11:36 PM;;;;;User ID=,<Unknown>;;;;Standard=,0.00 QSU;;;;;Standard=,0.00 QSU
+QC Score=,Good;;;;;QC Score=,Good;;;;;Pre Calibration Value=,0.02 QSU;;;;;;;;;;Calibration Start Time=,9/15/2020 11:38:28 AM;;;;;DO Cap Serial Number=,19F102932;;;;Pre Calibration Value=,-0.94 QSU;;;;;Pre Calibration Value=,-0.51 QSU
+Instrument Type=,EXO2;;;;;Instrument Type=,EXO2;;;;;Post Calibration Value=,0.00 QSU;;;;;;;;;;Calibration End Time=,9/15/2020 11:40:37 AM;;;;;DO Cap Replacement Date=,7/9/2019 2:51:37 PM;;;;Post Calibration Value=,-0.01 QSU;;;;;Post Calibration Value=,0.00 QSU
+Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539;;;;;Raw Value=,0.00 QSU;;;;;;;;;;Calibration Status=,Completed;;;;;DO Gain=,1.04;;;;Raw Value=,0.00 QSU;;;;;Raw Value=,0.00 QSU
+Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539;;;;;Temperature=,22.395 °C;;;;;;;;;;QC Score=,Good;;;;;DO mg/L=,10.69 mg/L;;;;Temperature=,19.287 °C;;;;;Temperature=,19.827 °C
+Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73;;;;;Stability Achieved=,Yes;;;;;;;;;;Instrument Type=,EXO2;;;;;;;;;Stability Achieved=,Yes;;;;;Stability Achieved=,Yes
+Parameter Type=,fDOM (QSU);;;;;Parameter Type=,fDOM (QSU);;;;;;;;;;;;;;;Instrument Name=,Sonde 19G102539;;;;;[Cal Point 1];;;;;;;;;
+Sensor Type=,fDOM;;;;;Sensor Type=,fDOM;;;;;[Cal Point 2];;;;;;;;;;Instrument Serial Number=,19G102539;;;;;Standard=,100.0 % Sat;;;;[Cal Point 2];;;;;[Cal Point 2]
+Sensor Serial Number=,19F100722;;;;;Sensor Serial Number=,19F100722;;;;;Standard=,300.00 QSU;;;;;;;;;;Instrument Firmware Version=,1.0.73;;;;;Pre Calibration Value=,99.9 % Sat;;;;Standard=,300.00 QSU;;;;;Standard=,300.00 QSU
+Sensor Firmware Version=,3.0.0;;;;;Sensor Firmware Version=,3.0.0;;;;;Pre Calibration Value=,307.08 QSU;;;;;;;;;;Parameter Type=,fDOM (QSU);;;;;Post Calibration Value=,98.3 % Sat;;;;Pre Calibration Value=,246.11 QSU;;;;;Pre Calibration Value=,358.74 QSU
+User ID=,<Unknown>;;;;;User ID=,<Unknown>;;;;;Post Calibration Value=,300.00 QSU;;;;;;;;;;Sensor Type=,fDOM;;;;;Raw Value=,0.0 % Sat;;;;Post Calibration Value=,300.00 QSU;;;;;Post Calibration Value=,300.00 QSU
+;;;;;;;;;;Raw Value=,0.00 QSU;;;;;;;;;;Sensor Serial Number=,19F100722;;;;;Temperature=,11.593 °C;;;;Raw Value=,0.00 QSU;;;;;Raw Value=,0.00 QSU
+[Cal Point 1];;;;;[Cal Point 1];;;;;Temperature=,21.857 °C;;;;;;;;;;Sensor Firmware Version=,3.0.0;;;;;Stability Achieved=,Yes;;;;Temperature=,19.340 °C;;;;;Temperature=,19.162 °C
+Standard=,0.00 QSU;;;;;Standard=,0.00 QSU;;;;;Stability Achieved=,Yes;;;;;;;;;;User ID=,<Unknown>;;;;;Barometer=,747.0 mmHg;;;;Stability Achieved=,Yes;;;;;Stability Achieved=,Yes
+Pre Calibration Value=,0.04 QSU;;;;;Pre Calibration Value=,-0.90 QSU;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Post Calibration Value=,0.00 QSU;;;;;Post Calibration Value=,0.00 QSU;;;;;----------;;;;;;;;;;[Cal Point 1];;;;;----------;;;;----------;;;;;----------
+Raw Value=,0.00 QSU;;;;;Raw Value=,0.00 QSU;;;;;;;;;;;;;;;Standard=,0.00 QSU;;;;;;;;;;;;;;
+Temperature=,22.619 °C;;;;;Temperature=,22.835 °C;;;;;;;;;;;;;;;Pre Calibration Value=,-0.21 QSU;;;;;;;;;;;;;;
+Stability Achieved=,Yes;;;;;Stability Achieved=,Yes;;;;;;;;;;;;;;;Post Calibration Value=,0.00 QSU;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;Raw Value=,0.00 QSU;;;;;;;;;;;;;;
+[Cal Point 2];;;;;[Cal Point 2];;;;;;;;;;;;;;;Temperature=,21.284 °C;;;;;;;;;;;;;;
+Standard=,300.00 QSU;;;;;Standard=,300.00 QSU;;;;;;;;;;;;;;;Stability Achieved=,Yes;;;;;;;;;;;;;;
+Pre Calibration Value=,263.14 QSU;;;;;Pre Calibration Value=,332.65 QSU;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Post Calibration Value=,300.00 QSU;;;;;Post Calibration Value=,300.00 QSU;;;;;;;;;;;;;;;[Cal Point 2];;;;;;;;;;;;;;
+Raw Value=,0.00 QSU;;;;;Raw Value=,0.00 QSU;;;;;;;;;;;;;;;Standard=,300.00 QSU;;;;;;;;;;;;;;
+Temperature=,21.956 °C;;;;;Temperature=,22.293 °C;;;;;;;;;;;;;;;Pre Calibration Value=,289.54 QSU;;;;;;;;;;;;;;
+Stability Achieved=,Yes;;;;;Stability Achieved=,Yes;;;;;;;;;;;;;;;Post Calibration Value=,300.00 QSU;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;Raw Value=,0.00 QSU;;;;;;;;;;;;;;
+----------;;;;;----------;;;;;;;;;;;;;;;Temperature=,21.320 °C;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;Stability Achieved=,Yes;;;;;;;;;;;;;;
+Last Calibration Time=,12/4/2019 3:03:50 PM;;;;;Last Calibration Time=,6/5/2020 5:09:38 PM;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Calibration Start Time=,6/5/2020 5:04:41 PM;;;;;Calibration Start Time=,7/23/2020 3:54:11 PM;;;;;;;;;;;;;;;----------;;;;;;;;;;;;;;
+Calibration End Time=,6/5/2020 5:09:38 PM;;;;;Calibration End Time=,7/23/2020 3:58:40 PM;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Calibration Status=,Completed;;;;;Calibration Status=,Completed;;;;;;;;;;;;;;;Last Calibration Time=,8/27/2020 1:23:36 PM;;;;;;;;;;;;;;
+QC Score=,Warning;;;;;QC Score=,Good;;;;;;;;;;;;;;;Calibration Start Time=,9/15/2020 1:38:13 PM;;;;;;;;;;;;;;
+Instrument Type=,EXO2;;;;;Instrument Type=,EXO2;;;;;;;;;;;;;;;Calibration End Time=,9/15/2020 1:38:56 PM;;;;;;;;;;;;;;
+Instrument Name=,Sonde 19G102539;;;;;Instrument Name=,Sonde 19G102539;;;;;;;;;;;;;;;Calibration Status=,Completed;;;;;;;;;;;;;;
+Instrument Serial Number=,19G102539;;;;;Instrument Serial Number=,19G102539;;;;;;;;;;;;;;;QC Score=,Good;;;;;;;;;;;;;;
+Instrument Firmware Version=,1.0.73;;;;;Instrument Firmware Version=,1.0.73;;;;;;;;;;;;;;;Instrument Type=,EXO2;;;;;;;;;;;;;;
+Parameter Type=,fDOM (RFU);;;;;Parameter Type=,fDOM (RFU);;;;;;;;;;;;;;;Instrument Name=,Sonde 19G102539;;;;;;;;;;;;;;
+Sensor Type=,fDOM;;;;;Sensor Type=,fDOM;;;;;;;;;;;;;;;Instrument Serial Number=,19G102539;;;;;;;;;;;;;;
+Sensor Serial Number=,19F100722;;;;;Sensor Serial Number=,19F100722;;;;;;;;;;;;;;;Instrument Firmware Version=,1.0.73;;;;;;;;;;;;;;
+Sensor Firmware Version=,3.0.0;;;;;Sensor Firmware Version=,3.0.0;;;;;;;;;;;;;;;Parameter Type=,DO (% Sat);;;;;;;;;;;;;;
+User ID=,<Unknown>;;;;;User ID=,<Unknown>;;;;;;;;;;;;;;;Sensor Type=,DO;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;Sensor Serial Number=,19G101573;;;;;;;;;;;;;;
+[Cal Point 1];;;;;[Cal Point 1];;;;;;;;;;;;;;;Sensor Firmware Version=,3.0.0;;;;;;;;;;;;;;
+Standard=,0.00 RFU;;;;;Standard=,0.00 RFU;;;;;;;;;;;;;;;User ID=,<Unknown>;;;;;;;;;;;;;;
+Pre Calibration Value=,0.08 RFU;;;;;Pre Calibration Value=,-0.31 RFU;;;;;;;;;;;;;;;DO Cap Serial Number=,19F102932;;;;;;;;;;;;;;
+Post Calibration Value=,0.00 RFU;;;;;Post Calibration Value=,0.00 RFU;;;;;;;;;;;;;;;DO Cap Replacement Date=,7/9/2019 2:51:37 PM;;;;;;;;;;;;;;
+Raw Value=,0.00 RFU;;;;;Raw Value=,0.00 RFU;;;;;;;;;;;;;;;DO Gain=,1.06;;;;;;;;;;;;;;
+Temperature=,22.210 °C;;;;;Temperature=,22.857 °C;;;;;;;;;;;;;;;DO mg/L=,10.26 mg/L;;;;;;;;;;;;;;
+Stability Achieved=,Yes;;;;;Stability Achieved=,Yes;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;[Cal Point 1];;;;;;;;;;;;;;
+[Cal Point 2];;;;;[Cal Point 2];;;;;;;;;;;;;;;Standard=,100.0 % Sat;;;;;;;;;;;;;;
+Standard=,100.00 RFU;;;;;Standard=,100.00 RFU;;;;;;;;;;;;;;;Pre Calibration Value=,99.0 % Sat;;;;;;;;;;;;;;
+Pre Calibration Value=,87.98 RFU;;;;;Pre Calibration Value=,123.66 RFU;;;;;;;;;;;;;;;Post Calibration Value=,100.2 % Sat;;;;;;;;;;;;;;
+Post Calibration Value=,100.00 RFU;;;;;Post Calibration Value=,100.00 RFU;;;;;;;;;;;;;;;Raw Value=,0.0 % Sat;;;;;;;;;;;;;;
+Raw Value=,0.00 RFU;;;;;Raw Value=,0.00 RFU;;;;;;;;;;;;;;;Temperature=,14.270 °C;;;;;;;;;;;;;;
+Temperature=,21.866 °C;;;;;Temperature=,22.297 °C;;;;;;;;;;;;;;;Stability Achieved=,Yes;;;;;;;;;;;;;;
+Stability Achieved=,Yes;;;;;Stability Achieved=,Yes;;;;;;;;;;;;;;;Barometer=,761.0 mmHg;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+----------;;;;;----------;;;;;;;;;;;;;;;----------;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Last Calibration Time=,6/9/2020 10:02:27 AM;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Calibration Start Time=,6/9/2020 3:31:10 PM;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Calibration End Time=,6/9/2020 3:31:33 PM;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Calibration Status=,Completed;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+QC Score=,Good;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Instrument Type=,EXO2;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Instrument Name=,Sonde 19G102539;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Instrument Serial Number=,19G102539;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Instrument Firmware Version=,1.0.73;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Parameter Type=,Depth (m);;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Sensor Type=,Depth;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Sensor Serial Number=,19G100819;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Sensor Firmware Version=,3.0.0;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+User ID=,<Unknown>;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+[Cal Point 1];;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Standard=,0.000 m;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Pre Calibration Value=,-0.007 m;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Post Calibration Value=,0.000 m;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Raw Value=,0.000 m;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Temperature=,15.775 °C;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Stability Achieved=,Yes;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+----------;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

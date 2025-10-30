@@ -1,0 +1,31 @@
+KorEXO Calibration File Export
+
+Last Calibration Time=,8/13/2020 1:31:24 PM
+Calibration Start Time=,8/27/2020 1:23:10 PM
+Calibration End Time=,8/27/2020 1:23:36 PM
+Calibration Status=,Completed
+QC Score=,Good
+Instrument Type=,EXO2
+Instrument Name=,Sonde 19G102539
+Instrument Serial Number=,19G102539
+Instrument Firmware Version=,1.0.73
+Parameter Type=,DO (% Sat)
+Sensor Type=,DO
+Sensor Serial Number=,19G101573
+Sensor Firmware Version=,3.0.0
+User ID=,<Unknown>
+DO Cap Serial Number=,19F102932
+DO Cap Replacement Date=,7/9/2019 2:51:37 PM
+DO Gain=,1.05
+DO mg/L=,9.77 mg/L
+
+[Cal Point 1]
+Standard=,100.0 % Sat
+Pre Calibration Value=,134.4 % Sat
+Post Calibration Value=,99.3 % Sat
+Raw Value=,0.0 % Sat
+Temperature=,16.197 °C
+Stability Achieved=,Yes
+Barometer=,755.0 mmHg
+
+----------

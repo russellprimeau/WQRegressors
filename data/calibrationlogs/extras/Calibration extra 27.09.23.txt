@@ -1,0 +1,13 @@
+pH - orange color instead of green color in software after calibration, but no information on why it is orange.
+
+Turbidity calibration with black sensor guard. Removed central wiper and pH.
+
+Removed central wiper, turbidity and pH sensors when doint fDOM calibration.
+
+FDOM QSU normal.
+FDOM RFU normal.
+
+Temperature:	19.123
+Nist equipment:	19.3
+	
+

@@ -1,0 +1,14 @@
+Installed new pH sensor. Also using new brand (WTW) for pH calibration. Slopes approx. 176.4 and 167.3
+
+Turbidity calibration with black sensor guard. Removed central wiper and pH.
+Rinse atleast 3 times with destilled water before zero calibration.
+Dry probe with whatman paper before immersing in solution.
+
+Removed central wiper, turbidity and pH sensors when doing fDOM calibration.
+
+Calibrated DO twice, because we forgot to change the barometer reading.
+
+Temperature:	19.450
+Nist equipment:	19.3
+	
+

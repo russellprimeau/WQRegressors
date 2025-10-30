@@ -1,0 +1,4 @@
+Temperature:
+Nist equipment	18.8
+Sonde		18.685
+

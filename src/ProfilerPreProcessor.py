@@ -12,7 +12,7 @@ import numpy as np
 # Clean profiler hourly surface data. Fill small gaps by interpolation.
 
 # Load the CSV file
-df = pd.read_csv("../data/HourlyDemo.csv")
+df = pd.read_csv("../data/FullHourly.csv")
 
 # Remove extraneous metadata
 sensor_columns = [col for col in df.columns if col.startswith("sensorParms")]
@@ -22,16 +22,13 @@ df = df[["TIMESTAMP"] + sensor_columns]
 df["TIMESTAMP"] = pd.to_datetime(df["TIMESTAMP"])
 df = df.sort_values("TIMESTAMP").drop_duplicates(subset="TIMESTAMP")
 
-# Step 3: Replace -9999 and NaN with NaN for interpolation
+# Replace -9999 and NaN with NaN for interpolation
 df[sensor_columns] = df[sensor_columns].replace([-9999, "NaN"], np.nan)
 
-# Step 4: Round TIMESTAMP to the nearest hour
+# Round TIMESTAMP to the nearest hour
 df["TIMESTAMP"] = df["TIMESTAMP"].dt.round("h")
 
-# Step 5: Add Segment column initialized to 1
-df["Segment"] = 1
-
-# Step 6: Fill gaps and track interpolated rows
+# Fill gaps and track interpolated rows
 df = df.reset_index(drop=True)
 new_rows = []
 df["Interpolated"] = 0
@@ -53,9 +50,34 @@ for i in range(1, len(df)):
 df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
 df = df.sort_values("TIMESTAMP").reset_index(drop=True)
 
-# Step 7: Interpolate missing values and round to 2 decimals
+# Interpolate missing values and round to 2 decimals
 df[sensor_columns] = df[sensor_columns].interpolate(method="linear")
 df[sensor_columns] = df[sensor_columns].round(2)
+
+column_names = {
+            "TIMESTAMP": "TIMESTAMP",
+            "RECORD": "Pfl - Record Number",
+            "PFL_Counter": "Pfl - Day",
+            "CntRS232": "Pfl - CntRS232",
+            "RS232Dpt": "Pfl - Vertical Position1 (m)",
+            "sensorParms(1)": "Pfl - Temp (C)",
+            "sensorParms(2)": "Pfl - Cond (μS_cm)",
+            "sensorParms(3)": "Pfl - Sp Cond (microS_cm)",
+            "sensorParms(4)": "Pfl - Salinity (ppt)",
+            "sensorParms(5)": "Pfl - pH",
+            "sensorParms(6)": "Pfl - DO (% Sat)",
+            "sensorParms(7)": "Pfl - Turbidity (NTU)",
+            "sensorParms(8)": "Pfl - Turbidity (FNU)",
+            "sensorParms(9)": "Pfl - Vertical Position (m)",
+            "sensorParms(10)": "Pfl - fDOM (RFU)",
+            "sensorParms(11)": "Pfl - fDOM (QSU)",
+            "lat": "Latitude",
+            "lon": "Longitude",
+        }
+df = df.rename(columns=column_names)
+keepers = ["TIMESTAMP", "Interpolated", "Pfl - Temp (C)", "Pfl - Sp Cond (microS_cm)", "Pfl - pH", "Pfl - DO (% Sat)",
+           "Pfl - Turbidity (FNU)", "Pfl - fDOM (RFU)", "Pfl - fDOM (QSU)"]
+df = df[keepers]
 
 #######################################################################################################################
 # Add weather station data to the dataset.

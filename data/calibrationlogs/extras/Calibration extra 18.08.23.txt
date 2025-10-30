@@ -1,0 +1,11 @@
+Turbidity calibration with black sensor guard. Removed central wiper and pH.
+
+Removed central wiper, turbidity and pH sensors when doint fDOM calibration.
+
+FDOM QSU normal.
+FDOM RFU normal.
+
+Temperature:	19.036
+Nist equipment:	19.2
+	
+

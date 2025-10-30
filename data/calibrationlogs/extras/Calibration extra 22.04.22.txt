@@ -1,0 +1,11 @@
+First calibration after sonde was stuck in the bottom of Brusdalsvatnet.
+
+Turbidity calibration with black sensor guard. 
+Turbidity had shifted alot from previous calibration. Maybe because of stuck in mud bottom of the lake?
+
+Removed central wiper, turbidity and pH sensors when doint fDOM calibration.
+
+Temperature:
+Nist equipment	19.3
+Sonde		19.226
+

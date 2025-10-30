@@ -1,0 +1,202 @@
+KorEXO Calibration File Export
+
+Last Calibration Time=,4/22/2022 10:59:18 AM
+Calibration Start Time=,6/20/2022 1:10:23 PM
+Calibration End Time=,6/20/2022 1:17:36 PM
+Calibration Status=,Completed
+QC Score=,Good
+Instrument Type=,EXO2
+Instrument Name=,Sonde 19G102539
+Instrument Serial Number=,19G102539
+Instrument Firmware Version=,1.0.73
+Parameter Type=,pH
+Sensor Type=,pH
+Sensor Serial Number=,21B101596
+Sensor Firmware Version=,3.0.0
+User ID=,<Unknown>
+Sensor Module Replacement Date=,3/24/2021 12:00:00 AM
+pH Range 4.00-7.02 Delta Slope=,176.1 mV
+pH Range 4.00-7.02 mV per Decade=,58.30
+pH Range 7.02-10.06 Delta Slope=,178.6 mV
+pH Range 7.02-10.06 mV per Decade=,58.75
+
+[Cal Point 1]
+Standard=,7.02 pH
+Pre Calibration Value=,7.17 pH
+Post Calibration Value=,7.02 pH
+Raw Value=,-18.8 mV
+Temperature=,19.766 °C
+Stability Achieved=,Yes
+
+[Cal Point 2]
+Standard=,4.00 pH
+Pre Calibration Value=,4.15 pH
+Post Calibration Value=,4.00 pH
+Raw Value=,157.3 mV
+Temperature=,19.961 °C
+Stability Achieved=,Yes
+
+[Cal Point 3]
+Standard=,10.06 pH
+Pre Calibration Value=,10.23 pH
+Post Calibration Value=,10.06 pH
+Raw Value=,-197.4 mV
+Temperature=,19.618 °C
+Stability Achieved=,Yes
+
+----------
+
+Last Calibration Time=,4/22/2022 11:03:09 AM
+Calibration Start Time=,6/20/2022 1:18:50 PM
+Calibration End Time=,6/20/2022 1:21:10 PM
+Calibration Status=,Completed
+QC Score=,Good
+Instrument Type=,EXO2
+Instrument Name=,Sonde 19G102539
+Instrument Serial Number=,19G102539
+Instrument Firmware Version=,1.0.73
+Parameter Type=,Sp Cond (µS/cm)
+Sensor Type=,Wiped Conductivity And Temperature
+Sensor Serial Number=,19F100067
+Sensor Firmware Version=,3.0.5
+User ID=,<Unknown>
+Cell Constant=,0.48
+
+[Cal Point 1]
+Standard=,1000.0 µS/cm
+Pre Calibration Value=,990.6 µS/cm
+Post Calibration Value=,1000.0 µS/cm
+Raw Value=,0.0 µS/cm
+Temperature=,19.632 °C
+Stability Achieved=,Yes
+
+----------
+
+Last Calibration Time=,4/22/2022 11:15:39 AM
+Calibration Start Time=,6/20/2022 1:36:56 PM
+Calibration End Time=,6/20/2022 1:37:25 PM
+Calibration Status=,Completed
+QC Score=,Good
+Instrument Type=,EXO2
+Instrument Name=,Sonde 19G102539
+Instrument Serial Number=,19G102539
+Instrument Firmware Version=,1.0.73
+Parameter Type=,DO (% Sat)
+Sensor Type=,DO
+Sensor Serial Number=,19G101573
+Sensor Firmware Version=,3.0.0
+User ID=,<Unknown>
+DO Cap Serial Number=,19F102932
+DO Cap Replacement Date=,7/9/2019 2:51:37 PM
+DO Gain=,1.05
+DO mg/L=,9.21 mg/L
+
+[Cal Point 1]
+Standard=,100.0 % Sat
+Pre Calibration Value=,100.9 % Sat
+Post Calibration Value=,100.1 % Sat
+Raw Value=,0.0 % Sat
+Temperature=,19.310 °C
+Stability Achieved=,Yes
+Barometer=,759.0 mmHg
+
+----------
+
+Last Calibration Time=,4/22/2022 11:41:55 AM
+Calibration Start Time=,6/20/2022 1:56:36 PM
+Calibration End Time=,6/20/2022 2:01:45 PM
+Calibration Status=,Completed
+QC Score=,Warning
+Instrument Type=,EXO2
+Instrument Name=,Sonde 19G102539
+Instrument Serial Number=,19G102539
+Instrument Firmware Version=,1.0.73
+Parameter Type=,Turbidity (FNU)
+Sensor Type=,Turbidity
+Sensor Serial Number=,19G100122
+Sensor Firmware Version=,3.0.0
+User ID=,<Unknown>
+
+[Cal Point 1]
+Standard=,0.00 FNU
+Pre Calibration Value=,-0.09 FNU
+Post Calibration Value=,0.00 FNU
+Raw Value=,0.00 FNU
+Temperature=,19.006 °C
+Stability Achieved=,Yes
+
+[Cal Point 2]
+Standard=,12.40 FNU
+Pre Calibration Value=,2.25 FNU
+Post Calibration Value=,12.40 FNU
+Raw Value=,0.00 FNU
+Temperature=,20.290 °C
+Stability Achieved=,Yes
+
+----------
+
+Last Calibration Time=,4/22/2022 11:54:43 AM
+Calibration Start Time=,6/20/2022 2:05:47 PM
+Calibration End Time=,6/20/2022 2:11:06 PM
+Calibration Status=,Completed
+QC Score=,Good
+Instrument Type=,EXO2
+Instrument Name=,Sonde 19G102539
+Instrument Serial Number=,19G102539
+Instrument Firmware Version=,1.0.73
+Parameter Type=,fDOM (RFU)
+Sensor Type=,fDOM
+Sensor Serial Number=,19F100722
+Sensor Firmware Version=,3.0.0
+User ID=,<Unknown>
+
+[Cal Point 1]
+Standard=,0.00 RFU
+Pre Calibration Value=,0.13 RFU
+Post Calibration Value=,0.00 RFU
+Raw Value=,0.00 RFU
+Temperature=,18.823 °C
+Stability Achieved=,Yes
+
+[Cal Point 2]
+Standard=,100.00 RFU
+Pre Calibration Value=,91.47 RFU
+Post Calibration Value=,100.00 RFU
+Raw Value=,0.00 RFU
+Temperature=,19.657 °C
+Stability Achieved=,Yes
+
+----------
+
+Last Calibration Time=,3/24/2022 4:26:29 PM
+Calibration Start Time=,6/20/2022 2:11:17 PM
+Calibration End Time=,6/20/2022 2:16:01 PM
+Calibration Status=,Completed
+QC Score=,Good
+Instrument Type=,EXO2
+Instrument Name=,Sonde 19G102539
+Instrument Serial Number=,19G102539
+Instrument Firmware Version=,1.0.73
+Parameter Type=,fDOM (QSU)
+Sensor Type=,fDOM
+Sensor Serial Number=,19F100722
+Sensor Firmware Version=,3.0.0
+User ID=,<Unknown>
+
+[Cal Point 1]
+Standard=,0.00 QSU
+Pre Calibration Value=,0.67 QSU
+Post Calibration Value=,0.00 QSU
+Raw Value=,0.00 QSU
+Temperature=,18.466 °C
+Stability Achieved=,Yes
+
+[Cal Point 2]
+Standard=,300.00 QSU
+Pre Calibration Value=,289.34 QSU
+Post Calibration Value=,300.00 QSU
+Raw Value=,0.00 QSU
+Temperature=,19.639 °C
+Stability Achieved=,Yes
+
+----------

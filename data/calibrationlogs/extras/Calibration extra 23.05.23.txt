@@ -1,0 +1,10 @@
+Tubidity 12.4 NTNU standard expired march 2023. Have ordered a new one, but it hasn't arrived.
+
+Turbidity calibration with black sensor guard. Removed central wiper.
+
+Removed central wiper, turbidity and pH sensors when doint fDOM calibration.
+
+Temperature:	19.033
+Nist equipment:	19.1
+	
+

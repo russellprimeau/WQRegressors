@@ -1,0 +1,6 @@
+Temperature:
+Nist equipment	20,4
+Sonde		20,323
+
+Turbidity 1NTU (opened 30.04.21):
+Sonde measured	 NTU

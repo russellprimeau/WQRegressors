@@ -1,0 +1,14 @@
+Turbidity calibration with black sensor guard. Removed central wiper and pH.
+Rinse atleast 3 times with destilled water before zero calibration.
+Dry probe with whatman paper before immersing in solution.
+
+Removed central wiper, turbidity and pH sensors when doint fDOM calibration.
+
+We were out of conductivity calibration liquid. Aanderaa hadn't fixed their agreement so we couldn't order yet.
+
+We did two pH calibrations because of yellow score, still got yellow score on try number two. From the manual it could be the sensor has reached it's lifespan.
+
+Temperature:	20.870
+Nist equipment:	20.8
+	
+

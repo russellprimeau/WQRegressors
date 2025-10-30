@@ -1,0 +1,23 @@
+Turbidity calibration with black sensor guard. Removed central wiper and pH.
+Rinse atleast 3 times with destilled water before zero calibration.
+
+Removed central wiper, turbidity and pH sensors when doint fDOM calibration.
+
+Used expired conductivity calibration liquid: 14.03.24
+
+Pre-cal: 26 FNU at first
+Pre-cal 5.8 FNU second
+Pre-cal: 12.38 FNU third
+
+We did two pH calibrations because of two-point first, meant to do 3-point.
+We did three turbidity calibrations because of wanting to be certain that the calibration had gone fine.
+
+For depth calibration (didn't use it):
+Latitude: 62.4770
+Altitude: 25.9
+
+
+Temperature:	19.487
+Nist equipment:	19.3
+	
+

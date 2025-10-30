@@ -1,0 +1,13 @@
+Tubidity 12.4 NTNU standard expired march 2023. Have ordered a new one, but it hasn't arrived.
+
+Turbidity calibration with black sensor guard. Removed central wiper.
+
+Removed central wiper, turbidity and pH sensors when doint fDOM calibration.
+
+FDOM QSU calibration zero (destilled water). Exceeds expected value message. Pre calibration value of 500+, expected close to 300.
+FDOM RFU normal.
+
+Temperature:	19.701
+Nist equipment:	19.9
+	
+

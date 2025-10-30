@@ -1,0 +1,9 @@
+Turbidity calibration with black sensor guard. Removed central wiper.
+Turbidity had shifted alot from previous calibration.
+
+Removed central wiper, turbidity and pH sensors when doint fDOM calibration.
+
+Temperature:
+Nist equipment	19.0
+Sonde		18.857
+
