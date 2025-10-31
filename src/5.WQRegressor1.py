@@ -107,7 +107,7 @@ def visualize_predictions(model, dataset, num_samples=3):
 
 # Main pipeline
 def main():
-    csv_file = 'timeseries_data.csv'  # Replace with actual file name
+    csv_file = '../data/output/for_regression/Combined_Cleaned.csv'  # Replace with actual file name
     data = load_data(csv_file)
     dataset = TimeSeriesDataset(data, input_window=168, output_window=48)
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
