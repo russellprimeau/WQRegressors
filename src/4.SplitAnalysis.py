@@ -162,16 +162,28 @@ if __name__ == '__main__':
 
     # Identify prediction targets (default: all Eurofins data)
     # target_columns = df.columns[-9:]
-    # target_columns = ["06-E.coli"]
-    target_columns = ['SCADA - Temperature (°C)']
-    seg_length = 72
+    target_columns = ["SCADA - Temperature (°C)"]
+    # target_columns = ['SCADA - Temperature (°C)']
+    seg_length = 24
 
     # gapless(df, target_columns)  # Analysis function #1
     # gapped(df, target_columns, seg_length)  # Analysis function #2
 
     # output_dir = "../data/output/for_regression/Eurofins_complete_rows"
-    output_dir = "../data/output/for_regression/SCADATemp72hr"
-    length = 72
+    output_dir = "../data/output/for_regression/SCADATemp96hr"
+    length = 96
     # to_normalize = df.columns[3:]
-    to_normalize = []
+    to_normalize = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
+        'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
+        'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)',
+        'Hourly average wind direction (°)', 'Average wind speed (m/s)',
+        'Maximum sustained wind speed, 3-second span (m/s)', 'Time of maximum 3s Gust',
+        'Maximum sustained wind speed, 10-minute span (m/s)', 'Time of maximum 10 minute gust',
+        'Hourly average atmospheric pressure at station (mBar)', 'Maximum pressure differential, 3-hour span (mBar)',
+        'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)',
+        'Longwave (IR) radiation (W/m2)', 'Instantaneous sea-level atmospheric pressure (mBar)',
+        'Shortwave (solar) radiation (W/m2)', 'Precipitation (mm/hr)', 'Instantaneous temperature (°C)',
+        'Maximum temperature (°C)', 'Minimum temperature (°C)', 'Average humidity (% relative humidity)',
+        'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
+        '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
     split(df, output_dir, target_columns, length, to_normalize, 0)
