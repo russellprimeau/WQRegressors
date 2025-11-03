@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
@@ -31,7 +32,7 @@ def load_samples(directory, input_columns, output_columns, input_rows, output_ro
             print(f"Sample {filename} skipped — not enough rows ({len(df)} < {input_rows.stop})")
             continue  # skip files without enough rows
 
-        input_seq = df.loc[input_rows, input_columns].values  # shape: [timesteps, input_dim]
+        input_seq = df.iloc[input_rows, :][input_columns].values
         output_seq = df.iloc[output_rows:, :][output_columns].values
 
         if np.isnan(input_seq).any() or np.isnan(output_seq).any():
@@ -105,19 +106,91 @@ def evaluate_model(model, dataset):
     targets = targets[mask]
     return predictions, targets
 
-def evaluate_baseline(dataset, historical_df, output_columns, data_dir, output_rows=-1):
+def evaluate_naive(dataset, historical_df, output_columns, data_dir, output_rows=-1, gap_hours=5):
+    """
+    For each sample in the dataset:
+    - Find the timestamp of the output row in the sample file.
+    - In historical_df, find the most recent non-NaN value for each output column
+      that occurs at least `gap_hours` before the sample_time.
+    """
     predictions, targets = [], []
     for i in range(len(dataset)):
         _, y, filename = dataset[i]
+
+        # Load the sample file to get the timestamp of the output
+        sample_df = pd.read_csv(os.path.join(data_dir, filename), parse_dates=["TIMESTAMP"])
+        output_time = sample_df["TIMESTAMP"].iloc[output_rows]
+
+        # Apply gap constraint
+        cutoff_time = output_time - pd.Timedelta(hours=gap_hours)
+
+        # Filter historical data before cutoff_time
+        earlier_values = historical_df[historical_df["TIMESTAMP"] < cutoff_time][output_columns]
+
+        # Drop NaN values and select the last valid row
+        valid_values = earlier_values.dropna()
+        if valid_values.empty:
+            baseline_pred = np.full(len(output_columns), np.nan)
+        else:
+            baseline_pred = valid_values.iloc[-1].values
+
+        predictions.append(baseline_pred)
+        targets.append(y.numpy())  # Convert tensor to numpy
+
+    return np.array(predictions), np.array(targets)
+
+def evaluate_linear(dataset, historical_df, output_columns, data_dir, output_rows=-1, window_hours=6):
+    """
+    For each sample:
+    - Find the timestamp of the output row in the sample file.
+    - Collect all valid historical values within `window_hours` before sample_time.
+    - Fit a least-squares linear regression model (time vs value) for each output column.
+    - Predict the value at sample_time.
+    Handles NaNs in both input and output.
+    """
+    predictions, targets = [], []
+
+    for i in range(len(dataset)):
+        _, y, filename = dataset[i]
+
+        # Load sample file to get timestamp of output
         sample_df = pd.read_csv(os.path.join(data_dir, filename), parse_dates=["TIMESTAMP"])
         sample_time = sample_df["TIMESTAMP"].iloc[output_rows]
-        earlier_values = historical_df[historical_df["TIMESTAMP"] < sample_time][output_columns]
-        # Drop NaN values before selecting the last one
-        valid_values = earlier_values.dropna()
-        baseline_pred = valid_values.iloc[-1].values if not valid_values.empty else np.full(len(output_columns), np.nan)
-        predictions.append(baseline_pred)
-        targets.append(y.item())
-        print("Baseline: ", sample_time," in ",filename, ". Naive prediction: ", baseline_pred, "Ground truth: ", y.item())
+
+        # Define time window
+        start_time = sample_time - pd.Timedelta(hours=window_hours)
+
+        # Filter historical data within the window
+        window_df = historical_df[(historical_df["TIMESTAMP"] >= start_time) &
+                                  (historical_df["TIMESTAMP"] < sample_time)][["TIMESTAMP"] + output_columns]
+
+        # Drop rows with NaN in output columns
+        window_df = window_df.dropna(subset=output_columns)
+
+        # If no valid data, return NaN predictions
+        if window_df.empty:
+            pred = np.full(len(output_columns), np.nan)
+        else:
+            # Convert timestamps to numeric (seconds since start_time)
+            times = (window_df["TIMESTAMP"] - start_time).dt.total_seconds().values.reshape(-1, 1)
+            pred = []
+            for col in output_columns:
+                values = window_df[col].values
+                # If all values are NaN or empty after filtering, return NaN
+                if len(values) == 0 or np.isnan(values).all():
+                    pred.append(np.nan)
+                else:
+                    # Fit linear regression
+                    model = LinearRegression()
+                    model.fit(times, values)
+                    # Predict at sample_time
+                    target_time = (sample_time - start_time).total_seconds()
+                    pred.append(model.predict([[target_time]])[0])
+            pred = np.array(pred)
+
+        predictions.append(pred)
+        targets.append(y.numpy())  # Convert tensor to numpy
+
     return np.array(predictions), np.array(targets)
 
 def visualizer(*pred_target_pairs, labels=None, num_samples=100):
@@ -132,10 +205,10 @@ def visualizer(*pred_target_pairs, labels=None, num_samples=100):
         preds = preds[:min(len(preds),num_samples)]
         targets = targets[:min(len(targets),num_samples)]
         label = labels[i] if labels else f"Model {i+1}"
-        mae = mean_absolute_error(targets, preds)
-        rmse = mean_squared_error(targets, preds)
-        r2 = r2_score(targets, preds)
-        print(f"{label} -> MAE: {mae:.4f}, RMSE: {rmse:.4f}, R²: {r2:.4f}")
+        # mae = mean_absolute_error(targets, preds)
+        # rmse = mean_squared_error(targets, preds)
+        # r2 = r2_score(targets, preds)
+        # print(f"{label} -> MAE: {mae:.4f}, RMSE: {rmse:.4f}, R²: {r2:.4f}")
 
         # Plot predictions
         ax.scatter(targets, preds, label=f"{label}", alpha=0.7, color=colors[i])
@@ -179,7 +252,6 @@ def normalize_columns(df, columns, min=0, max=1):
             df_normalized[col] = (min_val + max_val) / 2
 
     return df_normalized
-
 
 class TimeSeriesTransformer(nn.Module):
     def __init__(self, input_dim, model_dim=64, num_heads=4, num_layers=4, dropout=0.1, output_dim=1, seq_len=72):
@@ -278,14 +350,14 @@ if __name__ == '__main__':
         'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
         '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
 
-    data_dir = "../data/output/for_regression/SCADATemp96hr"
-    input_columns = ['Pfl - Temp (C)', 'SCADA - Temperature (°C)']
-    output_columns = ['SCADA - Temperature (°C)']
-    input_rows = slice(0, 96)
+    data_dir = "../data/output/for_regression/Arsen24hr"
+    input_columns = ['Precipitation (mm/hr)', 'SCADA - Temperature (°C)']
+    output_columns = ['21-Arsen']
+    input_rows = slice(0, 23)
     output_rows = -1
     random_state = 40  # Random seed which deterministically sets the test/train split
     test_size = 0.15  # Fraction of samples saved for evaluation after training
-    batch_size = 32  # Minibatch size. Smaller batches -> noisier, but escapes local minima quicker
+    batch_size = 1  # Minibatch size. Smaller batches -> noisier, but escapes local minima quicker
     num_epochs = 200  # Training duration (excessive epochs can cause overfitting to training data)
     loss_threshold = 0.00001  # Threshold of acceptably small loss to terminate training early
     learning_rate = 1e-4  # Limit on parameter adjustment size per epoch
@@ -300,23 +372,23 @@ if __name__ == '__main__':
     output_dim = len(output_columns) * len(sample_df.iloc[output_rows:])
     seq_len = input_rows.stop - input_rows.start  #
 
-    # Pre-process dataset
-    samples = load_samples(data_dir, input_columns=input_columns, output_columns=output_columns,
-                                          input_rows=input_rows, output_rows=output_rows)
-    all_filenames = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv")])
-    train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=random_state)
-    with open("../data/output/for_regression/train_files.txt", "w") as f:
-        f.writelines(f"{s[2]}\n" for s in train_samples)
-    with open("../data/output/for_regression/test_files.txt", "w") as f:
-        f.writelines(f"{s[2]}\n" for s in test_samples)
-
-    ## Train
-    train_dataset = TimeSeriesTargetDataset(train_samples)
-    dataloader = DataLoader(train_dataset, batch_size=10, shuffle=True)
-    model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
-                                  dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
-    train_model(model, dataloader, num_epochs, learning_rate, loss_threshold)
-    torch.save(model.state_dict(), "../data/output/for_regression/transformer_model.pt")
+    # # Pre-process dataset
+    # samples = load_samples(data_dir, input_columns=input_columns, output_columns=output_columns,
+    #                                       input_rows=input_rows, output_rows=output_rows)
+    # all_filenames = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv")])
+    # train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=random_state)
+    # with open("../data/output/for_regression/train_files.txt", "w") as f:
+    #     f.writelines(f"{s[2]}\n" for s in train_samples)
+    # with open("../data/output/for_regression/test_files.txt", "w") as f:
+    #     f.writelines(f"{s[2]}\n" for s in test_samples)
+    #
+    # ## Train
+    # train_dataset = TimeSeriesTargetDataset(train_samples)
+    # dataloader = DataLoader(train_dataset, batch_size=10, shuffle=True)
+    # model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
+    #                               dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
+    # train_model(model, dataloader, num_epochs, learning_rate, loss_threshold)
+    # torch.save(model.state_dict(), "../data/output/for_regression/transformer_model.pt")
 
     ## Post-processing
     model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
@@ -337,8 +409,11 @@ if __name__ == '__main__':
     sort_df = historic_df.sort_values("TIMESTAMP")
     norm_df = normalize_columns(sort_df, data_columns)
 
-    baseline_preds, targets_baseline = evaluate_baseline(test_dataset, norm_df, output_columns, data_dir,
-                                                         output_rows=output_rows)
+    baseline_preds, targets_baseline = evaluate_naive(test_dataset, norm_df, output_columns, data_dir,
+                                                         output_rows=output_rows, gap_hours=48)
 
-    visualizer((model_preds, targets), (baseline_preds, targets_baseline),
-                     labels=["Transformer", "Baseline"], num_samples=200)
+    linear_preds, targets_linear = evaluate_linear(test_dataset, norm_df, output_columns, data_dir,)
+    print(linear_preds, targets_linear)
+
+    visualizer((model_preds, targets), (baseline_preds, targets_baseline), (linear_preds, targets_linear),
+                     labels=["Transformer", "Baseline", "Linear"], num_samples=200)

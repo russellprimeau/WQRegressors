@@ -162,7 +162,7 @@ if __name__ == '__main__':
 
     # Identify prediction targets (default: all Eurofins data)
     # target_columns = df.columns[-9:]
-    target_columns = ["SCADA - Temperature (°C)"]
+    target_columns = ['21-Arsen']
     # target_columns = ['SCADA - Temperature (°C)']
     seg_length = 24
 
@@ -170,8 +170,8 @@ if __name__ == '__main__':
     # gapped(df, target_columns, seg_length)  # Analysis function #2
 
     # output_dir = "../data/output/for_regression/Eurofins_complete_rows"
-    output_dir = "../data/output/for_regression/SCADATemp96hr"
-    length = 96
+    output_dir = "../data/output/for_regression/Arsen24hr"
+    length = 48
     # to_normalize = df.columns[3:]
     to_normalize = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
