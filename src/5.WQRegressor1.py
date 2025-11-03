@@ -2,19 +2,22 @@
 Time Series Forecasting using Transformer Model in PyTorch.
 """
 
+
+import os
 import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
-import os
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
-def load_samples_from_directory(directory, input_columns, output_columns, input_rows, output_rows, file_list=None):
+def load_samples(directory, input_columns, output_columns, input_rows, output_rows, file_list=None):
     samples = []
     for filename in sorted(os.listdir(directory)):
         if not filename.endswith(".csv"):
@@ -37,6 +40,117 @@ def load_samples_from_directory(directory, input_columns, output_columns, input_
         samples.append((input_seq, output_seq, filename))
     print("Samples loaded")
     return samples
+
+def train_model(model, dataloader, num_epochs=100, learning_rate=1e-3, loss_threshold=1e-3):
+
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    model.train()
+    epoch_losses = []
+
+    for epoch in range(num_epochs):
+        epoch_loss = 0
+        for inputs, targets, _ in dataloader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+
+        avg_loss = epoch_loss / len(dataloader)
+        epoch_losses.append(avg_loss)
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss/len(dataloader):.4f}")
+
+        # Early stopping condition
+        if loss_threshold is not None and avg_loss <= loss_threshold:
+            print(f"Stopping early at epoch {epoch + 1} because loss reached {avg_loss:.6f}")
+            break
+
+        # # Plotting loss vs. epochs on log-log scale
+        # plt.figure(figsize=(8, 6))
+        # x_vals = list(range(1, len(epoch_losses) + 1))
+        # y_vals = epoch_losses
+        # plt.loglog(x_vals, y_vals, marker='o')
+        # plt.xlabel("Epoch")
+        # plt.ylabel("Loss")
+        # plt.title("Training Loss vs. Epochs (Log-Log Scale)")
+        # plt.grid(True, which="both", ls="--")
+        # plt.tight_layout()
+        # plt.savefig("../data/output/for_regression/loss_plot.png")
+        # plt.close()
+
+def evaluate_model(model, dataset):
+    model.eval()
+    predictions = []
+    targets = []
+
+    with torch.no_grad():
+        for i in range(len(dataset)):
+            x, y, filename = dataset[i]
+            x = x.unsqueeze(0).to(device)  # Add batch dimension
+            pred = model(x).squeeze().item()
+            true = y.item()
+            # print(f"{filename}: Prediction = {pred:.4f}, Target = {true:.4f}")
+            predictions.append(pred)
+            targets.append(true)
+
+    # Convert to NumPy arrays and filter out NaN/inf
+    predictions = np.array(predictions)
+    targets = np.array(targets)
+    mask = np.isfinite(predictions) & np.isfinite(targets)
+    predictions = predictions[mask]
+    targets = targets[mask]
+    return predictions, targets
+
+def evaluate_baseline(dataset, historical_df, output_columns, data_dir, output_rows=-1):
+    predictions, targets = [], []
+    for i in range(len(dataset)):
+        _, y, filename = dataset[i]
+        sample_df = pd.read_csv(os.path.join(data_dir, filename), parse_dates=["TIMESTAMP"])
+        sample_time = sample_df["TIMESTAMP"].iloc[output_rows]
+        earlier_values = historical_df[historical_df["TIMESTAMP"] < sample_time][output_columns]
+        baseline_pred = earlier_values.iloc[-1].values[0] if not earlier_values.empty else np.nan
+        predictions.append(baseline_pred)
+        targets.append(y.item())
+    return np.array(predictions), np.array(targets)
+
+def visualizer(*pred_target_pairs, labels=None, num_samples=100):
+    sns.set_style("whitegrid")
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    colors = sns.color_palette("husl", len(pred_target_pairs))
+    min_val, max_val = float("inf"), float("-inf")
+
+    # Compute and print statistics
+    for i, (preds, targets) in enumerate(pred_target_pairs):
+        if i > num_samples:
+            break
+        label = labels[i] if labels else f"Model {i+1}"
+        mae = mean_absolute_error(targets, preds)
+        rmse = mean_squared_error(targets, preds)
+        r2 = r2_score(targets, preds)
+        print(f"{label} -> MAE: {mae:.4f}, RMSE: {rmse:.4f}, R²: {r2:.4f}")
+
+        # Plot predictions
+        ax.scatter(targets, preds, label=f"{label}", alpha=0.7, color=colors[i])
+        min_val = min(min_val, targets.min(), preds.min())
+        max_val = max(max_val, targets.max(), preds.max())
+
+    # Diagonal reference line
+    ax.plot([min_val, max_val], [min_val, max_val], color="red", linestyle="--")
+    ax.set_xlabel("Actual Value")
+    ax.set_ylabel("Predicted Value")
+    ax.set_title("Predicted vs Actual Values")
+    ax.set_xlim(0.95 * min_val, 1.05 * max_val)
+    ax.set_ylim(0.95 * min_val, 1.05 * max_val)
+    ax.set_aspect("equal", adjustable="box")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig("../data/output/for_regression/predictions.png")
+    # plt.show()  # Tk/Tcl issues preventing interactivity
 
 class TimeSeriesTransformer(nn.Module):
     def __init__(self, input_dim, model_dim=64, num_heads=4, num_layers=4, dropout=0.1, output_dim=1, seq_len=72):
@@ -99,101 +213,10 @@ class TimeSeriesTargetDataset(Dataset):
         y = torch.tensor(target_seq, dtype=torch.float32).flatten()
         return x, y, filename
 
-# Training loop
-def train_model(model, dataloader, num_epochs=100, learning_rate=1e-3, loss_threshold=1e-3):
-
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    model.train()
-    epoch_losses = []
-
-    for epoch in range(num_epochs):
-        epoch_loss = 0
-        for inputs, targets, _ in dataloader:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-
-        avg_loss = epoch_loss / len(dataloader)
-        epoch_losses.append(avg_loss)
-        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss/len(dataloader):.4f}")
-
-        # Early stopping condition
-        if loss_threshold is not None and avg_loss <= loss_threshold:
-            print(f"Stopping early at epoch {epoch + 1} because loss reached {avg_loss:.6f}")
-            break
-
-        # Plotting loss vs. epochs on log-log scale
-        plt.figure(figsize=(8, 6))
-        x_vals = list(range(1, len(epoch_losses) + 1))
-        y_vals = epoch_losses
-        plt.loglog(x_vals, y_vals, marker='o')
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.title("Training Loss vs. Epochs (Log-Log Scale)")
-        plt.grid(True, which="both", ls="--")
-        plt.tight_layout()
-        plt.savefig("../data/output/for_regression/loss_plot.png")
-        plt.close()
-
-
-def visualize_predictions(model, dataset, num_samples=50):
-    """
-    Visualize predicted vs. actual scalar values for a few samples.
-    """
-
-    model.eval()
-    predictions = []
-    targets = []
-    print(predictions)
-
-    with torch.no_grad():
-        for i in range(min(num_samples, len(dataset))):
-            x, y, filename = dataset[i]
-            x = x.unsqueeze(0).to(device)  # Add batch dimension
-            pred = model(x).squeeze().item()
-            true = y.item()
-            print(f"{filename}: Prediction = {pred:.4f}, Target = {true:.4f}")
-            predictions.append(pred)
-            targets.append(true)
-
-    # Convert to NumPy arrays and filter out NaN/inf
-    predictions = np.array(predictions)
-    targets = np.array(targets)
-    mask = np.isfinite(predictions) & np.isfinite(targets)
-    predictions = predictions[mask]
-    targets = targets[mask]
-
-    # Determine common bounds
-    min_val = min(predictions.min(), targets.min())
-    max_val = max(predictions.max(), targets.max())
-
-        # Plot
-    sns.set_style(style="whitegrid")
-    fig, ax = plt.subplots(figsize=(8, 8))
-    ax.scatter(targets, predictions)
-    ax.plot([min_val, max_val], [min_val, max_val], color='red', linestyle='--')  # Diagonal line
-    ax.set_xlabel("Actual Value")
-    ax.set_ylabel("Predicted Value")
-    ax.set_title("Predicted vs Actual Values")
-    ax.set_xlim(0.95*min_val, 1.05*max_val)
-    ax.set_ylim(0.95*min_val, 1.05*max_val)
-    ax.set_aspect('equal', adjustable='box')
-    plt.tight_layout()
-    plt.show()
-
-def naive():
-    # Load the sensor data
-    df = pd.read_csv("../data/output/for_regression/Combined_Cleaned.csv", parse_dates=["TIMESTAMP"])
-    df = df.sort_values("TIMESTAMP")
-
 if __name__ == '__main__':
+    matplotlib.use('Agg')  # Non-interactive backend for file output
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = "cpu"
     print(f"Using device: {device}")
 
     data_dir = "../data/output/for_regression/SCADATemp72hr"
@@ -222,7 +245,7 @@ if __name__ == '__main__':
     test_size = 0.2  # Fraction of samples saved for evaluation after training
     num_epochs = 800  # Training duration (excessive epochs can cause overfitting to training data)
     loss_threshold = 1e-2  # Threshold of acceptably small loss to terminate training early
-    learning_rate = 1e-2  # Limit on parameter adjustment size per epoch
+    learning_rate = 1e-3  # Limit on parameter adjustment size per epoch
     model_dim = 32  # Size of each token's embedding vector?
     num_heads = 4  # Parallel attention heads
     num_layers = 2  # Depth of NN
@@ -235,32 +258,41 @@ if __name__ == '__main__':
     seq_len = input_rows.stop - input_rows.start  #
 
     ## Pre-process dataset
-    samples = load_samples_from_directory(data_dir, input_columns=input_columns, output_columns=output_columns,
-                                          input_rows=input_rows, output_rows=output_rows)
-    all_filenames = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv")])
-    train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=40)
-    with open("../data/output/for_regression/train_files.txt", "w") as f:
-        f.writelines(f"{s[2]}\n" for s in train_samples)
-    with open("../data/output/for_regression/test_files.txt", "w") as f:
-        f.writelines(f"{s[2]}\n" for s in test_samples)
-
-    ## Train
-    train_dataset = TimeSeriesTargetDataset(train_samples)
-    dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
-                                  dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
-    train_model(model, dataloader, num_epochs, learning_rate, loss_threshold)
-    torch.save(model.state_dict(), "../data/output/for_regression/transformer_model.pt")
+    # samples = load_samples_from_directory(data_dir, input_columns=input_columns, output_columns=output_columns,
+    #                                       input_rows=input_rows, output_rows=output_rows)
+    # all_filenames = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv")])
+    # train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=40)
+    # with open("../data/output/for_regression/train_files.txt", "w") as f:
+    #     f.writelines(f"{s[2]}\n" for s in train_samples)
+    # with open("../data/output/for_regression/test_files.txt", "w") as f:
+    #     f.writelines(f"{s[2]}\n" for s in test_samples)
+    #
+    # ## Train
+    # train_dataset = TimeSeriesTargetDataset(train_samples)
+    # dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    # model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
+    #                               dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
+    # train_model(model, dataloader, num_epochs, learning_rate, loss_threshold)
+    # torch.save(model.state_dict(), "../data/output/for_regression/transformer_model.pt")
 
     ## Post-processing
     model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
-                                  dropout=dropout, output_dim=output_dim, seq_len=seq_len)
-    model.load_state_dict(torch.load("../data/output/for_regression/transformer_model.pt"))
+                                  dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
+    model.load_state_dict(torch.load("../data/output/for_regression/transformer_model.pt", map_location=device))
     model.eval()  # Set to evaluation mode
 
     with open("../data/output/for_regression/test_files.txt") as f:
         test_files = [line.strip() for line in f]
-    test_samples = load_samples_from_directory(data_dir,input_columns=input_columns,output_columns=output_columns,
+    test_samples = load_samples(data_dir,input_columns=input_columns,output_columns=output_columns,
         input_rows=input_rows, output_rows=output_rows, file_list=test_files)
     test_dataset = TimeSeriesTargetDataset(test_samples)
-    visualize_predictions(model, test_dataset)
+
+    model_preds, targets = evaluate_model(model, test_dataset)
+
+    historic_df = pd.read_csv("../data/output/for_regression/Combined_Cleaned.csv", parse_dates=["TIMESTAMP"])
+    df = historic_df.sort_values("TIMESTAMP")
+
+    baseline_preds, targets_baseline = evaluate_baseline(test_dataset, historic_df, output_columns, data_dir, output_rows=output_rows)
+
+    visualizer((model_preds, targets), (baseline_preds, targets_baseline),
+                     labels=["Transformer", "Baseline"])
