@@ -69,18 +69,18 @@ def train_model(model, dataloader, num_epochs=100, learning_rate=1e-3, loss_thre
             print(f"Stopping early at epoch {epoch + 1} because loss reached {avg_loss:.6f}")
             break
 
-        # # Plotting loss vs. epochs on log-log scale
-        # plt.figure(figsize=(8, 6))
-        # x_vals = list(range(1, len(epoch_losses) + 1))
-        # y_vals = epoch_losses
-        # plt.loglog(x_vals, y_vals, marker='o')
-        # plt.xlabel("Epoch")
-        # plt.ylabel("Loss")
-        # plt.title("Training Loss vs. Epochs (Log-Log Scale)")
-        # plt.grid(True, which="both", ls="--")
-        # plt.tight_layout()
-        # plt.savefig("../data/output/for_regression/loss_plot.png")
-        # plt.close()
+        # Plotting loss vs. epochs on log-log scale
+        plt.figure(figsize=(8, 6))
+        x_vals = list(range(1, len(epoch_losses) + 1))
+        y_vals = epoch_losses
+        plt.loglog(x_vals, y_vals, marker='o')
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Training Loss vs. Epochs (Log-Log Scale)")
+        plt.grid(True, which="both", ls="--")
+        plt.tight_layout()
+        plt.savefig("../data/output/for_regression/loss_plot.png")
+        plt.close()
 
 def evaluate_model(model, dataset):
     model.eval()
@@ -115,6 +115,7 @@ def evaluate_baseline(dataset, historical_df, output_columns, data_dir, output_r
         baseline_pred = earlier_values.iloc[-1].values[0] if not earlier_values.empty else np.nan
         predictions.append(baseline_pred)
         targets.append(y.item())
+        print("Baseline: ", sample_time," in ",filename, ". Naive prediction: ", baseline_pred, "Ground truth: ", y.item())
     return np.array(predictions), np.array(targets)
 
 def visualizer(*pred_target_pairs, labels=None, num_samples=100):
@@ -126,8 +127,8 @@ def visualizer(*pred_target_pairs, labels=None, num_samples=100):
 
     # Compute and print statistics
     for i, (preds, targets) in enumerate(pred_target_pairs):
-        if i > num_samples:
-            break
+        preds = preds[:num_samples]
+        targets = targets[:num_samples]
         label = labels[i] if labels else f"Model {i+1}"
         mae = mean_absolute_error(targets, preds)
         rmse = mean_squared_error(targets, preds)
@@ -214,13 +215,14 @@ class TimeSeriesTargetDataset(Dataset):
         return x, y, filename
 
 if __name__ == '__main__':
-    matplotlib.use('Agg')  # Non-interactive backend for file output
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # device = "cpu"
     print(f"Using device: {device}")
 
     data_dir = "../data/output/for_regression/SCADATemp72hr"
     # data_dir = "../data/output/for_regression/Eurofins_Ecoli24hr"
+
+    matplotlib.use('Agg')  # Non-interactive backend for file output
 
 
     ## Configure input, output and model hyperparameters
@@ -238,7 +240,17 @@ if __name__ == '__main__':
     #     'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
     #     '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
 
-    input_columns = ['Pfl - Temp (C)']
+    input_columns = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
+        'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
+        'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)',
+        'Hourly average wind direction (°)', 'Average wind speed (m/s)',
+        'Maximum sustained wind speed, 3-second span (m/s)', 'Time of maximum 3s Gust',
+        'Maximum sustained wind speed, 10-minute span (m/s)', 'Time of maximum 10 minute gust',
+        'Hourly average atmospheric pressure at station (mBar)', 'Maximum pressure differential, 3-hour span (mBar)',
+        'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)',
+        'Longwave (IR) radiation (W/m2)', 'Instantaneous sea-level atmospheric pressure (mBar)',
+        'Shortwave (solar) radiation (W/m2)', 'Precipitation (mm/hr)', 'Instantaneous temperature (°C)',
+        'Maximum temperature (°C)', 'Minimum temperature (°C)', 'Average humidity (% relative humidity)']
     output_columns = ['SCADA - Temperature (°C)']
     input_rows = slice(0, 72)
     output_rows = -1
@@ -246,9 +258,9 @@ if __name__ == '__main__':
     num_epochs = 800  # Training duration (excessive epochs can cause overfitting to training data)
     loss_threshold = 1e-2  # Threshold of acceptably small loss to terminate training early
     learning_rate = 1e-3  # Limit on parameter adjustment size per epoch
-    model_dim = 32  # Size of each token's embedding vector?
+    model_dim = 64  # Size of each token's embedding vector?
     num_heads = 4  # Parallel attention heads
-    num_layers = 2  # Depth of NN
+    num_layers = 4  # Depth of NN
     dropout = 0.1  # Regularization technique to prevent overtraining by randomly removing some neurons each epoch
 
     # Generate parameters from selection
@@ -257,23 +269,23 @@ if __name__ == '__main__':
     output_dim = len(output_columns) * len(sample_df.iloc[output_rows:])
     seq_len = input_rows.stop - input_rows.start  #
 
-    ## Pre-process dataset
-    # samples = load_samples_from_directory(data_dir, input_columns=input_columns, output_columns=output_columns,
-    #                                       input_rows=input_rows, output_rows=output_rows)
-    # all_filenames = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv")])
-    # train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=40)
-    # with open("../data/output/for_regression/train_files.txt", "w") as f:
-    #     f.writelines(f"{s[2]}\n" for s in train_samples)
-    # with open("../data/output/for_regression/test_files.txt", "w") as f:
-    #     f.writelines(f"{s[2]}\n" for s in test_samples)
-    #
-    # ## Train
-    # train_dataset = TimeSeriesTargetDataset(train_samples)
-    # dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    # model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
-    #                               dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
-    # train_model(model, dataloader, num_epochs, learning_rate, loss_threshold)
-    # torch.save(model.state_dict(), "../data/output/for_regression/transformer_model.pt")
+    # Pre-process dataset
+    samples = load_samples(data_dir, input_columns=input_columns, output_columns=output_columns,
+                                          input_rows=input_rows, output_rows=output_rows)
+    all_filenames = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv")])
+    train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=40)
+    with open("../data/output/for_regression/train_files.txt", "w") as f:
+        f.writelines(f"{s[2]}\n" for s in train_samples)
+    with open("../data/output/for_regression/test_files.txt", "w") as f:
+        f.writelines(f"{s[2]}\n" for s in test_samples)
+
+    ## Train
+    train_dataset = TimeSeriesTargetDataset(train_samples)
+    dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
+                                  dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
+    train_model(model, dataloader, num_epochs, learning_rate, loss_threshold)
+    torch.save(model.state_dict(), "../data/output/for_regression/transformer_model.pt")
 
     ## Post-processing
     model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
@@ -295,4 +307,4 @@ if __name__ == '__main__':
     baseline_preds, targets_baseline = evaluate_baseline(test_dataset, historic_df, output_columns, data_dir, output_rows=output_rows)
 
     visualizer((model_preds, targets), (baseline_preds, targets_baseline),
-                     labels=["Transformer", "Baseline"])
+                     labels=["Transformer", "Baseline"], num_samples=100)
