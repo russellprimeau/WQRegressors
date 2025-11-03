@@ -1,7 +1,7 @@
 """
 Combines datasets from the profiler, weather station, SCADA system and Eurofins reports in a single table.
 
-Small gaps are filled by linear interpolation.
+Small gaps (below a specified threshold, default of 6 hours) are filled by linear interpolation.
 When there is a gap in any one column, either all rows can be dropped, or "NaN" can be retained for that column.
 """
 
@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 
 
-def clean_profiler(df):
+def clean_profiler(full_df):
     """
     Clean profiler hourly surface data. Fill small gaps by interpolation.
     :param df: dataframe of profiler hourly surface data
@@ -17,8 +17,8 @@ def clean_profiler(df):
     """
 
     # Drop extraneous metadata columns
-    sensor_columns = [col for col in df.columns if col.startswith("sensorParms")]
-    df = df[["TIMESTAMP"] + sensor_columns]
+    sensor_columns = [col for col in full_df.columns if col.startswith("sensorParms")]
+    df = full_df[["TIMESTAMP"] + sensor_columns].copy()
 
     # Convert TIMESTAMP to datetime, sort, and drop duplicates
     df["TIMESTAMP"] = pd.to_datetime(df["TIMESTAMP"])
@@ -160,6 +160,31 @@ if __name__ == '__main__':
 
     # Merge data from other sources into the dataset.
     merge1_df = add_source(clean_df, weather_df, include_NAs=False, max_gap=6)
+
+    weather_columns = {"1818_time: AA[mBar]": "Instantaneous atmospheric pressure (mBar)",
+                    "1818_time: DD Retning[°]": "Wind direction 10minRollingAvg (°)",
+                    "1818_time: DX_l[°]": "Hourly average wind direction (°)",
+                    "1818_time: FF Hastighet[m/s]": "Average wind speed (m/s)",
+                    "1818_time: FG_l[m/s]": "Maximum sustained wind speed, 3-second span (m/s)",
+                    "1818_time: FG_tid_l[N/A]": "Time of maximum 3s Gust",
+                    "1818_time: FX Kast[m/s]": "Maximum sustained wind speed, 10-minute span (m/s)",
+                    "1818_time: FX_tid_l[N/A]": "Time of maximum 10 minute gust",
+                    "1818_time: PO Trykk stasjonshøyde[mBar]":
+                        "Hourly average atmospheric pressure at station (mBar)",
+                    "1818_time: PP[mBar]": "Maximum pressure differential, 3-hour span (mBar)",
+                    "1818_time: PR Trykk redusert til havnivå[mBar]":
+                        "Instantaneous atmospheric pressure compensated for temperature, humidity and station "
+                        "elevation (mBar)",
+                    "1818_time: QLI Langbølget[W/m2]": "Longwave (IR) radiation (W/m2)",
+                    "1818_time: QNH[mBar]": "Instantaneous sea-level atmospheric pressure (mBar)",
+                    "1818_time: QSI Kortbølget[W/m2]": "Shortwave (solar) radiation (W/m2)",
+                    "1818_time: RR_1[mm]": "Precipitation (mm/hr)",
+                    "1818_time: TA Middel[°C]": "Instantaneous temperature (°C)",
+                    "1818_time: TA_a_Max[°C]": "Maximum temperature (°C)",
+                    "1818_time: TA_a_Min[°C]": "Minimum temperature (°C)",
+                    "1818_time: UU Luftfuktighet[%RH]": "Average humidity (% relative humidity)"
+                    }
+    merge1_df.rename(columns=weather_columns, inplace=True)
     merge2_df = add_source(merge1_df, scada_df, include_NAs=True, max_gap=6)
     merge3_df = add_source(merge2_df, eurofins_df, include_NAs=True, max_gap=6)
 

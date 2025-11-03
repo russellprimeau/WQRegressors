@@ -9,6 +9,20 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.express as px
 
+def clean_directory(directory_path):
+    """
+    Deletes all files within the specified directory.
+    Subdirectories and their contents are not affected.
+    """
+    try:
+        for filename in os.listdir(directory_path):
+            file_path = os.path.join(directory_path, filename)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+                # print(f"Deleted file: {file_path}")
+    except OSError as e:
+        print(f"Error deleting files in {directory_path}: {e}")
+
 def gapless(df, target_columns):
     """
     Evaluate # of samples with time series leading directly into the Eurofin sample time (for "nowcast").
@@ -43,18 +57,17 @@ def gapless(df, target_columns):
     plt.savefig("../data/output/for_regression/analysis/segment_analysis.png")
     plt.show()
 
-def gapped(df, target_columns):
+def gapped(df, target_columns, seg_length):
     """
     Evaluate a range of gaps from time series to Eurofins values.
     :return:
     """
-    # Initialize a dictionary to store results
-    gap_results = {gap: 0 for gap in range(0, 167, 5)}
 
     results_df = pd.DataFrame({"Gap Hours", "Valid Segments", "Variable Name"})
-
     for column in target_columns:
-        print(column)
+        # Initialize a dictionary to store results
+        gap_results = {gap: 0 for gap in range(0, 167, 5)}
+        # print(column)
         # Iterate over each row with a non-null value in the last column
         for idx, row in df[df[column].notna()].iterrows():
             current_time = row["TIMESTAMP"]
@@ -67,7 +80,7 @@ def gapped(df, target_columns):
                     first_row = preceding_rows.iloc[0]
                     segment_value = first_row["Segment"]
                     segment_rows = df[(df["TIMESTAMP"] <= first_row["TIMESTAMP"]) & (df["Segment"] == segment_value)]
-                    if len(segment_rows) >= 10:
+                    if len(segment_rows) >= seg_length:
                         gap_results[gap] += 1
 
         result = pd.DataFrame({
@@ -81,25 +94,60 @@ def gapped(df, target_columns):
 
     fig = px.line(results_df, x="Gap Hours", y="Valid Segments", color="Variable Name",
                   title=f"Effect of Gap on Valid Segments", markers=True)
-    fig.write_image("../data/output/analysis/gap_vs_segments.png")
+    fig.write_image("../data/output/for_regression/analysis/gap_vs_segments.png")
 
-def split(df, output_dir, length):
+def normalize_columns(df, columns, min=0, max=1):
+    """
+    Normalize specified columns in a DataFrame to a given range.
 
-    # Create a directory to store the output files
-    os.makedirs(output_dir, exist_ok=True)
+    Parameters:
+    - df: pandas.DataFrame
+    - columns: list of column names to normalize
+    - target_range: tuple (min, max) for the normalization range
+
+    Returns:
+    - A copy of the DataFrame with normalized columns.
+    """
+    df_normalized = df.copy()
+    min_val, max_val = min, max
+    for col in columns:
+        col_min = df[col].min()
+        col_max = df[col].max()
+        if col_max != col_min:
+            df_normalized[col] = ((df[col] - col_min) / (col_max - col_min)) * (max_val - min_val) + min_val
+        else:
+            # If all values are the same, set them to the midpoint of the target range
+            df_normalized[col] = (min_val + max_val) / 2
+
+    return df_normalized
+
+def split(df, output_dir, target_columns=["06-E.coli","08-Kimtall 22°C","21-Arsen","24-Bly","32-Kadmium","36-Kopper filtrert","37-Krom","41-Nikkel","Sink (Zn)"], length=1, to_normalize=[], offset=0):
+    """
+    Break up a dataset which contains gaps into many files of standard size, which do not contain gaps
+    :param df: dataframe of consolidated dataset to be broken up
+    :param output_dir: where to save the output files
+    :param length: chunk size (threshold for consecutive rows to include in each sample)
+    :return:
+    """
+
+    df = normalize_columns(df, to_normalize, 0, 1)
+
+    os.makedirs(output_dir, exist_ok=True)  # Create a directory to store the output files
+    clean_directory(output_dir)  #
 
     # Initialize a counter for naming output files
     segment_counter = 1
 
     # Iterate through the dataframe to find valid segments
-    for i in range(len(df) - 23):
-        segment = df.iloc[i:i+24]
+    for i in range(len(df) - (length-1)):
+        segment = df.iloc[i:i+length]
         last_row = segment.iloc[-1]
         preceding_rows = segment.iloc[:-1]
 
         # Check if the last row has any non-null value in the last ten columns
-        if last_row[target_columns].notnull().any():
-            # Check if the 'Segment' column has a constant value in the preceding 167 rows
+        if last_row[target_columns].notnull().all():
+
+            # Check if the 'Segment' column has a constant value in all rows
             if preceding_rows['Segment'].nunique() == 1:
                 # Save the segment to a CSV file
                 output_file = os.path.join(output_dir, f"segment_{segment_counter}.csv")
@@ -112,12 +160,18 @@ if __name__ == '__main__':
     df = pd.read_csv("../data/output/for_regression/Combined_Cleaned.csv", parse_dates=["TIMESTAMP"])
     df = df.sort_values("TIMESTAMP")
 
-    # Identify prediction targets (Eurofins data)
-    target_columns = df.columns[-9:]
+    # Identify prediction targets (default: all Eurofins data)
+    # target_columns = df.columns[-9:]
+    # target_columns = ["06-E.coli"]
+    target_columns = ['SCADA - Temperature (°C)']
+    seg_length = 72
 
-    gapless(df, target_columns)
-    # gapped(df, target_columns)
+    # gapless(df, target_columns)  # Analysis function #1
+    # gapped(df, target_columns, seg_length)  # Analysis function #2
 
-    output_dir = "../data/output/for_regression/partial_Eurofins"
-    length = 24
-    # split(df, output_dir, length)
+    # output_dir = "../data/output/for_regression/Eurofins_complete_rows"
+    output_dir = "../data/output/for_regression/SCADATemp72hr"
+    length = 72
+    # to_normalize = df.columns[3:]
+    to_normalize = []
+    split(df, output_dir, target_columns, length, to_normalize, 0)

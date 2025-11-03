@@ -1,7 +1,8 @@
-'''
+"""
 Time Series Forecasting using Transformer Model in PyTorch.
-'''
+"""
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,113 +10,257 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
-import numpy as np
+import os
+from sklearn.model_selection import train_test_split
 
-# Transformer model definition
+
+def load_samples_from_directory(directory, input_columns, output_columns, input_rows, output_rows, file_list=None):
+    samples = []
+    for filename in sorted(os.listdir(directory)):
+        if not filename.endswith(".csv"):
+            continue
+        if file_list is not None and filename not in file_list:
+            continue  # Skip files not in the provided list
+        df = pd.read_csv(os.path.join(directory, filename))
+        if not set(input_columns + output_columns).issubset(df.columns):
+            continue  # skip files with missing columns
+        if len(df) < input_rows.stop:
+            print(f"Sample {filename} skipped — not enough rows ({len(df)} < {input_rows.stop})")
+            continue  # skip files without enough rows
+
+        input_seq = df.loc[input_rows, input_columns].values  # shape: [timesteps, input_dim]
+        output_seq = df.iloc[output_rows:, :][output_columns].values
+
+        if np.isnan(input_seq).any() or np.isnan(output_seq).any():
+            print(f"Sample {filename} skipped - contains NaN values")
+            continue  # skip invalid samples
+        samples.append((input_seq, output_seq, filename))
+    print("Samples loaded")
+    return samples
+
 class TimeSeriesTransformer(nn.Module):
-    def __init__(self, input_dim, model_dim=64, num_heads=4, num_layers=3, output_window=48, dropout=0.1):
+    def __init__(self, input_dim, model_dim=64, num_heads=4, num_layers=4, dropout=0.1, output_dim=1, seq_len=72):
         super(TimeSeriesTransformer, self).__init__()
         self.model_dim = model_dim
-        self.output_window = output_window
-        self.input_dim = input_dim
 
+        # Project input features to model dimension
         self.input_proj = nn.Linear(input_dim, model_dim)
-        self.pos_embedding = nn.Parameter(torch.randn(1, 168, model_dim))
 
-        encoder_layer = nn.TransformerEncoderLayer(d_model=model_dim, nhead=num_heads, dropout=dropout)
+        # Positional encoding (learned)
+        self.pos_embedding = nn.Parameter(torch.randn(1, seq_len, model_dim))  # 24 timesteps
+
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=num_heads,
+            dropout=dropout,
+            batch_first=True  # <-- Add this
+        )
+
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        self.output_proj = nn.Linear(model_dim, input_dim * output_window)
+        # Output projection to scalar
+        self.output_proj = nn.Linear(model_dim, output_dim)
 
     def forward(self, x):
+        """
+        x: [batch_size, seq_len=24, input_dim=28]
+        returns: [batch_size, output_dim=1]
+        """
         batch_size, seq_len, _ = x.size()
-        x = self.input_proj(x)
+
+        # Project input features
+        x = self.input_proj(x)  # [batch_size, seq_len, model_dim]
+
+        # Add positional encoding
         x = x + self.pos_embedding[:, :seq_len, :]
-        x = x.transpose(0, 1)
+
+        # Encode
         encoded = self.transformer_encoder(x)
-        encoded = encoded.transpose(0, 1)
-        last_encoding = encoded[:, -1, :]
-        output = self.output_proj(last_encoding)
-        output = output.view(batch_size, self.output_window, self.input_dim)
+
+        # Use last timestep's encoding
+        last_encoding = encoded[:, -1, :]  # [batch_size, model_dim]
+
+        # Project to output
+        output = self.output_proj(last_encoding)  # [batch_size, 1]
+
         return output
 
-# Custom dataset for time series
-class TimeSeriesDataset(Dataset):
-    def __init__(self, data, input_window=168, output_window=48):
-        self.data = data
-        self.input_window = input_window
-        self.output_window = output_window
-        self.samples = []
-        self.prepare_samples()
-
-    def prepare_samples(self):
-        total_length = len(self.data)
-        for i in range(total_length - self.input_window - self.output_window):
-            input_seq = self.data[i:i+self.input_window]
-            output_seq = self.data[i+self.input_window:i+self.input_window+self.output_window]
-            self.samples.append((input_seq, output_seq))
+class TimeSeriesTargetDataset(Dataset):
+    def __init__(self, samples):
+        self.samples = samples
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        input_seq, output_seq = self.samples[idx]
-        return torch.tensor(input_seq, dtype=torch.float32), torch.tensor(output_seq, dtype=torch.float32)
-
-# Load data from CSV
-def load_data(csv_file):
-    df = pd.read_csv(csv_file)
-    data = df.values  # shape: [num_timesteps, num_features]
-    return data
+        input_seq, target_seq, filename = self.samples[idx]
+        x = torch.tensor(input_seq, dtype=torch.float32)
+        y = torch.tensor(target_seq, dtype=torch.float32).flatten()
+        return x, y, filename
 
 # Training loop
-def train_model(model, dataloader, num_epochs=10, learning_rate=1e-3):
+def train_model(model, dataloader, num_epochs=100, learning_rate=1e-3, loss_threshold=1e-3):
+
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     model.train()
+    epoch_losses = []
+
     for epoch in range(num_epochs):
         epoch_loss = 0
-        for inputs, targets in dataloader:
+        for inputs, targets, _ in dataloader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
+
+        avg_loss = epoch_loss / len(dataloader)
+        epoch_losses.append(avg_loss)
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss/len(dataloader):.4f}")
 
-# Visualize predictions
-def visualize_predictions(model, dataset, num_samples=3):
+        # Early stopping condition
+        if loss_threshold is not None and avg_loss <= loss_threshold:
+            print(f"Stopping early at epoch {epoch + 1} because loss reached {avg_loss:.6f}")
+            break
+
+        # Plotting loss vs. epochs on log-log scale
+        plt.figure(figsize=(8, 6))
+        x_vals = list(range(1, len(epoch_losses) + 1))
+        y_vals = epoch_losses
+        plt.loglog(x_vals, y_vals, marker='o')
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Training Loss vs. Epochs (Log-Log Scale)")
+        plt.grid(True, which="both", ls="--")
+        plt.tight_layout()
+        plt.savefig("../data/output/for_regression/loss_plot.png")
+        plt.close()
+
+
+def visualize_predictions(model, dataset, num_samples=50):
+    """
+    Visualize predicted vs. actual scalar values for a few samples.
+    """
+
     model.eval()
-    for i in range(num_samples):
-        inputs, targets = dataset[i]
-        inputs = inputs.unsqueeze(0)
-        with torch.no_grad():
-            predictions = model(inputs).squeeze(0).numpy()
-        targets = targets.numpy()
-        for feature in range(inputs.shape[2]):
-            plt.figure(figsize=(10, 4))
-            sns.lineplot(x=np.arange(48), y=targets[:, feature], label='Target')
-            sns.lineplot(x=np.arange(48), y=predictions[:, feature], label='Prediction')
-            plt.title(f'Sample {i+1} - Feature {feature+1}')
-            plt.xlabel('Time Step')
-            plt.ylabel('Value')
-            plt.legend()
-            plt.tight_layout()
-            plt.savefig(f'prediction_sample_{i+1}_feature_{feature+1}.png')
-            plt.close()
+    predictions = []
+    targets = []
+    print(predictions)
 
-# Main pipeline
-def main():
-    csv_file = '../data/output/for_regression/Combined_Cleaned.csv'  # Replace with actual file name
-    data = load_data(csv_file)
-    dataset = TimeSeriesDataset(data, input_window=168, output_window=48)
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+    with torch.no_grad():
+        for i in range(min(num_samples, len(dataset))):
+            x, y, filename = dataset[i]
+            x = x.unsqueeze(0).to(device)  # Add batch dimension
+            pred = model(x).squeeze().item()
+            true = y.item()
+            print(f"{filename}: Prediction = {pred:.4f}, Target = {true:.4f}")
+            predictions.append(pred)
+            targets.append(true)
 
-    input_dim = data.shape[1]
-    model = TimeSeriesTransformer(input_dim=input_dim)
+    # Convert to NumPy arrays and filter out NaN/inf
+    predictions = np.array(predictions)
+    targets = np.array(targets)
+    mask = np.isfinite(predictions) & np.isfinite(targets)
+    predictions = predictions[mask]
+    targets = targets[mask]
 
-    train_model(model, dataloader, num_epochs=10)
-    visualize_predictions(model, dataset)
+    # Determine common bounds
+    min_val = min(predictions.min(), targets.min())
+    max_val = max(predictions.max(), targets.max())
 
-main()
+        # Plot
+    sns.set_style(style="whitegrid")
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.scatter(targets, predictions)
+    ax.plot([min_val, max_val], [min_val, max_val], color='red', linestyle='--')  # Diagonal line
+    ax.set_xlabel("Actual Value")
+    ax.set_ylabel("Predicted Value")
+    ax.set_title("Predicted vs Actual Values")
+    ax.set_xlim(0.95*min_val, 1.05*max_val)
+    ax.set_ylim(0.95*min_val, 1.05*max_val)
+    ax.set_aspect('equal', adjustable='box')
+    plt.tight_layout()
+    plt.show()
+
+def naive():
+    # Load the sensor data
+    df = pd.read_csv("../data/output/for_regression/Combined_Cleaned.csv", parse_dates=["TIMESTAMP"])
+    df = df.sort_values("TIMESTAMP")
+
+if __name__ == '__main__':
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    data_dir = "../data/output/for_regression/SCADATemp72hr"
+    # data_dir = "../data/output/for_regression/Eurofins_Ecoli24hr"
+
+
+    ## Configure input, output and model hyperparameters
+    # all_columns = ['TIMESTAMP', 'Segment', 'Interpolated', 'Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
+    #     'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
+    #     'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)',
+    #     'Hourly average wind direction (°)', 'Average wind speed (m/s)',
+    #     'Maximum sustained wind speed, 3-second span (m/s)', 'Time of maximum 3s Gust',
+    #     'Maximum sustained wind speed, 10-minute span (m/s)', 'Time of maximum 10 minute gust',
+    #     'Hourly average atmospheric pressure at station (mBar)', 'Maximum pressure differential, 3-hour span (mBar)',
+    #     'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)',
+    #     'Longwave (IR) radiation (W/m2)', 'Instantaneous sea-level atmospheric pressure (mBar)',
+    #     'Shortwave (solar) radiation (W/m2)', 'Precipitation (mm/hr)', 'Instantaneous temperature (°C)',
+    #     'Maximum temperature (°C)', 'Minimum temperature (°C)', 'Average humidity (% relative humidity)',
+    #     'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
+    #     '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
+
+    input_columns = ['Pfl - Temp (C)']
+    output_columns = ['SCADA - Temperature (°C)']
+    input_rows = slice(0, 72)
+    output_rows = -1
+    test_size = 0.2  # Fraction of samples saved for evaluation after training
+    num_epochs = 800  # Training duration (excessive epochs can cause overfitting to training data)
+    loss_threshold = 1e-2  # Threshold of acceptably small loss to terminate training early
+    learning_rate = 1e-2  # Limit on parameter adjustment size per epoch
+    model_dim = 32  # Size of each token's embedding vector?
+    num_heads = 4  # Parallel attention heads
+    num_layers = 2  # Depth of NN
+    dropout = 0.1  # Regularization technique to prevent overtraining by randomly removing some neurons each epoch
+
+    # Generate parameters from selection
+    input_dim = len(input_columns)
+    sample_df = pd.read_csv(os.path.join(data_dir, sorted(os.listdir(data_dir))[0]))
+    output_dim = len(output_columns) * len(sample_df.iloc[output_rows:])
+    seq_len = input_rows.stop - input_rows.start  #
+
+    ## Pre-process dataset
+    samples = load_samples_from_directory(data_dir, input_columns=input_columns, output_columns=output_columns,
+                                          input_rows=input_rows, output_rows=output_rows)
+    all_filenames = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv")])
+    train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=40)
+    with open("../data/output/for_regression/train_files.txt", "w") as f:
+        f.writelines(f"{s[2]}\n" for s in train_samples)
+    with open("../data/output/for_regression/test_files.txt", "w") as f:
+        f.writelines(f"{s[2]}\n" for s in test_samples)
+
+    ## Train
+    train_dataset = TimeSeriesTargetDataset(train_samples)
+    dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
+                                  dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
+    train_model(model, dataloader, num_epochs, learning_rate, loss_threshold)
+    torch.save(model.state_dict(), "../data/output/for_regression/transformer_model.pt")
+
+    ## Post-processing
+    model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
+                                  dropout=dropout, output_dim=output_dim, seq_len=seq_len)
+    model.load_state_dict(torch.load("../data/output/for_regression/transformer_model.pt"))
+    model.eval()  # Set to evaluation mode
+
+    with open("../data/output/for_regression/test_files.txt") as f:
+        test_files = [line.strip() for line in f]
+    test_samples = load_samples_from_directory(data_dir,input_columns=input_columns,output_columns=output_columns,
+        input_rows=input_rows, output_rows=output_rows, file_list=test_files)
+    test_dataset = TimeSeriesTargetDataset(test_samples)
+    visualize_predictions(model, test_dataset)
