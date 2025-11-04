@@ -9,53 +9,13 @@ import pandas as pd
 import numpy as np
 
 
-def clean_profiler(full_df):
+def clean_profiler(full_df, max_gap=6):
     """
     Clean profiler hourly surface data. Fill small gaps by interpolation.
     :param df: dataframe of profiler hourly surface data
     :return:
     """
-
-    # Drop extraneous metadata columns
-    sensor_columns = [col for col in full_df.columns if col.startswith("sensorParms")]
-    df = full_df[["TIMESTAMP"] + sensor_columns].copy()
-
-    # Convert TIMESTAMP to datetime, sort, and drop duplicates
-    df["TIMESTAMP"] = pd.to_datetime(df["TIMESTAMP"])
-    df = df.sort_values("TIMESTAMP").drop_duplicates(subset="TIMESTAMP")
-
-    # Replace -9999 and NaN with NaN for interpolation
-    df[sensor_columns] = df[sensor_columns].replace([-9999, "NaN"], np.nan)
-
-    # Round TIMESTAMP to the nearest hour
-    df["TIMESTAMP"] = df["TIMESTAMP"].dt.round("h")
-
-    # Fill gaps and track interpolated rows
-    df = df.reset_index(drop=True)
-    new_rows = []
-    df["Interpolated"] = 0
-
-    for i in range(1, len(df)):
-        current_time = df.loc[i, "TIMESTAMP"]
-        previous_time = df.loc[i - 1, "TIMESTAMP"]
-        time_diff = (current_time - previous_time).total_seconds() / 3600
-
-        if 1 < time_diff <= 6:
-            for h in range(1, int(time_diff)):
-                new_time = previous_time + pd.Timedelta(hours=h)
-                new_row = {"TIMESTAMP": new_time, "Interpolated": 1}
-                for col in sensor_columns:
-                    new_row[col] = np.nan
-                new_rows.append(new_row)
-
-    # Append new rows and sort again
-    df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
-    df = df.sort_values("TIMESTAMP").reset_index(drop=True)
-
-    # Interpolate missing values and round to 2 decimals
-    df[sensor_columns] = df[sensor_columns].interpolate(method="linear")
-    df[sensor_columns] = df[sensor_columns].round(2)
-
+    full_df["Interpolated"] = 0
     # Apply column labels
     column_names = {
         "TIMESTAMP": "TIMESTAMP",
@@ -77,11 +37,47 @@ def clean_profiler(full_df):
         "lat": "Latitude",
         "lon": "Longitude",
     }
-    df = df.rename(columns=column_names)
-    keepers = ["TIMESTAMP", "Interpolated", "Pfl - Temp (C)", "Pfl - Sp Cond (microS_cm)", "Pfl - pH",
-               "Pfl - DO (% Sat)",
-               "Pfl - Turbidity (FNU)", "Pfl - fDOM (RFU)", "Pfl - fDOM (QSU)"]
-    df = df[keepers]
+    df = full_df.rename(columns=column_names)
+    sensor_columns = ["Pfl - Temp (C)", "Pfl - Sp Cond (microS_cm)", "Pfl - pH",
+                      "Pfl - DO (% Sat)",
+                      "Pfl - Turbidity (FNU)", "Pfl - fDOM (RFU)", "Pfl - fDOM (QSU)"]
+    keepers = ["TIMESTAMP", "Interpolated"] + sensor_columns
+    df = df[keepers].copy()
+
+    # Convert TIMESTAMP to datetime, sort, and drop duplicates
+    df["TIMESTAMP"] = pd.to_datetime(df["TIMESTAMP"])
+    df = df.sort_values("TIMESTAMP").drop_duplicates(subset="TIMESTAMP")
+
+    # Replace -9999 and NaN with NaN for interpolation
+    df[sensor_columns] = df[sensor_columns].replace([-9999, "NaN"], np.nan)
+
+    # Round TIMESTAMP to the nearest hour
+    df["TIMESTAMP"] = df["TIMESTAMP"].dt.round("h")
+
+    # Fill gaps and track interpolated rows
+    df = df.reset_index(drop=True)
+    new_rows = []
+
+    for i in range(1, len(df)):
+        current_time = df.loc[i, "TIMESTAMP"]
+        previous_time = df.loc[i - 1, "TIMESTAMP"]
+        time_diff = (current_time - previous_time).total_seconds() / 3600
+
+        if 1 < time_diff <= max_gap:
+            for h in range(1, int(time_diff)):
+                new_time = previous_time + pd.Timedelta(hours=h)
+                new_row = {"TIMESTAMP": new_time, "Interpolated": 1}
+                for col in sensor_columns:
+                    new_row[col] = np.nan
+                new_rows.append(new_row)
+
+    # Append new rows and sort again
+    df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+    df = df.sort_values("TIMESTAMP").reset_index(drop=True)
+
+    # Interpolate missing values and round to 2 decimals
+    df[sensor_columns] = df[sensor_columns].interpolate(method="linear")
+    df[sensor_columns] = df[sensor_columns].round(2)
     return df
 
 def add_source(df, secondary_df, include_NAs=False, max_gap=6):
@@ -133,6 +129,31 @@ def add_source(df, secondary_df, include_NAs=False, max_gap=6):
 
     return merged_df
 
+def decompose_direction(df, column_name):
+    """
+    Replace a column containing degree values with two new columns representing
+    the x and y components using cosine and sine. The new columns are inserted
+    at the same position as the original column.
+
+    Parameters:
+    - df: pandas.DataFrame
+    - column_name: str, name of the column containing degree values
+
+    Returns:
+    - Modified DataFrame with x and y components replacing the original column
+    """
+    df_copy = df.copy()
+    radians = np.deg2rad(df_copy[column_name])
+    x_component = np.cos(radians)
+    y_component = np.sin(radians)
+
+    insert_position = df_copy.columns.get_loc(column_name)
+    df_copy.drop(columns=[column_name], inplace=True)
+    df_copy.insert(insert_position, f"{column_name}_x", x_component)
+    df_copy.insert(insert_position + 1, f"{column_name}_y", y_component)
+
+    return df_copy
+
 def count_segs(df):
     time_diff = df["TIMESTAMP"].diff()  # Calculate time difference between consecutive rows
     breaks = time_diff > pd.Timedelta(hours=1)  # Identify breaks (gaps greater than 1 hour)
@@ -156,7 +177,7 @@ if __name__ == '__main__':
     eurofins_df = pd.read_csv("../data/input/sensors/Eurofins.csv", sep=";", decimal=",", parse_dates=["Time"])
 
     # Clean profiler dataset, which is foundation for other sources
-    clean_df = clean_profiler(df)
+    clean_df = clean_profiler(df, max_gap=6)
 
     # Merge data from other sources into the dataset.
     merge1_df = add_source(clean_df, weather_df, include_NAs=False, max_gap=6)
@@ -185,7 +206,11 @@ if __name__ == '__main__':
                     "1818_time: UU Luftfuktighet[%RH]": "Average humidity (% relative humidity)"
                     }
     merge1_df.rename(columns=weather_columns, inplace=True)
-    merge2_df = add_source(merge1_df, scada_df, include_NAs=True, max_gap=6)
+
+    decomp_df = decompose_direction(merge1_df, "Wind direction 10minRollingAvg (°)")
+    decomp2_df = decompose_direction(decomp_df, "Hourly average wind direction (°)")
+
+    merge2_df = add_source(decomp2_df, scada_df, include_NAs=True, max_gap=6)
     merge3_df = add_source(merge2_df, eurofins_df, include_NAs=True, max_gap=6)
 
     segmented_df = count_segs(merge3_df)  # Add column with index for continuous segments

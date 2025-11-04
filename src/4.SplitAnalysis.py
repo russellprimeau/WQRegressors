@@ -179,8 +179,9 @@ if __name__ == '__main__':
     # to_normalize = df.columns[3:]
     to_normalize = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
-        'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)',
-        'Hourly average wind direction (°)', 'Average wind speed (m/s)',
+        'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)_x',
+        'Wind direction 10minRollingAvg (°)_y',
+        'Hourly average wind direction (°)_x', 'Hourly average wind direction (°)_y', 'Average wind speed (m/s)',
         'Maximum sustained wind speed, 3-second span (m/s)', 'Time of maximum 3s Gust',
         'Maximum sustained wind speed, 10-minute span (m/s)', 'Time of maximum 10 minute gust',
         'Hourly average atmospheric pressure at station (mBar)', 'Maximum pressure differential, 3-hour span (mBar)',

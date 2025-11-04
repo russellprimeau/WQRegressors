@@ -162,27 +162,8 @@ def evaluate_linear(directory, dataset, historic, output_columns, data_dir,
     """
     Linear baseline with causal gap constraint and optional debug visualization.
 
-    Parameters
-    ----------
-    dataset : Dataset
-        (input, target, filename) tuples.
-    historic : Path to DataFrame
-        Full historical dataset with timestamps and target columns.
-    output_columns : list
-        List of columns to predict.
-    data_dir : str
-        Directory containing sample CSVs.
-    output_rows : slice or int
-        Rows in each file that define the forecast horizon.
-    window_hours : float
-        Regression window width in hours.
-    gap_hours : float
-        Minimum time gap (in hours) before forecast start; ensures causal use of data.
-    debug_plot : bool
-        If True, generates a plot for each evaluated sample showing the regression fit
-        and forecasted points.
+    Now also plots the true target values (ground truth) in green for comparison.
     """
-
     # Load full time series as input for simple "baseline" models
     df = pd.read_csv(historic, parse_dates=["TIMESTAMP"])
     sort_df = df.sort_values("TIMESTAMP")
@@ -230,18 +211,24 @@ def evaluate_linear(directory, dataset, historic, output_columns, data_dir,
                     pred_matrix[:, j] = model.predict(forecast_secs)
 
                     # === Debug plot for this variable ===
-                    if debug_plot and j < examples:
+                    if debug_plot and i < examples:
                         plt.figure(figsize=(8, 5))
+                        # Historical training data
                         plt.scatter(window_df["TIMESTAMP"], values, label="Training data", color="blue", alpha=0.6)
                         # Regression line (continuous fit within training window)
                         fit_times = np.linspace(times.min(), times.max(), 100).reshape(-1, 1)
                         fit_dates = [window_start + pd.Timedelta(seconds=s) for s in fit_times.flatten()]
                         plt.plot(fit_dates, model.predict(fit_times), "k--", label="Fitted line")
-                        # Forecast points
+                        # Forecast predictions
                         plt.scatter(output_times, pred_matrix[:, j], color="orange", label="Predictions", zorder=5)
+                        # === NEW: plot ground truth (targets) ===
+                        plt.plot(output_times, y.numpy().reshape(-1)[j::len(output_columns)],
+                                 color="green", marker="o", linestyle="", label="Ground truth", zorder=6)
+
                         # Reference verticals
                         plt.axvline(window_end, color="red", linestyle="--", label=f"Gap start (-{gap_hours}h)")
                         plt.axvline(forecast_start, color="red", linestyle=":", label="Forecast start")
+
                         plt.title(f"Linear Regression Forecast — {col}\nSample: {filename}")
                         plt.xlabel("Timestamp")
                         plt.ylabel(col)
@@ -256,38 +243,95 @@ def evaluate_linear(directory, dataset, historic, output_columns, data_dir,
 
     return np.array(predictions), np.array(targets)
 
-def evaluate_seasonal(dataset, historic, output_columns, data_dir, output_rows=-1):
-    # Load full time series as input for simple "baseline" models
+def evaluate_seasonal(dataset, historic, output_columns, data_dir, output_rows=-1, diurnal_window=2):
+    """
+    Seasonal baseline with temporal proximity (±time_window_hours) and hierarchical fallbacks.
+    For each forecast timestamp, the prediction is computed as:
+        1. Mean of all past-year values from the same ISO week and within ±time_window_hours of the same time of day.
+        2. If none found, mean of all past-year values from the same ISO week (any time).
+        3. If none found, mean of all past-year values from the same calendar month (any time).
+        4. If none found, mean of all past-year values (any time).
+
+    Parameters
+    ----------
+    dataset : Dataset
+        Sequence of (input, target, filename) tuples.
+    historic : str
+        Path to full historical CSV with 'TIMESTAMP' and relevant columns.
+    output_columns : list
+        Columns to forecast.
+    data_dir : str
+        Directory containing the per-sample CSVs.
+    output_rows : slice or int
+        Slice defining the forecast horizon rows in each file.
+    diurnal_window : float
+        Maximum allowed deviation in hours for time-of-day matching.
+
+    Returns
+    -------
+    predictions : np.ndarray
+        Array of shape (n_samples, n_outputs) matching evaluate_model().
+    targets : np.ndarray
+        Array of shape (n_samples, n_outputs) matching evaluate_model().
+    """
+    # Load and normalize historical data
     df = pd.read_csv(historic, parse_dates=["TIMESTAMP"])
     sort_df = df.sort_values("TIMESTAMP")
     historical_df = normalize_columns(sort_df, data_columns, directory=data_dir)
 
     predictions, targets = [], []
 
+    # Precompute datetime components
     historical_df["TIMESTAMP"] = pd.to_datetime(historical_df["TIMESTAMP"])
-    historical_df["WEEK"] = historical_df["TIMESTAMP"].apply(lambda ts: ts.isocalendar().week)
     historical_df["YEAR"] = historical_df["TIMESTAMP"].dt.year
+    historical_df["WEEK"] = historical_df["TIMESTAMP"].apply(lambda ts: ts.isocalendar().week)
+    historical_df["MONTH"] = historical_df["TIMESTAMP"].dt.month
+    historical_df["HOUR"] = historical_df["TIMESTAMP"].dt.hour + historical_df["TIMESTAMP"].dt.minute / 60.0
 
     for i in range(len(dataset)):
         _, y, filename = dataset[i]
 
-        # Load the sample file to get the timestamp of the output
+        # Load the sample file to get forecast timestamps
         sample_df = pd.read_csv(os.path.join(data_dir, filename), parse_dates=["TIMESTAMP"])
-        output_time = sample_df["TIMESTAMP"].iloc[output_rows]
-        target_week = output_time.isocalendar().week
-        target_year = output_time.year
+        output_times = sample_df["TIMESTAMP"].iloc[output_rows:]
+        if len(output_times) == 0:
+            continue
 
-        # Filter historical data by matching week number, excluding same year
-        seasonal_df = historical_df[(historical_df["WEEK"] == target_week) & (historical_df["YEAR"] != target_year)]
+        pred_matrix = np.zeros((len(output_times), len(output_columns)))
 
-        # Drop NaNs and compute mean for each output column
-        seasonal_values = seasonal_df[output_columns].dropna()
-        if seasonal_values.empty:
-            seasonal_pred = np.full(len(output_columns), np.nan)
-        else:
-            seasonal_pred = seasonal_values.mean().values
+        for t_idx, ts in enumerate(output_times):
+            target_year = ts.year
+            target_week = ts.isocalendar().week
+            target_month = ts.month
+            target_hour = ts.hour + ts.minute / 60.0
 
-        predictions.append(np.array(seasonal_pred).reshape(-1))
+            # Exclude same calendar year
+            candidates = historical_df[historical_df["YEAR"] != target_year]
+
+            # --- Step 1: same week, within ±time_window_hours of same time of day ---
+            within_hours = np.abs(candidates["HOUR"] - target_hour) <= diurnal_window
+            week_match = candidates["WEEK"] == target_week
+            subset = candidates[week_match & within_hours]
+
+            # --- Step 2: fallback to same week (any time) ---
+            if subset.empty:
+                subset = candidates[week_match]
+
+            # --- Step 3: fallback to same month (any time) ---
+            if subset.empty:
+                subset = candidates[candidates["MONTH"] == target_month]
+
+            # --- Step 4: fallback to all available past years ---
+            if subset.empty:
+                subset = candidates
+
+            seasonal_values = subset[output_columns].dropna()
+            if seasonal_values.empty:
+                pred_matrix[t_idx, :] = np.nan
+            else:
+                pred_matrix[t_idx, :] = seasonal_values.mean().values
+
+        predictions.append(pred_matrix.reshape(-1))
         targets.append(y.numpy().reshape(-1))
 
     return np.array(predictions), np.array(targets)
@@ -334,8 +378,8 @@ def visualizer(*pred_target_pairs, labels=None, directory="../data/output/regres
     ax.set_xlabel("Actual Value")
     ax.set_ylabel("Predicted Value")
     ax.set_title("Predicted vs Actual Values")
-    ax.set_xlim(0.95 * min_val, 1.05 * max_val)
-    ax.set_ylim(0.95 * min_val, 1.05 * max_val)
+    ax.set_xlim(min_val, max_val)
+    ax.set_ylim(min_val, max_val)
     ax.set_aspect("equal", adjustable="box")
     ax.legend()
     plt.tight_layout()
@@ -511,8 +555,9 @@ if __name__ == '__main__':
     ## Configure input, output and model hyperparameters
     all_columns = ['TIMESTAMP', 'Segment', 'Interpolated', 'Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
-        'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)',
-        'Hourly average wind direction (°)', 'Average wind speed (m/s)',
+        'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)_x',
+        'Wind direction 10minRollingAvg (°)_y', 'Hourly average wind direction (°)_x',
+        'Hourly average wind direction (°)_y', 'Average wind speed (m/s)',
         'Maximum sustained wind speed, 3-second span (m/s)', 'Time of maximum 3s Gust',
         'Maximum sustained wind speed, 10-minute span (m/s)', 'Time of maximum 10 minute gust',
         'Hourly average atmospheric pressure at station (mBar)', 'Maximum pressure differential, 3-hour span (mBar)',
@@ -525,8 +570,9 @@ if __name__ == '__main__':
 
     data_columns = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
-        'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)',
-        'Hourly average wind direction (°)', 'Average wind speed (m/s)',
+        'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)_x',
+        'Wind direction 10minRollingAvg (°)_y', 'Hourly average wind direction (°)_x',
+        'Hourly average wind direction (°)_y', 'Average wind speed (m/s)',
         'Maximum sustained wind speed, 3-second span (m/s)', 'Time of maximum 3s Gust',
         'Maximum sustained wind speed, 10-minute span (m/s)', 'Time of maximum 10 minute gust',
         'Hourly average atmospheric pressure at station (mBar)', 'Maximum pressure differential, 3-hour span (mBar)',
@@ -539,50 +585,71 @@ if __name__ == '__main__':
 
     data_dir = "../data/output/regression/SCADATemp96hr"  # Directory with samples for test/train dataset
     historic = "../data/output/regression/Combined_Cleaned.csv"  # Path to file with baseline model input
-    input_columns = ['Pfl - Temp (C)', 'Pfl - Turbidity (FNU)', 'Precipitation (mm/hr)', 'SCADA - Temperature (°C)']
+    input_columns = ['Pfl - Temp (C)',
+        'Pfl - Sp Cond (microS_cm)',
+        'Pfl - pH',
+        'Pfl - DO (% Sat)',
+        'Pfl - Turbidity (FNU)',
+        'Pfl - fDOM (QSU)',
+        'Instantaneous atmospheric pressure (mBar)',
+        'Hourly average wind direction (°)_x',
+        'Hourly average wind direction (°)_y',
+        'Average wind speed (m/s)',
+        'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)',
+        'Longwave (IR) radiation (W/m2)',
+        'Shortwave (solar) radiation (W/m2)',
+        'Precipitation (mm/hr)',
+        'Instantaneous temperature (°C)',
+        'Average humidity (% relative humidity)'
+                     ]
     output_columns = ['SCADA - Temperature (°C)']
     input_rows = slice(0, 83)
     output_rows = -12
-    gap_hours = 0  # Period before first forecast value from which input data is not used in baseline models
-    window_hours = 36  # Length of period for linear regression training (must be ~500 hrs for Eurofins params)
-    random_state = 40  # Random seed which deterministically sets the test/train split
+
+    # ML Training Hyperparameters
+    random_state = 35  # Random seed which deterministically sets the test/train split
     test_size = 0.15  # Fraction of samples saved for evaluation after training
-    batch_size = 1  # Minibatch size. Smaller batches -> noisier, but escapes local minima quicker
-    num_epochs = 100  # Training duration (excessive epochs can cause overfitting to training data)
-    loss_threshold = 0.00001  # Threshold of acceptably small loss to terminate training early
+    batch_size = 10  # Minibatch size. Smaller batches -> noisier, but escapes local minima quicker
+    num_epochs = 1000  # Training duration (excessive epochs can cause overfitting to training data)
+    loss_threshold = 0.000001  # Threshold of acceptably small loss to terminate training early
     learning_rate = 1e-4  # Limit on parameter adjustment size per epoch
-    model_dim = 128  # Model size
+    model_dim = 256  # Model size
     num_heads = 4  # Parallel attention heads
     num_layers = 8  # Depth of NN
     dropout = 0.1  # Regularization technique to prevent overtraining by randomly removing some neurons each epoch
 
-    # Generate parameters from selection
+    # Baseline model calculation parameters
+    gap_hours = 0  # Period before first forecast value from which input data is not used in baseline models
+    window_hours = 6  # Length of period for linear regression training (must be ~500 hrs for Eurofins params)
+    diurnal_window = 1  # Number of hours before/after target time to include in average for seasonal model
+
+    # Generate additional model dimensions parametrically based on selection
     input_dim = len(input_columns)
     files = [ f for f in os.listdir(data_dir) if os.path.isfile(os.path.join(data_dir,f)) ]
     sample_df = pd.read_csv(os.path.join(data_dir, sorted(files)[0]))
     output_dim = len(output_columns) * len(sample_df.iloc[output_rows:])
-    seq_len = input_rows.stop - input_rows.start  #
+    seq_len = input_rows.stop - input_rows.start
 
-    # # Pre-process dataset
-    # samples = load_samples(data_dir, input_columns=input_columns, output_columns=output_columns,
-    #                                       input_rows=input_rows, output_rows=output_rows)
-    # all_filenames = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv")])
-    # train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=random_state)
-    # os.makedirs(os.path.join(data_dir, "model"), exist_ok=True)
-    # file1 = Path(data_dir, "model", "train_files.txt")
-    # with open(file1, "w") as f:
-    #     f.writelines(f"{s[2]}\n" for s in train_samples)
-    # file2 = Path(data_dir, "model", "test_files.txt")
-    # with open(file2, "w") as f:
-    #     f.writelines(f"{s[2]}\n" for s in test_samples)
-    #
-    # ## Train
-    # train_dataset = TimeSeriesTargetDataset(train_samples)
-    # dataloader = DataLoader(train_dataset, batch_size=10, shuffle=True)
-    # model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
-    #                               dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
-    # train_model(data_dir, model, dataloader, num_epochs, learning_rate, loss_threshold)
-    # torch.save(model.state_dict(), Path(data_dir, "model","transformer_model.pt"))
+    # Pre-process dataset
+    samples = load_samples(data_dir, input_columns=input_columns, output_columns=output_columns,
+                                          input_rows=input_rows, output_rows=output_rows)
+    all_filenames = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv")])
+    train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=random_state)
+    os.makedirs(os.path.join(data_dir, "model"), exist_ok=True)
+    file1 = Path(data_dir, "model", "train_files.txt")
+    with open(file1, "w") as f:
+        f.writelines(f"{s[2]}\n" for s in train_samples)
+    file2 = Path(data_dir, "model", "test_files.txt")
+    with open(file2, "w") as f:
+        f.writelines(f"{s[2]}\n" for s in test_samples)
+
+    ## Train
+    train_dataset = TimeSeriesTargetDataset(train_samples)
+    dataloader = DataLoader(train_dataset, batch_size=10, shuffle=True)
+    model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
+                                  dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
+    train_model(data_dir, model, dataloader, num_epochs, learning_rate, loss_threshold)
+    torch.save(model.state_dict(), Path(data_dir, "model","transformer_model.pt"))
 
     ## Post-processing
     model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
@@ -597,20 +664,15 @@ if __name__ == '__main__':
         input_rows=input_rows, output_rows=output_rows, file_list=test_files)
     test_dataset = TimeSeriesTargetDataset(test_samples)
 
-    # model_preds, targets = evaluate_model(model, test_dataset)
-    # naive_preds, naive_targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
-    #                                             output_rows=output_rows, gap_hours=gap_hours)
-    # linear_preds, linear_targets = evaluate_linear(data_dir, test_dataset, historic, output_columns, data_dir,
-    #                                                output_rows=output_rows, window_hours=window_hours, gap_hours=gap_hours,
-    #                                                debug_plot=True)
+    model_preds, targets = evaluate_model(model, test_dataset)
+    naive_preds, naive_targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
+                                                output_rows=output_rows, gap_hours=gap_hours)
+    linear_preds, linear_targets = evaluate_linear(data_dir, test_dataset, historic, output_columns, data_dir,
+                                                   output_rows=output_rows, window_hours=window_hours, gap_hours=gap_hours,
+                                                   debug_plot=True, examples=10)
     seasonal_preds, seasonal_targets = evaluate_seasonal(test_dataset, historic, output_columns, data_dir,
-                                                         output_rows=output_rows)
-    print("seasonal_preds: ", seasonal_preds.size)
-    print("seasonal_targets: ", seasonal_targets.size)
+                                                         output_rows=output_rows, diurnal_window=diurnal_window)
 
-    visualizer((seasonal_preds, seasonal_targets),
-               labels=["Seasonal"], directory=data_dir, num_samples=100)
-    #
-    # visualizer((model_preds, targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
-    #            (seasonal_preds, seasonal_targets),
-    #            labels=["Transformer", "Naive", "Linear", "Seasonal"], directory=data_dir, num_samples=100)
+    visualizer((model_preds, targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
+               (seasonal_preds, seasonal_targets),
+               labels=["Transformer", "Naive", "Linear", "Seasonal"], directory=data_dir, num_samples=200)
