@@ -102,7 +102,6 @@ def evaluate_model(model, dataset):
     mask = np.isfinite(predictions).all(axis=1) & np.isfinite(targets).all(axis=1)
     return predictions[mask], targets[mask]
 
-
 def evaluate_naive(dataset, historical_df, output_columns, data_dir, output_rows=-1, gap_hours=5):
     predictions, targets = [], []
     for i in range(len(dataset)):
@@ -125,8 +124,8 @@ def evaluate_naive(dataset, historical_df, output_columns, data_dir, output_rows
         else:
             baseline_pred = valid_values.iloc[-1].values
 
-        predictions.append(baseline_pred.flatten())
-        targets.append(y.numpy().flatten())  # Ensure target is flattened
+        predictions.append(np.array(baseline_pred).reshape(-1))
+        targets.append(y.numpy().reshape(-1))  # Ensure target is flattened
 
     return np.array(predictions), np.array(targets)
 
@@ -168,9 +167,8 @@ def evaluate_linear(dataset, historical_df, output_columns, data_dir, output_row
                     pred.append(model.predict([[target_time]])[0])
             pred = np.array(pred)
 
-        predictions.append(pred.flatten())
-        targets.append(y.numpy().flatten())  # Ensure target is flattened
-
+        predictions.append(np.array(pred).reshape(-1))
+        targets.append(y.numpy().reshape(-1))  # Ensure target is flattened
     return np.array(predictions), np.array(targets)
 
 def visualizer(*pred_target_pairs, labels=None, num_samples=100):
@@ -349,23 +347,23 @@ if __name__ == '__main__':
     output_dim = len(output_columns) * len(sample_df.iloc[output_rows:])
     seq_len = input_rows.stop - input_rows.start  #
 
-    # # Pre-process dataset
-    # samples = load_samples(data_dir, input_columns=input_columns, output_columns=output_columns,
-    #                                       input_rows=input_rows, output_rows=output_rows)
-    # all_filenames = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv")])
-    # train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=random_state)
-    # with open("../data/output/for_regression/train_files.txt", "w") as f:
-    #     f.writelines(f"{s[2]}\n" for s in train_samples)
-    # with open("../data/output/for_regression/test_files.txt", "w") as f:
-    #     f.writelines(f"{s[2]}\n" for s in test_samples)
-    #
-    # ## Train
-    # train_dataset = TimeSeriesTargetDataset(train_samples)
-    # dataloader = DataLoader(train_dataset, batch_size=10, shuffle=True)
-    # model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
-    #                               dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
-    # train_model(model, dataloader, num_epochs, learning_rate, loss_threshold)
-    # torch.save(model.state_dict(), "../data/output/for_regression/transformer_model.pt")
+    # Pre-process dataset
+    samples = load_samples(data_dir, input_columns=input_columns, output_columns=output_columns,
+                                          input_rows=input_rows, output_rows=output_rows)
+    all_filenames = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv")])
+    train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=random_state)
+    with open("../data/output/for_regression/train_files.txt", "w") as f:
+        f.writelines(f"{s[2]}\n" for s in train_samples)
+    with open("../data/output/for_regression/test_files.txt", "w") as f:
+        f.writelines(f"{s[2]}\n" for s in test_samples)
+
+    ## Train
+    train_dataset = TimeSeriesTargetDataset(train_samples)
+    dataloader = DataLoader(train_dataset, batch_size=10, shuffle=True)
+    model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
+                                  dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
+    train_model(model, dataloader, num_epochs, learning_rate, loss_threshold)
+    torch.save(model.state_dict(), "../data/output/for_regression/transformer_model.pt")
 
     ## Post-processing
     model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
@@ -386,12 +384,20 @@ if __name__ == '__main__':
     sort_df = historic_df.sort_values("TIMESTAMP")
     norm_df = normalize_columns(sort_df, data_columns)
 
-    baseline_preds, targets_baseline = evaluate_naive(test_dataset, norm_df, output_columns, data_dir,
-                                                         output_rows=output_rows, gap_hours=48)
+    naive_preds, naive_targets = evaluate_naive(test_dataset, norm_df, output_columns, data_dir,
+                                                output_rows=output_rows, gap_hours=48)
 
-    linear_preds, targets_linear = evaluate_linear(test_dataset, norm_df, output_columns, data_dir, window_hours=530)
+    print("naive_preds", naive_preds.size, naive_preds)
+    print("naive_targets", naive_targets.size, naive_targets)
 
-    # (baseline_preds, targets_baseline), (linear_preds, targets_linear),
+    linear_preds, linear_targets = evaluate_linear(test_dataset, norm_df, output_columns, data_dir,
+                                                   output_rows=output_rows, window_hours=530)
 
-    visualizer((linear_preds, targets_linear),
-                     labels=["Transformer"], num_samples=200)
+    print("linear_preds", linear_preds.size, linear_preds)
+    print("linear_targets", linear_targets.size, linear_targets)
+
+
+    # visualizer((model_preds, targets), (naive_preds, naive_targets[0]), (linear_preds, linear_targets[0]), labels=["Transformer", "Naive", "Linear"], num_samples=200)
+    visualizer((model_preds, targets), labels=["Transformer"], num_samples=200)
+    # visualizer((naive_preds, naive_targets[0]), labels=["Naive"], num_samples=200)
+    # visualizer((linear_preds, linear_targets[0]), labels=["Naive"], num_samples=200)
