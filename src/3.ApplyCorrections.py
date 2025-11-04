@@ -84,7 +84,7 @@ def correct(sensor_df, summary_dir):
 
 if __name__ == '__main__':
     # Load the sensor data
-    sensor_df = pd.read_csv("../data/output/for_regression/Combined_Cleaned.csv", parse_dates=["TIMESTAMP"])
+    sensor_df = pd.read_csv("../data/output/regression/Combined_Cleaned.csv", parse_dates=["TIMESTAMP"])
     sensor_df = sensor_df.sort_values("TIMESTAMP")
 
     # Point to the directory with the calibration log summary tables

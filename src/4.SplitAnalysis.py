@@ -6,6 +6,7 @@ Then, split the dataset into files for each equivalent sample.
 
 import os
 import pandas as pd
+import matplotlib
 import matplotlib.pyplot as plt
 import plotly.express as px
 
@@ -29,6 +30,7 @@ def gapless(df, target_columns):
     Plot results for each parameter.
     :return:
     """
+
     # Initialize a dictionary to store results
     results = {col: [] for col in target_columns}
 
@@ -54,14 +56,15 @@ def gapless(df, target_columns):
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("../data/output/for_regression/analysis/segment_analysis.png")
-    plt.show()
+    plt.savefig("../data/output/regression/availability/segment_analysis.png")
+    # plt.show()
 
 def gapped(df, target_columns, seg_length):
     """
     Evaluate a range of gaps from time series to Eurofins values.
     :return:
     """
+    os.makedirs(os.path.join("..data/output/regression/availability"), exist_ok=True)
 
     results_df = pd.DataFrame({"Gap Hours", "Valid Segments", "Variable Name"})
     for column in target_columns:
@@ -94,7 +97,7 @@ def gapped(df, target_columns, seg_length):
 
     fig = px.line(results_df, x="Gap Hours", y="Valid Segments", color="Variable Name",
                   title=f"Effect of Gap on Valid Segments", markers=True)
-    fig.write_image("../data/output/for_regression/analysis/gap_vs_segments.png")
+    fig.write_image("../data/output/regression/availability/gap_vs_segments.png")
 
 def normalize_columns(df, columns, min=0, max=1):
     """
@@ -156,8 +159,9 @@ def split(df, output_dir, target_columns=["06-E.coli","08-Kimtall 22°C","21-Ars
 
 
 if __name__ == '__main__':
+    matplotlib.use('Agg')  # Non-interactive backend for file output to handle remote machine installation errors
     # Load the sensor data
-    df = pd.read_csv("../data/output/for_regression/Combined_Cleaned.csv", parse_dates=["TIMESTAMP"])
+    df = pd.read_csv("../data/output/regression/Combined_Cleaned.csv", parse_dates=["TIMESTAMP"])
     df = df.sort_values("TIMESTAMP")
 
     # Identify prediction targets (default: all Eurofins data)
@@ -166,11 +170,11 @@ if __name__ == '__main__':
     # target_columns = ['SCADA - Temperature (°C)']
     seg_length = 96
 
-    # gapless(df, target_columns)  # Analysis function #1
+    gapless(df, target_columns)  # Analysis function #1
     # gapped(df, target_columns, seg_length)  # Analysis function #2
 
-    # output_dir = "../data/output/for_regression/Eurofins_complete_rows"
-    output_dir = "../data/output/for_regression/SCADA96hr"
+    # output_dir = "../data/output/regression/Eurofins_complete_rows"
+    output_dir = "../data/output/regression/SCADATemp96hr"
     length = 96
     # to_normalize = df.columns[3:]
     to_normalize = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',

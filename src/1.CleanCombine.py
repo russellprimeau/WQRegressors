@@ -191,4 +191,4 @@ if __name__ == '__main__':
     segmented_df = count_segs(merge3_df)  # Add column with index for continuous segments
 
     # Save the cleaned and merged dataset
-    segmented_df.to_csv("../data/output/for_regression/Combined_Cleaned.csv", index=False)
+    segmented_df.to_csv("../data/output/regression/Combined_Cleaned.csv", index=False)
