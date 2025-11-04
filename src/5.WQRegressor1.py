@@ -45,7 +45,7 @@ def load_samples(directory, input_columns, output_columns, input_rows, output_ro
 def train_model(model, dataloader, num_epochs=100, learning_rate=1e-3, loss_threshold=1e-3):
 
     criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     model.train()
     epoch_losses = []
 
@@ -65,10 +65,10 @@ def train_model(model, dataloader, num_epochs=100, learning_rate=1e-3, loss_thre
         epoch_losses.append(avg_loss)
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss/len(dataloader):.6f}")
 
-        # Early stopping condition
-        if loss_threshold is not None and avg_loss <= loss_threshold:
-            print(f"Stopping early at epoch {epoch + 1} because loss reached {avg_loss:.6f}")
-            break
+        # # Early stopping condition
+        # if loss_threshold is not None and avg_loss <= loss_threshold:
+        #     print(f"Stopping early at epoch {epoch + 1} because loss reached {avg_loss:.6f}")
+        #     break
 
         # Plotting loss vs. epochs on log-log scale
         plt.figure(figsize=(8, 6))
@@ -92,27 +92,18 @@ def evaluate_model(model, dataset):
         for i in range(len(dataset)):
             x, y, filename = dataset[i]
             x = x.unsqueeze(0).to(device)  # Add batch dimension
-            pred = model(x).squeeze().item()
-            true = y.item()
-            # print(f"{filename}: Prediction = {pred:.4f}, Target = {true:.4f}")
+            pred = model(x).squeeze().cpu().numpy()
+            true = y.cpu().numpy()
             predictions.append(pred)
             targets.append(true)
 
-    # Convert to NumPy arrays and filter out NaN/inf
     predictions = np.array(predictions)
     targets = np.array(targets)
-    mask = np.isfinite(predictions) & np.isfinite(targets)
-    predictions = predictions[mask]
-    targets = targets[mask]
-    return predictions, targets
+    mask = np.isfinite(predictions).all(axis=1) & np.isfinite(targets).all(axis=1)
+    return predictions[mask], targets[mask]
+
 
 def evaluate_naive(dataset, historical_df, output_columns, data_dir, output_rows=-1, gap_hours=5):
-    """
-    For each sample in the dataset:
-    - Find the timestamp of the output row in the sample file.
-    - In historical_df, find the most recent non-NaN value for each output column
-      that occurs at least `gap_hours` before the sample_time.
-    """
     predictions, targets = [], []
     for i in range(len(dataset)):
         _, y, filename = dataset[i]
@@ -134,20 +125,12 @@ def evaluate_naive(dataset, historical_df, output_columns, data_dir, output_rows
         else:
             baseline_pred = valid_values.iloc[-1].values
 
-        predictions.append(baseline_pred)
-        targets.append(y.numpy())  # Convert tensor to numpy
+        predictions.append(baseline_pred.flatten())
+        targets.append(y.numpy().flatten())  # Ensure target is flattened
 
     return np.array(predictions), np.array(targets)
 
 def evaluate_linear(dataset, historical_df, output_columns, data_dir, output_rows=-1, window_hours=6):
-    """
-    For each sample:
-    - Find the timestamp of the output row in the sample file.
-    - Collect all valid historical values within `window_hours` before sample_time.
-    - Fit a least-squares linear regression model (time vs value) for each output column.
-    - Predict the value at sample_time.
-    Handles NaNs in both input and output.
-    """
     predictions, targets = [], []
 
     for i in range(len(dataset)):
@@ -176,20 +159,17 @@ def evaluate_linear(dataset, historical_df, output_columns, data_dir, output_row
             pred = []
             for col in output_columns:
                 values = window_df[col].values
-                # If all values are NaN or empty after filtering, return NaN
                 if len(values) == 0 or np.isnan(values).all():
                     pred.append(np.nan)
                 else:
-                    # Fit linear regression
                     model = LinearRegression()
                     model.fit(times, values)
-                    # Predict at sample_time
                     target_time = (sample_time - start_time).total_seconds()
                     pred.append(model.predict([[target_time]])[0])
             pred = np.array(pred)
 
-        predictions.append(pred)
-        targets.append(y.numpy())  # Convert tensor to numpy
+        predictions.append(pred.flatten())
+        targets.append(y.numpy().flatten())  # Ensure target is flattened
 
     return np.array(predictions), np.array(targets)
 
@@ -200,20 +180,18 @@ def visualizer(*pred_target_pairs, labels=None, num_samples=100):
     colors = sns.color_palette("husl", len(pred_target_pairs))
     min_val, max_val = float("inf"), float("-inf")
 
-    # Compute and print statistics
     for i, (preds, targets) in enumerate(pred_target_pairs):
-        preds = preds[:min(len(preds),num_samples)]
-        targets = targets[:min(len(targets),num_samples)]
-        label = labels[i] if labels else f"Model {i+1}"
-        # mae = mean_absolute_error(targets, preds)
-        # rmse = mean_squared_error(targets, preds)
-        # r2 = r2_score(targets, preds)
-        # print(f"{label} -> MAE: {mae:.4f}, RMSE: {rmse:.4f}, R²: {r2:.4f}")
+        preds = np.array(preds)
+        targets = np.array(targets)
 
-        # Plot predictions
-        ax.scatter(targets, preds, label=f"{label}", alpha=0.7, color=colors[i])
-        min_val = min(min_val, targets.min(), preds.min())
-        max_val = max(max_val, targets.max(), preds.max())
+        # Flatten multi-dimensional outputs
+        preds = preds[:num_samples].reshape(-1)
+        targets = targets[:num_samples].reshape(-1)
+
+        label = labels[i] if labels else f"Model {i+1}"
+        ax.scatter(targets, preds, label=label, alpha=0.7, color=colors[i])
+        min_val = min(min_val, np.nanmin(targets), np.nanmin(preds))
+        max_val = max(max_val, np.nanmax(targets), np.nanmax(preds))
 
     # Diagonal reference line
     ax.plot([min_val, max_val], [min_val, max_val], color="red", linestyle="--")
@@ -226,7 +204,6 @@ def visualizer(*pred_target_pairs, labels=None, num_samples=100):
     ax.legend()
     plt.tight_layout()
     plt.savefig("../data/output/for_regression/predictions.png")
-    # plt.show()  # Tk/Tcl issues preventing interactivity
 
 def normalize_columns(df, columns, min=0, max=1):
     """
@@ -350,21 +327,21 @@ if __name__ == '__main__':
         'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
         '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
 
-    data_dir = "../data/output/for_regression/Arsen24hr"
-    input_columns = ['Precipitation (mm/hr)', 'SCADA - Temperature (°C)']
-    output_columns = ['21-Arsen']
-    input_rows = slice(0, 23)
-    output_rows = -1
+    data_dir = "../data/output/for_regression/SCADA96hr"
+    input_columns = ['Pfl - Temp (C)', 'Pfl - Turbidity (FNU)', 'Precipitation (mm/hr)', 'SCADA - Temperature (°C)']
+    output_columns = ['SCADA - Temperature (°C)']
+    input_rows = slice(0, 85)
+    output_rows = -10
     random_state = 40  # Random seed which deterministically sets the test/train split
     test_size = 0.15  # Fraction of samples saved for evaluation after training
-    batch_size = 1  # Minibatch size. Smaller batches -> noisier, but escapes local minima quicker
-    num_epochs = 200  # Training duration (excessive epochs can cause overfitting to training data)
+    batch_size = 15  # Minibatch size. Smaller batches -> noisier, but escapes local minima quicker
+    num_epochs = 10  # Training duration (excessive epochs can cause overfitting to training data)
     loss_threshold = 0.00001  # Threshold of acceptably small loss to terminate training early
     learning_rate = 1e-4  # Limit on parameter adjustment size per epoch
     model_dim = 128  # Model size
     num_heads = 4  # Parallel attention heads
-    num_layers = 4  # Depth of NN
-    dropout = 0.2  # Regularization technique to prevent overtraining by randomly removing some neurons each epoch
+    num_layers = 8  # Depth of NN
+    dropout = 0.05  # Regularization technique to prevent overtraining by randomly removing some neurons each epoch
 
     # Generate parameters from selection
     input_dim = len(input_columns)
@@ -412,8 +389,9 @@ if __name__ == '__main__':
     baseline_preds, targets_baseline = evaluate_naive(test_dataset, norm_df, output_columns, data_dir,
                                                          output_rows=output_rows, gap_hours=48)
 
-    linear_preds, targets_linear = evaluate_linear(test_dataset, norm_df, output_columns, data_dir,)
-    print(linear_preds, targets_linear)
+    linear_preds, targets_linear = evaluate_linear(test_dataset, norm_df, output_columns, data_dir, window_hours=530)
 
-    visualizer((model_preds, targets), (baseline_preds, targets_baseline), (linear_preds, targets_linear),
-                     labels=["Transformer", "Baseline", "Linear"], num_samples=200)
+    # (baseline_preds, targets_baseline), (linear_preds, targets_linear),
+
+    visualizer((linear_preds, targets_linear),
+                     labels=["Transformer"], num_samples=200)
