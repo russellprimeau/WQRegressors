@@ -409,6 +409,7 @@ def visualizer(*pred_target_pairs, labels=None, directory="../data/output/regres
         ax[2].set_ylabel("R²")
 
         for a in ax:
+            a.set_xticks(range(len(labels_m)))  # or use actual tick positions
             a.set_xticklabels(labels_m, rotation=30, ha="right")
             a.grid(True, axis="y", linestyle="--", alpha=0.6)
 
