@@ -264,18 +264,20 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, output_rows=-
 
     predictions, targets = [], []
 
+    historical_df["TIMESTAMP"] = pd.to_datetime(historical_df["TIMESTAMP"])
+    historical_df["WEEK"] = historical_df["TIMESTAMP"].apply(lambda ts: ts.isocalendar().week)
+    historical_df["YEAR"] = historical_df["TIMESTAMP"].dt.year
+
     for i in range(len(dataset)):
         _, y, filename = dataset[i]
 
-        # Load sample file to get timestamp of output
+        # Load the sample file to get the timestamp of the output
         sample_df = pd.read_csv(os.path.join(data_dir, filename), parse_dates=["TIMESTAMP"])
         output_time = sample_df["TIMESTAMP"].iloc[output_rows]
         target_week = output_time.isocalendar().week
         target_year = output_time.year
 
         # Filter historical data by matching week number, excluding same year
-        historical_df["WEEK"] = historical_df["TIMESTAMP"].apply(lambda ts: ts.isocalendar().week)
-        historical_df["YEAR"] = historical_df["TIMESTAMP"].dt.year
         seasonal_df = historical_df[(historical_df["WEEK"] == target_week) & (historical_df["YEAR"] != target_year)]
 
         # Drop NaNs and compute mean for each output column
@@ -285,7 +287,7 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, output_rows=-
         else:
             seasonal_pred = seasonal_values.mean().values
 
-        predictions.append(seasonal_pred.reshape(-1))
+        predictions.append(np.array(seasonal_pred).reshape(-1))
         targets.append(y.numpy().reshape(-1))
 
     return np.array(predictions), np.array(targets)
@@ -552,7 +554,7 @@ if __name__ == '__main__':
     model_dim = 128  # Model size
     num_heads = 4  # Parallel attention heads
     num_layers = 8  # Depth of NN
-    dropout = 0.05  # Regularization technique to prevent overtraining by randomly removing some neurons each epoch
+    dropout = 0.1  # Regularization technique to prevent overtraining by randomly removing some neurons each epoch
 
     # Generate parameters from selection
     input_dim = len(input_columns)
@@ -561,26 +563,26 @@ if __name__ == '__main__':
     output_dim = len(output_columns) * len(sample_df.iloc[output_rows:])
     seq_len = input_rows.stop - input_rows.start  #
 
-    # Pre-process dataset
-    samples = load_samples(data_dir, input_columns=input_columns, output_columns=output_columns,
-                                          input_rows=input_rows, output_rows=output_rows)
-    all_filenames = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv")])
-    train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=random_state)
-    os.makedirs(os.path.join(data_dir, "model"), exist_ok=True)
-    file1 = Path(data_dir, "model", "train_files.txt")
-    with open(file1, "w") as f:
-        f.writelines(f"{s[2]}\n" for s in train_samples)
-    file2 = Path(data_dir, "model", "test_files.txt")
-    with open(file2, "w") as f:
-        f.writelines(f"{s[2]}\n" for s in test_samples)
-
-    ## Train
-    train_dataset = TimeSeriesTargetDataset(train_samples)
-    dataloader = DataLoader(train_dataset, batch_size=10, shuffle=True)
-    model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
-                                  dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
-    train_model(data_dir, model, dataloader, num_epochs, learning_rate, loss_threshold)
-    torch.save(model.state_dict(), Path(data_dir, "model","transformer_model.pt"))
+    # # Pre-process dataset
+    # samples = load_samples(data_dir, input_columns=input_columns, output_columns=output_columns,
+    #                                       input_rows=input_rows, output_rows=output_rows)
+    # all_filenames = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv")])
+    # train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=random_state)
+    # os.makedirs(os.path.join(data_dir, "model"), exist_ok=True)
+    # file1 = Path(data_dir, "model", "train_files.txt")
+    # with open(file1, "w") as f:
+    #     f.writelines(f"{s[2]}\n" for s in train_samples)
+    # file2 = Path(data_dir, "model", "test_files.txt")
+    # with open(file2, "w") as f:
+    #     f.writelines(f"{s[2]}\n" for s in test_samples)
+    #
+    # ## Train
+    # train_dataset = TimeSeriesTargetDataset(train_samples)
+    # dataloader = DataLoader(train_dataset, batch_size=10, shuffle=True)
+    # model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
+    #                               dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
+    # train_model(data_dir, model, dataloader, num_epochs, learning_rate, loss_threshold)
+    # torch.save(model.state_dict(), Path(data_dir, "model","transformer_model.pt"))
 
     ## Post-processing
     model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
@@ -595,15 +597,20 @@ if __name__ == '__main__':
         input_rows=input_rows, output_rows=output_rows, file_list=test_files)
     test_dataset = TimeSeriesTargetDataset(test_samples)
 
-    model_preds, targets = evaluate_model(model, test_dataset)
-    naive_preds, naive_targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
-                                                output_rows=output_rows, gap_hours=gap_hours)
-    linear_preds, linear_targets = evaluate_linear(data_dir, test_dataset, historic, output_columns, data_dir,
-                                                   output_rows=output_rows, window_hours=window_hours, gap_hours=gap_hours,
-                                                   debug_plot=True)
+    # model_preds, targets = evaluate_model(model, test_dataset)
+    # naive_preds, naive_targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
+    #                                             output_rows=output_rows, gap_hours=gap_hours)
+    # linear_preds, linear_targets = evaluate_linear(data_dir, test_dataset, historic, output_columns, data_dir,
+    #                                                output_rows=output_rows, window_hours=window_hours, gap_hours=gap_hours,
+    #                                                debug_plot=True)
     seasonal_preds, seasonal_targets = evaluate_seasonal(test_dataset, historic, output_columns, data_dir,
                                                          output_rows=output_rows)
+    print("seasonal_preds: ", seasonal_preds.size)
+    print("seasonal_targets: ", seasonal_targets.size)
 
-    visualizer((model_preds, targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
-               (seasonal_preds, seasonal_targets),
-               labels=["Transformer", "Naive", "Linear", "Seasonal"], directory=data_dir, num_samples=100)
+    visualizer((seasonal_preds, seasonal_targets),
+               labels=["Seasonal"], directory=data_dir, num_samples=100)
+    #
+    # visualizer((model_preds, targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
+    #            (seasonal_preds, seasonal_targets),
+    #            labels=["Transformer", "Naive", "Linear", "Seasonal"], directory=data_dir, num_samples=100)
