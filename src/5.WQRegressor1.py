@@ -2,7 +2,6 @@
 Time Series Forecasting using Transformer Model in PyTorch.
 """
 
-
 import os
 from pathlib import Path
 import json
@@ -66,10 +65,10 @@ def train_model(directory, model, dataloader, num_epochs=100, learning_rate=1e-3
         epoch_losses.append(avg_loss)
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss/len(dataloader):.6f}")
 
-        # # Early stopping condition
-        # if loss_threshold is not None and avg_loss <= loss_threshold:
-        #     print(f"Stopping early at epoch {epoch + 1} because loss reached {avg_loss:.6f}")
-        #     break
+        # Early stopping condition
+        if loss_threshold is not None and avg_loss <= loss_threshold:
+            print(f"Stopping early at epoch {epoch + 1} because loss reached {avg_loss:.6f}")
+            break
 
         # Plotting loss vs. epochs on log-log scale
         plt.figure(figsize=(8, 6))
@@ -133,7 +132,7 @@ def evaluate_naive(dataset, historic, output_columns, data_dir, output_rows=-1, 
         _, y, filename = dataset[i]
 
         # Load the sample file to get the output times
-        sample_df = pd.read_csv(os.path.join(data_dir, filename), parse_dates=["TIMESTAMP"])
+        sample_df = pd.read_csv(os.path.join(data_dir, 'samples', filename), parse_dates=["TIMESTAMP"])
         output_times = sample_df["TIMESTAMP"].iloc[output_rows:]
 
         # Apply gap constraint (before the first output timestamp)
@@ -178,7 +177,7 @@ def evaluate_linear(directory, dataset, historic, output_columns, data_dir,
         _, y, filename = dataset[i]
 
         # Load sample to get output timestamps
-        sample_df = pd.read_csv(os.path.join(data_dir, filename), parse_dates=["TIMESTAMP"])
+        sample_df = pd.read_csv(os.path.join(data_dir, 'samples', filename), parse_dates=["TIMESTAMP"])
         output_times = sample_df["TIMESTAMP"].iloc[output_rows:]
 
         # Forecast window definition
@@ -292,7 +291,7 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, output_rows=-
         _, y, filename = dataset[i]
 
         # Load the sample file to get forecast timestamps
-        sample_df = pd.read_csv(os.path.join(data_dir, filename), parse_dates=["TIMESTAMP"])
+        sample_df = pd.read_csv(os.path.join(data_dir, 'samples', filename), parse_dates=["TIMESTAMP"])
         output_times = sample_df["TIMESTAMP"].iloc[output_rows:]
         if len(output_times) == 0:
             continue
@@ -344,24 +343,17 @@ def visualizer(*pred_target_pairs, labels=None, directory="../data/output/regres
     fig, ax = plt.subplots(figsize=(8, 8))
     colors = sns.color_palette("husl", len(pred_target_pairs))
     min_val, max_val = float("inf"), float("-inf")
-
     metrics = []  # store (label, MAE, RMSE, R2)
 
     for i, (preds, targets) in enumerate(pred_target_pairs):
         preds = np.array(preds)
         targets = np.array(targets)
-
-        # Flatten multi-dimensional outputs
         preds = preds[:num_samples].reshape(-1)
         targets = targets[:num_samples].reshape(-1)
-
         label = labels[i] if labels else f"Model {i+1}"
         ax.scatter(targets, preds, label=label, alpha=0.7, color=colors[i])
-
         min_val = min(min_val, np.nanmin(targets), np.nanmin(preds))
         max_val = max(max_val, np.nanmax(targets), np.nanmax(preds))
-
-        # Compute metrics
         mask = np.isfinite(preds) & np.isfinite(targets)
         if mask.any():
             mae = mean_absolute_error(targets[mask], preds[mask])
@@ -373,7 +365,6 @@ def visualizer(*pred_target_pairs, labels=None, directory="../data/output/regres
             metrics.append((label, np.nan, np.nan, np.nan))
             print(f"{label}: no valid data for metrics")
 
-    # Diagonal reference line
     ax.plot([min_val, max_val], [min_val, max_val], color="red", linestyle="--")
     ax.set_xlabel("Actual Value")
     ax.set_ylabel("Predicted Value")
@@ -392,31 +383,57 @@ def visualizer(*pred_target_pairs, labels=None, directory="../data/output/regres
         mae_vals = [m[1] for m in metrics]
         rmse_vals = [m[2] for m in metrics]
         r2_vals = [m[3] for m in metrics]
-
         fig, ax = plt.subplots(1, 3, figsize=(14, 5))
         bar_kwargs = dict(alpha=0.7)
-
         ax[0].bar(labels_m, mae_vals, color=colors, **bar_kwargs)
         ax[0].set_title("Mean Absolute Error")
         ax[0].set_ylabel("MAE")
-
         ax[1].bar(labels_m, rmse_vals, color=colors, **bar_kwargs)
         ax[1].set_title("Root Mean Squared Error")
         ax[1].set_ylabel("RMSE")
-
         ax[2].bar(labels_m, r2_vals, color=colors, **bar_kwargs)
         ax[2].set_title("R² Score")
         ax[2].set_ylabel("R²")
-
         for a in ax:
-            a.set_xticks(range(len(labels_m)))  # or use actual tick positions
+            a.set_xticks(range(len(labels_m)))
             a.set_xticklabels(labels_m, rotation=30, ha="right")
             a.grid(True, axis="y", linestyle="--", alpha=0.6)
-
         plt.suptitle("Model Performance Metrics", fontsize=14)
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.savefig(Path(directory, "model", "metrics_summary.png"))
         plt.close(fig)
+
+    # === NEW: RMSE vs Forecast Horizon ===
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for i, (preds, targets) in enumerate(pred_target_pairs):
+        preds = np.array(preds)
+        targets = np.array(targets)
+        label = labels[i] if labels else f"Model {i+1}"
+        if preds.ndim == 1:
+            preds = preds.reshape(-1, 1)
+        if targets.ndim == 1:
+            targets = targets.reshape(-1, 1)
+        if preds.shape != targets.shape:
+            continue
+        horizon = preds.shape[1]
+        rmse_per_step = []
+        for t in range(horizon):
+            mask = np.isfinite(preds[:, t]) & np.isfinite(targets[:, t])
+            if mask.any():
+                rmse = np.sqrt(mean_squared_error(targets[mask, t], preds[mask, t]))
+            else:
+                rmse = np.nan
+            rmse_per_step.append(rmse)
+        ax.plot(range(1, horizon + 1), rmse_per_step, marker='o', label=label, color=colors[i])
+
+    ax.set_title("RMSE vs Forecast Horizon")
+    ax.set_xlabel("Forecast Step (T+)")
+    ax.set_ylabel("RMSE")
+    ax.legend()
+    ax.grid(True, linestyle="--", alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(Path(directory, "model", "horizon_rmse.png"))
+    plt.close(fig)
 
 def normalize_columns(df, columns, min=0, max=1, directory="../data/output/regression"):
     """
@@ -553,7 +570,8 @@ if __name__ == '__main__':
 
     matplotlib.use('Agg')  # Non-interactive backend for file output to handle remote machine installation errors
 
-    ## Configure input, output and model hyperparameters
+    ##################################################################################################################
+    # Configure input, output and model hyperparameters
     all_columns = ['TIMESTAMP', 'Segment', 'Interpolated', 'Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
         'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)_x',
@@ -584,7 +602,7 @@ if __name__ == '__main__':
         'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
         '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
 
-    data_dir = "../data/output/regression/SCADATemp96hr"  # Directory with samples for test/train dataset
+    data_dir = "../data/output/regression/SCADATemp96hr"  # Parent directory of test/train sample folder
     historic = "../data/output/regression/Combined_Cleaned.csv"  # Path to file with baseline model input
     input_columns = ['Pfl - Temp (C)',
         'Pfl - Sp Cond (microS_cm)',
@@ -611,7 +629,7 @@ if __name__ == '__main__':
     random_state = 35  # Random seed which deterministically sets the test/train split
     test_size = 0.15  # Fraction of samples saved for evaluation after training
     batch_size = 10  # Minibatch size. Smaller batches -> noisier, but escapes local minima quicker
-    num_epochs = 1000  # Training duration (excessive epochs can cause overfitting to training data)
+    num_epochs = 2  # Training duration (excessive epochs can cause overfitting to training data)
     loss_threshold = 0.000001  # Threshold of acceptably small loss to terminate training early
     learning_rate = 1e-4  # Limit on parameter adjustment size per epoch
     model_dim = 256  # Model size
@@ -621,20 +639,21 @@ if __name__ == '__main__':
 
     # Baseline model calculation parameters
     gap_hours = 0  # Period before first forecast value from which input data is not used in baseline models
-    window_hours = 6  # Length of period for linear regression training (must be ~500 hrs for Eurofins params)
+    window_hours = 48  # Length of period for linear regression training (must be ~500 hrs for Eurofins params)
     diurnal_window = 1  # Number of hours before/after target time to include in average for seasonal model
 
     # Generate additional model dimensions parametrically based on selection
     input_dim = len(input_columns)
-    files = [ f for f in os.listdir(data_dir) if os.path.isfile(os.path.join(data_dir,f)) ]
-    sample_df = pd.read_csv(os.path.join(data_dir, sorted(files)[0]))
+    files = [ f for f in os.listdir(os.path.join(data_dir,'samples')) if os.path.isfile(os.path.join(data_dir,'samples',f)) ]
+    sample_df = pd.read_csv(os.path.join(data_dir, 'samples', sorted(files)[0]))
     output_dim = len(output_columns) * len(sample_df.iloc[output_rows:])
     seq_len = input_rows.stop - input_rows.start
 
+    ##################################################################################################################
     # Pre-process dataset
-    samples = load_samples(data_dir, input_columns=input_columns, output_columns=output_columns,
+    samples = load_samples(os.path.join(data_dir,'samples'), input_columns=input_columns, output_columns=output_columns,
                                           input_rows=input_rows, output_rows=output_rows)
-    all_filenames = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv")])
+    all_filenames = sorted([f for f in os.listdir(os.path.join(data_dir,'samples')) if f.endswith(".csv")])
     train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=random_state)
     os.makedirs(os.path.join(data_dir, "model"), exist_ok=True)
     file1 = Path(data_dir, "model", "train_files.txt")
@@ -644,6 +663,7 @@ if __name__ == '__main__':
     with open(file2, "w") as f:
         f.writelines(f"{s[2]}\n" for s in test_samples)
 
+    ##################################################################################################################
     ## Train
     train_dataset = TimeSeriesTargetDataset(train_samples)
     dataloader = DataLoader(train_dataset, batch_size=10, shuffle=True)
@@ -652,7 +672,8 @@ if __name__ == '__main__':
     train_model(data_dir, model, dataloader, num_epochs, learning_rate, loss_threshold)
     torch.save(model.state_dict(), Path(data_dir, "model","transformer_model.pt"))
 
-    ## Post-processing
+    #################################################################################################################
+    # Post-processing
     model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
                                   dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
     model.load_state_dict(torch.load(os.path.join(data_dir, "model","transformer_model.pt"), map_location=device))
@@ -666,6 +687,9 @@ if __name__ == '__main__':
     test_dataset = TimeSeriesTargetDataset(test_samples)
 
     model_preds, targets = evaluate_model(model, test_dataset)
+    print("model_preds", model_preds.size)
+    print("targets", targets.size)
+
     naive_preds, naive_targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
                                                 output_rows=output_rows, gap_hours=gap_hours)
     linear_preds, linear_targets = evaluate_linear(data_dir, test_dataset, historic, output_columns, data_dir,
@@ -674,6 +698,9 @@ if __name__ == '__main__':
     seasonal_preds, seasonal_targets = evaluate_seasonal(test_dataset, historic, output_columns, data_dir,
                                                          output_rows=output_rows, diurnal_window=diurnal_window)
 
-    visualizer((model_preds, targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
-               (seasonal_preds, seasonal_targets),
-               labels=["Transformer", "Naive", "Linear", "Seasonal"], directory=data_dir, num_samples=200)
+    visualizer((model_preds, targets),
+               labels=["Transformer"], directory=data_dir, num_samples=200)
+
+    # visualizer((model_preds, targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
+    #            (seasonal_preds, seasonal_targets),
+    #            labels=["Transformer", "Naive", "Linear", "Seasonal"], directory=data_dir, num_samples=200)

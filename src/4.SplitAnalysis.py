@@ -166,16 +166,18 @@ if __name__ == '__main__':
 
     # Identify prediction targets (default: all Eurofins data)
     # target_columns = df.columns[-9:]
-    target_columns = ['SCADA - Temperature (°C)']
+    target_columns = ['36-Kopper filtrert']
     # target_columns = ['SCADA - Temperature (°C)']
-    seg_length = 96
+    seg_length = 24  # fixed segment length for evaluating range of lengths of gap betweeen input and output
 
+    # To evaluate the impact of sample dimensions on # of available samples:
     gapless(df, target_columns)  # Analysis function #1
     # gapped(df, target_columns, seg_length)  # Analysis function #2
 
-    # output_dir = "../data/output/regression/Eurofins_complete_rows"
-    output_dir = "../data/output/regression/SCADATemp96hr"
+    set_name  = "Kopper24hr"
     length = 96
+    output_dir = os.path.join("../data/output/regression", set_name, 'samples')
+
     # to_normalize = df.columns[3:]
     to_normalize = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
