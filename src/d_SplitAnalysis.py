@@ -27,7 +27,7 @@ def clean_directory(directory_path):
     except OSError as e:
         print(f"Error deleting files in {directory_path}: {e}")
 
-def gapless(df, target_columns):
+def gapless(df, target_columns, name="length_v_count_analysis"):
     """
     Evaluate # of samples with time series leading directly into the Eurofin sample time (for "nowcast").
     Plot results for each parameter.
@@ -59,10 +59,10 @@ def gapless(df, target_columns):
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("../data/output/regression/availability/segment_analysis.png")
+    plt.savefig(os.path.join("../data/output/regression/availability", name + ".png"))
     # plt.show()
 
-def gapped(df, target_columns, seg_length):
+def gapped(df, target_columns, seg_length, name="length_v_count_analysis"):
     """
     Evaluate a range of gaps from time series to Eurofins values.
     :return:
@@ -100,9 +100,9 @@ def gapped(df, target_columns, seg_length):
 
     fig = px.line(results_df, x="Gap Hours", y="Valid Segments", color="Variable Name",
                   title=f"Effect of Gap on Valid Segments", markers=True)
-    fig.write_image("../data/output/regression/availability/gap_vs_segments.png")
+    fig.write_image(os.path.join("../data/output/regression/availability", name + ".png"))
 
-def normalize_columns(df, columns, min=0, max=1, directory="../data/output/regression"):
+def normalize_columns(df, columns, min=0, max=1, save=False, directory="../data/output/regression"):
     """
     Normalize specified columns in a DataFrame to a given range and save original min/max values.
 
@@ -129,11 +129,12 @@ def normalize_columns(df, columns, min=0, max=1, directory="../data/output/regre
         else:
             df_normalized[col] = (min_val + max_val) / 2
 
-    # Save normalization parameters to file
-    file = Path(directory, "model", "normalized.csv")
-    file.parent.mkdir(parents=True, exist_ok=True)
-    with open(file, "w") as f:
-        json.dump(normalization_params, f)
+    # Save normalization parameters to file if selected:
+    if save:
+        file = Path(directory, "normalized.csv")
+        file.parent.mkdir(parents=True, exist_ok=True)
+        with open(file, "w") as f:
+            json.dump(normalization_params, f)
 
     return df_normalized
 
@@ -146,7 +147,7 @@ def split(df, output_dir, target_columns=["06-E.coli","08-Kimtall 22°C","21-Ars
     :return:
     """
 
-    df = normalize_columns(df, to_normalize, 0, 1, os.path.join(output_dir, 'model'))
+    df = normalize_columns(df, to_normalize, 0, 1, save=True, directory=output_dir)
 
     os.makedirs(output_dir + '/samples', exist_ok=True)  # Create a directory to store the output files
     clean_directory(output_dir + '/samples')  #
@@ -178,7 +179,7 @@ if __name__ == '__main__':
     df = df.sort_values("TIMESTAMP")
 
     ## Identify prediction target columns. Output will only include samples with valid value in last row.
-    target_columns = ['08-Kimtall 22°C']  # alternative 1: name-based selection
+    target_columns = ['SCADA - Temperature (°C)']  # alternative 1: name-based selection
     # target_columns = df.columns[-9:]  # alternative 2: index-based selection
 
     ## To analyze the impact of sample dimensions on the # of available samples:
@@ -187,8 +188,8 @@ if __name__ == '__main__':
     # gapped(df, target_columns, seg_length)  # Analysis function #2
 
     ## Name the dataset and select the size of each sample (# of timesteps/rows)
-    set_name  = "Kimtall24hr"  # Name of subdirectory where samples will be organized
-    length = 24  # Hours of contiguous data per sample
+    set_name  = "SCADATemp168hr"  # Name of subdirectory where samples will be organized
+    length = 168  # Hours of contiguous data per sample
     output_dir = os.path.join("../data/output/regression", set_name)
 
     ## Select columns where values in samples will be normalized, which helps with calculating loss accurately

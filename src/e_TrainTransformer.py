@@ -40,7 +40,7 @@ def load_samples(directory, input_columns, output_columns, input_rows, output_ro
     print("Samples loaded")
     return samples
 
-def train_model(directory, model, dataloader, num_epochs=100, learning_rate=1e-3, loss_threshold=1e-3):
+def train_model(directory, model, model_name, dataloader, num_epochs=100, learning_rate=1e-3, loss_threshold=1e-3):
 
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -78,7 +78,7 @@ def train_model(directory, model, dataloader, num_epochs=100, learning_rate=1e-3
         plt.title("Training Loss vs. Epochs (Log-Log Scale)")
         plt.grid(True, which="both", ls="--")
         plt.tight_layout()
-        plt.savefig(os.path.join(directory, "model", "loss_plot.png"))
+        plt.savefig(os.path.join(directory, "models", model_name, "loss_plot.png"))
         plt.close()
 
 class TimeSeriesTransformer(nn.Module):
@@ -182,7 +182,7 @@ if __name__ == '__main__':
         'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
         '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
 
-    data_dir = "../data/output/regression/Kimtall24hr"  # Parent directory of test/train sample folder
+    data_dir = "../data/output/regression/SCADATemp168hr"  # Parent directory of test/train sample folder
     historic = "../data/output/regression/Combined_Cleaned.csv"  # Path to file with baseline model input
     input_columns = ['Pfl - Temp (C)',
         'Pfl - Sp Cond (microS_cm)',
@@ -201,10 +201,11 @@ if __name__ == '__main__':
         'Instantaneous temperature (°C)',
         'Average humidity (% relative humidity)'
                      ]  # Default: all different-dimensioned profiler and weather params, no SCADA
-    output_columns = ['08-Kimtall 22°C']
-    output_rows = -1  # Default: -1 (increase value to increase forecast length, but decrease input_row_2 accordingly)
+    output_columns = ['SCADA - Temperature (°C)']
+    model_name = "24hr_fore"
+    output_rows = -24  # Default: -1 (increase value to increase forecast length, but decrease input_row_2 accordingly)
     input_row_1 = 0  # Default: 0
-    input_row_2 = 23  # Default: len(sample) - abs(output_rows)
+    input_row_2 = 143  # Default: len(sample) - abs(output_rows)
 
     # Model hyperparameters
     model_dim = 256  # Model size
@@ -215,16 +216,16 @@ if __name__ == '__main__':
     # Training hyperparameters
     random_state = 35  # Random seed which deterministically sets the test/train split
     test_size = 0.15  # Fraction of samples saved for evaluation after training
-    batch_size = 10  # Minibatch size. Smaller batches -> noisier, but escapes local minima quicker
-    num_epochs = 200  # Training duration (excessive epochs can cause overfitting to training data)
+    batch_size = 1  # Minibatch size. Smaller batches -> noisier, but escapes local minima quicker
+    num_epochs = 100  # Training duration (excessive epochs can cause overfitting to training data)
     loss_threshold = 0.000001  # Threshold of acceptably small loss to terminate training early
     learning_rate = 1e-4  # Limit on parameter adjustment size per epoch
 
     # Generate additional model dimensions parametrically based on selection
     input_rows = slice(input_row_1, input_row_2)
-    files = [f for f in os.listdir(os.path.join(data_dir, 'samples')) if
-             os.path.isfile(os.path.join(data_dir, 'samples', f))]
-    sample_df = pd.read_csv(os.path.join(data_dir, 'samples', sorted(files)[0]))
+    files = [f for f in os.listdir(Path(data_dir, 'samples')) if
+             os.path.isfile(Path(data_dir, 'samples', f))]
+    sample_df = pd.read_csv(Path(data_dir, 'samples', sorted(files)[0]))
 
     # Encapsulate model configuration in a dictionary
     config = {
@@ -243,7 +244,8 @@ if __name__ == '__main__':
     }
 
     # Write model configuration dictionary to file
-    with open(Path(data_dir, 'model', 'model_config.json'), 'w') as f:
+    os.makedirs(os.path.join(data_dir, "models", model_name), exist_ok=True)
+    with open(Path(data_dir, 'models', model_name, 'model_config.json'), 'w') as f:
         json.dump(config, f)
 
     ##################################################################################################################
@@ -252,21 +254,20 @@ if __name__ == '__main__':
                                           input_rows=input_rows, output_rows=output_rows)
     all_filenames = sorted([f for f in os.listdir(os.path.join(data_dir,'samples')) if f.endswith(".csv")])
     train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=random_state)
-    os.makedirs(os.path.join(data_dir, "model"), exist_ok=True)
-    file1 = Path(data_dir, "model", "train_files.txt")
+    file1 = Path(data_dir, "models", model_name, "train_files.txt")
     with open(file1, "w") as f:
         f.writelines(f"{s[2]}\n" for s in train_samples)
-    file2 = Path(data_dir, "model", "test_files.txt")
+    file2 = Path(data_dir, "models", model_name, "test_files.txt")
     with open(file2, "w") as f:
         f.writelines(f"{s[2]}\n" for s in test_samples)
 
     ##################################################################################################################
-    ## Train
+    ## Train transformer model on 'train' portion of dataset
     train_dataset = TimeSeriesTargetDataset(train_samples)
     dataloader = DataLoader(train_dataset, batch_size=10, shuffle=True)
     # model = TimeSeriesTransformer(input_dim=input_dim, model_dim=model_dim, num_heads=num_heads, num_layers=num_layers,
     #                               dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
     model = TimeSeriesTransformer(config).to(device)
 
-    train_model(data_dir, model, dataloader, num_epochs, learning_rate, loss_threshold)
-    torch.save(model.state_dict(), Path(data_dir, "model","transformer_model.pt"))
+    train_model(data_dir, model, model_name, dataloader, num_epochs, learning_rate, loss_threshold)
+    torch.save(model.state_dict(), Path(data_dir, "models", model_name, "transformer_model.pt"))
