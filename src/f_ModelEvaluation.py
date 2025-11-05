@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import Dataset
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from d_SplitAnalysis import normalize_columns
 from e_TrainTransformer import load_samples
 from e_TrainTransformer import TimeSeriesTransformer
 from e_TrainTransformer import TimeSeriesTargetDataset
@@ -61,7 +62,7 @@ def evaluate_naive(dataset, historic, output_columns, data_dir, output_rows=-1, 
     # Load lookup table for baseline model
     df = pd.read_csv(historic,parse_dates=["TIMESTAMP"])
     sort_df = df.sort_values("TIMESTAMP")
-    historical_df = normalize_columns(sort_df, data_columns)
+    historical_df = normalize_columns(sort_df, output_columns)
 
     predictions, targets = [], []
     for i in range(len(dataset)):
@@ -102,7 +103,7 @@ def evaluate_linear(directory, dataset, historic, output_columns, data_dir,
     # Load full time series as input for simple "baseline" models
     df = pd.read_csv(historic, parse_dates=["TIMESTAMP"])
     sort_df = df.sort_values("TIMESTAMP")
-    historical_df = normalize_columns(sort_df, data_columns, directory=data_dir)
+    historical_df = normalize_columns(sort_df, output_columns, directory=data_dir)
 
     if debug_plot:
         os.makedirs(os.path.join(directory, "model", "examples_linear"), exist_ok=True)
@@ -212,7 +213,7 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, output_rows=-
     # Load and normalize historical data
     df = pd.read_csv(historic, parse_dates=["TIMESTAMP"])
     sort_df = df.sort_values("TIMESTAMP")
-    historical_df = normalize_columns(sort_df, data_columns, directory=data_dir)
+    historical_df = normalize_columns(sort_df, output_columns, directory=data_dir)
 
     predictions, targets = [], []
 
@@ -369,41 +370,6 @@ def visualizer(*pred_target_pairs, labels=None, directory="../data/output/regres
     plt.savefig(Path(directory, "model", "horizon_rmse.png"))
     plt.close(fig)
 
-def normalize_columns(df, columns, min=0, max=1, directory="../data/output/regression"):
-    """
-    Normalize specified columns in a DataFrame to a given range and save original min/max values.
-
-    Parameters:
-    - df: pandas.DataFrame
-    - columns: list of column names to normalize
-    - min: minimum value of target range
-    - max: maximum value of target range
-    - save_path: path to save normalization parameters
-
-    Returns:
-    - A copy of the DataFrame with normalized columns.
-    """
-    df_normalized = df.copy()
-    min_val, max_val = min, max
-    normalization_params = {}
-
-    for col in columns:
-        col_min = df[col].min()
-        col_max = df[col].max()
-        normalization_params[col] = {"min": col_min, "max": col_max}
-        if col_max != col_min:
-            df_normalized[col] = ((df[col] - col_min) / (col_max - col_min)) * (max_val - min_val) + min_val
-        else:
-            df_normalized[col] = (min_val + max_val) / 2
-
-    # Save normalization parameters to file
-    file = Path(directory, "model", "normalized.csv")
-    file.parent.mkdir(parents=True, exist_ok=True)
-    with open(file, "w") as f:
-        json.dump(normalization_params, f)
-
-    return df_normalized
-
 def reverse_normalize_columns(df, columns, min=0, max=1, directory="../data/output/regression"):
     """
     Reverse normalization of specified columns using saved parameters.
@@ -445,23 +411,23 @@ if __name__ == '__main__':
     matplotlib.use('Agg')  # Non-interactive backend for file output to handle remote machine installation errors
 
     ##################################################################################################################
-    # Load input, output and model hyperparameters
+    # Load input, output and model hyperparameters from data_dir
 
 
-    data_dir = "../data/output/regression/SCADATemp96hr"  # Parent directory of test/train sample folder
+    data_dir = "../data/output/regression/Kimtall24hr"  # Parent directory of test/train sample folder
 
     with open(Path(data_dir, 'model', 'model_config.json'), 'r') as f:
         config = json.load(f)
 
     input_columns = config["input_columns"]
     output_columns = config["output_columns"]
-    input_rows = config["input_rows"]
+    input_rows = slice(config["input_row_1"], config["input_row_2"])
     output_rows = config["output_rows"]
 
     # Configure simple non-ML ("baseline") model calculation methods
     historic = "../data/output/regression/Combined_Cleaned.csv"  # Path to file with baseline model input
     gap_hours = 0  # Period before first forecast value from which input data is not used in baseline models
-    window_hours = 4  # Length of period for linear regression training (must be ~500 hrs for Eurofins params)
+    window_hours = 550  # Length of period for linear regression training (min. ~530 hrs for Eurofins params)
     diurnal_window = 1  # Number of hours before/after target time to include in average for seasonal model
 
     ################################################################################################################

@@ -15,6 +15,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 
+
 def load_samples(directory, input_columns, output_columns, input_rows, output_rows, file_list=None):
     samples = []
     for filename in sorted(os.listdir(directory)):
@@ -141,6 +142,7 @@ class TimeSeriesTargetDataset(Dataset):
         y = torch.tensor(target_seq, dtype=torch.float32).flatten()
         return x, y, filename
 
+
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # device = "cpu"
@@ -180,7 +182,7 @@ if __name__ == '__main__':
         'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
         '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
 
-    data_dir = "../data/output/regression/SCADATemp96hr"  # Parent directory of test/train sample folder
+    data_dir = "../data/output/regression/Kimtall24hr"  # Parent directory of test/train sample folder
     historic = "../data/output/regression/Combined_Cleaned.csv"  # Path to file with baseline model input
     input_columns = ['Pfl - Temp (C)',
         'Pfl - Sp Cond (microS_cm)',
@@ -198,10 +200,11 @@ if __name__ == '__main__':
         'Precipitation (mm/hr)',
         'Instantaneous temperature (°C)',
         'Average humidity (% relative humidity)'
-                     ]
-    output_columns = ['SCADA - Temperature (°C)']
-    input_rows = slice(0, 71)
-    output_rows = -24
+                     ]  # Default: all different-dimensioned profiler and weather params, no SCADA
+    output_columns = ['08-Kimtall 22°C']
+    output_rows = -1  # Default: -1 (increase value to increase forecast length, but decrease input_row_2 accordingly)
+    input_row_1 = 0  # Default: 0
+    input_row_2 = 23  # Default: len(sample) - abs(output_rows)
 
     # Model hyperparameters
     model_dim = 256  # Model size
@@ -213,11 +216,12 @@ if __name__ == '__main__':
     random_state = 35  # Random seed which deterministically sets the test/train split
     test_size = 0.15  # Fraction of samples saved for evaluation after training
     batch_size = 10  # Minibatch size. Smaller batches -> noisier, but escapes local minima quicker
-    num_epochs = 2  # Training duration (excessive epochs can cause overfitting to training data)
+    num_epochs = 200  # Training duration (excessive epochs can cause overfitting to training data)
     loss_threshold = 0.000001  # Threshold of acceptably small loss to terminate training early
     learning_rate = 1e-4  # Limit on parameter adjustment size per epoch
 
     # Generate additional model dimensions parametrically based on selection
+    input_rows = slice(input_row_1, input_row_2)
     files = [f for f in os.listdir(os.path.join(data_dir, 'samples')) if
              os.path.isfile(os.path.join(data_dir, 'samples', f))]
     sample_df = pd.read_csv(os.path.join(data_dir, 'samples', sorted(files)[0]))
@@ -230,9 +234,10 @@ if __name__ == '__main__':
         'num_layers' : num_layers,
         'dropout' : dropout,
         'output_dim' : len(output_columns) * len(sample_df.iloc[output_rows:]),
-        'seq_len' : input_rows.stop - input_rows.start,
+        'seq_len' : input_row_2 - input_row_1,
         'input_columns' : input_columns,
-        'input_rows': input_rows,
+        'input_row_1': input_row_1,
+        'input_row_2': input_row_2,
         'output_columns' : output_columns,
         'output_rows' : output_rows,
     }

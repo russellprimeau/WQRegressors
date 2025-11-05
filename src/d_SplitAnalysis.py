@@ -5,10 +5,13 @@ Then, split the dataset into files for each equivalent sample.
 '''
 
 import os
+import json
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 import plotly.express as px
+from pathlib import Path
+
 
 def clean_directory(directory_path):
     """
@@ -99,28 +102,38 @@ def gapped(df, target_columns, seg_length):
                   title=f"Effect of Gap on Valid Segments", markers=True)
     fig.write_image("../data/output/regression/availability/gap_vs_segments.png")
 
-def normalize_columns(df, columns, min=0, max=1):
+def normalize_columns(df, columns, min=0, max=1, directory="../data/output/regression"):
     """
-    Normalize specified columns in a DataFrame to a given range.
+    Normalize specified columns in a DataFrame to a given range and save original min/max values.
 
     Parameters:
     - df: pandas.DataFrame
     - columns: list of column names to normalize
-    - target_range: tuple (min, max) for the normalization range
+    - min: minimum value of target range
+    - max: maximum value of target range
+    - save_path: path to save normalization parameters
 
     Returns:
     - A copy of the DataFrame with normalized columns.
     """
     df_normalized = df.copy()
     min_val, max_val = min, max
+    normalization_params = {}
+
     for col in columns:
         col_min = df[col].min()
         col_max = df[col].max()
+        normalization_params[col] = {"min": col_min, "max": col_max}
         if col_max != col_min:
             df_normalized[col] = ((df[col] - col_min) / (col_max - col_min)) * (max_val - min_val) + min_val
         else:
-            # If all values are the same, set them to the midpoint of the target range
             df_normalized[col] = (min_val + max_val) / 2
+
+    # Save normalization parameters to file
+    file = Path(directory, "model", "normalized.csv")
+    file.parent.mkdir(parents=True, exist_ok=True)
+    with open(file, "w") as f:
+        json.dump(normalization_params, f)
 
     return df_normalized
 
@@ -133,10 +146,10 @@ def split(df, output_dir, target_columns=["06-E.coli","08-Kimtall 22°C","21-Ars
     :return:
     """
 
-    df = normalize_columns(df, to_normalize, 0, 1)
+    df = normalize_columns(df, to_normalize, 0, 1, os.path.join(output_dir, 'model'))
 
-    os.makedirs(output_dir, exist_ok=True)  # Create a directory to store the output files
-    clean_directory(output_dir)  #
+    os.makedirs(output_dir + '/samples', exist_ok=True)  # Create a directory to store the output files
+    clean_directory(output_dir + '/samples')  #
 
     # Initialize a counter for naming output files
     segment_counter = 1
@@ -153,7 +166,7 @@ def split(df, output_dir, target_columns=["06-E.coli","08-Kimtall 22°C","21-Ars
             # Check if the 'Segment' column has a constant value in all rows
             if preceding_rows['Segment'].nunique() == 1:
                 # Save the segment to a CSV file
-                output_file = os.path.join(output_dir, f"segment_{segment_counter}.csv")
+                output_file = os.path.join(output_dir, 'samples', f"segment_{segment_counter}.csv")
                 segment.to_csv(output_file, index=False)
                 segment_counter += 1
 
@@ -164,20 +177,21 @@ if __name__ == '__main__':
     df = pd.read_csv("../data/output/regression/Combined_Cleaned.csv", parse_dates=["TIMESTAMP"])
     df = df.sort_values("TIMESTAMP")
 
-    # Identify prediction targets (default: all Eurofins data)
-    # target_columns = df.columns[-9:]
-    target_columns = ['36-Kopper filtrert']
-    # target_columns = ['SCADA - Temperature (°C)']
-    seg_length = 24  # fixed segment length for evaluating range of lengths of gap betweeen input and output
+    ## Identify prediction target columns. Output will only include samples with valid value in last row.
+    target_columns = ['08-Kimtall 22°C']  # alternative 1: name-based selection
+    # target_columns = df.columns[-9:]  # alternative 2: index-based selection
 
-    # To evaluate the impact of sample dimensions on # of available samples:
+    ## To analyze the impact of sample dimensions on the # of available samples:
     gapless(df, target_columns)  # Analysis function #1
+    # seg_length = 24  # fixed segment length for evaluating range of lengths of gap betweeen input and output
     # gapped(df, target_columns, seg_length)  # Analysis function #2
 
-    set_name  = "Kopper24hr"
-    length = 96
-    output_dir = os.path.join("../data/output/regression", set_name, 'samples')
+    ## Name the dataset and select the size of each sample (# of timesteps/rows)
+    set_name  = "Kimtall24hr"  # Name of subdirectory where samples will be organized
+    length = 24  # Hours of contiguous data per sample
+    output_dir = os.path.join("../data/output/regression", set_name)
 
+    ## Select columns where values in samples will be normalized, which helps with calculating loss accurately
     # to_normalize = df.columns[3:]
     to_normalize = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
