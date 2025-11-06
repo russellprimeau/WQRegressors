@@ -178,24 +178,218 @@ def evaluate_linear(data_dir, model_name, dataset, historic, output_columns,
 
     return np.array(predictions), np.array(targets)
 
+# def evaluate_seasonal(dataset, historic, output_columns, data_dir, model_name,
+#                       output_rows=-1, diurnal_window=2, secondary=None):
+#     """
+#     Seasonal baseline using either the full `historical_df` or,
+#     if available, a secondary CSV file for specific output columns.
+#
+#     For each output column:
+#       - If it exists in the `secondary` CSV file, use that file’s data instead of `historical_df`
+#       - Otherwise, use `historical_df`
+#     """
+#     import os
+#     import numpy as np
+#     import pandas as pd
+#     import matplotlib.pyplot as plt
+#     import seaborn as sns
+#
+#     # --- Load and normalize primary historical data ---
+#     df = pd.read_csv(historic, parse_dates=["TIMESTAMP"]).sort_values("TIMESTAMP")
+#     historical_df = normalize_columns(df, output_columns, directory=data_dir)
+#
+#     # --- Load secondary data (if provided) ---
+#     secondary_df = None
+#     if secondary and os.path.exists(secondary):
+#         try:
+#             secondary_df = pd.read_csv(secondary, sep=";", decimal=".", parse_dates=["Time"]).sort_values("Time")
+#         except:
+#             secondary_df = pd.read_csv(secondary, sep=";", decimal=",", parse_dates=["Time"]).sort_values("Time")
+#         secondary_df.rename(columns={"Time": "TIMESTAMP"}, inplace=True)
+#         secondary_df = normalize_columns(secondary_df, output_columns, directory=data_dir)
+#
+#     # --- Prepare primary dataframe ---
+#     def prepare_time_columns(df):
+#         df["YEAR"] = df["TIMESTAMP"].dt.year
+#         df["DAYOFYEAR"] = df["TIMESTAMP"].dt.dayofyear
+#         df["HOUR"] = df["TIMESTAMP"].dt.hour + df["TIMESTAMP"].dt.minute / 60.0
+#         return df
+#
+#     historical_df = prepare_time_columns(historical_df)
+#     if secondary_df is not None:
+#         secondary_df = prepare_time_columns(secondary_df)
+#
+#     predictions, targets = [], []
+#
+#     # === Predict values for each sample ===
+#     for i in range(len(dataset)):
+#         _, y, filename = dataset[i]
+#         sample_df = pd.read_csv(os.path.join(data_dir, 'samples', filename), parse_dates=["TIMESTAMP"])
+#         output_times = sample_df["TIMESTAMP"].iloc[output_rows:]
+#         if len(output_times) == 0:
+#             continue
+#
+#         pred_matrix = np.zeros((len(output_times), len(output_columns)))
+#
+#         for t_idx, ts in enumerate(output_times):
+#             target_year = ts.year
+#             target_day = ts.timetuple().tm_yday
+#             target_hour = ts.hour + ts.minute / 60.0
+#
+#             for j, col in enumerate(output_columns):
+#                 # Pick data source: secondary or primary
+#                 src_df = None
+#                 if secondary_df is not None and col in secondary_df.columns:
+#                     src_df = secondary_df
+#                 elif col in historical_df.columns:
+#                     src_df = historical_df
+#                 else:
+#                     pred_matrix[t_idx, j] = np.nan
+#                     continue
+#
+#                 candidates = src_df[src_df["YEAR"] != target_year].copy()
+#                 if candidates.empty:
+#                     pred_matrix[t_idx, j] = np.nan
+#                     continue
+#
+#                 day_diff = np.abs(candidates["DAYOFYEAR"] - target_day)
+#                 day_diff = np.minimum(day_diff, 365 - day_diff)
+#                 candidates["DAY_DIFF"] = day_diff
+#                 candidates["HOUR_DIFF"] = np.abs(candidates["HOUR"] - target_hour)
+#
+#                 subset = candidates[(candidates["DAY_DIFF"] <= 4) & (candidates["HOUR_DIFF"] <= diurnal_window)]
+#                 if subset.empty:
+#                     subset = candidates[candidates["DAY_DIFF"] <= 4]
+#                 if subset.empty:
+#                     subset = candidates[candidates["DAY_DIFF"] <= 15]
+#                 if subset.empty:
+#                     subset = candidates
+#
+#                 vals = subset[[col]].dropna()
+#                 pred_matrix[t_idx, j] = vals[col].mean() if not vals.empty else np.nan
+#
+#         predictions.append(pred_matrix.reshape(-1))
+#         targets.append(y.numpy().reshape(-1))
+#
+#     predictions = np.array(predictions)
+#     targets = np.array(targets)
+#
+#     # === Diagnostic plot ===
+#     try:
+#         plot_dir = os.path.join(data_dir, "models", model_name, "examples_seasonal")
+#         os.makedirs(plot_dir, exist_ok=True)
+#         sns.set_style("whitegrid")
+#
+#         # Ground truth values (same as before)
+#         gt_records = []
+#         for i in range(len(dataset)):
+#             _, y, filename = dataset[i]
+#             sample_df = pd.read_csv(os.path.join(data_dir, 'samples', filename), parse_dates=["TIMESTAMP"])
+#             output_times = sample_df["TIMESTAMP"].iloc[output_rows:]
+#             if len(output_times) == 0:
+#                 continue
+#             flat = y.numpy().reshape(-1)
+#             for j, col in enumerate(output_columns):
+#                 vals = flat[j::len(output_columns)]
+#                 gt_records.append(pd.DataFrame({
+#                     "YEAR": output_times.dt.year,
+#                     "DAYOFYEAR": output_times.dt.dayofyear +
+#                                  (output_times.dt.hour + output_times.dt.minute / 60.0) / 24.0,
+#                     "VALUE": vals,
+#                     "COLUMN": col
+#                 }))
+#         if not gt_records:
+#             return predictions, targets
+#         gt_df = pd.concat(gt_records, ignore_index=True)
+#
+#         # Synthetic hourly timeline for predictions
+#         synthetic_year = int(historical_df["YEAR"].max()) + 1
+#         start = pd.Timestamp(year=synthetic_year, month=1, day=1, hour=0)
+#         synthetic_times = pd.date_range(start=start, periods=24 * 366, freq="h")
+#
+#         synth_day = synthetic_times.dayofyear
+#         synth_hour = synthetic_times.hour + synthetic_times.minute / 60.0
+#         synth_dayofyear = synth_day + synth_hour / 24.0
+#
+#         ref_year = 2021
+#         month_starts = pd.date_range(f"{ref_year}-01-01", f"{ref_year}-12-31", freq="MS")
+#         month_dayofyear = [d.timetuple().tm_yday for d in month_starts]
+#         month_labels = [d.strftime("%b") for d in month_starts]
+#
+#         for col in output_columns:
+#             # Pick data source
+#             if secondary_df is not None and col in secondary_df.columns:
+#                 src_df = secondary_df
+#             else:
+#                 src_df = historical_df
+#
+#             continuous_vals = []
+#             for idx in range(len(synthetic_times)):
+#                 target_day = synth_day[idx]
+#                 target_hour = synth_hour[idx]
+#
+#                 candidates = src_df.copy()
+#                 day_diff = np.abs(candidates["DAYOFYEAR"] - target_day)
+#                 day_diff = np.minimum(day_diff, 365 - day_diff)
+#                 candidates["DAY_DIFF"] = day_diff
+#                 candidates["HOUR_DIFF"] = np.abs(candidates["HOUR"] - target_hour)
+#
+#                 subset = candidates[(candidates["DAY_DIFF"] <= 4) & (candidates["HOUR_DIFF"] <= diurnal_window)]
+#                 if subset.empty:
+#                     subset = candidates[candidates["DAY_DIFF"] <= 4]
+#                 if subset.empty:
+#                     subset = candidates[candidates["DAY_DIFF"] <= 15]
+#                 if subset.empty:
+#                     subset = candidates
+#
+#                 vals = subset[[col]].dropna()
+#                 continuous_vals.append(vals[col].mean() if not vals.empty else np.nan)
+#
+#             # Plot
+#             plt.figure(figsize=(12, 6))
+#             sub_gt = gt_df[gt_df["COLUMN"] == col]
+#             for yr, group in sub_gt.groupby("YEAR"):
+#                 g = group.sort_values("DAYOFYEAR")
+#                 plt.plot(g["DAYOFYEAR"], g["VALUE"], marker="o", linestyle="-", label=f"Actual {yr}", alpha=0.7)
+#
+#             y_vals = pd.Series(continuous_vals).interpolate().bfill().ffill()
+#             x_vals = np.array(synth_dayofyear, dtype=float)
+#
+#             # Prevent wraparound line
+#             jump_mask = np.diff(x_vals) < 0
+#             if np.any(jump_mask):
+#                 jump_idx = np.where(jump_mask)[0][0] + 1
+#                 plt.plot(x_vals[:jump_idx], y_vals[:jump_idx],
+#                          color="black", linewidth=2.5, label="Predicted")
+#                 plt.plot(x_vals[jump_idx:], y_vals[jump_idx:], color="black", linewidth=2.5)
+#             else:
+#                 plt.plot(x_vals, y_vals, color="black", linewidth=2.5, label="Predicted")
+#
+#             plt.xticks(month_dayofyear, month_labels)
+#             plt.xlim(0, 366)
+#             plt.xlabel("Month")
+#             plt.ylabel(col)
+#             plt.title(f"Seasonality-based Model for {col}")
+#             plt.legend(loc="best", fontsize=9)
+#             plt.tight_layout()
+#             plt.savefig(os.path.join(plot_dir, f"seasonal_{col}.png"))
+#             plt.close()
+#
+#         print(f"[Info] Saved seasonal plots (with optional secondary data) to: {plot_dir}")
+#
+#     except Exception as e:
+#         print(f"[Warning] Could not generate plot of seasonality model: {e}")
+#
+#     return predictions, targets
 def evaluate_seasonal(dataset, historic, output_columns, data_dir, model_name,
-                      output_rows=-1, diurnal_window=2):
+                      output_rows=-1, diurnal_window=2, secondary=None):
     """
-    Seasonal baseline with sliding ±day windows (continuous rather than discrete week/month bins).
+    Seasonal baseline using either full `historical_df` or, if available,
+    a secondary CSV file for specific output columns.
 
-    For each forecast timestamp:
-        1. Exclude data from the same calendar year.
-        2. Use hierarchical selection:
-            a. |Δday| ≤ 4 days  AND  |Δhour| ≤ diurnal_window
-            b. |Δday| ≤ 4 days
-            c. |Δday| ≤ 15 days
-            d. all remaining rows
-        3. Return column-wise mean of the first non-empty subset.
-
-    Also produces diagnostic plots:
-        - one connected line per actual year (ground truth),
-        - one continuous hourly "Predicted" series across a generic year,
-          with month labels on the x-axis.
+    Now also uses *all available values* from the chosen data source
+    (secondary or primary) as ground truth in the diagnostic plots,
+    separated into yearly series.
     """
     import os
     import numpy as np
@@ -203,24 +397,35 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, model_name,
     import matplotlib.pyplot as plt
     import seaborn as sns
 
-    # --- Load and normalize historical data ---
-    df = pd.read_csv(historic, parse_dates=["TIMESTAMP"])
-    sort_df = df.sort_values("TIMESTAMP")
-    historical_df = normalize_columns(sort_df, output_columns, directory=data_dir)
+    # --- Load and prepare data sources ---
+    df = pd.read_csv(historic, parse_dates=["TIMESTAMP"]).sort_values("TIMESTAMP")
+    historical_df = normalize_columns(df, output_columns, directory=data_dir)
+
+    # --- Load secondary data (if provided) ---
+    secondary_df = None
+    if secondary and os.path.exists(secondary):
+        try:
+            secondary_df = pd.read_csv(secondary, sep=";", decimal=".", parse_dates=["Time"]).sort_values("Time")
+        except:
+            secondary_df = pd.read_csv(secondary, sep=";", decimal=",", parse_dates=["Time"]).sort_values("Time")
+        secondary_df.rename(columns={"Time": "TIMESTAMP"}, inplace=True)
+        secondary_df = normalize_columns(secondary_df, output_columns, directory=data_dir)
+
+    def prepare_time_columns(df):
+        df["YEAR"] = df["TIMESTAMP"].dt.year
+        df["DAYOFYEAR"] = df["TIMESTAMP"].dt.dayofyear
+        df["HOUR"] = df["TIMESTAMP"].dt.hour + df["TIMESTAMP"].dt.minute / 60.0
+        return df
+
+    historical_df = prepare_time_columns(historical_df)
+    if secondary_df is not None:
+        secondary_df = prepare_time_columns(secondary_df)
 
     predictions, targets = [], []
 
-    # Precompute datetime components
-    historical_df["TIMESTAMP"] = pd.to_datetime(historical_df["TIMESTAMP"])
-    historical_df["YEAR"] = historical_df["TIMESTAMP"].dt.year
-    historical_df["DAYOFYEAR"] = historical_df["TIMESTAMP"].dt.dayofyear
-    historical_df["HOUR"] = historical_df["TIMESTAMP"].dt.hour + historical_df["TIMESTAMP"].dt.minute / 60.0
-
-    # --- Core seasonal calculation ---
+    # === Predict values for each sample ===
     for i in range(len(dataset)):
         _, y, filename = dataset[i]
-
-        # Load forecast timestamps
         sample_df = pd.read_csv(os.path.join(data_dir, 'samples', filename), parse_dates=["TIMESTAMP"])
         output_times = sample_df["TIMESTAMP"].iloc[output_rows:]
         if len(output_times) == 0:
@@ -233,33 +438,36 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, model_name,
             target_day = ts.timetuple().tm_yday
             target_hour = ts.hour + ts.minute / 60.0
 
-            # Exclude same calendar year, but include both earlier and later years
-            candidates = historical_df[historical_df["YEAR"] != target_year].copy()
-            if candidates.empty:
-                pred_matrix[t_idx, :] = np.nan
-                continue
+            for j, col in enumerate(output_columns):
+                # Select data source
+                if secondary_df is not None and col in secondary_df.columns:
+                    src_df = secondary_df
+                elif col in historical_df.columns:
+                    src_df = historical_df
+                else:
+                    pred_matrix[t_idx, j] = np.nan
+                    continue
 
-            # Compute absolute day difference with wrap-around (cyclic year)
-            day_diff = np.abs(candidates["DAYOFYEAR"] - target_day)
-            day_diff = np.minimum(day_diff, 365 - day_diff)  # wrap near year-end
-            candidates["DAY_DIFF"] = day_diff
-            candidates["HOUR_DIFF"] = np.abs(candidates["HOUR"] - target_hour)
+                candidates = src_df[src_df["YEAR"] != target_year].copy()
+                if candidates.empty:
+                    pred_matrix[t_idx, j] = np.nan
+                    continue
 
-            # --- Hierarchical filtering ---
-            subset = candidates[(candidates["DAY_DIFF"] <= 4) &
-                                (candidates["HOUR_DIFF"] <= diurnal_window)]
-            if subset.empty:
-                subset = candidates[candidates["DAY_DIFF"] <= 4]
-            if subset.empty:
-                subset = candidates[candidates["DAY_DIFF"] <= 15]
-            if subset.empty:
-                subset = candidates
+                day_diff = np.abs(candidates["DAYOFYEAR"] - target_day)
+                day_diff = np.minimum(day_diff, 365 - day_diff)
+                candidates["DAY_DIFF"] = day_diff
+                candidates["HOUR_DIFF"] = np.abs(candidates["HOUR"] - target_hour)
 
-            seasonal_values = subset[output_columns].dropna()
-            if seasonal_values.empty:
-                pred_matrix[t_idx, :] = np.nan
-            else:
-                pred_matrix[t_idx, :] = seasonal_values.mean().values
+                subset = candidates[(candidates["DAY_DIFF"] <= 4) & (candidates["HOUR_DIFF"] <= diurnal_window)]
+                if subset.empty:
+                    subset = candidates[candidates["DAY_DIFF"] <= 4]
+                if subset.empty:
+                    subset = candidates[candidates["DAY_DIFF"] <= 15]
+                if subset.empty:
+                    subset = candidates
+
+                vals = subset[[col]].dropna()
+                pred_matrix[t_idx, j] = vals[col].mean() if not vals.empty else np.nan
 
         predictions.append(pred_matrix.reshape(-1))
         targets.append(y.numpy().reshape(-1))
@@ -267,130 +475,105 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, model_name,
     predictions = np.array(predictions)
     targets = np.array(targets)
 
-    # === Diagnostic plot: continuous prediction & month-labeled x-axis ===
+    # === Diagnostic plot ===
     try:
         plot_dir = os.path.join(data_dir, "models", model_name, "examples_seasonal")
         os.makedirs(plot_dir, exist_ok=True)
-
-        # Ground truth
-        gt_records = []
-        for i in range(len(dataset)):
-            _, y, filename = dataset[i]
-            sample_df = pd.read_csv(os.path.join(data_dir, 'samples', filename), parse_dates=["TIMESTAMP"])
-            output_times = sample_df["TIMESTAMP"].iloc[output_rows:]
-            if len(output_times) == 0:
-                continue
-            flat = y.numpy().reshape(-1)
-            for j, col in enumerate(output_columns):
-                vals = flat[j::len(output_columns)]
-                gt_records.append(pd.DataFrame({
-                    "YEAR": output_times.dt.year,
-                    "DAYOFYEAR": output_times.dt.dayofyear +
-                                 (output_times.dt.hour + output_times.dt.minute / 60.0) / 24.0,
-                    "VALUE": vals,
-                    "COLUMN": col
-                }))
-        if len(gt_records) == 0:
-            return predictions, targets
-        gt_df = pd.concat(gt_records, ignore_index=True)
-
-        # Synthetic hourly grid for one generic year (smooth continuous line)
-        hist_years = historical_df["YEAR"].unique()
-        synthetic_year = int(historical_df["YEAR"].max()) + 1
-        hours_per_year = 24 * 366
-        start = pd.Timestamp(year=synthetic_year, month=1, day=1, hour=0)
-        synthetic_times = pd.date_range(start=start, periods=hours_per_year, freq='h', tz=None)
-        synth_dayofyear = synthetic_times.dayofyear + \
-            (synthetic_times.hour + synthetic_times.minute / 60.0) / 24.0
-        synth_hour = synthetic_times.hour + synthetic_times.minute / 60.0
-        synth_day = synthetic_times.dayofyear
-
-        continuous_preds = {col: [] for col in output_columns}
-        hist = historical_df
-
-        for idx in range(len(synthetic_times)):
-            target_day = synth_day[idx]
-            target_hour = synth_hour[idx]
-
-            candidates = hist.copy()
-            day_diff = np.abs(candidates["DAYOFYEAR"] - target_day)
-            day_diff = np.minimum(day_diff, 365 - day_diff)
-            candidates["DAY_DIFF"] = day_diff
-            candidates["HOUR_DIFF"] = np.abs(candidates["HOUR"] - target_hour)
-
-            subset = candidates[(candidates["DAY_DIFF"] <= 4) &
-                                (candidates["HOUR_DIFF"] <= diurnal_window)]
-            if subset.empty:
-                subset = candidates[candidates["DAY_DIFF"] <= 4]
-            if subset.empty:
-                subset = candidates[candidates["DAY_DIFF"] <= 15]
-            if subset.empty:
-                subset = candidates
-
-            seasonal_values = subset[output_columns].dropna()
-            if seasonal_values.empty:
-                for col in output_columns:
-                    continuous_preds[col].append(np.nan)
-            else:
-                means = seasonal_values.mean().values
-                for j, col in enumerate(output_columns):
-                    continuous_preds[col].append(means[j])
-
-        # --- Plot with month labels ---
         sns.set_style("whitegrid")
-        full_days = np.array(synth_dayofyear.tolist(), dtype=float)
+
+        # Synthetic hourly timeline for predicted curve
+        synthetic_year = int(historical_df["YEAR"].max()) + 1
+        start = pd.Timestamp(year=synthetic_year, month=1, day=1, hour=0)
+        synthetic_times = pd.date_range(start=start, periods=24 * 366, freq="h")
+        synth_day = synthetic_times.dayofyear
+        synth_hour = synthetic_times.hour + synthetic_times.minute / 60.0
+        synth_dayofyear = synth_day + synth_hour / 24.0
+
         ref_year = 2021
         month_starts = pd.date_range(f"{ref_year}-01-01", f"{ref_year}-12-31", freq="MS")
         month_dayofyear = [d.timetuple().tm_yday for d in month_starts]
         month_labels = [d.strftime("%b") for d in month_starts]
 
         for col in output_columns:
-            plt.figure(figsize=(12, 6))
-            sub_gt = gt_df[gt_df["COLUMN"] == col]
+            # Choose data source
+            if secondary_df is not None and col in secondary_df.columns:
+                src_df = secondary_df
+            else:
+                src_df = historical_df
 
-            for yr, group in sub_gt.groupby("YEAR"):
+            # --- Compute continuous predicted curve ---
+            continuous_vals = []
+            for idx in range(len(synthetic_times)):
+                target_day = synth_day[idx]
+                target_hour = synth_hour[idx]
+
+                candidates = src_df.copy()
+                day_diff = np.abs(candidates["DAYOFYEAR"] - target_day)
+                day_diff = np.minimum(day_diff, 365 - day_diff)
+                candidates["DAY_DIFF"] = day_diff
+                candidates["HOUR_DIFF"] = np.abs(candidates["HOUR"] - target_hour)
+
+                subset = candidates[(candidates["DAY_DIFF"] <= 4) & (candidates["HOUR_DIFF"] <= diurnal_window)]
+                if subset.empty:
+                    subset = candidates[candidates["DAY_DIFF"] <= 4]
+                if subset.empty:
+                    subset = candidates[candidates["DAY_DIFF"] <= 15]
+                if subset.empty:
+                    subset = candidates
+
+                vals = subset[[col]].dropna()
+                continuous_vals.append(vals[col].mean() if not vals.empty else np.nan)
+
+            # --- Build ground truth series for all years from source ---
+            gt_df = src_df[["YEAR", "DAYOFYEAR", "HOUR", col]].dropna()
+            gt_df["DAYOFYEAR"] = gt_df["DAYOFYEAR"] + gt_df["HOUR"] / 24.0
+
+            # --- Plot ---
+            plt.figure(figsize=(12, 6))
+
+            # Ground truth lines (all years)
+            for yr, group in gt_df.groupby("YEAR"):
                 g = group.sort_values("DAYOFYEAR")
                 plt.plot(
-                    g["DAYOFYEAR"], g["VALUE"],
-                    marker="o", linestyle="-",
-                    label=f"Actual {yr}", alpha=0.75
+                    g["DAYOFYEAR"],
+                    g[col],
+                    marker="o",
+                    linestyle="-",
+                    label=f"Actual {yr}",
+                    alpha=0.6,
                 )
 
-            pred_vals = np.array(continuous_preds[col], dtype=float)
-            if np.isnan(pred_vals).any():
-                s = pd.Series(pred_vals)
-                s = s.interpolate().bfill().ffill()
-                pred_vals = s.values
+            # Predicted continuous curve
+            y_vals = pd.Series(continuous_vals).interpolate().bfill().ffill()
+            x_vals = np.array(synth_dayofyear, dtype=float)
 
-            order = np.argsort(full_days)
-            x_sorted = full_days[order]
-            y_sorted = pred_vals[order]
-            unique_mask = np.concatenate(([True], np.diff(x_sorted) > 0))
-            x_sorted = x_sorted[unique_mask]
-            y_sorted = y_sorted[unique_mask]
-
-            plt.plot(
-                x_sorted, y_sorted,
-                color="black", linewidth=2.5,
-                label="Predicted"
-            )
+            # Prevent wraparound line (no Dec→Jan jump)
+            jump_mask = np.diff(x_vals) < 0
+            if np.any(jump_mask):
+                jump_idx = np.where(jump_mask)[0][0] + 1
+                plt.plot(x_vals[:jump_idx], y_vals[:jump_idx],
+                         color="black", linewidth=2.5, label="Predicted")
+                plt.plot(x_vals[jump_idx:], y_vals[jump_idx:], color="black", linewidth=2.5)
+            else:
+                plt.plot(x_vals, y_vals, color="black", linewidth=2.5, label="Predicted")
 
             plt.xticks(month_dayofyear, month_labels)
             plt.xlim(0, 366)
             plt.xlabel("Month")
             plt.ylabel(col)
-            plt.title(f"Seasonality-based model for {col}")
+            plt.title(f"Seasonality-based Model for {col}")
             plt.legend(loc="best", fontsize=9)
             plt.tight_layout()
             plt.savefig(os.path.join(plot_dir, f"seasonal_{col}.png"))
             plt.close()
 
-        print(f"[Info] Saved plot of seasonality model to: {plot_dir}")
+        print(f"[Info] Saved seasonality plot to: {plot_dir}")
 
     except Exception as e:
         print(f"[Warning] Could not generate plot of seasonality model: {e}")
 
     return predictions, targets
+
 
 def visualizer(*pred_target_pairs, labels=None, directory, model_name, num_samples=100):
     """
@@ -581,38 +764,44 @@ if __name__ == '__main__':
     # test_dataset = TimeSeriesTargetDataset(samples)
     ##################################################################################################################
     # Evaluate models
-
-    model_preds, targets = evaluate_model(model, test_dataset)
-    naive_preds, naive_targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
-                                                output_rows=output_rows, gap_hours=gap_hours)
-    linear_preds, linear_targets = evaluate_linear(data_dir, model_name, test_dataset, historic, output_columns,
-                                                   output_rows=output_rows, window_hours=window_hours,
-                                                   gap_hours=gap_hours,
-                                                   debug_plot=True, examples=10)
-
-    seasonal_preds, seasonal_targets = evaluate_seasonal(test_dataset, historic, output_columns, data_dir, model_name,
-                                                         output_rows=output_rows, diurnal_window=diurnal_window)
-
-    visualizer((model_preds, targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
-               (seasonal_preds, seasonal_targets),
-               labels=["Transformer", "Naive", "Linear", "Seasonal"], model_name=model_name, directory=data_dir,
-               num_samples=200)
     #
-    # results = []
-    # labels = []
+    # model_preds, targets = evaluate_model(model, test_dataset)
+    # naive_preds, naive_targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
+    #                                             output_rows=output_rows, gap_hours=gap_hours)
+    # linear_preds, linear_targets = evaluate_linear(data_dir, model_name, test_dataset, historic, output_columns,
+    #                                                output_rows=output_rows, window_hours=window_hours,
+    #                                                gap_hours=gap_hours,
+    #                                                debug_plot=True, examples=10)
     #
-    # for value in range(5,6,1):
-    #     print('value', value)
-    #     preds, targets = evaluate_linear(data_dir, model_name, test_dataset, historic, output_columns,
+    # seasonal_preds, seasonal_targets = evaluate_seasonal(test_dataset, historic, output_columns, data_dir, model_name,
+    #                                                      output_rows=output_rows, diurnal_window=diurnal_window,
+    #                                                      secondary="../data/input/sensors/SCADA.csv")
+    #
+    # visualizer((model_preds, targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
+    #            (seasonal_preds, seasonal_targets),
+    #            labels=["Transformer", "Naive", "Linear", "Seasonal"], model_name=model_name, directory=data_dir,
+    #            num_samples=200)
+
+    results = []
+    labels = []
+
+    # space_name = "explore_linear"
+    # os.makedirs(os.path.join(data_dir, "models", model_name, space_name), exist_ok=True)
+    # for value in range(1,60,1):
+    #     preds, targets = evaluate_linear(data_dir, Path(model_name, space_name, f"Window-{value}"), test_dataset, historic, output_columns,
     #                                                output_rows=output_rows, window_hours=value,
     #                                                gap_hours=gap_hours,
-    #                                                debug_plot=False, examples=10)
-    #     print('preds', type(preds), preds.shape)
-    #     print('targets', type(targets), targets.shape)
+    #                                                debug_plot=True, examples=3)
     #     results.append((preds, targets))
     #     labels.append(f"Window {value}h")
-    #
-    # print('preds from results', type(results[0]), results[0])
-    # print(type(results))
-    #
-    # visualizer(*results, labels=labels, model_name='LinearAlts', directory=..., num_samples=...)
+
+    space_name = "explore_naive"
+    os.makedirs(os.path.join(data_dir, "models", model_name, space_name), exist_ok=True)
+    for value in range(1,97,2):
+        preds, targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
+                                                output_rows=output_rows, gap_hours=value)
+        results.append((preds, targets))
+        labels.append(f"Window {value}h")
+
+
+    visualizer(*results, labels=labels, model_name=Path(model_name, space_name), directory=data_dir, num_samples=200)
