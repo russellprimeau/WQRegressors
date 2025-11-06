@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import torch
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from d_SplitAnalysis import normalize_columns
+from d_Resample import normalize_columns
 from e_TrainTransformer import load_samples
 from e_TrainTransformer import TimeSeriesTransformer
 from e_TrainTransformer import TimeSeriesTargetDataset
@@ -556,7 +556,7 @@ if __name__ == '__main__':
 
     ## Configure simple non-ML ("baseline") model calculation methods
     historic = "../data/output/regression/Combined_Cleaned.csv"  # Path to file with baseline model input
-    gap_hours = 1  # Period before first forecast value from which input data is not used in baseline models
+    gap_hours = 0  # Period before first forecast value from which input data is not used in baseline models
     window_hours = 5  # Length of period for linear regression training (min. ~530 hrs for Eurofins params)
     diurnal_window = 1  # Number of hours before/after target time to include in average for seasonal model
 
@@ -580,7 +580,7 @@ if __name__ == '__main__':
     #                        input_rows=input_rows, output_rows=output_rows)
     # test_dataset = TimeSeriesTargetDataset(samples)
     ##################################################################################################################
-    ## Evaluate models
+    # Evaluate models
 
     model_preds, targets = evaluate_model(model, test_dataset)
     naive_preds, naive_targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
@@ -597,15 +597,22 @@ if __name__ == '__main__':
                (seasonal_preds, seasonal_targets),
                labels=["Transformer", "Naive", "Linear", "Seasonal"], model_name=model_name, directory=data_dir,
                num_samples=200)
-
+    #
     # results = []
     # labels = []
     #
-    # for value in range(1,143,1):
-    #     preds, targets = evaluate_linear(data_dir, model_name, test_dataset, historic, output_columns, data_dir,
-    #                                                output_rows=output_rows, window_hours=window_hours, gap_hours=gap_hours,
-    #                                                debug_plot=True, examples=10)
+    # for value in range(5,6,1):
+    #     print('value', value)
+    #     preds, targets = evaluate_linear(data_dir, model_name, test_dataset, historic, output_columns,
+    #                                                output_rows=output_rows, window_hours=value,
+    #                                                gap_hours=gap_hours,
+    #                                                debug_plot=False, examples=10)
+    #     print('preds', type(preds), preds.shape)
+    #     print('targets', type(targets), targets.shape)
     #     results.append((preds, targets))
     #     labels.append(f"Window {value}h")
     #
-    # visualizer(*results, labels=labels, directory=..., num_samples=...)
+    # print('preds from results', type(results[0]), results[0])
+    # print(type(results))
+    #
+    # visualizer(*results, labels=labels, model_name='LinearAlts', directory=..., num_samples=...)
