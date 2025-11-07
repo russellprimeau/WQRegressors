@@ -2,6 +2,7 @@
 Compares accuracy of Time Series Forecasting using various models.
 """
 
+
 import os
 from pathlib import Path
 import json
@@ -12,12 +13,49 @@ import matplotlib
 import matplotlib.pyplot as plt
 import torch
 from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from d_Resample import normalize_columns
+from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score, accuracy_score, precision_score,
+                             recall_score, f1_score, confusion_matrix, roc_curve, precision_recall_curve, auc)
+# from d_Resample import normalize_columns
 from e_TrainTransformer import load_samples
 from e_TrainTransformer import TimeSeriesTransformer
 from e_TrainTransformer import TimeSeriesTargetDataset
+from src.d_Resample import normalize_columns
 
+def normalize_columns(df, columns, min=0, max=1, save=False, directory="../data/output/regression"):
+    """
+    Normalize specified columns in a DataFrame to a given range and save original min/max values.
+
+    Parameters:
+    - df: pandas.DataFrame
+    - columns: list of column names to normalize
+    - min: minimum value of target range
+    - max: maximum value of target range
+    - save_path: path to save normalization parameters
+
+    Returns:
+    - A copy of the DataFrame with normalized columns.
+    """
+    df_normalized = df.copy()
+    min_val, max_val = min, max
+    normalization_params = {}
+
+    for col in columns:
+        col_min = df[col].min()
+        col_max = df[col].max()
+        normalization_params[col] = {"min": col_min, "max": col_max}
+        if col_max != col_min:
+            df_normalized[col] = ((df[col] - col_min) / (col_max - col_min)) * (max_val - min_val) + min_val
+        else:
+            df_normalized[col] = (min_val + max_val) / 2
+
+    # Save normalization parameters to file if selected:
+    if save:
+        file = Path(directory, "normalized.csv")
+        file.parent.mkdir(parents=True, exist_ok=True)
+        with open(file, "w") as f:
+            json.dump(normalization_params, f)
+
+    return df_normalized
 
 def evaluate_model(model, dataset):
     model.eval()
@@ -178,209 +216,6 @@ def evaluate_linear(data_dir, model_name, dataset, historic, output_columns,
 
     return np.array(predictions), np.array(targets)
 
-# def evaluate_seasonal(dataset, historic, output_columns, data_dir, model_name,
-#                       output_rows=-1, diurnal_window=2, secondary=None):
-#     """
-#     Seasonal baseline using either the full `historical_df` or,
-#     if available, a secondary CSV file for specific output columns.
-#
-#     For each output column:
-#       - If it exists in the `secondary` CSV file, use that file’s data instead of `historical_df`
-#       - Otherwise, use `historical_df`
-#     """
-#     import os
-#     import numpy as np
-#     import pandas as pd
-#     import matplotlib.pyplot as plt
-#     import seaborn as sns
-#
-#     # --- Load and normalize primary historical data ---
-#     df = pd.read_csv(historic, parse_dates=["TIMESTAMP"]).sort_values("TIMESTAMP")
-#     historical_df = normalize_columns(df, output_columns, directory=data_dir)
-#
-#     # --- Load secondary data (if provided) ---
-#     secondary_df = None
-#     if secondary and os.path.exists(secondary):
-#         try:
-#             secondary_df = pd.read_csv(secondary, sep=";", decimal=".", parse_dates=["Time"]).sort_values("Time")
-#         except:
-#             secondary_df = pd.read_csv(secondary, sep=";", decimal=",", parse_dates=["Time"]).sort_values("Time")
-#         secondary_df.rename(columns={"Time": "TIMESTAMP"}, inplace=True)
-#         secondary_df = normalize_columns(secondary_df, output_columns, directory=data_dir)
-#
-#     # --- Prepare primary dataframe ---
-#     def prepare_time_columns(df):
-#         df["YEAR"] = df["TIMESTAMP"].dt.year
-#         df["DAYOFYEAR"] = df["TIMESTAMP"].dt.dayofyear
-#         df["HOUR"] = df["TIMESTAMP"].dt.hour + df["TIMESTAMP"].dt.minute / 60.0
-#         return df
-#
-#     historical_df = prepare_time_columns(historical_df)
-#     if secondary_df is not None:
-#         secondary_df = prepare_time_columns(secondary_df)
-#
-#     predictions, targets = [], []
-#
-#     # === Predict values for each sample ===
-#     for i in range(len(dataset)):
-#         _, y, filename = dataset[i]
-#         sample_df = pd.read_csv(os.path.join(data_dir, 'samples', filename), parse_dates=["TIMESTAMP"])
-#         output_times = sample_df["TIMESTAMP"].iloc[output_rows:]
-#         if len(output_times) == 0:
-#             continue
-#
-#         pred_matrix = np.zeros((len(output_times), len(output_columns)))
-#
-#         for t_idx, ts in enumerate(output_times):
-#             target_year = ts.year
-#             target_day = ts.timetuple().tm_yday
-#             target_hour = ts.hour + ts.minute / 60.0
-#
-#             for j, col in enumerate(output_columns):
-#                 # Pick data source: secondary or primary
-#                 src_df = None
-#                 if secondary_df is not None and col in secondary_df.columns:
-#                     src_df = secondary_df
-#                 elif col in historical_df.columns:
-#                     src_df = historical_df
-#                 else:
-#                     pred_matrix[t_idx, j] = np.nan
-#                     continue
-#
-#                 candidates = src_df[src_df["YEAR"] != target_year].copy()
-#                 if candidates.empty:
-#                     pred_matrix[t_idx, j] = np.nan
-#                     continue
-#
-#                 day_diff = np.abs(candidates["DAYOFYEAR"] - target_day)
-#                 day_diff = np.minimum(day_diff, 365 - day_diff)
-#                 candidates["DAY_DIFF"] = day_diff
-#                 candidates["HOUR_DIFF"] = np.abs(candidates["HOUR"] - target_hour)
-#
-#                 subset = candidates[(candidates["DAY_DIFF"] <= 4) & (candidates["HOUR_DIFF"] <= diurnal_window)]
-#                 if subset.empty:
-#                     subset = candidates[candidates["DAY_DIFF"] <= 4]
-#                 if subset.empty:
-#                     subset = candidates[candidates["DAY_DIFF"] <= 15]
-#                 if subset.empty:
-#                     subset = candidates
-#
-#                 vals = subset[[col]].dropna()
-#                 pred_matrix[t_idx, j] = vals[col].mean() if not vals.empty else np.nan
-#
-#         predictions.append(pred_matrix.reshape(-1))
-#         targets.append(y.numpy().reshape(-1))
-#
-#     predictions = np.array(predictions)
-#     targets = np.array(targets)
-#
-#     # === Diagnostic plot ===
-#     try:
-#         plot_dir = os.path.join(data_dir, "models", model_name, "examples_seasonal")
-#         os.makedirs(plot_dir, exist_ok=True)
-#         sns.set_style("whitegrid")
-#
-#         # Ground truth values (same as before)
-#         gt_records = []
-#         for i in range(len(dataset)):
-#             _, y, filename = dataset[i]
-#             sample_df = pd.read_csv(os.path.join(data_dir, 'samples', filename), parse_dates=["TIMESTAMP"])
-#             output_times = sample_df["TIMESTAMP"].iloc[output_rows:]
-#             if len(output_times) == 0:
-#                 continue
-#             flat = y.numpy().reshape(-1)
-#             for j, col in enumerate(output_columns):
-#                 vals = flat[j::len(output_columns)]
-#                 gt_records.append(pd.DataFrame({
-#                     "YEAR": output_times.dt.year,
-#                     "DAYOFYEAR": output_times.dt.dayofyear +
-#                                  (output_times.dt.hour + output_times.dt.minute / 60.0) / 24.0,
-#                     "VALUE": vals,
-#                     "COLUMN": col
-#                 }))
-#         if not gt_records:
-#             return predictions, targets
-#         gt_df = pd.concat(gt_records, ignore_index=True)
-#
-#         # Synthetic hourly timeline for predictions
-#         synthetic_year = int(historical_df["YEAR"].max()) + 1
-#         start = pd.Timestamp(year=synthetic_year, month=1, day=1, hour=0)
-#         synthetic_times = pd.date_range(start=start, periods=24 * 366, freq="h")
-#
-#         synth_day = synthetic_times.dayofyear
-#         synth_hour = synthetic_times.hour + synthetic_times.minute / 60.0
-#         synth_dayofyear = synth_day + synth_hour / 24.0
-#
-#         ref_year = 2021
-#         month_starts = pd.date_range(f"{ref_year}-01-01", f"{ref_year}-12-31", freq="MS")
-#         month_dayofyear = [d.timetuple().tm_yday for d in month_starts]
-#         month_labels = [d.strftime("%b") for d in month_starts]
-#
-#         for col in output_columns:
-#             # Pick data source
-#             if secondary_df is not None and col in secondary_df.columns:
-#                 src_df = secondary_df
-#             else:
-#                 src_df = historical_df
-#
-#             continuous_vals = []
-#             for idx in range(len(synthetic_times)):
-#                 target_day = synth_day[idx]
-#                 target_hour = synth_hour[idx]
-#
-#                 candidates = src_df.copy()
-#                 day_diff = np.abs(candidates["DAYOFYEAR"] - target_day)
-#                 day_diff = np.minimum(day_diff, 365 - day_diff)
-#                 candidates["DAY_DIFF"] = day_diff
-#                 candidates["HOUR_DIFF"] = np.abs(candidates["HOUR"] - target_hour)
-#
-#                 subset = candidates[(candidates["DAY_DIFF"] <= 4) & (candidates["HOUR_DIFF"] <= diurnal_window)]
-#                 if subset.empty:
-#                     subset = candidates[candidates["DAY_DIFF"] <= 4]
-#                 if subset.empty:
-#                     subset = candidates[candidates["DAY_DIFF"] <= 15]
-#                 if subset.empty:
-#                     subset = candidates
-#
-#                 vals = subset[[col]].dropna()
-#                 continuous_vals.append(vals[col].mean() if not vals.empty else np.nan)
-#
-#             # Plot
-#             plt.figure(figsize=(12, 6))
-#             sub_gt = gt_df[gt_df["COLUMN"] == col]
-#             for yr, group in sub_gt.groupby("YEAR"):
-#                 g = group.sort_values("DAYOFYEAR")
-#                 plt.plot(g["DAYOFYEAR"], g["VALUE"], marker="o", linestyle="-", label=f"Actual {yr}", alpha=0.7)
-#
-#             y_vals = pd.Series(continuous_vals).interpolate().bfill().ffill()
-#             x_vals = np.array(synth_dayofyear, dtype=float)
-#
-#             # Prevent wraparound line
-#             jump_mask = np.diff(x_vals) < 0
-#             if np.any(jump_mask):
-#                 jump_idx = np.where(jump_mask)[0][0] + 1
-#                 plt.plot(x_vals[:jump_idx], y_vals[:jump_idx],
-#                          color="black", linewidth=2.5, label="Predicted")
-#                 plt.plot(x_vals[jump_idx:], y_vals[jump_idx:], color="black", linewidth=2.5)
-#             else:
-#                 plt.plot(x_vals, y_vals, color="black", linewidth=2.5, label="Predicted")
-#
-#             plt.xticks(month_dayofyear, month_labels)
-#             plt.xlim(0, 366)
-#             plt.xlabel("Month")
-#             plt.ylabel(col)
-#             plt.title(f"Seasonality-based Model for {col}")
-#             plt.legend(loc="best", fontsize=9)
-#             plt.tight_layout()
-#             plt.savefig(os.path.join(plot_dir, f"seasonal_{col}.png"))
-#             plt.close()
-#
-#         print(f"[Info] Saved seasonal plots (with optional secondary data) to: {plot_dir}")
-#
-#     except Exception as e:
-#         print(f"[Warning] Could not generate plot of seasonality model: {e}")
-#
-#     return predictions, targets
 def evaluate_seasonal(dataset, historic, output_columns, data_dir, model_name,
                       output_rows=-1, diurnal_window=2, secondary=None):
     """
@@ -566,14 +401,35 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, model_name,
             plt.tight_layout()
             plt.savefig(os.path.join(plot_dir, f"seasonal_{col}.png"))
             plt.close()
-
-        print(f"[Info] Saved seasonality plot to: {plot_dir}")
-
     except Exception as e:
         print(f"[Warning] Could not generate plot of seasonality model: {e}")
 
     return predictions, targets
 
+def binarize_predictions(preds, targets, output_columns, thresholds_df):
+    """
+    Convert regression outputs to binary classification based on column-wise thresholds.
+    """
+    preds = np.array(preds)
+    targets = np.array(targets)
+
+    # Ensure shape is (n_samples, n_outputs)
+    if preds.ndim == 1:
+        preds = preds.reshape(-1, len(output_columns))
+    if targets.ndim == 1:
+        targets = targets.reshape(-1, len(output_columns))
+
+    binary_preds = np.zeros_like(preds, dtype=int)
+    binary_targets = np.zeros_like(targets, dtype=int)
+
+    for i, col in enumerate(output_columns):
+        if col not in thresholds_df.columns:
+            raise ValueError(f"Threshold for column '{col}' not found in thresholds_df.")
+        threshold = thresholds_df[col].iloc[0]
+        binary_preds[:, i] = (preds[:, i] > threshold).astype(int)
+        binary_targets[:, i] = (targets[:, i] > threshold).astype(int)
+
+    return binary_preds, binary_targets
 
 def visualizer(*pred_target_pairs, labels=None, directory, model_name, num_samples=100):
     """
@@ -683,37 +539,159 @@ def visualizer(*pred_target_pairs, labels=None, directory, model_name, num_sampl
     plt.savefig(Path(directory, "models", model_name, "horizon_rmse.png"))
     plt.close(fig)
 
-def reverse_normalize_columns(df, columns, min=0, max=1, directory="../data/output/regression"):
+def classification_visualizer(*pred_target_pairs, labels=None, directory='.', model_name='Classifier', num_samples=200):
+    os.makedirs(os.path.join(directory, "models", model_name, "classification"), exist_ok=True)
+    sns.set_style("whitegrid")
+    metrics = []
+    all_conf_matrices = []
+    roc_data = []
+    pr_data = []
+    auc_scores = []
+
+    for i, (preds, targets) in enumerate(pred_target_pairs):
+        preds = np.array(preds).reshape(-1)[:num_samples]
+        targets = np.array(targets).reshape(-1)[:num_samples]
+        label = labels[i] if labels else f"Model {i+1}"
+        mask = np.isfinite(preds) & np.isfinite(targets)
+        preds, targets = preds[mask], targets[mask]
+
+        acc = accuracy_score(targets, preds)
+        prec = precision_score(targets, preds, zero_division=0)
+        rec = recall_score(targets, preds, zero_division=0)
+        f1 = f1_score(targets, preds, zero_division=0)
+        metrics.append((label, acc, prec, rec, f1))
+
+        cm = confusion_matrix(targets, preds)
+        all_conf_matrices.append((label, cm))
+
+        fpr, tpr, _ = roc_curve(targets, preds)
+        roc_auc = auc(fpr, tpr)
+        roc_data.append((label, fpr, tpr, roc_auc))
+        auc_scores.append((label, roc_auc))
+
+        precision, recall, _ = precision_recall_curve(targets, preds)
+        pr_auc = auc(recall, precision)
+        pr_data.append((label, recall, precision, pr_auc))
+
+    # Combined Confusion Matrix Plot
+    fig, axes = plt.subplots(1, len(all_conf_matrices), figsize=(5 * len(all_conf_matrices), 4))
+    if len(all_conf_matrices) == 1:
+        axes = [axes]
+    for ax, (label, cm) in zip(axes, all_conf_matrices):
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax)
+        ax.set_title(f"{label}")
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("Actual")
+    plt.suptitle("Confusion Matrices")
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(Path(directory, "models", model_name, "classification", f"confusion.png"))
+    plt.close()
+
+    # Combined ROC Curve Plot
+    plt.figure(figsize=(6, 5))
+    for label, fpr, tpr, roc_auc in roc_data:
+        plt.plot(fpr, tpr, label=f"{label} (AUC = {roc_auc:.2f})")
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.title("ROC Curves")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(Path(directory, "models", model_name, "classification", f"roc.png"))
+    plt.close()
+
+    # Combined Precision-Recall Curve Plot
+    plt.figure(figsize=(6, 5))
+    for label, recall, precision, pr_auc in pr_data:
+        plt.plot(recall, precision, label=f"{label} (AUC = {pr_auc:.2f})")
+    plt.title("Precision-Recall Curves")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(Path(directory, "models", model_name, "classification", "pr.png"))
+    plt.close()
+
+    # AUC Bar Plot
+    labels_auc = [x[0] for x in auc_scores]
+    auc_vals = [x[1] for x in auc_scores]
+    plt.figure(figsize=(8, 5))
+    sns.barplot(x=labels_auc, y=auc_vals, hue=auc_scores, legend=False)
+    plt.title("AUC Scores")
+    plt.ylabel("AUC")
+    plt.xticks(rotation=30, ha="right")
+    plt.grid(True, axis="y", linestyle="--", alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(Path(directory, "models", model_name, "classification", "auc_scores.png"))
+    plt.close()
+
+# def reverse_normalize_columns(df, columns, min=0, max=1, directory="../data/output/regression"):
+#     """
+#     Reverse normalization of specified columns using saved parameters.
+#
+#     Parameters:
+#     - df: pandas.DataFrame
+#     - columns: list of column names to reverse normalize
+#     - min: minimum value of target range used during normalization
+#     - max: maximum value of target range used during normalization
+#     - param_path: path to load normalization parameters
+#
+#     Returns:
+#     - A copy of the DataFrame with columns restored to original scale.
+#     """
+#     df_restored = df.copy()
+#     min_val, max_val = min, max
+#
+#     # Load normalization parameters from file
+#     with open(Path(directory,"models", model_name, "normalization_params.json"), "r") as f:
+#         normalization_params = json.load(f)
+#
+#     for col in columns:
+#         if col in normalization_params:
+#             col_min = normalization_params[col]["min"]
+#             col_max = normalization_params[col]["max"]
+#             if col_max != col_min:
+#                 df_restored[col] = ((df[col] - min_val) / (max_val - min_val)) * (col_max - col_min) + col_min
+#             else:
+#                 df_restored[col] = col_min  # All values were the same originally
+#
+#     return df_restored
+
+def load_secondary(output_columns, window_hours=3):
     """
-    Reverse normalization of specified columns using saved parameters.
-
-    Parameters:
-    - df: pandas.DataFrame
-    - columns: list of column names to reverse normalize
-    - min: minimum value of target range used during normalization
-    - max: maximum value of target range used during normalization
-    - param_path: path to load normalization parameters
-
-    Returns:
-    - A copy of the DataFrame with columns restored to original scale.
+    Check which secondary source to use for the seasonal model, based on the output columns.
+    If Eurofins (very low sample rate) is output, set linear model window long enough to include multiple samples
     """
-    df_restored = df.copy()
-    min_val, max_val = min, max
 
-    # Load normalization parameters from file
-    with open(Path(directory,"models", model_name, "normalization_params.json"), "r") as f:
-        normalization_params = json.load(f)
+    Eurofin_columns = ['06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
+        '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
+    SCADA_columns = ['SCADA - pH', 'SCADA - Temperature (°C)',]
+    FullHourly_columns = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
+        'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)']
+    Weather_columns = ['Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)_x',
+        'Wind direction 10minRollingAvg (°)_y', 'Hourly average wind direction (°)_x',
+        'Hourly average wind direction (°)_y', 'Average wind speed (m/s)',
+        'Maximum sustained wind speed, 3-second span (m/s)', 'Time of maximum 3s Gust',
+        'Maximum sustained wind speed, 10-minute span (m/s)', 'Time of maximum 10 minute gust',
+        'Hourly average atmospheric pressure at station (mBar)', 'Maximum pressure differential, 3-hour span (mBar)',
+        'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)',
+        'Longwave (IR) radiation (W/m2)', 'Instantaneous sea-level atmospheric pressure (mBar)',
+        'Shortwave (solar) radiation (W/m2)', 'Precipitation (mm/hr)', 'Instantaneous temperature (°C)',
+        'Maximum temperature (°C)', 'Minimum temperature (°C)', 'Average humidity (% relative humidity)',]
 
-    for col in columns:
-        if col in normalization_params:
-            col_min = normalization_params[col]["min"]
-            col_max = normalization_params[col]["max"]
-            if col_max != col_min:
-                df_restored[col] = ((df[col] - min_val) / (max_val - min_val)) * (col_max - col_min) + col_min
-            else:
-                df_restored[col] = col_min  # All values were the same originally
-
-    return df_restored
+    new_window_hours = window_hours
+    if any(param in Eurofin_columns for param in output_columns):
+        secondary = "../data/input/sensors/Eurofins.csv"
+        new_window_hours = 550
+    elif any(param in SCADA_columns for param in output_columns):
+        secondary = "../data/input/sensors/SCADA.csv"
+    elif any(param in FullHourly_columns for param in output_columns):
+        secondary = "../data/input/sensors/FullHourly.csv"
+    elif any(param in Weather_columns for param in output_columns):
+        secondary = "../data/input/sensors/Weather.csv"
+    else:
+        secondary = False
+    return secondary, new_window_hours
 
 
 if __name__ == '__main__':
@@ -726,8 +704,9 @@ if __name__ == '__main__':
 
     ##################################################################################################################
     ## Load input, output and model hyperparameters from data_dir
-    data_dir = "../data/output/regression/SCADATemp168hr"  # Parent directory of test/train sample folder
-    model_name = "24hr_fore"
+
+    data_dir = "../data/output/regression/EColi24hr"  # Parent directory of test/train sample folder
+    model_name = "nowcast"
 
     with open(Path(data_dir, 'models', model_name, 'model_config.json'), 'r') as f:
         config = json.load(f)
@@ -739,9 +718,10 @@ if __name__ == '__main__':
 
     ## Configure simple non-ML ("baseline") model calculation methods
     historic = "../data/output/regression/Combined_Cleaned.csv"  # Path to file with baseline model input
-    gap_hours = 0  # Period before first forecast value from which input data is not used in baseline models
-    window_hours = 5  # Length of period for linear regression training (min. ~530 hrs for Eurofins params)
-    diurnal_window = 1  # Number of hours before/after target time to include in average for seasonal model
+    gap_hours = 1  # Period before first forecast value from which input data is not used in baseline models
+    window_hours = 550  # Length of period for linear regression training (min. ~530 hrs for Eurofins params)
+    diurnal_window = 1  # Number of hours before/after target time to include in diurnal average for seasonality model
+    secondary, window_hours = load_secondary(output_columns, window_hours)  # Check output_columns and automatically adjust some baseline models
 
     ################################################################################################################
     ## Prepare data and models for evaluation
@@ -749,7 +729,7 @@ if __name__ == '__main__':
     model.load_state_dict(torch.load(os.path.join(data_dir, "models", model_name, "transformer_model.pt"), map_location=device))
     model.eval()  # Set to evaluation mode
 
-    # Run evaluation using samples excluded from training
+    ## Run evaluation using samples excluded from training
     reloadset = Path(data_dir, "models", model_name, "test_files.txt")
     with open(reloadset) as f:
         test_files = [line.strip() for line in f]
@@ -762,29 +742,52 @@ if __name__ == '__main__':
     #                        output_columns=output_columns,
     #                        input_rows=input_rows, output_rows=output_rows)
     # test_dataset = TimeSeriesTargetDataset(samples)
+
+
     ##################################################################################################################
-    # Evaluate models
-    #
-    # model_preds, targets = evaluate_model(model, test_dataset)
-    # naive_preds, naive_targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
-    #                                             output_rows=output_rows, gap_hours=gap_hours)
-    # linear_preds, linear_targets = evaluate_linear(data_dir, model_name, test_dataset, historic, output_columns,
-    #                                                output_rows=output_rows, window_hours=window_hours,
-    #                                                gap_hours=gap_hours,
-    #                                                debug_plot=True, examples=10)
-    #
-    # seasonal_preds, seasonal_targets = evaluate_seasonal(test_dataset, historic, output_columns, data_dir, model_name,
-    #                                                      output_rows=output_rows, diurnal_window=diurnal_window,
-    #                                                      secondary="../data/input/sensors/SCADA.csv")
-    #
-    # visualizer((model_preds, targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
-    #            (seasonal_preds, seasonal_targets),
-    #            labels=["Transformer", "Naive", "Linear", "Seasonal"], model_name=model_name, directory=data_dir,
-    #            num_samples=200)
+    ## Evaluate regression models
 
-    results = []
-    labels = []
+    model_preds, targets = evaluate_model(model, test_dataset)
+    naive_preds, naive_targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
+                                                output_rows=output_rows, gap_hours=gap_hours)
+    linear_preds, linear_targets = evaluate_linear(data_dir, model_name, test_dataset, historic, output_columns,
+                                                   output_rows=output_rows, window_hours=window_hours,
+                                                   gap_hours=gap_hours,
+                                                   debug_plot=True, examples=10)
 
+    seasonal_preds, seasonal_targets = evaluate_seasonal(test_dataset, historic, output_columns, data_dir, model_name,
+                                                         output_rows=output_rows, diurnal_window=diurnal_window,
+                                                         secondary=secondary)
+
+    alternatives = [(model_preds, targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
+                    (seasonal_preds, seasonal_targets)]
+    labels = ["Transformer", "Naive", "Linear", "Seasonal"]
+
+    visualizer(*alternatives, labels=labels, model_name=model_name, directory=data_dir, num_samples=200)
+
+
+    ##################################################################################################################
+    ## Convert model predictions from regression to classification based on limit values
+
+    raw_thresholds_df = pd.read_csv(Path('../data/input', "Limits.csv"), sep=';', decimal='.')
+    thresholds_df = normalize_columns()
+
+    class_results = []
+    for alternative in alternatives:
+        preds, targets = binarize_predictions(alternative[0], alternative[1], output_columns=output_columns,
+                                              thresholds_df=thresholds_df)
+        class_results.append((preds, targets))
+
+    classification_visualizer(*class_results, labels=labels, directory=data_dir, model_name=model_name,
+                              num_samples=200)
+
+
+    ##################################################################################################################
+    ## Explore linear model parameter space
+    #
+    # results = []
+    # labels = []
+    #
     # space_name = "explore_linear"
     # os.makedirs(os.path.join(data_dir, "models", model_name, space_name), exist_ok=True)
     # for value in range(1,60,1):
@@ -795,13 +798,19 @@ if __name__ == '__main__':
     #     results.append((preds, targets))
     #     labels.append(f"Window {value}h")
 
-    space_name = "explore_naive"
-    os.makedirs(os.path.join(data_dir, "models", model_name, space_name), exist_ok=True)
-    for value in range(1,97,2):
-        preds, targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
-                                                output_rows=output_rows, gap_hours=value)
-        results.append((preds, targets))
-        labels.append(f"Window {value}h")
-
-
-    visualizer(*results, labels=labels, model_name=Path(model_name, space_name), directory=data_dir, num_samples=200)
+    ##################################################################################################################
+    ## Explore naive model parameter space
+    #
+    # results = []
+    # labels = []
+    #
+    # space_name = "explore_naive"
+    # os.makedirs(os.path.join(data_dir, "models", model_name, space_name), exist_ok=True)
+    # for value in range(1,97,2):
+    #     preds, targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
+    #                                             output_rows=output_rows, gap_hours=value)
+    #     results.append((preds, targets))
+    #     labels.append(f"Window {value}h")
+    #
+    #
+    # visualizer(*results, labels=labels, model_name=Path(model_name, space_name), directory=data_dir, num_samples=200)

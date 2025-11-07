@@ -179,33 +179,34 @@ if __name__ == '__main__':
     df = df.sort_values("TIMESTAMP")
 
     ## Identify prediction target columns. Output will only include samples with valid value in last row.
-    target_columns = ['SCADA - Temperature (°C)']  # alternative 1: name-based selection
+    target_columns = ['06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
+        '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']  # alternative 1: name-based selection
     # target_columns = df.columns[-9:]  # alternative 2: index-based selection
 
     ## To analyze the impact of sample dimensions on the # of available samples:
-    gapless(df, target_columns)  # Analysis function #1
+    gapless(df, target_columns, name="Eurofins_availability")  # Analysis function #1
     # seg_length = 24  # fixed segment length for evaluating range of lengths of gap betweeen input and output
     # gapped(df, target_columns, seg_length)  # Analysis function #2
 
     ## Name the dataset and select the size of each sample (# of timesteps/rows)
-    set_name  = "SCADATemp168hr"  # Name of subdirectory where samples will be organized
-    length = 168  # Hours of contiguous data per sample
-    output_dir = os.path.join("../data/output/regression", set_name)
+    # set_name  = "SCADATemp168hr"  # Name of subdirectory where samples will be organized
+    # length = 168  # Hours of contiguous data per sample
+    # output_dir = os.path.join("../data/output/regression", set_name)
 
     ## Select columns where values in samples will be normalized, which helps with calculating loss accurately
     # to_normalize = df.columns[3:]
-    to_normalize = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
-        'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
-        'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)_x',
-        'Wind direction 10minRollingAvg (°)_y',
-        'Hourly average wind direction (°)_x', 'Hourly average wind direction (°)_y', 'Average wind speed (m/s)',
-        'Maximum sustained wind speed, 3-second span (m/s)', 'Time of maximum 3s Gust',
-        'Maximum sustained wind speed, 10-minute span (m/s)', 'Time of maximum 10 minute gust',
-        'Hourly average atmospheric pressure at station (mBar)', 'Maximum pressure differential, 3-hour span (mBar)',
-        'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)',
-        'Longwave (IR) radiation (W/m2)', 'Instantaneous sea-level atmospheric pressure (mBar)',
-        'Shortwave (solar) radiation (W/m2)', 'Precipitation (mm/hr)', 'Instantaneous temperature (°C)',
-        'Maximum temperature (°C)', 'Minimum temperature (°C)', 'Average humidity (% relative humidity)',
-        'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
-        '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
-    split(df, output_dir, target_columns, length, to_normalize, 0)
+    # to_normalize = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
+    #     'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
+    #     'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)_x',
+    #     'Wind direction 10minRollingAvg (°)_y',
+    #     'Hourly average wind direction (°)_x', 'Hourly average wind direction (°)_y', 'Average wind speed (m/s)',
+    #     'Maximum sustained wind speed, 3-second span (m/s)', 'Time of maximum 3s Gust',
+    #     'Maximum sustained wind speed, 10-minute span (m/s)', 'Time of maximum 10 minute gust',
+    #     'Hourly average atmospheric pressure at station (mBar)', 'Maximum pressure differential, 3-hour span (mBar)',
+    #     'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)',
+    #     'Longwave (IR) radiation (W/m2)', 'Instantaneous sea-level atmospheric pressure (mBar)',
+    #     'Shortwave (solar) radiation (W/m2)', 'Precipitation (mm/hr)', 'Instantaneous temperature (°C)',
+    #     'Maximum temperature (°C)', 'Minimum temperature (°C)', 'Average humidity (% relative humidity)',
+    #     'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
+    #     '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
+    # split(df, output_dir, target_columns, length, to_normalize, 0)
