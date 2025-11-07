@@ -1,5 +1,5 @@
 """
-Compares accuracy of Time Series Forecasting using various models.
+Compares accuracy of Time Series Forecasting using various forecasts.
 """
 
 
@@ -12,13 +12,14 @@ import seaborn as sns
 import matplotlib
 import matplotlib.pyplot as plt
 import torch
+import xgboost as xgb
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score, accuracy_score, precision_score,
                              recall_score, f1_score, confusion_matrix, roc_curve, precision_recall_curve, auc)
 from d_Resample import normalize_columns
-from e_TrainTransformer import load_samples
-from e_TrainTransformer import TimeSeriesTransformer
-from e_TrainTransformer import TimeSeriesTargetDataset
+from e1_TrainTransformer import load_samples
+from e1_TrainTransformer import TimeSeriesTransformer
+from e1_TrainTransformer import TimeSeriesTargetDataset
 from src.d_Resample import normalize_columns
 
 
@@ -94,20 +95,20 @@ def evaluate_naive(dataset, historic, output_columns, data_dir, output_rows=-1, 
 
     return np.array(predictions), np.array(targets)
 
-def evaluate_linear(data_dir, model_name, dataset, historic, output_columns, output_rows=-1, window_hours=6,
+def evaluate_linear(data_dir, forecast_name, dataset, historic, output_columns, output_rows=-1, window_hours=6,
                     gap_hours=5, debug_plot=False, examples=10):
     """
     Linear baseline with causal gap constraint and optional debug visualization.
 
     Now also plots the true target values (ground truth) in green for comparison.
     """
-    # Load full time series as input for simple "baseline" models
+    # Load full time series as input for simple "baseline" forecasts
     df = pd.read_csv(historic, parse_dates=["TIMESTAMP"])
     sort_df = df.sort_values("TIMESTAMP")
-    historical_df = normalize_columns(sort_df, output_columns, save=False, directory=Path(data_dir, 'examples_linear'))
+    historical_df = normalize_columns(sort_df, output_columns, save=False, directory=Path(data_dir, 'linear'))
 
     if debug_plot:
-        os.makedirs(os.path.join(data_dir, "models", model_name, "examples_linear"), exist_ok=True)
+        os.makedirs(os.path.join(data_dir, "forecasts", forecast_name, "linear"), exist_ok=True)
 
     predictions, targets = [], []
 
@@ -171,7 +172,7 @@ def evaluate_linear(data_dir, model_name, dataset, historic, output_columns, out
                         plt.ylabel(col)
                         plt.legend()
                         plt.tight_layout()
-                        plt.savefig(os.path.join(os.path.join(data_dir, "models", model_name, "examples_linear"),
+                        plt.savefig(os.path.join(os.path.join(data_dir, "forecasts", forecast_name, "linear"),
                                                  f"{filename}_{col}_debug.png"))
                         plt.close()
 
@@ -180,7 +181,7 @@ def evaluate_linear(data_dir, model_name, dataset, historic, output_columns, out
 
     return np.array(predictions), np.array(targets)
 
-def evaluate_seasonal(dataset, historic, output_columns, data_dir, model_name, output_rows=-1, diurnal_window=2,
+def evaluate_seasonal(dataset, historic, output_columns, data_dir, forecast_name, output_rows=-1, diurnal_window=2,
                       secondary=None):
     """
     Seasonal baseline using either full `historical_df` or, if available,
@@ -276,7 +277,7 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, model_name, o
 
     # === Diagnostic plot ===
     try:
-        plot_dir = os.path.join(data_dir, "models", model_name, "examples_seasonal")
+        plot_dir = os.path.join(data_dir, "forecasts", forecast_name, "seasonal")
         os.makedirs(plot_dir, exist_ok=True)
         sns.set_style("whitegrid")
 
@@ -388,13 +389,13 @@ def binarize_predictions(preds, output_columns, thresholds_df):
         binarized[:, i] = (preds[:, i] > threshold).astype(int)
     return binarized
 
-def visualizer(*pred_target_pairs, labels=None, directory, model_name, num_samples=100):
+def visualizer(*pred_target_pairs, labels=None, directory, forecast_name, num_samples=100):
     """
     Visualize predictions and targets for a range of gaps from time series.
     :param pred_target_pairs:
     :param labels:
     :param directory:
-    :param model_name:
+    :param forecast_name:
     :param num_samples:
     :return:
     """
@@ -435,7 +436,7 @@ def visualizer(*pred_target_pairs, labels=None, directory, model_name, num_sampl
     ax.set_aspect("equal", adjustable="box")
     ax.legend()
     plt.tight_layout()
-    plt.savefig(Path(directory, "models", model_name, "predictions.png"))
+    plt.savefig(Path(directory, "forecasts", forecast_name, "predictions.png"))
     plt.close(fig)
 
     # === Metrics summary figure ===
@@ -461,7 +462,7 @@ def visualizer(*pred_target_pairs, labels=None, directory, model_name, num_sampl
             a.grid(True, axis="y", linestyle="--", alpha=0.6)
         plt.suptitle("Model Performance Metrics", fontsize=14)
         plt.tight_layout(rect=[0, 0, 1, 0.95])
-        plt.savefig(Path(directory, "models", model_name, "metrics_summary.png"))
+        plt.savefig(Path(directory, "forecasts", forecast_name, "metrics_summary.png"))
         plt.close(fig)
 
     # === NEW: RMSE vs Forecast Horizon ===
@@ -493,12 +494,12 @@ def visualizer(*pred_target_pairs, labels=None, directory, model_name, num_sampl
     ax.legend()
     ax.grid(True, linestyle="--", alpha=0.6)
     plt.tight_layout()
-    plt.savefig(Path(directory, "models", model_name, "horizon_rmse.png"))
+    plt.savefig(Path(directory, "forecasts", forecast_name, "horizon_rmse.png"))
     plt.close(fig)
 
-def classification_visualizer(*pred_target_pairs, labels=None, directory='.', model_name='Classifier',
+def classification_visualizer(*pred_target_pairs, labels=None, directory='.', forecast_name='Classifier',
                               num_samples=200):
-    os.makedirs(os.path.join(directory, "models", model_name, "classification"), exist_ok=True)
+    os.makedirs(os.path.join(directory, "forecasts", forecast_name, "classification"), exist_ok=True)
     sns.set_style("whitegrid")
     metrics = []
     all_conf_matrices = []
@@ -542,7 +543,7 @@ def classification_visualizer(*pred_target_pairs, labels=None, directory='.', mo
         ax.set_ylabel("Actual")
     plt.suptitle("Confusion Matrices")
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig(Path(directory, "models", model_name, "classification", f"confusion.png"))
+    plt.savefig(Path(directory, "forecasts", forecast_name, "classification", f"confusion.png"))
     plt.close()
 
     # Combined ROC Curve Plot
@@ -555,7 +556,7 @@ def classification_visualizer(*pred_target_pairs, labels=None, directory='.', mo
     plt.ylabel("True Positive Rate")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(Path(directory, "models", model_name, "classification", f"roc.png"))
+    plt.savefig(Path(directory, "forecasts", forecast_name, "classification", f"roc.png"))
     plt.close()
 
     # Combined Precision-Recall Curve Plot
@@ -567,7 +568,7 @@ def classification_visualizer(*pred_target_pairs, labels=None, directory='.', mo
     plt.ylabel("Precision")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(Path(directory, "models", model_name, "classification", "pr.png"))
+    plt.savefig(Path(directory, "forecasts", forecast_name, "classification", "pr.png"))
     plt.close()
 
     # AUC Bar Plot
@@ -580,7 +581,7 @@ def classification_visualizer(*pred_target_pairs, labels=None, directory='.', mo
     plt.xticks(rotation=30, ha="right")
     plt.grid(True, axis="y", linestyle="--", alpha=0.6)
     plt.tight_layout()
-    plt.savefig(Path(directory, "models", model_name, "classification", "auc_scores.png"))
+    plt.savefig(Path(directory, "forecasts", forecast_name, "classification", "auc_scores.png"))
     plt.close()
 
 def apply_saved_normalize(df, param_file, min_val=0, max_val=1):
@@ -684,9 +685,9 @@ if __name__ == '__main__':
     ##################################################################################################################
     ## Load input, output and model hyperparameters from data_dir
     data_dir = "../data/output/regression/Kimtall12hr"  # Parent directory of test/train sample folder
-    model_name = "nowcast"
+    forecast_name = "nowcast"
 
-    with open(Path(data_dir, 'models', model_name, 'model_config.json'), 'r') as f:
+    with open(Path(data_dir, 'forecasts', forecast_name, 'model_config.json'), 'r') as f:
         config = json.load(f)
 
     input_columns = config["input_columns"]
@@ -696,10 +697,10 @@ if __name__ == '__main__':
 
     ## Configure simple non-ML ("baseline") model calculation methods
     historic = "../data/output/regression/Consolidated.csv"  # Path to file with baseline model input
-    gap_hours = 1  # Period before first forecast value from which input data is not used in baseline models
+    gap_hours = 1  # Period before first forecast value from which input data is not used in baseline forecasts
     window_hours = 550  # Length of period for linear regression training (min. ~530 hrs for Eurofins params)
     diurnal_window = 1  # Number of hours before/after target time to include in diurnal average for seasonality model
-    secondary, window_hours = load_secondary(output_columns, window_hours)  # Check output_columns and automatically adjust some baseline models
+    secondary, window_hours = load_secondary(output_columns, window_hours)  # Check output_columns and automatically adjust some baseline forecasts
 
     ## To retain normalized values:
     # raw_thresholds_df = pd.read_csv(Path('../data/input', "Limits.csv"), sep=';', decimal='.')
@@ -708,50 +709,69 @@ if __name__ == '__main__':
     thresholds_df = pd.read_csv(Path('../data/input', "Limits.csv"), sep=';', decimal='.')
 
     ################################################################################################################
-    ## Prepare data and models for evaluation
+    ## Prepare data for evaluation in various forecasts
+    ## Run evaluation using samples excluded from training
+    reloadset = Path(data_dir, "forecasts", forecast_name, "test_files.txt")
+    with open(reloadset) as f:
+        test_files = [line.strip() for line in f]
+    test_samples = load_samples(os.path.join(data_dir,"samples"),input_columns=input_columns,output_columns=output_columns,
+        input_rows=input_rows, output_rows=output_rows, file_list=test_files)
+    test_dataset = TimeSeriesTargetDataset(test_samples)
+
+    ## Alternative: for full-coverage plotting of sparse data, evaluate forecasts on complete sample set (train + test)
+    # samples = load_samples(os.path.join(data_dir, 'samples'), input_columns=input_columns,
+    #                        output_columns=output_columns,
+    #                        input_rows=input_rows, output_rows=output_rows)
+    # test_dataset = TimeSeriesTargetDataset(samples)
+
+    X_test = np.array([s[0].flatten() for s in test_samples])
+    y_test = np.array([s[1].flatten()[0] for s in test_samples])
+
+    ################################################################################################################
+    ## Prepare transformer model for evaluation
     model = TimeSeriesTransformer(config).to(device)
-    model.load_state_dict(torch.load(os.path.join(data_dir, "models", model_name, "transformer_model.pt"), map_location=device))
+    model.load_state_dict(torch.load(os.path.join(data_dir, "forecasts", forecast_name, "transformer",
+                                                  "transformer_model.pt"), map_location=device))
     model.eval()  # Set to evaluation mode
 
-    # ## Run evaluation using samples excluded from training
-    # reloadset = Path(data_dir, "models", model_name, "test_files.txt")
-    # with open(reloadset) as f:
-    #     test_files = [line.strip() for line in f]
-    # test_samples = load_samples(os.path.join(data_dir,"samples"),input_columns=input_columns,output_columns=output_columns,
-    #     input_rows=input_rows, output_rows=output_rows, file_list=test_files)
-    # test_dataset = TimeSeriesTargetDataset(test_samples)
-
-    ## Alternative: for full-coverage plotting of sparse data, evaluate models on complete sample set (train + test)
-    samples = load_samples(os.path.join(data_dir, 'samples'), input_columns=input_columns,
-                           output_columns=output_columns,
-                           input_rows=input_rows, output_rows=output_rows)
-    test_dataset = TimeSeriesTargetDataset(samples)
-
+    # Prepare XGBRegresssor model for evaluation
+    xgbr_model = xgb.XGBRegressor()
+    xgbr_path = Path(data_dir, "forecasts", forecast_name, "XGBRegressor", "xgboost_model.json")
+    xgbr_model.load_model(xgbr_path)
 
     ##################################################################################################################
-    ## Evaluate regression models
+    ## Evaluate regression forecasts
     model_preds, model_targets = evaluate_model(model, test_dataset)
     naive_preds, naive_targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
                                                 output_rows=output_rows, gap_hours=gap_hours)
-    linear_preds, linear_targets = evaluate_linear(data_dir, model_name, test_dataset, historic, output_columns,
+    linear_preds, linear_targets = evaluate_linear(data_dir, forecast_name, test_dataset, historic, output_columns,
                                                    output_rows=output_rows, window_hours=window_hours,
                                                    gap_hours=gap_hours,
                                                    debug_plot=True, examples=10)
 
-    seasonal_preds, seasonal_targets = evaluate_seasonal(test_dataset, historic, output_columns, data_dir, model_name,
+    seasonal_preds, seasonal_targets = evaluate_seasonal(test_dataset, historic, output_columns, data_dir, forecast_name,
                                                          output_rows=output_rows, diurnal_window=diurnal_window,
                                                          secondary=secondary)
+    xgbr_pred_flat = xgbr_model.predict(X_test)
+
+    # Compute output_dim dynamically
+    sample_df = pd.read_csv(Path(data_dir, 'samples', sorted(os.listdir(Path(data_dir, 'samples')))[0]))
+    output_dim = len(output_columns) * len(sample_df.iloc[output_rows:])
+
+    # Reshape y_pred to [num_samples, output_dim]
+    xgbr_pred = xgbr_pred_flat.reshape(-1, output_dim)
+    xgbr_target = y_test.reshape(-1, output_dim)
 
     alternatives = [(model_preds, model_targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
-                    (seasonal_preds, seasonal_targets)]
-    labels = ["Transformer", "Naive", "Linear", "Seasonal"]
+                    (seasonal_preds, seasonal_targets), (xgbr_pred, xgbr_target)]
+    labels = ["Transformer", "Naive", "Linear", "Seasonal", "XGBRegressor"]
 
     reconstituted = []
     for preds, targets in alternatives:
         preds_original = reverse_normalize(preds, output_columns, Path(data_dir, "normalized.json"))
         targets_original = reverse_normalize(targets, output_columns, Path(data_dir, "normalized.json"))
         reconstituted.append((preds_original, targets_original))
-    visualizer(*reconstituted, labels=labels, model_name=model_name, directory=data_dir, num_samples=200)
+    visualizer(*reconstituted, labels=labels, forecast_name=forecast_name, directory=data_dir, num_samples=200)
 
     ##################################################################################################################
     ## Convert regression model outputs to classes based on thresholds for each output column, and
@@ -762,7 +782,7 @@ if __name__ == '__main__':
         bin_targets = binarize_predictions(targets, output_columns=output_columns, thresholds_df=thresholds_df)
         class_results.append((bin_preds, bin_targets))
 
-    classification_visualizer(*class_results, labels=labels, directory=data_dir, model_name=model_name,
+    classification_visualizer(*class_results, labels=labels, directory=data_dir, forecast_name=forecast_name,
                               num_samples=200)
 
     ##################################################################################################################
@@ -771,9 +791,9 @@ if __name__ == '__main__':
     # labels = []
     #
     # space_name = "explore_linear"
-    # os.makedirs(os.path.join(data_dir, "models", model_name, space_name), exist_ok=True)
+    # os.makedirs(os.path.join(data_dir, "forecasts", forecast_name, "linear", space_name), exist_ok=True)
     # for value in range(1,60,1):
-    #     preds, targets = evaluate_linear(data_dir, Path(model_name, space_name, f"Window-{value}"), test_dataset, historic, output_columns,
+    #     preds, targets = evaluate_linear(data_dir, Path(forecast_name, space_name, f"Window-{value}"), test_dataset, historic, output_columns,
     #                                                output_rows=output_rows, window_hours=value,
     #                                                gap_hours=gap_hours,
     #                                                debug_plot=True, examples=3)
@@ -786,7 +806,7 @@ if __name__ == '__main__':
     # labels = []
     #
     # space_name = "explore_naive"
-    # os.makedirs(os.path.join(data_dir, "models", model_name, space_name), exist_ok=True)
+    # os.makedirs(os.path.join(data_dir, "forecasts", forecast_name, "naive", space_name), exist_ok=True)
     # for value in range(1,97,2):
     #     preds, targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
     #                                             output_rows=output_rows, gap_hours=value)
@@ -794,4 +814,4 @@ if __name__ == '__main__':
     #     labels.append(f"Window {value}h")
     #
     #
-    # visualizer(*results, labels=labels, model_name=Path(model_name, space_name), directory=data_dir, num_samples=200)
+    # visualizer(*results, labels=labels, forecast_name=Path(forecast_name, space_name), directory=data_dir, num_samples=200)

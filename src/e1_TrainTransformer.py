@@ -40,7 +40,7 @@ def load_samples(directory, input_columns, output_columns, input_rows, output_ro
     print("Samples loaded")
     return samples
 
-def train_model(directory, model, model_name, dataloader, num_epochs=100, learning_rate=1e-3, loss_threshold=1e-3):
+def train_model(directory, model, forecast_name, dataloader, num_epochs=100, learning_rate=1e-3, loss_threshold=1e-3):
 
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -78,7 +78,7 @@ def train_model(directory, model, model_name, dataloader, num_epochs=100, learni
         plt.title("Training Loss vs. Epochs (Log-Log Scale)")
         plt.grid(True, which="both", ls="--")
         plt.tight_layout()
-        plt.savefig(os.path.join(directory, "models", model_name, "loss_plot.png"))
+        plt.savefig(os.path.join(directory, "forecasts", forecast_name, "loss_plot.png"))
         plt.close()
 
 class TimeSeriesTransformer(nn.Module):
@@ -167,7 +167,6 @@ if __name__ == '__main__':
         'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
         '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '09-Koliforme bakterier 37°C',
         '07-Intestinale enterokokker', '01-Farge', '04-Turbiditet', '44-pH, surhetsgrad']
-
     data_columns = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
         'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)_x',
@@ -204,7 +203,7 @@ if __name__ == '__main__':
         'Average humidity (% relative humidity)'
                      ]  # Default: all different-dimensioned profiler and weather params, no SCADA
     output_columns = ['08-Kimtall 22°C']
-    model_name = "nowcast"
+    forecast_name = "nowcast"
     output_rows = -1  # Default: -1 (increase value to increase forecast length, but decrease input_row_2 accordingly)
     input_row_1 = 0  # Default: 0
     input_row_2 = 11  # Default: len(sample) - abs(output_rows)
@@ -245,9 +244,8 @@ if __name__ == '__main__':
         'output_rows' : output_rows,
     }
 
-    # Write model configuration dictionary to file
-    os.makedirs(os.path.join(data_dir, "models", model_name), exist_ok=True)
-    with open(Path(data_dir, 'models', model_name, 'model_config.json'), 'w') as f:
+    # Write model configuration dictionary to file so it can be re-run and re-used for other model types
+    with open(Path(data_dir, 'forecasts', forecast_name, 'model_config.json'), 'w') as f:
         json.dump(config, f)
 
     ##################################################################################################################
@@ -256,10 +254,10 @@ if __name__ == '__main__':
                                           input_rows=input_rows, output_rows=output_rows)
     all_filenames = sorted([f for f in os.listdir(os.path.join(data_dir,'samples')) if f.endswith(".csv")])
     train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=random_state)
-    file1 = Path(data_dir, "models", model_name, "train_files.txt")
+    file1 = Path(data_dir, "forecasts", forecast_name, "train_files.txt")
     with open(file1, "w") as f:
         f.writelines(f"{s[2]}\n" for s in train_samples)
-    file2 = Path(data_dir, "models", model_name, "test_files.txt")
+    file2 = Path(data_dir, "forecasts", forecast_name, "test_files.txt")
     with open(file2, "w") as f:
         f.writelines(f"{s[2]}\n" for s in test_samples)
 
@@ -271,5 +269,6 @@ if __name__ == '__main__':
     #                               dropout=dropout, output_dim=output_dim, seq_len=seq_len).to(device)
     model = TimeSeriesTransformer(config).to(device)
 
-    train_model(data_dir, model, model_name, dataloader, num_epochs, learning_rate, loss_threshold)
-    torch.save(model.state_dict(), Path(data_dir, "models", model_name, "transformer_model.pt"))
+    train_model(data_dir, model, forecast_name, dataloader, num_epochs, learning_rate, loss_threshold)
+    os.makedirs(os.path.join(data_dir, "forecasts", forecast_name, "transformer"), exist_ok=True)
+    torch.save(model.state_dict(), Path(data_dir, "forecasts", forecast_name, "transformer", "transformer_model.pt"))
