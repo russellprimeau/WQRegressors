@@ -31,7 +31,7 @@ def correct(sensor_df, summary_dir):
 
         # Iterate over each calibration time
         for calibration_time in calibration_df["Calibration End Time"]:
-            # Filter for timestamps within 12 hours before and after
+            # Filter for timestamps within x hours before and after
             time_window_start = calibration_time - timedelta(hours=24)
             time_window_end = calibration_time + timedelta(hours=24)
 
@@ -84,7 +84,7 @@ def correct(sensor_df, summary_dir):
 
 if __name__ == '__main__':
     # Load the sensor data
-    sensor_df = pd.read_csv("../data/output/regression/Combined_Cleaned.csv", parse_dates=["TIMESTAMP"])
+    sensor_df = pd.read_csv("../data/output/regression/Consolidated.csv", parse_dates=["TIMESTAMP"])
     sensor_df = sensor_df.sort_values("TIMESTAMP")
 
     # Point to the directory with the calibration log summary tables

@@ -4,9 +4,11 @@ Combines datasets from the profiler, weather station, SCADA system and Eurofins 
 Small gaps (below a specified threshold, default of 6 hours) are filled by linear interpolation.
 When there is a gap in any one column, either all rows can be dropped, or "NaN" can be retained for that column.
 """
+import os
 
 import pandas as pd
 import numpy as np
+from pathlib import Path
 
 
 def clean_profiler(full_df, max_gap=6):
@@ -80,7 +82,7 @@ def clean_profiler(full_df, max_gap=6):
     df[sensor_columns] = df[sensor_columns].round(2)
     return df
 
-def add_source(df, secondary_df, include_NAs=False, max_gap=6):
+def add_source(df, secondary_df, include_NAs=False, max_gap=6, binarize=False):
     # Rename 'Time' in secondary_df to match 'TIMESTAMP' in primary_df
     secondary_df.rename(columns={"Time": "TIMESTAMP"}, inplace=True)
     # === MERGE ON TIMESTAMP ===
@@ -95,6 +97,10 @@ def add_source(df, secondary_df, include_NAs=False, max_gap=6):
 
     # Convert to numeric where possible
     merged_df[new_columns] = merged_df[new_columns].apply(pd.to_numeric, errors='coerce')
+
+    if binarize:
+        thresholds_df = pd.read_csv(Path('../data/input', "Limits.csv"), sep=';', decimal='.')
+        merged_df = binarize_dataframe(merged_df, output_columns=new_columns, thresholds_df=thresholds_df)
 
     # Create a mask where all new columns are NaN
     missing_mask = merged_df[new_columns].isna().all(axis=1)
@@ -124,10 +130,25 @@ def add_source(df, secondary_df, include_NAs=False, max_gap=6):
     # Drop rows
     if not include_NAs:
         merged_df.drop(index=rows_to_drop, inplace=True)
-        # Interpolate remaining missing values in new columns
+        # Interpolate remaining missing values in new_columns
         merged_df[new_columns] = merged_df[new_columns].interpolate(method="linear", limit=max_gap, limit_direction="both")
 
     return merged_df
+
+def binarize_dataframe(df, output_columns, thresholds_df):
+    """
+    Convert values in specified columns of a DataFrame to binary (0 or 1)
+    based on thresholds provided in a single-row thresholds_df.
+    NaN values are preserved.
+    """
+    binary_df = df.copy()
+    for col in output_columns:
+        if col not in thresholds_df.columns:
+            raise ValueError(f"Threshold for column '{col}' not found in thresholds_df.")
+        threshold = thresholds_df.iloc[0][col]
+        # Apply threshold only to non-NaN values
+        binary_df[col] = binary_df[col].where(binary_df[col].isna(), (binary_df[col] > threshold).astype(int))
+    return binary_df
 
 def decompose_direction(df, column_name):
     """
@@ -211,9 +232,13 @@ if __name__ == '__main__':
     decomp2_df = decompose_direction(decomp_df, "Hourly average wind direction (°)")
 
     merge2_df = add_source(decomp2_df, scada_df, include_NAs=True, max_gap=6)
-    merge3_df = add_source(merge2_df, eurofins_df, include_NAs=True, max_gap=6)
+    merge3_df = add_source(merge2_df, eurofins_df, include_NAs=True, max_gap=6, binarize=True)
 
     segmented_df = count_segs(merge3_df)  # Add column with index for continuous segments
 
     # Save the cleaned and merged dataset
-    segmented_df.to_csv("../data/output/regression/Combined_Cleaned.csv", index=False)
+    output_dir = "../data/output/classification"
+    filename = "Consolidated_binarized.csv"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    segmented_df.to_csv(Path(output_dir, filename), index=False)

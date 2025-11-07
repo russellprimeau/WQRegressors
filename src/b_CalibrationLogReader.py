@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import os
 import re
 from collections import defaultdict
+from pathlib import Path
 
 
 def sanitize_filename(name):
@@ -22,53 +23,106 @@ def sanitize_filename(name):
     """
     return re.sub(r'[\\/*?:"<>|]', "_", name)
 
+# def parse_calibration_file(filepath):
+#     """
+#     Parse a single calibration log file
+#     :param filepath:
+#     :return:
+#     """
+#     with open(filepath, 'r', encoding='latin-1') as f:
+#         content = f.read()
+#
+#     # Remove header lines like 'KorEXO Calibration File Export'
+#     lines = content.strip().splitlines()
+#     lines = [line for line in lines if not line.strip().startswith("KorEXO Calibration File Export")]
+#     content = "\n".join(lines)
+#
+#     chapters = content.split("----------")
+#     for chapter in chapters:
+#         paragraphs = [p.strip() for p in chapter.strip().split('\n\n') if p.strip()]
+#         if not paragraphs:
+#             continue
+#
+#         # Extract metadata from the first paragraph
+#         metadata_lines = paragraphs[0].split('\n')
+#         metadata = {}
+#         for line in metadata_lines:
+#             if '=,' in line:
+#                 key, value = map(str.strip, line.split('=,', 1))
+#                 metadata[key] = value
+#
+#         # Extract data from subsequent paragraphs
+#         data_entry = metadata.copy()
+#         field_counts = defaultdict(int)
+#         for para in paragraphs[1:]:
+#             lines = para.strip().split('\n')
+#             for line in lines[1:]:  # Skip first line (e.g., [Cal Point 1])
+#                 if '=,' in line:
+#                     key, value = map(str.strip, line.split('=,', 1))
+#                     field_counts[key] += 1
+#                     if field_counts[key] == 1 and key not in data_entry:
+#                         data_entry[key] = value
+#                     else:
+#                         data_entry[f"{key} {field_counts[key]}"] = value
+#
+#             # Determine chapter name
+#             chapter_name = metadata.get("Parameter Type", "Unknown")
+#             chapter_dataframes[chapter_name].append(data_entry)
 
-def parse_calibration_file(filepath):
-    """
-    Parse a single calibration log file
-    :param filepath:
-    :return:
-    """
-    with open(filepath, 'r', encoding='latin-1') as f:
-        content = f.read()
+def parse_calibration_files(directory):
+    chapter_dataframes = defaultdict(list)
 
-    # Remove header lines like 'KorEXO Calibration File Export'
-    lines = content.strip().splitlines()
-    lines = [line for line in lines if not line.strip().startswith("KorEXO Calibration File Export")]
-    content = "\n".join(lines)
+    for filename in os.listdir(directory):
+        if filename.endswith(".csv"):
+            filepath = os.path.join(directory, filename)
+            with open(filepath, 'r', encoding='latin-1') as f:
+                content = f.read()
 
-    chapters = content.split("----------")
-    for chapter in chapters:
-        paragraphs = [p.strip() for p in chapter.strip().split('\n\n') if p.strip()]
-        if not paragraphs:
-            continue
+            # Remove header lines like 'KorEXO Calibration File Export'
+            lines = content.strip().splitlines()
+            lines = [line for line in lines if not line.strip().startswith("KorEXO Calibration File Export")]
+            content = "\n".join(lines)
 
-        # Extract metadata from the first paragraph
-        metadata_lines = paragraphs[0].split('\n')
-        metadata = {}
-        for line in metadata_lines:
-            if '=,' in line:
-                key, value = map(str.strip, line.split('=,', 1))
-                metadata[key] = value
+            # Split into chapters using '----------'
+            chapters = content.split("----------")
 
-        # Extract data from subsequent paragraphs
-        data_entry = metadata.copy()
-        field_counts = defaultdict(int)
-        for para in paragraphs[1:]:
-            lines = para.strip().split('\n')
-            for line in lines[1:]:  # Skip first line (e.g., [Cal Point 1])
-                if '=,' in line:
-                    key, value = map(str.strip, line.split('=,', 1))
-                    field_counts[key] += 1
-                    if field_counts[key] == 1 and key not in data_entry:
-                        data_entry[key] = value
-                    else:
-                        data_entry[f"{key} {field_counts[key]}"] = value
+            for chapter in chapters:
+                paragraphs = [p.strip() for p in chapter.strip().split('\n\n') if p.strip()]
+                if not paragraphs:
+                    continue
 
-        # Determine chapter name
-        chapter_name = metadata.get("Parameter Type", "Unknown")
-        chapter_dataframes[chapter_name].append(data_entry)
+                # Extract metadata from the first paragraph
+                metadata_lines = paragraphs[0].splitlines()
+                metadata = {}
+                for line in metadata_lines:
+                    if '=,' in line:
+                        key, value = map(str.strip, line.split('=,', 1))
+                        metadata[key] = value
 
+                # Extract chapter name
+                chapter_name = metadata.get("Parameter Type", "Unknown")
+                print(f"Creating chapter '{chapter_name}' from file: {filename}")
+
+                # Extract data paragraphs
+                for para in paragraphs[1:]:
+                    lines = para.strip().splitlines()
+                    data_entry = metadata.copy()
+                    field_counter = defaultdict(int)
+                    for line in lines[1:]:  # Skip first line (e.g., [Cal Point 1])
+                        if '=,' in line:
+                            key, value = map(str.strip, line.split('=,', 1))
+                            field_counter[key] += 1
+                            if field_counter[key] == 1:
+                                data_entry[key] = value
+                            else:
+                                data_entry[f"{key} {field_counter[key]}"] = value
+                    chapter_dataframes[chapter_name].append(data_entry)
+
+    # Convert lists of dicts to DataFrames
+    for chapter in chapter_dataframes:
+        chapter_dataframes[chapter] = pd.DataFrame(chapter_dataframes[chapter])
+
+    return chapter_dataframes
 
 def summarize(relative_dir):
     """
@@ -81,13 +135,26 @@ def summarize(relative_dir):
     # Dictionary to hold dataframes grouped by Parameter Type
     chapter_dataframes = defaultdict(list)
 
-    # Parse all CSV files in the directory
-    for file in csv_files:
-        parse_calibration_file(os.path.join(relative_dir, file))
+
+
+    # Example usage
+    # directory = "."  # Current directory
+    chapter_dfs = parse_calibration_files(relative_dir)
+
+    # # Display the chapter names and first few rows of each DataFrame
+    # for chapter, df in chapter_dfs.items():
+    #     print(f"\nChapter: {chapter}")
+    #     print(df.head())
+    #
+
+
+    # # Parse all CSV files in the directory
+    # for file in csv_files:
+    #     parse_calibration_files(Path(relative_dir, file))
 
     # Convert lists of dicts to DataFrames and process datetime columns
     final_dataframes = {}
-    for chapter, entries in chapter_dataframes.items():
+    for chapter, entries in chapter_dfs.items():
         df = pd.DataFrame(entries)
 
         for col in ['Calibration End Time', 'Last Calibration Time']:
@@ -120,7 +187,9 @@ def summarize(relative_dir):
         # print(df.columns)
         # print(df.head(20))
 
-        output_dir = '../data/output/calibration/summaries'
+        output_dir = '../data/output/calibration/summaries2'
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
         sanitized_name = sanitize_filename(chapter)
         filename = os.path.join(output_dir, f"{sanitized_name}.csv")
         df.to_csv(filename, index=False)
@@ -169,5 +238,5 @@ def summarize(relative_dir):
 
 if __name__ == '__main__':
     # Define the relative path to the directory containing CSV files
-    relative_dir = '../data/input/sensors/calibrationlogs'
+    relative_dir = '../data/input/calibrationlogs'
     summarize(relative_dir)

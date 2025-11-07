@@ -15,47 +15,12 @@ import torch
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score, accuracy_score, precision_score,
                              recall_score, f1_score, confusion_matrix, roc_curve, precision_recall_curve, auc)
-# from d_Resample import normalize_columns
+from d_Resample import normalize_columns
 from e_TrainTransformer import load_samples
 from e_TrainTransformer import TimeSeriesTransformer
 from e_TrainTransformer import TimeSeriesTargetDataset
 from src.d_Resample import normalize_columns
 
-def normalize_columns(df, columns, min=0, max=1, save=False, directory="../data/output/regression"):
-    """
-    Normalize specified columns in a DataFrame to a given range and save original min/max values.
-
-    Parameters:
-    - df: pandas.DataFrame
-    - columns: list of column names to normalize
-    - min: minimum value of target range
-    - max: maximum value of target range
-    - save_path: path to save normalization parameters
-
-    Returns:
-    - A copy of the DataFrame with normalized columns.
-    """
-    df_normalized = df.copy()
-    min_val, max_val = min, max
-    normalization_params = {}
-
-    for col in columns:
-        col_min = df[col].min()
-        col_max = df[col].max()
-        normalization_params[col] = {"min": col_min, "max": col_max}
-        if col_max != col_min:
-            df_normalized[col] = ((df[col] - col_min) / (col_max - col_min)) * (max_val - min_val) + min_val
-        else:
-            df_normalized[col] = (min_val + max_val) / 2
-
-    # Save normalization parameters to file if selected:
-    if save:
-        file = Path(directory, "normalized.csv")
-        file.parent.mkdir(parents=True, exist_ok=True)
-        with open(file, "w") as f:
-            json.dump(normalization_params, f)
-
-    return df_normalized
 
 def evaluate_model(model, dataset):
     model.eval()
@@ -129,9 +94,8 @@ def evaluate_naive(dataset, historic, output_columns, data_dir, output_rows=-1, 
 
     return np.array(predictions), np.array(targets)
 
-def evaluate_linear(data_dir, model_name, dataset, historic, output_columns,
-                    output_rows=-1, window_hours=6, gap_hours=5,
-                    debug_plot=False, examples=10):
+def evaluate_linear(data_dir, model_name, dataset, historic, output_columns, output_rows=-1, window_hours=6,
+                    gap_hours=5, debug_plot=False, examples=10):
     """
     Linear baseline with causal gap constraint and optional debug visualization.
 
@@ -216,8 +180,8 @@ def evaluate_linear(data_dir, model_name, dataset, historic, output_columns,
 
     return np.array(predictions), np.array(targets)
 
-def evaluate_seasonal(dataset, historic, output_columns, data_dir, model_name,
-                      output_rows=-1, diurnal_window=2, secondary=None):
+def evaluate_seasonal(dataset, historic, output_columns, data_dir, model_name, output_rows=-1, diurnal_window=2,
+                      secondary=None):
     """
     Seasonal baseline using either full `historical_df` or, if available,
     a secondary CSV file for specific output columns.
@@ -406,30 +370,23 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, model_name,
 
     return predictions, targets
 
-def binarize_predictions(preds, targets, output_columns, thresholds_df):
+def binarize_predictions(preds, output_columns, thresholds_df):
     """
     Convert regression outputs to binary classification based on column-wise thresholds.
     """
     preds = np.array(preds)
-    targets = np.array(targets)
-
     # Ensure shape is (n_samples, n_outputs)
     if preds.ndim == 1:
         preds = preds.reshape(-1, len(output_columns))
-    if targets.ndim == 1:
-        targets = targets.reshape(-1, len(output_columns))
 
-    binary_preds = np.zeros_like(preds, dtype=int)
-    binary_targets = np.zeros_like(targets, dtype=int)
+    binarized = np.zeros_like(preds, dtype=int)
 
     for i, col in enumerate(output_columns):
         if col not in thresholds_df.columns:
             raise ValueError(f"Threshold for column '{col}' not found in thresholds_df.")
         threshold = thresholds_df[col].iloc[0]
-        binary_preds[:, i] = (preds[:, i] > threshold).astype(int)
-        binary_targets[:, i] = (targets[:, i] > threshold).astype(int)
-
-    return binary_preds, binary_targets
+        binarized[:, i] = (preds[:, i] > threshold).astype(int)
+    return binarized
 
 def visualizer(*pred_target_pairs, labels=None, directory, model_name, num_samples=100):
     """
@@ -539,7 +496,8 @@ def visualizer(*pred_target_pairs, labels=None, directory, model_name, num_sampl
     plt.savefig(Path(directory, "models", model_name, "horizon_rmse.png"))
     plt.close(fig)
 
-def classification_visualizer(*pred_target_pairs, labels=None, directory='.', model_name='Classifier', num_samples=200):
+def classification_visualizer(*pred_target_pairs, labels=None, directory='.', model_name='Classifier',
+                              num_samples=200):
     os.makedirs(os.path.join(directory, "models", model_name, "classification"), exist_ok=True)
     sns.set_style("whitegrid")
     metrics = []
@@ -625,37 +583,58 @@ def classification_visualizer(*pred_target_pairs, labels=None, directory='.', mo
     plt.savefig(Path(directory, "models", model_name, "classification", "auc_scores.png"))
     plt.close()
 
-# def reverse_normalize_columns(df, columns, min=0, max=1, directory="../data/output/regression"):
-#     """
-#     Reverse normalization of specified columns using saved parameters.
-#
-#     Parameters:
-#     - df: pandas.DataFrame
-#     - columns: list of column names to reverse normalize
-#     - min: minimum value of target range used during normalization
-#     - max: maximum value of target range used during normalization
-#     - param_path: path to load normalization parameters
-#
-#     Returns:
-#     - A copy of the DataFrame with columns restored to original scale.
-#     """
-#     df_restored = df.copy()
-#     min_val, max_val = min, max
-#
-#     # Load normalization parameters from file
-#     with open(Path(directory,"models", model_name, "normalization_params.json"), "r") as f:
-#         normalization_params = json.load(f)
-#
-#     for col in columns:
-#         if col in normalization_params:
-#             col_min = normalization_params[col]["min"]
-#             col_max = normalization_params[col]["max"]
-#             if col_max != col_min:
-#                 df_restored[col] = ((df[col] - min_val) / (max_val - min_val)) * (col_max - col_min) + col_min
-#             else:
-#                 df_restored[col] = col_min  # All values were the same originally
-#
-#     return df_restored
+def apply_saved_normalize(df, param_file, min_val=0, max_val=1):
+    """
+    Normalize columns in df using saved min/max values from param_file.
+
+    Parameters:
+    - df: pandas DataFrame with columns to normalize
+    - param_file: path to JSON file with saved normalization parameters
+    - min_val, max_val: range used during original normalization
+
+    Returns:
+    - df_normalized: DataFrame with normalized values
+    """
+    df_normalized = df.copy()
+    with open(param_file, 'r') as f:
+        normalization_params = json.load(f)
+
+    for col in df.columns:
+        if col in normalization_params:
+            col_min = normalization_params[col]["min"]
+            col_max = normalization_params[col]["max"]
+            if col_max != col_min:
+                df_normalized[col] = ((df[col] - col_min) / (col_max - col_min)) * (max_val - min_val) + min_val
+            else:
+                df_normalized[col] = (min_val + max_val) / 2
+    return df_normalized
+
+def reverse_normalize(array, output_columns, param_file, min_val=0, max_val=1):
+    """
+    Reverse normalization on a NumPy array using saved parameters.
+
+    Parameters:
+    - array: NumPy array of shape (n_samples, n_outputs)
+    - output_columns: list of column names corresponding to array columns
+    - param_file: path to JSON file with saved normalization parameters
+    - min_val, max_val: range used during original normalization
+
+    Returns:
+    - array_restored: NumPy array with values in original scale
+    """
+    with open(param_file, 'r') as f:
+        normalization_params = json.load(f)
+
+    array_restored = np.copy(array)
+    for i, col in enumerate(output_columns):
+        if col in normalization_params:
+            col_min = normalization_params[col]["min"]
+            col_max = normalization_params[col]["max"]
+            if col_max != col_min:
+                array_restored[:, i] = ((array[:, i] - min_val) / (max_val - min_val)) * (col_max - col_min) + col_min
+            else:
+                array_restored[:, i] = col_min  # All values were the same originally
+    return array_restored
 
 def load_secondary(output_columns, window_hours=3):
     """
@@ -663,8 +642,9 @@ def load_secondary(output_columns, window_hours=3):
     If Eurofins (very low sample rate) is output, set linear model window long enough to include multiple samples
     """
 
-    Eurofin_columns = ['06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
-        '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
+    Eurofin_columns = ['06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly', '32-Kadmium', '36-Kopper filtrert',
+                       '37-Krom', '41-Nikkel', 'Sink (Zn)', '09-Koliforme bakterier 37°C',
+                       '07-Intestinale enterokokker', '01-Farge', '04-Turbiditet', '44-pH, surhetsgrad']
     SCADA_columns = ['SCADA - pH', 'SCADA - Temperature (°C)',]
     FullHourly_columns = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)']
@@ -697,15 +677,13 @@ def load_secondary(output_columns, window_hours=3):
 if __name__ == '__main__':
     ## Configure execution space
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # device = "cpu"
     print(f"Using device: {device}")
 
     matplotlib.use('Agg')  # Non-interactive backend for file output to handle remote machine installation errors
 
     ##################################################################################################################
     ## Load input, output and model hyperparameters from data_dir
-
-    data_dir = "../data/output/regression/EColi24hr"  # Parent directory of test/train sample folder
+    data_dir = "../data/output/regression/Kimtall12hr"  # Parent directory of test/train sample folder
     model_name = "nowcast"
 
     with open(Path(data_dir, 'models', model_name, 'model_config.json'), 'r') as f:
@@ -717,11 +695,17 @@ if __name__ == '__main__':
     output_rows = config["output_rows"]
 
     ## Configure simple non-ML ("baseline") model calculation methods
-    historic = "../data/output/regression/Combined_Cleaned.csv"  # Path to file with baseline model input
+    historic = "../data/output/regression/Consolidated.csv"  # Path to file with baseline model input
     gap_hours = 1  # Period before first forecast value from which input data is not used in baseline models
     window_hours = 550  # Length of period for linear regression training (min. ~530 hrs for Eurofins params)
     diurnal_window = 1  # Number of hours before/after target time to include in diurnal average for seasonality model
     secondary, window_hours = load_secondary(output_columns, window_hours)  # Check output_columns and automatically adjust some baseline models
+
+    ## To retain normalized values:
+    # raw_thresholds_df = pd.read_csv(Path('../data/input', "Limits.csv"), sep=';', decimal='.')
+    # thresholds_df = apply_saved_normalize(raw_thresholds_df, param_file=Path(data_dir, "normalized.json"))
+    ## If working in real (not normalized) values:
+    thresholds_df = pd.read_csv(Path('../data/input', "Limits.csv"), sep=';', decimal='.')
 
     ################################################################################################################
     ## Prepare data and models for evaluation
@@ -729,25 +713,24 @@ if __name__ == '__main__':
     model.load_state_dict(torch.load(os.path.join(data_dir, "models", model_name, "transformer_model.pt"), map_location=device))
     model.eval()  # Set to evaluation mode
 
-    ## Run evaluation using samples excluded from training
-    reloadset = Path(data_dir, "models", model_name, "test_files.txt")
-    with open(reloadset) as f:
-        test_files = [line.strip() for line in f]
-    test_samples = load_samples(os.path.join(data_dir,"samples"),input_columns=input_columns,output_columns=output_columns,
-        input_rows=input_rows, output_rows=output_rows, file_list=test_files)
-    test_dataset = TimeSeriesTargetDataset(test_samples)
+    # ## Run evaluation using samples excluded from training
+    # reloadset = Path(data_dir, "models", model_name, "test_files.txt")
+    # with open(reloadset) as f:
+    #     test_files = [line.strip() for line in f]
+    # test_samples = load_samples(os.path.join(data_dir,"samples"),input_columns=input_columns,output_columns=output_columns,
+    #     input_rows=input_rows, output_rows=output_rows, file_list=test_files)
+    # test_dataset = TimeSeriesTargetDataset(test_samples)
 
-    # ## Alternative: for full-coverage plotting of sparse data, evaluate models on complete sample set (train + test)
-    # samples = load_samples(os.path.join(data_dir, 'samples'), input_columns=input_columns,
-    #                        output_columns=output_columns,
-    #                        input_rows=input_rows, output_rows=output_rows)
-    # test_dataset = TimeSeriesTargetDataset(samples)
+    ## Alternative: for full-coverage plotting of sparse data, evaluate models on complete sample set (train + test)
+    samples = load_samples(os.path.join(data_dir, 'samples'), input_columns=input_columns,
+                           output_columns=output_columns,
+                           input_rows=input_rows, output_rows=output_rows)
+    test_dataset = TimeSeriesTargetDataset(samples)
 
 
     ##################################################################################################################
     ## Evaluate regression models
-
-    model_preds, targets = evaluate_model(model, test_dataset)
+    model_preds, model_targets = evaluate_model(model, test_dataset)
     naive_preds, naive_targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
                                                 output_rows=output_rows, gap_hours=gap_hours)
     linear_preds, linear_targets = evaluate_linear(data_dir, model_name, test_dataset, historic, output_columns,
@@ -759,32 +742,31 @@ if __name__ == '__main__':
                                                          output_rows=output_rows, diurnal_window=diurnal_window,
                                                          secondary=secondary)
 
-    alternatives = [(model_preds, targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
+    alternatives = [(model_preds, model_targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
                     (seasonal_preds, seasonal_targets)]
     labels = ["Transformer", "Naive", "Linear", "Seasonal"]
 
-    visualizer(*alternatives, labels=labels, model_name=model_name, directory=data_dir, num_samples=200)
-
+    reconstituted = []
+    for preds, targets in alternatives:
+        preds_original = reverse_normalize(preds, output_columns, Path(data_dir, "normalized.json"))
+        targets_original = reverse_normalize(targets, output_columns, Path(data_dir, "normalized.json"))
+        reconstituted.append((preds_original, targets_original))
+    visualizer(*reconstituted, labels=labels, model_name=model_name, directory=data_dir, num_samples=200)
 
     ##################################################################################################################
-    ## Convert model predictions from regression to classification based on limit values
-
-    raw_thresholds_df = pd.read_csv(Path('../data/input', "Limits.csv"), sep=';', decimal='.')
-    thresholds_df = normalize_columns()
-
+    ## Convert regression model outputs to classes based on thresholds for each output column, and
+    # evaluate success of regressors on classification problem
     class_results = []
-    for alternative in alternatives:
-        preds, targets = binarize_predictions(alternative[0], alternative[1], output_columns=output_columns,
-                                              thresholds_df=thresholds_df)
-        class_results.append((preds, targets))
+    for preds, targets in reconstituted:
+        bin_preds = binarize_predictions(preds, output_columns=output_columns, thresholds_df=thresholds_df)
+        bin_targets = binarize_predictions(targets, output_columns=output_columns, thresholds_df=thresholds_df)
+        class_results.append((bin_preds, bin_targets))
 
     classification_visualizer(*class_results, labels=labels, directory=data_dir, model_name=model_name,
                               num_samples=200)
 
-
     ##################################################################################################################
     ## Explore linear model parameter space
-    #
     # results = []
     # labels = []
     #
@@ -800,7 +782,6 @@ if __name__ == '__main__':
 
     ##################################################################################################################
     ## Explore naive model parameter space
-    #
     # results = []
     # labels = []
     #

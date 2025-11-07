@@ -165,7 +165,8 @@ if __name__ == '__main__':
         'Shortwave (solar) radiation (W/m2)', 'Precipitation (mm/hr)', 'Instantaneous temperature (°C)',
         'Maximum temperature (°C)', 'Minimum temperature (°C)', 'Average humidity (% relative humidity)',
         'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
-        '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
+        '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '09-Koliforme bakterier 37°C',
+        '07-Intestinale enterokokker', '01-Farge', '04-Turbiditet', '44-pH, surhetsgrad']
 
     data_columns = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
@@ -179,11 +180,12 @@ if __name__ == '__main__':
         'Longwave (IR) radiation (W/m2)', 'Instantaneous sea-level atmospheric pressure (mBar)',
         'Shortwave (solar) radiation (W/m2)', 'Precipitation (mm/hr)', 'Instantaneous temperature (°C)',
         'Maximum temperature (°C)', 'Minimum temperature (°C)', 'Average humidity (% relative humidity)',
-        'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
-        '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
+        'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly', '32-Kadmium',
+        '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '09-Koliforme bakterier 37°C',
+        '07-Intestinale enterokokker', '01-Farge', '04-Turbiditet', '44-pH, surhetsgrad']
 
-    data_dir = "../data/output/regression/SCADATemp168hr"  # Parent directory of test/train sample folder
-    historic = "../data/output/regression/Combined_Cleaned.csv"  # Path to file with baseline model input
+    data_dir = "../data/output/regression/Kimtall12hr"  # Parent directory of test/train sample folder
+    historic = "../data/output/regression/Consolidated.csv"  # Path to file with baseline model input
     input_columns = ['Pfl - Temp (C)',
         'Pfl - Sp Cond (microS_cm)',
         'Pfl - pH',
@@ -201,23 +203,23 @@ if __name__ == '__main__':
         'Instantaneous temperature (°C)',
         'Average humidity (% relative humidity)'
                      ]  # Default: all different-dimensioned profiler and weather params, no SCADA
-    output_columns = ['SCADA - Temperature (°C)']
-    model_name = "24hr_fore"
-    output_rows = -24  # Default: -1 (increase value to increase forecast length, but decrease input_row_2 accordingly)
+    output_columns = ['08-Kimtall 22°C']
+    model_name = "nowcast"
+    output_rows = -1  # Default: -1 (increase value to increase forecast length, but decrease input_row_2 accordingly)
     input_row_1 = 0  # Default: 0
-    input_row_2 = 143  # Default: len(sample) - abs(output_rows)
+    input_row_2 = 11  # Default: len(sample) - abs(output_rows)
 
     # Model hyperparameters
-    model_dim = 256  # Model size
+    model_dim = 128  # Model size
     num_heads = 4  # Parallel attention heads
     num_layers = 8  # Depth of NN
     dropout = 0.1  # % neurons to randomly remove each epoch to prevent overfitting (regularization)
 
     # Training hyperparameters
     random_state = 35  # Random seed which deterministically sets the test/train split
-    test_size = 0.15  # Fraction of samples saved for evaluation after training
+    test_size = 0.2  # Fraction of samples saved for evaluation after training
     batch_size = 1  # Minibatch size. Smaller batches -> noisier, but escapes local minima quicker
-    num_epochs = 100  # Training duration (excessive epochs can cause overfitting to training data)
+    num_epochs = 12  # Training duration (excessive epochs can cause overfitting to training data)
     loss_threshold = 0.000001  # Threshold of acceptably small loss to terminate training early
     learning_rate = 1e-4  # Limit on parameter adjustment size per epoch
 
