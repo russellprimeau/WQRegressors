@@ -5,16 +5,14 @@ Small gaps (below a specified threshold, default of 6 hours) are filled by linea
 When there is a gap in any one column, either all rows can be dropped, or "NaN" can be retained for that column.
 """
 import os
-
-import pandas as pd
 import numpy as np
+import pandas as pd
 from pathlib import Path
 
 
 def clean_profiler(full_df, max_gap=6):
     """
     Clean profiler hourly surface data. Fill small gaps by interpolation.
-    :param df: dataframe of profiler hourly surface data
     :return:
     """
     full_df["Interpolated"] = 0

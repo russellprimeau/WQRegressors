@@ -3,6 +3,7 @@ Apply a linear correction to each of the sensor columns based on the observed er
 '''
 
 import os
+import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -28,8 +29,10 @@ def correct(sensor_df, summary_dir):
         before_values = []
         after_values = []
         differences = []
+        between_counts = []
 
         # Iterate over each calibration time
+        previous_time = None
         for calibration_time in calibration_df["Calibration End Time"]:
             # Filter for timestamps within x hours before and after
             time_window_start = calibration_time - timedelta(hours=24)
@@ -41,40 +44,72 @@ def correct(sensor_df, summary_dir):
             after = sensor_df[(sensor_df["TIMESTAMP"] > calibration_time) &
                               (sensor_df["TIMESTAMP"] <= time_window_end)]
 
-            # Check if both before and after exist
-            if not before.empty and not after.empty:
-                before_val = before.iloc[-1][profiler_var]
-                after_val = after.iloc[0][profiler_var]
-                diff = after_val - before_val
-            else:
-                before_val = after_val = diff = None  # or np.nan
+            # # Check if both before and after exist
+            # if not before.empty and not after.empty:
+            #     before_val = before.iloc[-1][profiler_var]
+            #     after_val = after.iloc[0][profiler_var]
+            #     diff = abs(after_val - before_val)
+            # else:
+            #     before_val = after_val = diff = None  # or np.nan
 
+            # Count rows between previous and current calibration_time
+            if previous_time is not None:
+                between_rows = sensor_df[
+                    (sensor_df["TIMESTAMP"] > previous_time) &
+                    (sensor_df["TIMESTAMP"] <= calibration_time)
+                    ]
+                if len(between_rows) < 13:
+                    before_val = after_val = diff = np.nan
+                else:
+                    if not before.empty and not after.empty:
+                        before_val = before.iloc[-1][profiler_var]
+                        after_val = after.iloc[0][profiler_var]
+                        diff = abs(after_val - before_val)
+                    else:
+                        before_val = after_val = diff = np.nan
+            else:
+                between_count = 0
+                before_val = after_val = diff = np.nan
+
+            previous_time = calibration_time
             before_values.append(before_val)
             after_values.append(after_val)
             differences.append(diff)
+            between_counts.append(between_count)
 
         # Add new columns to the summary dataframe
         calibration_df["Before Value"] = before_values
         calibration_df["After Value"] = after_values
         calibration_df["Difference"] = differences
-        keepers = ["Last Calibration Time","Calibration Start Time","Calibration End Time","Calibration Status","Standard","Pre Calibration Value","Post Calibration Value","Raw Value","Temperature","Timespan","Correction1","Before Value","After Value","Difference"]
+        calibration_df["Between Count"] = between_counts
+        keepers = ["Last Calibration Time","Calibration Start Time","Calibration End Time","Calibration Status",
+                   "Standard","Pre Calibration Value","Post Calibration Value","Raw Value","Temperature","Timespan",
+                   "Correction1","Before Value","After Value","Difference", "Between Count"]
+
         calibration_df = calibration_df[keepers]
-        calibration_df.to_csv(f"../data/calibrationlogs/corrections/{param}.csv", index=False)
+        calibration_df.to_csv(f"../data/output/calibration/corrections/{param}.csv", index=False)
+
         calibration_df["Span"] = calibration_df["Calibration Start Time"] - calibration_df["Last Calibration Time"]
 
         plt.figure(figsize=(10, 6))
-        sns.scatterplot(x="Span", y="Difference", data=calibration_df, label=profiler_var)
+        ax = sns.scatterplot(x="Span", y="Difference", data=calibration_df, label=profiler_var)
+        ax.grid()
+
+        # for i, row in calibration_df.iterrows():
+        #     ax.annotate(f"{row['Calibration End Time'].strftime('%Y-%m-%d %H:%M')}\nCount: {row['Points']}",
+        #                 row["Span"], row["Difference"])
+
 
         plt.title("")
         plt.xlabel("Timespan")
         plt.ylabel(f"Error, {profiler_var}")
         # plt.xscale('log')
         # plt.yscale('log')
-        plt.grid()
         plt.legend()
         plt.tight_layout()
         plt.xticks(rotation=45)  # Rotate x-axis labels by 45 degrees
         plt.show()
+
 
         # calibration_df = calibration_df["Calibration End Time", "Last Calibration Time", "Before Value", "After Value", "Difference"]
         # calibration_df = calibration_df["Calibration End Time"]
