@@ -51,7 +51,8 @@ def gapless(df, target_columns, name="length_v_count_analysis"):
     plt.figure(figsize=(12, 8))
     for col in target_columns:
         lengths, counts = zip(*results[col])
-        plt.plot(lengths, counts, label=col)
+        plt.plot(lengths, counts, '--', label=col)
+        print(col, max(counts))
 
     plt.xlabel("Segment Length")
     plt.ylabel("Number of Valid Segments")
@@ -180,17 +181,17 @@ if __name__ == '__main__':
     matplotlib.use('Agg')  # Non-interactive backend for file output to handle remote machine installation errors
     ## Load sensor data
     ## For binary classification (of Eurofins parameters):
-    df = pd.read_csv("../data/output/classification/Consolidated_binarized.csv",
+    df = pd.read_csv("../data/output/regression/Consolidated.csv",
                      parse_dates=["TIMESTAMP"])
     ## For regression (of any parameters:
     # df = pd.read_csv("../data/output/regression/Consolidated.csv",parse_dates=["TIMESTAMP"])
     df = df.sort_values("TIMESTAMP")
 
     ## Identify prediction target columns. Output will only include samples with valid value in last row.
-    target_columns = ['06-E.coli']
-    # target_columns = ['06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly', '32-Kadmium',
-    #     '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '09-Koliforme bakterier 37°C',
-    #     '07-Intestinale enterokokker']  # alternative 1: name-based selection
+    # target_columns = ['06-E.coli']
+    target_columns = ['06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly', '32-Kadmium',
+        '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '09-Koliforme bakterier 37°C',
+        '07-Intestinale enterokokker', '01-Farge', '04-Turbiditet', '44-pH, surhetsgrad']  # alternative 1: name-based selection
     # target_columns = df.columns[-9:]  # alternative 2: index-based selection
 
     ## To analyze the impact of sample dimensions on the # of available samples:
@@ -220,5 +221,5 @@ if __name__ == '__main__':
         'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly', '32-Kadmium',
         '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '09-Koliforme bakterier 37°C',
         '07-Intestinale enterokokker', '01-Farge', '04-Turbiditet', '44-pH, surhetsgrad']
-    split(df, output_dir, target_columns, length, to_normalize, 0)
+    # split(df, output_dir, target_columns, length, to_normalize, 0)
 #

@@ -684,10 +684,12 @@ if __name__ == '__main__':
 
     ##################################################################################################################
     ## Load input, output and model hyperparameters from data_dir
-    data_dir = "../data/output/regression/Kimtall12hr"  # Parent directory of test/train sample folder
+    # data_dir = "../data/output/regression/Kimtall12hr"  # Parent directory of test/train sample folder
+    data_dir = "../data/output/classification/Ecoli24hr"
     forecast_name = "nowcast"
+    model_name = "xgbclassifier"
 
-    with open(Path(data_dir, 'forecasts', forecast_name, 'model_config.json'), 'r') as f:
+    with open(Path(data_dir, 'forecasts', forecast_name, model_name, 'model_config.json'), 'r') as f:
         config = json.load(f)
 
     input_columns = config["input_columns"]
@@ -728,62 +730,62 @@ if __name__ == '__main__':
     y_test = np.array([s[1].flatten()[0] for s in test_samples])
 
     ################################################################################################################
-    ## Prepare transformer model for evaluation
-    model = TimeSeriesTransformer(config).to(device)
-    model.load_state_dict(torch.load(os.path.join(data_dir, "forecasts", forecast_name, "transformer",
-                                                  "transformer_model.pt"), map_location=device))
-    model.eval()  # Set to evaluation mode
-
-    # Prepare XGBRegresssor model for evaluation
-    xgbr_model = xgb.XGBRegressor()
-    xgbr_path = Path(data_dir, "forecasts", forecast_name, "XGBRegressor", "xgboost_model.json")
-    xgbr_model.load_model(xgbr_path)
+    # ## Prepare transformer model for evaluation
+    # model = TimeSeriesTransformer(config).to(device)
+    # model.load_state_dict(torch.load(os.path.join(data_dir, "forecasts", forecast_name, "transformer",
+    #                                               "transformer_model.pt"), map_location=device))
+    # model.eval()  # Set to evaluation mode
+    #
+    # # Prepare XGBRegresssor model for evaluation
+    # xgbr_model = xgb.XGBRegressor()
+    # xgbr_path = Path(data_dir, "forecasts", forecast_name, "XGBRegressor", "xgboost_model.json")
+    # xgbr_model.load_model(xgbr_path)
 
     ##################################################################################################################
     ## Evaluate regression forecasts
-    model_preds, model_targets = evaluate_model(model, test_dataset)
-    naive_preds, naive_targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
-                                                output_rows=output_rows, gap_hours=gap_hours)
-    linear_preds, linear_targets = evaluate_linear(data_dir, forecast_name, test_dataset, historic, output_columns,
-                                                   output_rows=output_rows, window_hours=window_hours,
-                                                   gap_hours=gap_hours,
-                                                   debug_plot=True, examples=10)
-
-    seasonal_preds, seasonal_targets = evaluate_seasonal(test_dataset, historic, output_columns, data_dir, forecast_name,
-                                                         output_rows=output_rows, diurnal_window=diurnal_window,
-                                                         secondary=secondary)
-    xgbr_pred_flat = xgbr_model.predict(X_test)
-
-    # Compute output_dim dynamically
-    sample_df = pd.read_csv(Path(data_dir, 'samples', sorted(os.listdir(Path(data_dir, 'samples')))[0]))
-    output_dim = len(output_columns) * len(sample_df.iloc[output_rows:])
-
-    # Reshape y_pred to [num_samples, output_dim]
-    xgbr_pred = xgbr_pred_flat.reshape(-1, output_dim)
-    xgbr_target = y_test.reshape(-1, output_dim)
-
-    alternatives = [(model_preds, model_targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
-                    (seasonal_preds, seasonal_targets), (xgbr_pred, xgbr_target)]
-    labels = ["Transformer", "Naive", "Linear", "Seasonal", "XGBRegressor"]
-
-    reconstituted = []
-    for preds, targets in alternatives:
-        preds_original = reverse_normalize(preds, output_columns, Path(data_dir, "normalized.json"))
-        targets_original = reverse_normalize(targets, output_columns, Path(data_dir, "normalized.json"))
-        reconstituted.append((preds_original, targets_original))
-    visualizer(*reconstituted, labels=labels, forecast_name=forecast_name, directory=data_dir, num_samples=200)
+    # model_preds, model_targets = evaluate_model(model, test_dataset)
+    # naive_preds, naive_targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
+    #                                             output_rows=output_rows, gap_hours=gap_hours)
+    # linear_preds, linear_targets = evaluate_linear(data_dir, forecast_name, test_dataset, historic, output_columns,
+    #                                                output_rows=output_rows, window_hours=window_hours,
+    #                                                gap_hours=gap_hours,
+    #                                                debug_plot=True, examples=10)
+    #
+    # seasonal_preds, seasonal_targets = evaluate_seasonal(test_dataset, historic, output_columns, data_dir, forecast_name,
+    #                                                      output_rows=output_rows, diurnal_window=diurnal_window,
+    #                                                      secondary=secondary)
+    # xgbr_pred_flat = xgbr_model.predict(X_test)
+    #
+    # # Compute output_dim dynamically
+    # sample_df = pd.read_csv(Path(data_dir, 'samples', sorted(os.listdir(Path(data_dir, 'samples')))[0]))
+    # output_dim = len(output_columns) * len(sample_df.iloc[output_rows:])
+    #
+    # # Reshape y_pred to [num_samples, output_dim]
+    # xgbr_pred = xgbr_pred_flat.reshape(-1, output_dim)
+    # xgbr_target = y_test.reshape(-1, output_dim)
+    #
+    # alternatives = [(model_preds, model_targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
+    #                 (seasonal_preds, seasonal_targets), (xgbr_pred, xgbr_target)]
+    # labels = ["Transformer", "Naive", "Linear", "Seasonal", "XGBRegressor"]
+    #
+    # reconstituted = []
+    # for preds, targets in alternatives:
+    #     preds_original = reverse_normalize(preds, output_columns, Path(data_dir, "normalized.json"))
+    #     targets_original = reverse_normalize(targets, output_columns, Path(data_dir, "normalized.json"))
+    #     reconstituted.append((preds_original, targets_original))
+    # visualizer(*reconstituted, labels=labels, forecast_name=forecast_name, directory=data_dir, num_samples=200)
 
     ##################################################################################################################
     ## Convert regression model outputs to classes based on thresholds for each output column, and
     # evaluate success of regressors on classification problem
-    class_results = []
-    for preds, targets in reconstituted:
-        bin_preds = binarize_predictions(preds, output_columns=output_columns, thresholds_df=thresholds_df)
-        bin_targets = binarize_predictions(targets, output_columns=output_columns, thresholds_df=thresholds_df)
-        class_results.append((bin_preds, bin_targets))
+    # class_results = []
+    # for preds, targets in reconstituted:
+    #     bin_preds = binarize_predictions(preds, output_columns=output_columns, thresholds_df=thresholds_df)
+    #     bin_targets = binarize_predictions(targets, output_columns=output_columns, thresholds_df=thresholds_df)
+    #     class_results.append((bin_preds, bin_targets))
 
-    classification_visualizer(*class_results, labels=labels, directory=data_dir, forecast_name=forecast_name,
-                              num_samples=200)
+    # classification_visualizer(*class_results, labels=labels, directory=data_dir, forecast_name=forecast_name,
+    #                           num_samples=200)
 
     ##################################################################################################################
     ## Explore linear model parameter space
@@ -815,3 +817,23 @@ if __name__ == '__main__':
     #
     #
     # visualizer(*results, labels=labels, forecast_name=Path(forecast_name, space_name), directory=data_dir, num_samples=200)
+
+
+    ## Prepare XGBClassifier model for evaluation
+    xgbc_model = xgb.XGBClassifier()
+    xgbc_path = Path(data_dir, "forecasts", forecast_name, "xgbclassifier", "xgboost_model.json")
+    xgbc_model.load_model(xgbc_path)
+
+    xgbc_pred_flat = xgbc_model.predict(X_test)
+
+    # Compute output_dim dynamically
+    sample_df = pd.read_csv(Path(data_dir, 'samples', sorted(os.listdir(Path(data_dir, 'samples')))[0]))
+    output_dim = len(output_columns) * len(sample_df.iloc[output_rows:])
+
+    ## Reshape y_pred to [num_samples, output_dim]
+    xgbc_pred = xgbc_pred_flat.reshape(-1, output_dim)
+    xgbc_target = y_test.reshape(-1, output_dim)
+    labels = ['XGBClassifier']
+
+    classification_visualizer((xgbc_pred, xgbc_target), labels=labels, directory=data_dir, forecast_name=forecast_name,
+                              num_samples=200)
