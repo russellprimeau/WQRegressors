@@ -230,13 +230,21 @@ if __name__ == '__main__':
     decomp2_df = decompose_direction(decomp_df, "Hourly average wind direction (°)")
 
     merge2_df = add_source(decomp2_df, scada_df, include_NAs=True, max_gap=6)
-    merge3_df = add_source(merge2_df, eurofins_df, include_NAs=True, max_gap=6, binarize=True)
+    merge3_df = add_source(merge2_df, eurofins_df, include_NAs=True, max_gap=6, binarize=False)
+    # merge3_df = add_source(merge2_df, eurofins_df, include_NAs=True, max_gap=6, binarize=True)
 
     segmented_df = count_segs(merge3_df)  # Add column with index for continuous segments
 
-    # Save the cleaned and merged dataset
-    output_dir = "../data/output/classification"
-    filename = "Consolidated_binarized.csv"
+    ## Save the cleaned and merged dataset
+    # For regression (with optional post-process classification)
+    output_dir = "../data/output/regression"
+    filename = "Consolidated.csv"
+
+    # For classification only:
+    # output_dir = "../data/output/classification"
+    # filename = "Consolidated_binarized.csv"
+
+
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     segmented_df.to_csv(Path(output_dir, filename), index=False)

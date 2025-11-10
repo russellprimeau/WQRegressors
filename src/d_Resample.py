@@ -187,11 +187,14 @@ if __name__ == '__main__':
     df = df.sort_values("TIMESTAMP")
 
     ## Identify prediction target columns. Output will only include samples with valid value in last row.
-    target_columns = ['06-E.coli']  # alternative 1: name-based selection
+    target_columns = ['06-E.coli']
+    # target_columns = ['06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly', '32-Kadmium',
+    #     '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '09-Koliforme bakterier 37°C',
+    #     '07-Intestinale enterokokker']  # alternative 1: name-based selection
     # target_columns = df.columns[-9:]  # alternative 2: index-based selection
 
     ## To analyze the impact of sample dimensions on the # of available samples:
-    # gapless(df, target_columns, name="Eurofins_availability")  # Analysis function #1
+    gapless(df, target_columns, name="Eurofins_availability")  # Analysis function #1
     # seg_length = 24  # fixed segment length for evaluating range of lengths of gap betweeen input and output
     # gapped(df, target_columns, seg_length)  # Analysis function #2
 
@@ -218,3 +221,4 @@ if __name__ == '__main__':
         '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '09-Koliforme bakterier 37°C',
         '07-Intestinale enterokokker', '01-Farge', '04-Turbiditet', '44-pH, surhetsgrad']
     split(df, output_dir, target_columns, length, to_normalize, 0)
+#

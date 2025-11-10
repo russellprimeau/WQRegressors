@@ -102,7 +102,7 @@ def correct(sensor_df, summary_dir):
 
         plt.title("")
         plt.xlabel("Timespan")
-        plt.ylabel(f"Error, {profiler_var}")
+        plt.ylabel(f"Absolute Error, {profiler_var}")
         # plt.xscale('log')
         # plt.yscale('log')
         plt.legend()
