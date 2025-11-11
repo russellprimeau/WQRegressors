@@ -5,9 +5,13 @@ Small gaps (below a specified threshold, default of 6 hours) are filled by linea
 When there is a gap in any one column, either all rows can be dropped, or "NaN" can be retained for that column.
 """
 import os
+import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import dash
+from dash import dcc, html, Output, Input, State
+import plotly.graph_objects as go
 
 
 def clean_profiler(full_df, max_gap=6):
@@ -146,6 +150,7 @@ def binarize_dataframe(df, output_columns, thresholds_df):
         threshold = thresholds_df.iloc[0][col]
         # Apply threshold only to non-NaN values
         binary_df[col] = binary_df[col].where(binary_df[col].isna(), (binary_df[col] > threshold).astype(int))
+    binary_df["anomaly"] = binary_df[output_columns].bool(axis=1)
     return binary_df
 
 def decompose_direction(df, column_name):
@@ -187,11 +192,215 @@ def count_segs(df):
     df = df[cols]  # Reorder the DataFrame
     return df
 
+def normalize_columns(df, columns, min=0, max=1, save=False, directory="../data/output/regression"):
+    """
+    Normalize specified columns in a DataFrame to a given range and save original min/max values.
+
+    Parameters:
+    - df: pandas.DataFrame
+    - columns: list of column names to normalize
+    - min: minimum value of target range
+    - max: maximum value of target range
+    - save_path: path to save normalization parameters
+
+    Returns:
+    - A copy of the DataFrame with normalized columns.
+    """
+    df_normalized = df.copy()
+    min_val, max_val = min, max
+    normalization_params = {}
+    for col in columns:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            col_min = df[col].min()
+            col_max = df[col].max()
+            normalization_params[col] = {"min": col_min, "max": col_max}
+            if col_max != col_min:
+                df_normalized[col] = ((df[col] - col_min) / (col_max - col_min)) * (max_val - min_val) + min_val
+            else:
+                df_normalized[col] = (min_val + max_val) / 2
+
+    # Save normalization parameters to file if selected:
+    if save:
+        file = Path(directory, "normalized.json")
+        file.parent.mkdir(parents=True, exist_ok=True)
+        with open(file, "w") as f:
+            json.dump(normalization_params, f)
+
+    return df_normalized
+
+def explore_data(full, *raw):
+    app = dash.Dash(__name__)
+    fig = go.Figure()
+    app.layout = html.Div([
+        html.H3("Toggle Data Sources"),
+        dcc.RadioItems(
+            id='source-select',
+            options=[
+                {'label': 'Cleaned', 'value': 'Cleaned'},
+                {'label': 'Original Sources', 'value': 'Original Sources'},
+            ],
+            value='Cleaned',
+            inline=True
+        ),
+        dcc.RadioItems(
+            id='normalize',
+            options=[
+                {'label': 'Normalized on (0,1)', 'value': 'Normalized'},
+                {'label': 'Original Units', 'value': 'Original Values'},
+            ],
+            value='Normalized',
+            inline=True
+        ),
+
+        dcc.RadioItems(
+            id='plot-mode',
+            options=[
+                {'label': 'Continuous Time', 'value': 'continuous'},
+                {'label': 'Seasonality', 'value': 'seasonality'}
+            ],
+            value='continuous',
+            inline=True
+        ),
+        html.Button('Toggle All Traces', id='toggle-btn', n_clicks=0),
+        dcc.Graph(id='timeseries-plot', figure=fig, style={'height': '90vh', 'width': '100%'})
+    ],
+        style={'height': '100vh', 'width': '100%', 'padding': '10px', 'box-sizing': 'border-box'})
+
+    @app.callback(
+        Output('timeseries-plot', 'figure'),
+        [Input('source-select', 'value'),
+        Input('normalize', 'value'),
+        Input('toggle-btn', 'n_clicks'),
+         Input('plot-mode', 'value')],
+        State('timeseries-plot', 'figure')
+    )
+
+    def update_plot(source_key, normalize_key, n_clicks, mode, current_fig):
+        ctx = dash.callback_context
+        triggered = ctx.triggered[0]['prop_id'].split('.')[0]
+
+        if triggered == 'toggle-btn':
+            # Toggle visibility only
+            fig = go.Figure(current_fig)
+            all_visible = all(trace.visible == True for trace in fig.data)
+            for trace in fig.data:
+                trace.visible = 'legendonly' if all_visible else True
+            return fig
+
+        to_normalize = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
+                        'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
+                        'Pfl - fDOM (QSU)',
+                        'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)_x',
+                        'Wind direction 10minRollingAvg (°)_y',
+                        'Hourly average wind direction (°)_x', 'Hourly average wind direction (°)_y',
+                        'Average wind speed (m/s)',
+                        'Maximum sustained wind speed, 3-second span (m/s)', 'Time of maximum 3s Gust',
+                        'Maximum sustained wind speed, 10-minute span (m/s)', 'Time of maximum 10 minute gust',
+                        'Hourly average atmospheric pressure at station (mBar)',
+                        'Maximum pressure differential, 3-hour span (mBar)',
+                        'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)',
+                        'Longwave (IR) radiation (W/m2)', 'Instantaneous sea-level atmospheric pressure (mBar)',
+                        'Shortwave (solar) radiation (W/m2)', 'Precipitation (mm/hr)',
+                        'Instantaneous temperature (°C)',
+                        'Maximum temperature (°C)', 'Minimum temperature (°C)',
+                        'Average humidity (% relative humidity)',
+                        'SCADA - pH', 'SCADA - Temperature (°C)', '01-Farge', '04-Turbiditet', '06-E.coli',
+                        '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
+                        '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)',
+                        '44-pH, surhetsgrad']
+        # Convert dict to go.Figure
+        fig = go.Figure()
+
+        if source_key == 'Cleaned':
+            if normalize_key == 'Normalized':
+                full_df = normalize_columns(full, to_normalize)
+                title = "Cleaned, Normalized Dataset (for models)"
+            else:
+                full_df = full
+                title = "Cleaned Dataset (for models)"
+            dfs = [full_df]
+        else:
+            dfs = []
+            if normalize_key == 'Normalized':
+                for df in raw:
+                    dfs.append(normalize_columns(df, to_normalize))
+                title = "Original Datasets, Normalized"
+            else:
+                dfs = raw
+                title = "Original Datasets, Original Values"
+
+        # Dash patterns for years
+        dash_styles = ['solid', 'dash', 'dot', 'dashdot']
+
+        # Add traces
+        if mode == 'continuous':
+            for df in dfs:
+                for col in df.columns:
+                    if col not in ["TIMESTAMP", "TIME", "Interpolated", "Segment"]:
+                        fig.add_trace(go.Scatter(x=df["TIMESTAMP"], y=df[col], mode="lines", name=col, connectgaps=True))
+        else:
+            for df in dfs:
+                # Extract years and months
+                df['year'] = df['TIMESTAMP'].dt.year
+                df['time'] = (df['TIMESTAMP'].dt.dayofyear - 1) * 24 + df['TIMESTAMP'].dt.hour
+                for col in df.columns:
+                    if col not in ["TIMESTAMP", "TIME", "Interpolated", "Segment", "year", "time"]:
+                        for i, year in enumerate(sorted(df['year'].unique())):
+                            subset = df[df['year'] == year]
+                            fig.add_trace(go.Scatter(
+                                x=subset['time'], y=subset[col],mode='lines',name=f"{col} ({year})",
+                                line=dict(dash=dash_styles[i % len(dash_styles)]))
+                            )
+
+                fig.update_xaxes(title='Month', tickmode='array', tickvals=list(range(1, 8760, 720)),
+                                 ticktext=['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov',
+                                           'Dec'])
+
+        fig.update_layout(title=title, xaxis_title="TIMESTAMP", yaxis_title="Value")
+
+        # Toggle logic
+        if n_clicks > 0:
+            all_visible = all(trace.visible == True for trace in fig.data)
+            for trace in fig.data:
+                trace.visible = 'legendonly' if all_visible else True
+
+        return fig
+
+    app.run(debug=True)
+
 
 if __name__ == '__main__':
     # Load data files
     df = pd.read_csv("../data/input/sensors/FullHourly.csv")  # Profiler data
     weather_df = pd.read_csv("../data/input/sensors/Weather.csv", sep=";", decimal=",", parse_dates=["Time"])
+    weather_columns = {"1818_time: AA[mBar]": "Instantaneous atmospheric pressure (mBar)",
+                       "1818_time: DD Retning[°]": "Wind direction 10minRollingAvg (°)",
+                       "1818_time: DX_l[°]": "Hourly average wind direction (°)",
+                       "1818_time: FF Hastighet[m/s]": "Average wind speed (m/s)",
+                       "1818_time: FG_l[m/s]": "Maximum sustained wind speed, 3-second span (m/s)",
+                       "1818_time: FG_tid_l[N/A]": "Time of maximum 3s Gust",
+                       "1818_time: FX Kast[m/s]": "Maximum sustained wind speed, 10-minute span (m/s)",
+                       "1818_time: FX_tid_l[N/A]": "Time of maximum 10 minute gust",
+                       "1818_time: PO Trykk stasjonshøyde[mBar]":
+                           "Hourly average atmospheric pressure at station (mBar)",
+                       "1818_time: PP[mBar]": "Maximum pressure differential, 3-hour span (mBar)",
+                       "1818_time: PR Trykk redusert til havnivå[mBar]":
+                           "Instantaneous atmospheric pressure compensated for temperature, humidity and station "
+                           "elevation (mBar)",
+                       "1818_time: QLI Langbølget[W/m2]": "Longwave (IR) radiation (W/m2)",
+                       "1818_time: QNH[mBar]": "Instantaneous sea-level atmospheric pressure (mBar)",
+                       "1818_time: QSI Kortbølget[W/m2]": "Shortwave (solar) radiation (W/m2)",
+                       "1818_time: RR_1[mm]": "Precipitation (mm/hr)",
+                       "1818_time: TA Middel[°C]": "Instantaneous temperature (°C)",
+                       "1818_time: TA_a_Max[°C]": "Maximum temperature (°C)",
+                       "1818_time: TA_a_Min[°C]": "Minimum temperature (°C)",
+                       "1818_time: UU Luftfuktighet[%RH]": "Average humidity (% relative humidity)"
+                       }
+    weather_df.rename(columns=weather_columns, inplace=True)
+    decomp_df = decompose_direction(weather_df, "Wind direction 10minRollingAvg (°)")
+    decomp2_df = decompose_direction(decomp_df, "Hourly average wind direction (°)")
+
     scada_df = pd.read_csv("../data/input/sensors/SCADA.csv", sep=";", decimal=".", parse_dates=["Time"])
     eurofins_df = pd.read_csv("../data/input/sensors/Eurofins.csv", sep=";", decimal=",", parse_dates=["Time"])
 
@@ -199,37 +408,8 @@ if __name__ == '__main__':
     clean_df = clean_profiler(df, max_gap=6)
 
     # Merge data from other sources into the dataset.
-    merge1_df = add_source(clean_df, weather_df, include_NAs=False, max_gap=6)
-
-    weather_columns = {"1818_time: AA[mBar]": "Instantaneous atmospheric pressure (mBar)",
-                    "1818_time: DD Retning[°]": "Wind direction 10minRollingAvg (°)",
-                    "1818_time: DX_l[°]": "Hourly average wind direction (°)",
-                    "1818_time: FF Hastighet[m/s]": "Average wind speed (m/s)",
-                    "1818_time: FG_l[m/s]": "Maximum sustained wind speed, 3-second span (m/s)",
-                    "1818_time: FG_tid_l[N/A]": "Time of maximum 3s Gust",
-                    "1818_time: FX Kast[m/s]": "Maximum sustained wind speed, 10-minute span (m/s)",
-                    "1818_time: FX_tid_l[N/A]": "Time of maximum 10 minute gust",
-                    "1818_time: PO Trykk stasjonshøyde[mBar]":
-                        "Hourly average atmospheric pressure at station (mBar)",
-                    "1818_time: PP[mBar]": "Maximum pressure differential, 3-hour span (mBar)",
-                    "1818_time: PR Trykk redusert til havnivå[mBar]":
-                        "Instantaneous atmospheric pressure compensated for temperature, humidity and station "
-                        "elevation (mBar)",
-                    "1818_time: QLI Langbølget[W/m2]": "Longwave (IR) radiation (W/m2)",
-                    "1818_time: QNH[mBar]": "Instantaneous sea-level atmospheric pressure (mBar)",
-                    "1818_time: QSI Kortbølget[W/m2]": "Shortwave (solar) radiation (W/m2)",
-                    "1818_time: RR_1[mm]": "Precipitation (mm/hr)",
-                    "1818_time: TA Middel[°C]": "Instantaneous temperature (°C)",
-                    "1818_time: TA_a_Max[°C]": "Maximum temperature (°C)",
-                    "1818_time: TA_a_Min[°C]": "Minimum temperature (°C)",
-                    "1818_time: UU Luftfuktighet[%RH]": "Average humidity (% relative humidity)"
-                    }
-    merge1_df.rename(columns=weather_columns, inplace=True)
-
-    decomp_df = decompose_direction(merge1_df, "Wind direction 10minRollingAvg (°)")
-    decomp2_df = decompose_direction(decomp_df, "Hourly average wind direction (°)")
-
-    merge2_df = add_source(decomp2_df, scada_df, include_NAs=True, max_gap=6)
+    merge1_df = add_source(clean_df, decomp2_df, include_NAs=False, max_gap=6)
+    merge2_df = add_source(merge1_df, scada_df, include_NAs=True, max_gap=6)
     merge3_df = add_source(merge2_df, eurofins_df, include_NAs=True, max_gap=6, binarize=False)
     # merge3_df = add_source(merge2_df, eurofins_df, include_NAs=True, max_gap=6, binarize=True)
 
@@ -244,7 +424,8 @@ if __name__ == '__main__':
     # output_dir = "../data/output/classification"
     # filename = "Consolidated_binarized.csv"
 
-
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    segmented_df.to_csv(Path(output_dir, filename), index=False)
+    # segmented_df.to_csv(Path(output_dir, filename), index=False)
+
+    explore_data(merge3_df, clean_df, decomp2_df, scada_df, eurofins_df)

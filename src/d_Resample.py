@@ -11,7 +11,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import plotly.express as px
 from pathlib import Path
-
+from a_CleanCombine import normalize_columns
 
 def clean_directory(directory_path):
     """
@@ -103,46 +103,10 @@ def gapped(df, target_columns, seg_length, name="length_v_count_analysis"):
                   title=f"Effect of Gap on Valid Segments", markers=True)
     fig.write_image(os.path.join("../data/output/regression/availability", name + ".png"))
 
-def normalize_columns(df, columns, min=0, max=1, save=False, directory="../data/output/regression"):
-    """
-    Normalize specified columns in a DataFrame to a given range and save original min/max values.
-
-    Parameters:
-    - df: pandas.DataFrame
-    - columns: list of column names to normalize
-    - min: minimum value of target range
-    - max: maximum value of target range
-    - save_path: path to save normalization parameters
-
-    Returns:
-    - A copy of the DataFrame with normalized columns.
-    """
-    df_normalized = df.copy()
-    min_val, max_val = min, max
-    normalization_params = {}
-
-    for col in columns:
-        col_min = df[col].min()
-        col_max = df[col].max()
-        normalization_params[col] = {"min": col_min, "max": col_max}
-        if col_max != col_min:
-            df_normalized[col] = ((df[col] - col_min) / (col_max - col_min)) * (max_val - min_val) + min_val
-        else:
-            df_normalized[col] = (min_val + max_val) / 2
-
-    # Save normalization parameters to file if selected:
-    if save:
-        file = Path(directory, "normalized.json")
-        file.parent.mkdir(parents=True, exist_ok=True)
-        with open(file, "w") as f:
-            json.dump(normalization_params, f)
-
-    return df_normalized
-
-def split(df, output_dir, target_columns=['06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly', '32-Kadmium',
-                                          '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)',
-                                          '09-Koliforme bakterier 37°C', '07-Intestinale enterokokker', '01-Farge',
-                                          '04-Turbiditet', '44-pH, surhetsgrad'],
+def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.coli',
+                        '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
+                        '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)',
+                        '44-pH, surhetsgrad'],
           length=1, to_normalize=[], offset=0):
     """
     Break up a dataset which contains gaps into many files of standard size, which do not contain gaps
@@ -189,9 +153,10 @@ if __name__ == '__main__':
 
     ## Identify prediction target columns. Output will only include samples with valid value in last row.
     # target_columns = ['06-E.coli']
-    target_columns = ['06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly', '32-Kadmium',
-        '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '09-Koliforme bakterier 37°C',
-        '07-Intestinale enterokokker', '01-Farge', '04-Turbiditet', '44-pH, surhetsgrad']  # alternative 1: name-based selection
+    target_columns = ['01-Farge', '04-Turbiditet', '06-E.coli',
+                        '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
+                        '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)',
+                        '44-pH, surhetsgrad']  # alternative 1: name-based selection
     # target_columns = df.columns[-9:]  # alternative 2: index-based selection
 
     ## To analyze the impact of sample dimensions on the # of available samples:
@@ -218,8 +183,8 @@ if __name__ == '__main__':
         'Longwave (IR) radiation (W/m2)', 'Instantaneous sea-level atmospheric pressure (mBar)',
         'Shortwave (solar) radiation (W/m2)', 'Precipitation (mm/hr)', 'Instantaneous temperature (°C)',
         'Maximum temperature (°C)', 'Minimum temperature (°C)', 'Average humidity (% relative humidity)',
-        'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly', '32-Kadmium',
-        '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '09-Koliforme bakterier 37°C',
-        '07-Intestinale enterokokker', '01-Farge', '04-Turbiditet', '44-pH, surhetsgrad']
+        'SCADA - pH', 'SCADA - Temperature (°C)', '01-Farge', '04-Turbiditet', '06-E.coli',
+        '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
+        '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '44-pH, surhetsgrad']
     # split(df, output_dir, target_columns, length, to_normalize, 0)
 #

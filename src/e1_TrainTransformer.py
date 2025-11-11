@@ -164,9 +164,9 @@ if __name__ == '__main__':
         'Longwave (IR) radiation (W/m2)', 'Instantaneous sea-level atmospheric pressure (mBar)',
         'Shortwave (solar) radiation (W/m2)', 'Precipitation (mm/hr)', 'Instantaneous temperature (°C)',
         'Maximum temperature (°C)', 'Minimum temperature (°C)', 'Average humidity (% relative humidity)',
-        'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly',
-        '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '09-Koliforme bakterier 37°C',
-        '07-Intestinale enterokokker', '01-Farge', '04-Turbiditet', '44-pH, surhetsgrad']
+        'SCADA - pH', 'SCADA - Temperature (°C)', '01-Farge', '04-Turbiditet', '06-E.coli',
+        '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen', '24-Bly',
+        '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '44-pH, surhetsgrad']
     data_columns = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
         'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)_x',
@@ -179,9 +179,9 @@ if __name__ == '__main__':
         'Longwave (IR) radiation (W/m2)', 'Instantaneous sea-level atmospheric pressure (mBar)',
         'Shortwave (solar) radiation (W/m2)', 'Precipitation (mm/hr)', 'Instantaneous temperature (°C)',
         'Maximum temperature (°C)', 'Minimum temperature (°C)', 'Average humidity (% relative humidity)',
-        'SCADA - pH', 'SCADA - Temperature (°C)', '06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly', '32-Kadmium',
-        '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '09-Koliforme bakterier 37°C',
-        '07-Intestinale enterokokker', '01-Farge', '04-Turbiditet', '44-pH, surhetsgrad']
+        'SCADA - pH', 'SCADA - Temperature (°C)', '01-Farge', '04-Turbiditet', '06-E.coli',
+        '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen', '24-Bly',
+        '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '44-pH, surhetsgrad']
 
     data_dir = "../data/output/regression/Kimtall12hr"  # Parent directory of test/train sample folder
     historic = "../data/output/regression/Consolidated.csv"  # Path to file with baseline model input

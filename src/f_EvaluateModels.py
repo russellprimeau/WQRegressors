@@ -16,7 +16,7 @@ import xgboost as xgb
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score, accuracy_score, precision_score,
                              recall_score, f1_score, confusion_matrix, roc_curve, precision_recall_curve, auc)
-from d_Resample import normalize_columns
+from a_CleanCombine import normalize_columns
 from e1_TrainTransformer import load_samples
 from e1_TrainTransformer import TimeSeriesTransformer
 from e1_TrainTransformer import TimeSeriesTargetDataset
@@ -643,9 +643,10 @@ def load_secondary(output_columns, window_hours=3):
     If Eurofins (very low sample rate) is output, set linear model window long enough to include multiple samples
     """
 
-    Eurofin_columns = ['06-E.coli', '08-Kimtall 22°C', '21-Arsen', '24-Bly', '32-Kadmium', '36-Kopper filtrert',
-                       '37-Krom', '41-Nikkel', 'Sink (Zn)', '09-Koliforme bakterier 37°C',
-                       '07-Intestinale enterokokker', '01-Farge', '04-Turbiditet', '44-pH, surhetsgrad']
+    Eurofin_columns = ['01-Farge', '04-Turbiditet', '06-E.coli',
+                        '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
+                        '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)',
+                        '44-pH, surhetsgrad']
     SCADA_columns = ['SCADA - pH', 'SCADA - Temperature (°C)',]
     FullHourly_columns = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)']
