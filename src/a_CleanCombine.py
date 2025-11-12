@@ -252,7 +252,6 @@ def explore_data(full, *raw):
             value='Normalized',
             inline=True
         ),
-
         dcc.RadioItems(
             id='plot-mode',
             options=[
@@ -260,6 +259,15 @@ def explore_data(full, *raw):
                 {'label': 'Seasonality', 'value': 'seasonality'}
             ],
             value='continuous',
+            inline=True
+        ),
+        dcc.RadioItems(
+            id='thresholds',
+            options=[
+                {'label': 'Hide limit values', 'value': 'off'},
+                {'label': 'Show limit values', 'value': 'on'}
+            ],
+            value='off',
             inline=True
         ),
         html.Button('Toggle All Traces', id='toggle-btn', n_clicks=0),
@@ -272,11 +280,13 @@ def explore_data(full, *raw):
         [Input('source-select', 'value'),
         Input('normalize', 'value'),
         Input('toggle-btn', 'n_clicks'),
-         Input('plot-mode', 'value')],
+         Input('plot-mode', 'value'),
+         Input('thresholds', 'value')],
         State('timeseries-plot', 'figure')
     )
 
-    def update_plot(source_key, normalize_key, n_clicks, mode, current_fig):
+    def update_plot(source_key, normalize_key, n_clicks, mode, thresholds, current_fig):
+        print(f"Before update: {len(current_fig['data'])} traces")
         ctx = dash.callback_context
         triggered = ctx.triggered[0]['prop_id'].split('.')[0]
 
@@ -337,7 +347,7 @@ def explore_data(full, *raw):
         if mode == 'continuous':
             for df in dfs:
                 for col in df.columns:
-                    if col not in ["TIMESTAMP", "TIME", "Interpolated", "Segment"]:
+                    if col not in ["TIMESTAMP", "TIME", "Interpolated", "Segment", "year", "time"]:
                         fig.add_trace(go.Scatter(x=df["TIMESTAMP"], y=df[col], mode="lines", name=col, connectgaps=True))
         else:
             for df in dfs:
@@ -357,7 +367,42 @@ def explore_data(full, *raw):
                                  ticktext=['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov',
                                            'Dec'])
 
-        fig.update_layout(title=title, xaxis_title="TIMESTAMP", yaxis_title="Value")
+        print(f"Before thresholds update: {len(fig.data)} traces")
+        if thresholds == 'on':
+            raw_thresholds_df = pd.read_csv('../data/input/Limits.csv', sep=';', decimal='.')
+            raw_thresholds_df = raw_thresholds_df.astype(float)
+            print(raw_thresholds_df.dtypes)
+            Eurofins_columns = ['01-Farge', '04-Turbiditet', '06-E.coli',
+                        '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
+                        '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)',
+                        '44-pH, surhetsgrad']
+            if normalize_key == 'Normalized':
+                thresholds_df = normalize_columns(raw_thresholds_df, Eurofins_columns)
+            else:
+                thresholds_df = raw_thresholds_df
+            thresholds_dict = {col + ' limit': thresholds_df[col].iloc[0] for col in thresholds_df.columns}
+            print(thresholds_dict)
+
+            # Extract x-axis range
+            x_range = []
+            all_x = []
+            for trace in fig.data:
+                if hasattr(trace, 'x'):
+                    all_x.extend(trace.x)
+            x_range = [min(all_x), max(all_x)]
+
+            for label, val in thresholds_dict.items():
+                print(f"Limit for {label}: {val} on {x_range}")
+                fig.add_trace(go.Scatter(
+                    x=(x_range[0], x_range[1]),
+                    y=[val, val],
+                    mode='lines',
+                    line=dict(color='black', dash='dash'),
+                    name=label
+                ))
+
+        fig.update_layout(title=title, xaxis_title="Time", yaxis_title="Value")
+        print(f"After update: {len(fig.data)} traces")
 
         # Toggle logic
         if n_clicks > 0:
