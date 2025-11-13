@@ -18,24 +18,24 @@ if __name__ == "__main__":
     matplotlib.use('Agg')  # Non-interactive backend
 
     # Configuration parameters
-    data_dir = "../data/output/classification/Ecoli24hr"
+    data_dir = "../data/output/classification/Anomaly24hr"
     forecast_name = "nowcast"
     model_name = "xgbclassifier"
     input_columns = [
-        'Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)', 'Pfl - pH', 'Pfl - DO (% Sat)',
-        'Pfl - Turbidity (FNU)', 'Pfl - fDOM (QSU)', 'Instantaneous atmospheric pressure (mBar)',
-        'Hourly average wind direction (°)_x', 'Hourly average wind direction (°)_y',
-        'Average wind speed (m/s)', 'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)',
-        'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
-        'Precipitation (mm/hr)', 'Instantaneous temperature (°C)', 'Average humidity (% relative humidity)'
+        'Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
+                        'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
+                        'Pfl - fDOM (QSU)', "Wind speed, x (m/s)", "Wind speed, y (m/s)",
+                        'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
+                        'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
+                        '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)'
     ]
-    output_columns = ['06-E.coli']
+    output_columns = ['anomaly']
     output_rows = -1
     input_row_1 = 0
     input_row_2 = 23
     input_rows = slice(input_row_1, input_row_2)
     random_state = 32
-    test_size = 0.25
+    test_size = 0.22
 
     # Generate additional model dimensions parametrically based on selection
     input_rows = slice(input_row_1, input_row_2)
@@ -56,7 +56,9 @@ if __name__ == "__main__":
     }
 
     # Write model configuration dictionary to file so it can be re-run and re-used for other model types
-    with open(Path(data_dir, 'forecasts', forecast_name, model_name, 'model_config.json'), 'w') as f:
+    filepath = Path(data_dir, 'forecasts', forecast_name, model_name, 'model_config.json')
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    with open(filepath, 'w') as f:
         json.dump(config, f)
 
     # ## Load training set used for existing model(to avoid data leakage)
@@ -97,7 +99,7 @@ if __name__ == "__main__":
     model = xgb.XGBClassifier(
         tree_method='hist',
         objective='binary:logistic',
-        n_estimators=10000,
+        n_estimators=100000,
         max_depth=10,
         subsample=0.5,
         colsample_bytree=0.8,

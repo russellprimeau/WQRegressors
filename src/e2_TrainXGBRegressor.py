@@ -19,20 +19,20 @@ if __name__ == "__main__":
 
 
     # Configuration parameters (same as original script)
-    data_dir = "../data/output/regression/Kimtall12hr"
+    data_dir = "../data/output/regression/Koliforms48hr"
     forecast_name = "nowcast"
     model_name = "xgbregressor"
-    input_columns = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)', 'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)',
-                     'Pfl - fDOM (QSU)', 'Instantaneous atmospheric pressure (mBar)',
-                     'Hourly average wind direction (°)_x', 'Hourly average wind direction (°)_y',
-                     'Average wind speed (m/s)',
-                     'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)',
+    input_columns = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
+                     'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
+                     'Pfl - fDOM (QSU)', "Wind speed, x (m/s)", "Wind speed, y (m/s)",
+                     'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
                      'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
-                     'Precipitation (mm/hr)', 'Instantaneous temperature (°C)', 'Average humidity (% relative humidity)']
-    output_columns = ['08-Kimtall 22°C']
+                     '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)'
+                     ]  # Default: all different-dimensioned profiler and weather params, no SCADA
+    output_columns = ['09-Koliforme bakterier 37°C']
     output_rows = -1
     input_row_1 = 0
-    input_row_2 = 11
+    input_row_2 = 47
     input_rows = slice(input_row_1, input_row_2)
     random_state = 30
     test_size = 0.2
@@ -58,7 +58,7 @@ if __name__ == "__main__":
 
     # Initialize and train XGBoost Regressor
     model = xgb.XGBRegressor(tree_method='hist', objective='reg:squarederror', n_estimators=10000, max_depth=10,
-                             subsample=0.5, colsample_bytree=0.8, learning_rate=0.01, n_jobs=1)
+                             subsample=0.2, colsample_bytree=0.8, learning_rate=0.01, n_jobs=1)
     # model = xgb.XGBRegressor(objective='reg:squarederror')
     model.fit(X_train, y_train)
 

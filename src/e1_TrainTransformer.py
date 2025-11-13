@@ -78,7 +78,7 @@ def train_model(directory, model, forecast_name, dataloader, num_epochs=100, lea
         plt.title("Training Loss vs. Epochs (Log-Log Scale)")
         plt.grid(True, which="both", ls="--")
         plt.tight_layout()
-        plt.savefig(os.path.join(directory, "forecasts", forecast_name, "loss_plot.png"))
+        plt.savefig(os.path.join(directory, "forecasts", forecast_name, "transformer", "loss_plot.png"))
         plt.close()
 
 class TimeSeriesTransformer(nn.Module):
@@ -166,7 +166,7 @@ if __name__ == '__main__':
         'Maximum temperature (°C)', 'Minimum temperature (°C)', 'Average humidity (% relative humidity)',
         'SCADA - pH', 'SCADA - Temperature (°C)', '01-Farge', '04-Turbiditet', '06-E.coli',
         '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen', '24-Bly',
-        '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '44-pH, surhetsgrad']
+        '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
     data_columns = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
         'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)_x',
@@ -181,32 +181,22 @@ if __name__ == '__main__':
         'Maximum temperature (°C)', 'Minimum temperature (°C)', 'Average humidity (% relative humidity)',
         'SCADA - pH', 'SCADA - Temperature (°C)', '01-Farge', '04-Turbiditet', '06-E.coli',
         '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen', '24-Bly',
-        '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '44-pH, surhetsgrad']
+        '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
 
-    data_dir = "../data/output/regression/Kimtall12hr"  # Parent directory of test/train sample folder
+    data_dir = "../data/output/regression/Koliforms48hr"  # Parent directory of test/train sample folder
     historic = "../data/output/regression/Consolidated.csv"  # Path to file with baseline model input
-    input_columns = ['Pfl - Temp (C)',
-        'Pfl - Sp Cond (microS_cm)',
-        'Pfl - pH',
-        'Pfl - DO (% Sat)',
-        'Pfl - Turbidity (FNU)',
-        'Pfl - fDOM (QSU)',
-        'Instantaneous atmospheric pressure (mBar)',
-        'Hourly average wind direction (°)_x',
-        'Hourly average wind direction (°)_y',
-        'Average wind speed (m/s)',
-        'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)',
-        'Longwave (IR) radiation (W/m2)',
-        'Shortwave (solar) radiation (W/m2)',
-        'Precipitation (mm/hr)',
-        'Instantaneous temperature (°C)',
-        'Average humidity (% relative humidity)'
+    input_columns = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
+                        'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
+                        'Pfl - fDOM (QSU)', "Wind speed, x (m/s)", "Wind speed, y (m/s)",
+                        'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
+                        'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
+                        '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)'
                      ]  # Default: all different-dimensioned profiler and weather params, no SCADA
-    output_columns = ['08-Kimtall 22°C']
+    output_columns = ['09-Koliforme bakterier 37°C']
     forecast_name = "nowcast"
     output_rows = -1  # Default: -1 (increase value to increase forecast length, but decrease input_row_2 accordingly)
     input_row_1 = 0  # Default: 0
-    input_row_2 = 11  # Default: len(sample) - abs(output_rows)
+    input_row_2 = 47  # Default: len(sample) - abs(output_rows)
 
     # Model hyperparameters
     model_dim = 128  # Model size
@@ -245,7 +235,9 @@ if __name__ == '__main__':
     }
 
     # Write model configuration dictionary to file so it can be re-run and re-used for other model types
-    with open(Path(data_dir, 'forecasts', forecast_name, 'model_config.json'), 'w') as f:
+    filepath = Path(data_dir, 'forecasts', forecast_name, 'model_config.json')
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    with open(filepath, 'w') as f:
         json.dump(config, f)
 
     ##################################################################################################################

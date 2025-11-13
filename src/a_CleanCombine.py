@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 import dash
-from dash import dcc, html, Output, Input, State
+from dash import dcc, html, Output, Input
 import plotly.graph_objects as go
 
 
@@ -23,11 +23,11 @@ def clean_profiler(full_df, max_gap=6):
     # Apply column labels
     column_names = {
         "TIMESTAMP": "TIMESTAMP",
-        "RECORD": "Pfl - Record Number",
+        "RECORD": "Pfl - Record number",
         "PFL_Counter": "Pfl - Day",
         "CntRS232": "Pfl - CntRS232",
-        "RS232Dpt": "Pfl - Vertical Position1 (m)",
-        "sensorParms(1)": "Pfl - Temp (C)",
+        "RS232Dpt": "Pfl - Vertical position1 (m)",
+        "sensorParms(1)": "Pfl - Water temperature (°C)",
         "sensorParms(2)": "Pfl - Cond (microS_cm)",
         "sensorParms(3)": "Pfl - Sp Cond (microS_cm)",
         "sensorParms(4)": "Pfl - Salinity (ppt)",
@@ -35,14 +35,32 @@ def clean_profiler(full_df, max_gap=6):
         "sensorParms(6)": "Pfl - DO (% Sat)",
         "sensorParms(7)": "Pfl - Turbidity (NTU)",
         "sensorParms(8)": "Pfl - Turbidity (FNU)",
-        "sensorParms(9)": "Pfl - Vertical Position (m)",
+        "sensorParms(9)": "Pfl - Vertical position (m)",
         "sensorParms(10)": "Pfl - fDOM (RFU)",
         "sensorParms(11)": "Pfl - fDOM (QSU)",
         "lat": "Latitude",
         "lon": "Longitude",
     }
     df = full_df.rename(columns=column_names)
-    sensor_columns = ["Pfl - Temp (C)", "Pfl - Sp Cond (microS_cm)", "Pfl - pH",
+
+    error_conditions = {
+        "Pfl - Water temperature (°C)": (df['Pfl - Water temperature (°C)'] < 1) | (df['Pfl - Water temperature (°C)'] > 25),
+        "Pfl - Cond (microS_cm)": (df['Pfl - Cond (microS_cm)'] < 0) |(df['Pfl - Cond (microS_cm)'] > 45),
+        "Pfl - Sp Cond (microS_cm)": (df['Pfl - Sp Cond (microS_cm)'] < 1),
+        "Pfl - Salinity (ppt)": (df['Pfl - Salinity (ppt)'] < 0) | (df['Pfl - Salinity (ppt)'] > .03),
+        "Pfl - pH": (df['Pfl - pH'] < 2) | (df['Pfl - pH'] > 12),
+        "Pfl - DO (% Sat)": (df['Pfl - DO (% Sat)'] < 10) | (df['Pfl - DO (% Sat)'] > 120),
+        "Pfl - Turbidity (NTU)": (df['Pfl - Turbidity (NTU)'] < 0),
+        "Pfl - Turbidity (FNU)": (df['Pfl - Turbidity (FNU)'] < 0),
+        "Pfl - fDOM (RFU)": (df['Pfl - fDOM (RFU)'] < 0) | (df['Pfl - fDOM (RFU)'] > 100),
+        "Pfl - fDOM (QSU)": (df['Pfl - fDOM (QSU)'] < 0) | (df['Pfl - fDOM (QSU)'] > 300),
+    }
+
+    # Replace values meeting the error conditions with np.nan using boolean indexing
+    for col, condition in error_conditions.items():
+        full_df.loc[condition, col] = np.nan
+
+    sensor_columns = ["Pfl - Water temperature (°C)", "Pfl - Sp Cond (microS_cm)", "Pfl - pH",
                       "Pfl - DO (% Sat)",
                       "Pfl - Turbidity (FNU)", "Pfl - fDOM (RFU)", "Pfl - fDOM (QSU)"]
     keepers = ["TIMESTAMP", "Interpolated"] + sensor_columns
@@ -150,31 +168,38 @@ def binarize_dataframe(df, output_columns, thresholds_df):
         threshold = thresholds_df.iloc[0][col]
         # Apply threshold only to non-NaN values
         binary_df[col] = binary_df[col].where(binary_df[col].isna(), (binary_df[col] > threshold).astype(int))
-    binary_df["anomaly"] = binary_df[output_columns].bool(axis=1)
+    binary_df["anomaly"] = np.where(
+        binary_df[output_columns].notna().any(axis=1),  # At least one non-NaN
+        np.where(binary_df[output_columns].eq(1).any(axis=1), 1, 0),  # If any 1 → 1 else 0
+        np.nan  # If all NaN → NaN
+    )
     return binary_df
 
-def decompose_direction(df, column_name):
+def decompose_direction(df, directional, magnitude=None):
     """
-    Replace a column containing degree values with two new columns representing
-    the x and y components using cosine and sine. The new columns are inserted
-    at the same position as the original column.
+    Replace column (directional) storing values of direction in degrees with two new columns representing
+    the x and y components, optionally scaled by values from a magnitude column.
+    The new columns are inserted at the same position as the original column.
 
     Parameters:
     - df: pandas.DataFrame
-    - column_name: str, name of the column containing degree values
+    - directional: str, name of the column containing degree values
 
     Returns:
     - Modified DataFrame with x and y components replacing the original column
     """
     df_copy = df.copy()
-    radians = np.deg2rad(df_copy[column_name])
+    radians = np.deg2rad(df_copy[directional])
     x_component = np.cos(radians)
     y_component = np.sin(radians)
+    if magnitude is not None:
+        x_component = x_component * df_copy[magnitude].values
+        y_component = y_component * df_copy[magnitude].values
 
-    insert_position = df_copy.columns.get_loc(column_name)
-    df_copy.drop(columns=[column_name], inplace=True)
-    df_copy.insert(insert_position, f"{column_name}_x", x_component)
-    df_copy.insert(insert_position + 1, f"{column_name}_y", y_component)
+    insert_position = df_copy.columns.get_loc(directional)
+    df_copy.drop(columns=[directional], inplace=True)
+    df_copy.insert(insert_position, f"{directional}_x", x_component)
+    df_copy.insert(insert_position + 1, f"{directional}_y", y_component)
 
     return df_copy
 
@@ -192,64 +217,143 @@ def count_segs(df):
     df = df[cols]  # Reorder the DataFrame
     return df
 
-def normalize_columns(df, columns, min=0, max=1, save=False, directory="../data/output/regression"):
-    """
-    Normalize specified columns in a DataFrame to a given range and save original min/max values.
-
-    Parameters:
-    - df: pandas.DataFrame
-    - columns: list of column names to normalize
-    - min: minimum value of target range
-    - max: maximum value of target range
-    - save_path: path to save normalization parameters
-
-    Returns:
-    - A copy of the DataFrame with normalized columns.
-    """
+def normalize_columns(df, columns, param_file=None, min_val=0, max_val=1, save=False, directory="../data/output",
+                    filename="normalization.json"):
+    '''
+    Normalize values in columns (columns) from dataframe (df) either on to interval (min_val, max_val),
+    or optionally, by applying a previously defined normalization written to (param_file). Optionally, write the
+    applied normalization to (directory/filename) for later reuse.
+    :param df:
+    :param columns:
+    :param param_file:
+    :param min_val:
+    :param max_val:
+    :param save:
+    :param directory:
+    :param filename:
+    :return:
+    '''
     df_normalized = df.copy()
-    min_val, max_val = min, max
-    normalization_params = {}
+    if param_file is not None:
+        try:
+            with open(param_file, 'r') as f:
+                normalization_params = json.load(f)
+        except Exception as e:
+            # print(e)
+            normalization_params = {}
+    else:
+        normalization_params = {}
+
     for col in columns:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
-            col_min = df[col].min()
-            col_max = df[col].max()
-            normalization_params[col] = {"min": col_min, "max": col_max}
-            if col_max != col_min:
-                df_normalized[col] = ((df[col] - col_min) / (col_max - col_min)) * (max_val - min_val) + min_val
+            if (param_file is not None) and (col in normalization_params):
+                col_min = normalization_params[col]["min"]
+                col_max = normalization_params[col]["max"]
+                if col_max != col_min:
+                    df_normalized[col] = ((df[col] - col_min) / (col_max - col_min)) * (max_val - min_val) + min_val
+                else:
+                    df_normalized[col] = (min_val + max_val) / 2
             else:
-                df_normalized[col] = (min_val + max_val) / 2
+                # print(f"Column {col} not found in {param_file}.")
+                col_min = df[col].min()
+                col_max = df[col].max()
+                normalization_params[col] = {"min": col_min, "max": col_max}
+                if col_max != col_min:
+                    df_normalized[col] = ((df[col] - col_min) / (col_max - col_min)) * (max_val - min_val) + min_val
+                else:
+                    df_normalized[col] = (min_val + max_val) / 2
+        else:
+            # print(f"Column {col} not found in dataframe.")
+            pass
 
     # Save normalization parameters to file if selected:
     if save:
-        file = Path(directory, "normalized.json")
+        file = Path(directory, filename)
         file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(file, 'w') as f:
+                pass
+        except FileNotFoundError:
+            print(f"Error: File not found at {file}")
+            pass
         with open(file, "w") as f:
             json.dump(normalization_params, f)
-
     return df_normalized
+
+def rolling_sum(df, time_col, target_col, interval_hours):
+    """
+    Calculate rolling sum over a time-based interval.
+
+    Args:
+        df (pd.DataFrame): Input dataframe sorted by time.
+        time_col (str): Name of the timestamp column.
+        target_col (str): Column to sum.
+        interval_hours (int): Interval in hours.
+
+    Returns:
+        pd.DataFrame: Original dataframe with an added 'rolling_sum' column.
+    """
+    # Ensure time column is datetime
+    df = df.copy()
+    df[time_col] = pd.to_datetime(df[time_col])
+
+    # Initialize result column
+    rolling_sums = []
+
+    for i in range(len(df)):
+        current_time = df.loc[i, time_col]
+        window_start = current_time - pd.Timedelta(hours=interval_hours)
+
+        # Filter rows within the interval
+        mask = (df[time_col] >= window_start) & (df[time_col] <= current_time)
+        rolling_sums.append(df.loc[mask, target_col].sum())
+
+    df["rolling " + target_col] = rolling_sums
+    return df
 
 def explore_data(full, *raw):
     app = dash.Dash(__name__)
-    fig = go.Figure()
     app.layout = html.Div([
-        html.H3("Toggle Data Sources"),
+        html.H3("Configure plat area"),
+        html.H4("Upstream datasets:"),
+        dcc.Checklist(
+            id='in_sets',
+            options=[
+                {'label': 'Profiler', 'value': 'profiler'},
+                {'label': 'Weather', 'value': 'weather'},
+            ],
+            value=['profiler', 'weather'],
+            inline=True
+        ),
+        html.H4("Downstream (treatment plant):"),
+        dcc.Checklist(
+            id='out_sets',
+            options=[
+                {'label': 'SCADA', 'value': 'scada'},
+                {'label': 'Samples (Physical)', 'value': 'eurofins_phys'},
+                {'label': 'Samples (Biological)', 'value': 'eurofins_bio'},
+                {'label': 'Samples (Metals)', 'value': 'eurofins_metal'},
+            ],
+            value=['scada', 'eurofins_phys', 'eurofins_bio', 'eurofins_metal'],
+            inline=True
+        ),
         dcc.RadioItems(
             id='source-select',
             options=[
-                {'label': 'Cleaned', 'value': 'Cleaned'},
-                {'label': 'Original Sources', 'value': 'Original Sources'},
+                {'label': 'Filtered', 'value': 'cleaned'},
+                {'label': 'Full Extent', 'value': 'sources'},
             ],
-            value='Cleaned',
+            value='cleaned',
             inline=True
         ),
         dcc.RadioItems(
             id='normalize',
             options=[
-                {'label': 'Normalized on (0,1)', 'value': 'Normalized'},
-                {'label': 'Original Units', 'value': 'Original Values'},
+                {'label': 'Normalized on (0,1)', 'value': 'normalized'},
+                {'label': 'Original Units', 'value': 'original'},
             ],
-            value='Normalized',
+            value='normalized',
             inline=True
         ),
         dcc.RadioItems(
@@ -267,64 +371,75 @@ def explore_data(full, *raw):
                 {'label': 'Hide limit values', 'value': 'off'},
                 {'label': 'Show limit values', 'value': 'on'}
             ],
-            value='off',
+            value='on',
             inline=True
         ),
-        html.Button('Toggle All Traces', id='toggle-btn', n_clicks=0),
-        dcc.Graph(id='timeseries-plot', figure=fig, style={'height': '90vh', 'width': '100%'})
+        dcc.DatePickerRange(
+            id='date-range',
+            start_date=None,
+            end_date=None,
+            min_date_allowed=None,
+            max_date_allowed=None,
+            display_format='YYYY-MM-DD',
+        ),
+        dcc.Graph(id='timeseries-plot', style={'height': '90vh', 'width': '100%'})
     ],
         style={'height': '100vh', 'width': '100%', 'padding': '10px', 'box-sizing': 'border-box'})
 
     @app.callback(
         Output('timeseries-plot', 'figure'),
-        [Input('source-select', 'value'),
-        Input('normalize', 'value'),
-        Input('toggle-btn', 'n_clicks'),
+        [Input('in_sets', 'value'),
+         Input('out_sets', 'value'),
+         Input('source-select', 'value'),
+         Input('normalize', 'value'),
          Input('plot-mode', 'value'),
-         Input('thresholds', 'value')],
-        State('timeseries-plot', 'figure')
+         Input('thresholds', 'value'),
+         Input('date-range', 'start_date'),
+         Input('date-range', 'end_date')]
     )
-
-    def update_plot(source_key, normalize_key, n_clicks, mode, thresholds, current_fig):
-        print(f"Before update: {len(current_fig['data'])} traces")
-        ctx = dash.callback_context
-        triggered = ctx.triggered[0]['prop_id'].split('.')[0]
-
-        if triggered == 'toggle-btn':
-            # Toggle visibility only
-            fig = go.Figure(current_fig)
-            all_visible = all(trace.visible == True for trace in fig.data)
-            for trace in fig.data:
-                trace.visible = 'legendonly' if all_visible else True
-            return fig
-
-        to_normalize = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
+    def update_plot(input_key, output_key, source_key, normalize_key, mode_key, thresholds_key, start_date_key,
+                    end_date_key):
+        profiler_cols = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
                         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
-                        'Pfl - fDOM (QSU)',
-                        'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)_x',
-                        'Wind direction 10minRollingAvg (°)_y',
-                        'Hourly average wind direction (°)_x', 'Hourly average wind direction (°)_y',
-                        'Average wind speed (m/s)',
-                        'Maximum sustained wind speed, 3-second span (m/s)', 'Time of maximum 3s Gust',
-                        'Maximum sustained wind speed, 10-minute span (m/s)', 'Time of maximum 10 minute gust',
-                        'Hourly average atmospheric pressure at station (mBar)',
-                        'Maximum pressure differential, 3-hour span (mBar)',
-                        'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)',
-                        'Longwave (IR) radiation (W/m2)', 'Instantaneous sea-level atmospheric pressure (mBar)',
-                        'Shortwave (solar) radiation (W/m2)', 'Precipitation (mm/hr)',
-                        'Instantaneous temperature (°C)',
-                        'Maximum temperature (°C)', 'Minimum temperature (°C)',
-                        'Average humidity (% relative humidity)',
-                        'SCADA - pH', 'SCADA - Temperature (°C)', '01-Farge', '04-Turbiditet', '06-E.coli',
-                        '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
-                        '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)',
-                        '44-pH, surhetsgrad']
+                        'Pfl - fDOM (QSU)']
+        weather_cols = ["Wind speed, x (m/s)", "Wind speed, y (m/s)",
+                        'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
+                        'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
+                        '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)']
+        SCADA_cols = ['SCADA - pH', 'SCADA - Temperature (°C)']
+        Eurofins_phys = ['01-Farge', '04-Turbiditet']
+        Eurofins_bio = ['06-E.coli', '07-Intestinale enterokokker', '08-Kimtall 22°C',
+                         '09-Koliforme bakterier 37°C']
+        Eurofins_metal = ['21-Arsen', '24-Bly', '32-Kadmium', '36-Kopper filtrert',
+                         '37-Krom', '41-Nikkel', 'Sink (Zn)']
+        included_cols = []
+        if "profiler" in input_key:
+            included_cols += profiler_cols
+        if "weather" in input_key:
+            included_cols += weather_cols
+        if "scada" in output_key:
+            included_cols += SCADA_cols
+        if "eurofins_phys" in output_key:
+            included_cols += Eurofins_phys
+        if "eurofins_bio" in output_key:
+            included_cols += Eurofins_bio
+        if "eurofins_metal" in output_key:
+            included_cols += Eurofins_metal
         # Convert dict to go.Figure
         fig = go.Figure()
+        normalization_param_file = 'normalization.json'
 
-        if source_key == 'Cleaned':
-            if normalize_key == 'Normalized':
-                full_df = normalize_columns(full, to_normalize)
+        if source_key == 'cleaned':
+            if normalize_key == 'normalized':
+                filepath = Path("../data/input/" + normalization_param_file)
+                try:
+                    with open(filepath, 'w') as f:
+                        pass
+                except FileNotFoundError:
+                    print(f"Error: File not found at {filepath}")
+                    pass
+                full_df = normalize_columns(full, included_cols, save=True, directory="../data/input",
+                                            filename=normalization_param_file)
                 title = "Cleaned, Normalized Dataset (for models)"
             else:
                 full_df = full
@@ -332,86 +447,104 @@ def explore_data(full, *raw):
             dfs = [full_df]
         else:
             dfs = []
-            if normalize_key == 'Normalized':
+            if normalize_key == 'normalized':
+                filepath = Path("../data/input/" + normalization_param_file)
+                try:
+                    with open(filepath, 'w') as f:
+                        pass
+                except FileNotFoundError:
+                    print(f"Error: File not found at {filepath}")
+                    pass
                 for df in raw:
-                    dfs.append(normalize_columns(df, to_normalize))
+                    dfs.append(normalize_columns(df, included_cols, param_file=Path('../data/input', normalization_param_file), save=True,
+                                                 directory="../data/input", filename=normalization_param_file))
                 title = "Original Datasets, Normalized"
             else:
                 dfs = raw
                 title = "Original Datasets, Original Values"
 
         # Dash patterns for years
-        dash_styles = ['solid', 'dash', 'dot', 'dashdot']
+        dash_styles = ["solid", "dot", "dash", "longdash", "dashdot", "longdashdot"]
 
-        # Add traces
-        if mode == 'continuous':
-            for df in dfs:
-                for col in df.columns:
-                    if col not in ["TIMESTAMP", "TIME", "Interpolated", "Segment", "year", "time"]:
-                        fig.add_trace(go.Scatter(x=df["TIMESTAMP"], y=df[col], mode="lines", name=col, connectgaps=True))
-        else:
-            for df in dfs:
-                # Extract years and months
-                df['year'] = df['TIMESTAMP'].dt.year
-                df['time'] = (df['TIMESTAMP'].dt.dayofyear - 1) * 24 + df['TIMESTAMP'].dt.hour
-                for col in df.columns:
-                    if col not in ["TIMESTAMP", "TIME", "Interpolated", "Segment", "year", "time"]:
-                        for i, year in enumerate(sorted(df['year'].unique())):
-                            subset = df[df['year'] == year]
+        # Add data from sources to plot as traces
+
+        if mode_key == 'seasonality':  # Seasonality plot (use single year as x-range, overlay source data by year)
+            for plot_df in dfs:
+                # Extract years and time from start of year
+                plot_df['year'] = plot_df['TIMESTAMP'].dt.year
+                plot_df['time'] = (plot_df['TIMESTAMP'].dt.dayofyear - 1) * 24 + plot_df['TIMESTAMP'].dt.hour
+                for col in plot_df.columns:
+                    if col in included_cols:
+                        for i, year in enumerate(sorted(plot_df['year'].unique())):
+                            subset = plot_df[plot_df['year'] == year]
                             fig.add_trace(go.Scatter(
-                                x=subset['time'], y=subset[col],mode='lines',name=f"{col} ({year})",
-                                line=dict(dash=dash_styles[i % len(dash_styles)]))
+                                x=subset['time'], y=subset[col],mode='lines',name=f"{col} ({year})", connectgaps=True,
+                                line = dict(dash=dash_styles[i % len(dash_styles)]))
                             )
-
-                fig.update_xaxes(title='Month', tickmode='array', tickvals=list(range(1, 8760, 720)),
+                fig.update_xaxes(title='Month', tickmode='array', tickvals=[24,768,1464,2208,2928,3672,4392,5136,5880,6600,7344,8064,8808],
                                  ticktext=['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov',
-                                           'Dec'])
+                                           'Dec', 'Jan'])
+        else:  # Use the x-axis to show the entire range of source data continuously
+            for df in dfs:
+                for col in df.columns:
+                    if col in included_cols:
+                        fig.add_trace(go.Scatter(x=df["TIMESTAMP"], y=df[col], mode="lines", name=col, connectgaps=True))
 
-        print(f"Before thresholds update: {len(fig.data)} traces")
-        if thresholds == 'on':
+        if thresholds_key == 'on':
             raw_thresholds_df = pd.read_csv('../data/input/Limits.csv', sep=';', decimal='.')
             raw_thresholds_df = raw_thresholds_df.astype(float)
-            print(raw_thresholds_df.dtypes)
-            Eurofins_columns = ['01-Farge', '04-Turbiditet', '06-E.coli',
-                        '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
-                        '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)',
-                        '44-pH, surhetsgrad']
-            if normalize_key == 'Normalized':
-                thresholds_df = normalize_columns(raw_thresholds_df, Eurofins_columns)
+            if normalize_key == 'normalized':
+                thresholds_df = normalize_columns(raw_thresholds_df, included_cols,
+                                                  param_file=Path('../data/input',normalization_param_file),
+                                                  save=False)
+                for col in thresholds_df.columns:
+                    if col in included_cols:
+                        if thresholds_df[col].max() > 1:
+                            thresholds_df[col] = 1
+                        if thresholds_df[col].min() < 0:
+                            thresholds_df[col] = 0
+                    else:
+                        thresholds_df.drop(columns=[col], inplace=True)
             else:
-                thresholds_df = raw_thresholds_df
-            thresholds_dict = {col + ' limit': thresholds_df[col].iloc[0] for col in thresholds_df.columns}
-            print(thresholds_dict)
+                thresholds_df = raw_thresholds_df[raw_thresholds_df.columns.intersection(included_cols)]
+            thresholds_dict = {col: thresholds_df[col].iloc[0] for col in thresholds_df.columns}
 
             # Extract x-axis range
-            x_range = []
             all_x = []
             for trace in fig.data:
                 if hasattr(trace, 'x'):
                     all_x.extend(trace.x)
-            x_range = [min(all_x), max(all_x)]
+            x_min = pd.to_datetime(min(all_x))
+            x_max = pd.to_datetime(max(all_x))
 
-            for label, val in thresholds_dict.items():
-                print(f"Limit for {label}: {val} on {x_range}")
-                fig.add_trace(go.Scatter(
-                    x=(x_range[0], x_range[1]),
-                    y=[val, val],
-                    mode='lines',
-                    line=dict(color='black', dash='dash'),
-                    name=label
-                ))
-
-        fig.update_layout(title=title, xaxis_title="Time", yaxis_title="Value")
-        print(f"After update: {len(fig.data)} traces")
-
-        # Toggle logic
-        if n_clicks > 0:
-            all_visible = all(trace.visible == True for trace in fig.data)
-            for trace in fig.data:
-                trace.visible = 'legendonly' if all_visible else True
-
+            if mode_key == 'continuous':
+                for label, val in thresholds_dict.items():
+                    fig.add_trace(go.Scatter(
+                        x=[x_min, x_max],
+                        y=[val, val],
+                        mode='lines',
+                        name=label+' limit', connectgaps=True
+                    ))
+                fig.update_layout(title=title, xaxis_title="Time", yaxis_title="Value",
+                                  xaxis_range=[pd.to_datetime(start_date_key), pd.to_datetime(end_date_key)])
+            elif mode_key == 'seasonality':
+                for label, val in thresholds_dict.items():
+                    fig.add_trace(go.Scatter(
+                        x=[0, 8760],
+                        y=[val, val],
+                        mode='lines',
+                        name=label+' limit', connectgaps=True
+                    ))
+                fig.update_layout(title=title, xaxis_title="Time", yaxis_title="Value",
+                                  xaxis_range=[0, 8760])
+        else:
+            if mode_key == 'continuous':
+                fig.update_layout(title=title, xaxis_title="Time", yaxis_title="Value",
+                                      xaxis_range=[pd.to_datetime(start_date_key), pd.to_datetime(end_date_key)])
+            else:
+                fig.update_layout(title=title, xaxis_title="Time", yaxis_title="Value",
+                                  xaxis_range=[0, 8760])
         return fig
-
     app.run(debug=True)
 
 
@@ -419,7 +552,7 @@ if __name__ == '__main__':
     # Load data files
     df = pd.read_csv("../data/input/sensors/FullHourly.csv")  # Profiler data
     weather_df = pd.read_csv("../data/input/sensors/Weather.csv", sep=";", decimal=",", parse_dates=["Time"])
-    weather_columns = {"1818_time: AA[mBar]": "Instantaneous atmospheric pressure (mBar)",
+    full_weather_columns = {"1818_time: AA[mBar]": "Instantaneous atmospheric pressure (mBar)",
                        "1818_time: DD Retning[°]": "Wind direction 10minRollingAvg (°)",
                        "1818_time: DX_l[°]": "Hourly average wind direction (°)",
                        "1818_time: FF Hastighet[m/s]": "Average wind speed (m/s)",
@@ -442,9 +575,56 @@ if __name__ == '__main__':
                        "1818_time: TA_a_Min[°C]": "Minimum temperature (°C)",
                        "1818_time: UU Luftfuktighet[%RH]": "Average humidity (% relative humidity)"
                        }
-    weather_df.rename(columns=weather_columns, inplace=True)
-    decomp_df = decompose_direction(weather_df, "Wind direction 10minRollingAvg (°)")
-    decomp2_df = decompose_direction(decomp_df, "Hourly average wind direction (°)")
+
+    weather_df.rename(columns=full_weather_columns, inplace=True)
+
+    # Set negative shortwave values to 0 (this is very common and appears to represent a calibration issue)
+    weather_df['Shortwave (solar) radiation (W/m2)'] = (
+        np.where(weather_df['Shortwave (solar) radiation (W/m2)'] < 0, 0, weather_df['Shortwave (solar) radiation (W/m2)']))
+
+    # Define conditions for each parameter which indicate errors in the data
+    weather_error_conditions = {
+        "Time": (weather_df['Time'] < pd.to_datetime('2000-01-01')) | (weather_df['Time'] > pd.to_datetime('2099-12-31')),
+        'Hourly average wind direction (°)': (weather_df['Hourly average wind direction (°)'] < 0) | (weather_df['Hourly average wind direction (°)'] > 360),
+        "Average wind speed (m/s)": (weather_df["Average wind speed (m/s)"] < 0) | (weather_df["Average wind speed (m/s)"] > 100),
+        'Maximum sustained wind speed, 3-second span (m/s)': (weather_df['Maximum sustained wind speed, 3-second span (m/s)'] < 0) | (weather_df['Maximum sustained wind speed, 3-second span (m/s)'] > 100),
+        'Maximum sustained wind speed, 10-minute span (m/s)': (weather_df['Maximum sustained wind speed, 10-minute span (m/s)'] < 0) |(weather_df['Maximum sustained wind speed, 10-minute span (m/s)'] > 100),
+        'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)': (weather_df['Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)'] < 860) | (weather_df['Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)'] > 1080),
+        'Maximum pressure differential, 3-hour span (mBar)': (weather_df['Maximum pressure differential, 3-hour span (mBar)'] < 0) | (weather_df['Maximum pressure differential, 3-hour span (mBar)'] > 50),
+        'Longwave (IR) radiation (W/m2)': (weather_df['Longwave (IR) radiation (W/m2)'] < 0) | (weather_df['Longwave (IR) radiation (W/m2)'] > 750),
+        'Shortwave (solar) radiation (W/m2)': (weather_df['Shortwave (solar) radiation (W/m2)'] < 0) | (weather_df['Shortwave (solar) radiation (W/m2)'] > 900),
+        'Precipitation (mm/hr)': (weather_df['Precipitation (mm/hr)'] < 0) | ( weather_df['Precipitation (mm/hr)'] > 50),
+        'Maximum temperature (°C)': (weather_df['Maximum temperature (°C)'] < -40) | ( weather_df['Maximum temperature (°C)'] > 40),
+        'Minimum temperature (°C)': (weather_df['Minimum temperature (°C)'] < -40) | ( weather_df['Minimum temperature (°C)'] > 40),
+        'Average humidity (% relative humidity)': (weather_df['Average humidity (% relative humidity)'] < 0) | ( weather_df['Average humidity (% relative humidity)'] > 100)
+    }
+
+    # Replace values meeting the error conditions with np.nan using boolean indexing
+    for col, condition in weather_error_conditions.items():
+        weather_df.loc[condition, col] = np.nan
+    decomp_df = decompose_direction(weather_df, "Hourly average wind direction (°)",
+                                    "Average wind speed (m/s)")
+    weather_roll_df = rolling_sum(decomp_df, "Time", 'Precipitation (mm/hr)', 24)
+    simplified_weather_set = ['Time', 'Hourly average wind direction (°)_x',
+        'Hourly average wind direction (°)_y',
+        "Maximum sustained wind speed, 3-second span (m/s)",
+        'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)',
+        'Longwave (IR) radiation (W/m2)',
+        'Shortwave (solar) radiation (W/m2)',
+        'rolling Precipitation (mm/hr)',
+        'Instantaneous temperature (°C)',
+        'Average humidity (% relative humidity)']
+    weather_simp_df = weather_roll_df[simplified_weather_set].copy()
+    simplified_weather_names = {"Hourly average wind direction (°)_x":"Wind speed, x (m/s)",
+                                "Hourly average wind direction (°)_y": "Wind speed, y (m/s)",
+                                "Maximum sustained wind speed, 3-second span (m/s)": 'Maximum 3s wind gust (m/s)',
+                                "Instantaneous atmospheric pressure compensated for temperature, humidity and station "
+                                "elevation (mBar)": "Atmospheric pressure (mBar)",
+                                'Instantaneous temperature (°C)': 'Air temperature (°C)',
+                                'Average humidity (% relative humidity)': 'Humidity (%)',
+                                'rolling Precipitation (mm/hr)': '24hr precipitation total (mm)'}
+    weather_simp_df.rename(columns=simplified_weather_names, inplace=True)
+
 
     scada_df = pd.read_csv("../data/input/sensors/SCADA.csv", sep=";", decimal=".", parse_dates=["Time"])
     eurofins_df = pd.read_csv("../data/input/sensors/Eurofins.csv", sep=";", decimal=",", parse_dates=["Time"])
@@ -453,24 +633,27 @@ if __name__ == '__main__':
     clean_df = clean_profiler(df, max_gap=6)
 
     # Merge data from other sources into the dataset.
-    merge1_df = add_source(clean_df, decomp2_df, include_NAs=False, max_gap=6)
+    merge1_df = add_source(clean_df, weather_simp_df, include_NAs=False, max_gap=6)
     merge2_df = add_source(merge1_df, scada_df, include_NAs=True, max_gap=6)
-    merge3_df = add_source(merge2_df, eurofins_df, include_NAs=True, max_gap=6, binarize=False)
-    # merge3_df = add_source(merge2_df, eurofins_df, include_NAs=True, max_gap=6, binarize=True)
+    # merge3_df = add_source(merge2_df, eurofins_df, include_NAs=True, max_gap=6, binarize=False)  # For regression
+    merge3_df = add_source(merge2_df, eurofins_df, include_NAs=True, max_gap=6, binarize=True)  # For classification
 
     segmented_df = count_segs(merge3_df)  # Add column with index for continuous segments
 
     ## Save the cleaned and merged dataset
     # For regression (with optional post-process classification)
-    output_dir = "../data/output/regression"
-    filename = "Consolidated.csv"
+    # output_dir = "../data/output/regression"
+    # filename = "Consolidated.csv"
 
     # For classification only:
-    # output_dir = "../data/output/classification"
-    # filename = "Consolidated_binarized.csv"
+    output_dir = "../data/output/classification"
+    filename = "Consolidated_binarized.csv"
 
+
+    ## Write a combined dataset to file (either regression or classification)
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    # segmented_df.to_csv(Path(output_dir, filename), index=False)
+    segmented_df.to_csv(Path(output_dir, filename), index=False)
 
-    explore_data(merge3_df, clean_df, decomp2_df, scada_df, eurofins_df)
+    ## Visualize datasets in a browser window:
+    # explore_data(merge3_df, clean_df, weather_simp_df, scada_df, eurofins_df)

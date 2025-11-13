@@ -105,8 +105,7 @@ def gapped(df, target_columns, seg_length, name="length_v_count_analysis"):
 
 def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.coli',
                         '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
-                        '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)',
-                        '44-pH, surhetsgrad'],
+                        '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)'],
           length=1, to_normalize=[], offset=0):
     """
     Break up a dataset which contains gaps into many files of standard size, which do not contain gaps
@@ -116,7 +115,7 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
     :return:
     """
 
-    df = normalize_columns(df, to_normalize, 0, 1, save=True, directory=output_dir)
+    df = normalize_columns(df, to_normalize, param_file=None, min_val=0, max_val=1, save=True, directory=output_dir)
 
     os.makedirs(output_dir + '/samples', exist_ok=True)  # Create a directory to store the output files
     clean_directory(output_dir + '/samples')  #
@@ -130,7 +129,7 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
         last_row = segment.iloc[-1]
         preceding_rows = segment.iloc[:-1]
 
-        # Check if the last row has any non-null value in the last ten columns
+        # Check if the last row has any non-null value in the target columns
         if last_row[target_columns].notnull().all():
 
             # Check if the 'Segment' column has a constant value in all rows
@@ -145,46 +144,48 @@ if __name__ == '__main__':
     matplotlib.use('Agg')  # Non-interactive backend for file output to handle remote machine installation errors
     ## Load sensor data
     ## For binary classification (of Eurofins parameters):
-    df = pd.read_csv("../data/output/regression/Consolidated.csv",
-                     parse_dates=["TIMESTAMP"])
+    # df = pd.read_csv("../data/output/classification/Consolidated_binarized.csv",
+    #                  parse_dates=["TIMESTAMP"])
     ## For regression (of any parameters:
-    # df = pd.read_csv("../data/output/regression/Consolidated.csv",parse_dates=["TIMESTAMP"])
+    df = pd.read_csv("../data/output/regression/Consolidated.csv",parse_dates=["TIMESTAMP"])
     df = df.sort_values("TIMESTAMP")
 
     ## Identify prediction target columns. Output will only include samples with valid value in last row.
-    # target_columns = ['06-E.coli']
-    target_columns = ['01-Farge', '04-Turbiditet', '06-E.coli',
-                        '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
-                        '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)',
-                        '44-pH, surhetsgrad']  # alternative 1: name-based selection
+    target_columns = ['09-Koliforme bakterier 37°C']
+    # target_columns = ['01-Farge', '04-Turbiditet', '06-E.coli',
+    #                     '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
+    #                     '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']  # alternative 1: name-based selection
     # target_columns = df.columns[-9:]  # alternative 2: index-based selection
 
     ## To analyze the impact of sample dimensions on the # of available samples:
-    gapless(df, target_columns, name="Eurofins_availability")  # Analysis function #1
+    # gapless(df, target_columns, name="Eurofins_availability")  # Analysis function #1
     # seg_length = 24  # fixed segment length for evaluating range of lengths of gap betweeen input and output
     # gapped(df, target_columns, seg_length)  # Analysis function #2
 
     ## Name the dataset and select the size of each sample (# of timesteps/rows)
-    set_name  = "Ecoli24hr"  # Name of subdirectory where samples will be organized
-    length = 24  # Hours of contiguous data per sample
-    output_dir = os.path.join("../data/output/classification", set_name)
+    set_name  = "Koliforms48hr"  # Name of subdirectory where samples will be organized
+    length = 48  # Hours of contiguous data per sample
+    output_dir = os.path.join("../data/output/regression", set_name)
 
     ## Select columns where values in samples will be normalized, which helps with calculating loss accurately
     # to_normalize = df.columns[3:]
-    to_normalize = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
-        'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
-        'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)_x',
-        'Wind direction 10minRollingAvg (°)_y',
-        'Hourly average wind direction (°)_x', 'Hourly average wind direction (°)_y', 'Average wind speed (m/s)',
-        'Maximum sustained wind speed, 3-second span (m/s)', 'Time of maximum 3s Gust',
-        'Maximum sustained wind speed, 10-minute span (m/s)', 'Time of maximum 10 minute gust',
-        'Hourly average atmospheric pressure at station (mBar)', 'Maximum pressure differential, 3-hour span (mBar)',
-        'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)',
-        'Longwave (IR) radiation (W/m2)', 'Instantaneous sea-level atmospheric pressure (mBar)',
-        'Shortwave (solar) radiation (W/m2)', 'Precipitation (mm/hr)', 'Instantaneous temperature (°C)',
-        'Maximum temperature (°C)', 'Minimum temperature (°C)', 'Average humidity (% relative humidity)',
+    to_normalize = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
+                        'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
+                        'Pfl - fDOM (QSU)', "Wind speed, x (m/s)", "Wind speed, y (m/s)",
+                        'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
+                        'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
+                        '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
         'SCADA - pH', 'SCADA - Temperature (°C)', '01-Farge', '04-Turbiditet', '06-E.coli',
         '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
-        '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '44-pH, surhetsgrad']
-    # split(df, output_dir, target_columns, length, to_normalize, 0)
+        '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
+
+    # to_normalize = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
+    #                     'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
+    #                     'Pfl - fDOM (QSU)', "Wind speed, x (m/s)", "Wind speed, y (m/s)",
+    #                     'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
+    #                     'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
+    #                     '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
+    #     'SCADA - pH', 'SCADA - Temperature (°C)']
+
+    split(df, output_dir, target_columns, length, to_normalize, 0)
 #
