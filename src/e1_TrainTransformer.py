@@ -16,7 +16,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 
 
-def load_samples(directory, input_columns, output_columns, input_rows, output_rows, file_list=None):
+def load_samples(directory, input_columns, output_columns, input_rows, output_rows, file_list=None, fault_tolerant=False):
     samples = []
     for filename in sorted(os.listdir(directory)):
         if not filename.endswith(".csv"):
@@ -32,10 +32,10 @@ def load_samples(directory, input_columns, output_columns, input_rows, output_ro
 
         input_seq = df.iloc[input_rows, :][input_columns].values
         output_seq = df.iloc[output_rows:, :][output_columns].values
-
-        if np.isnan(input_seq).any() or np.isnan(output_seq).any():
-            print(f"Sample {filename} skipped - contains NaN values")
-            continue  # skip invalid samples
+        if not fault_tolerant:
+            if np.isnan(input_seq).any() or np.isnan(output_seq).any():
+                print(f"Sample {filename} skipped - contains NaN values")
+                continue  # skip invalid samples
         samples.append((input_seq, output_seq, filename))
     print("Samples loaded")
     return samples
@@ -78,7 +78,9 @@ def train_model(directory, model, forecast_name, dataloader, num_epochs=100, lea
         plt.title("Training Loss vs. Epochs (Log-Log Scale)")
         plt.grid(True, which="both", ls="--")
         plt.tight_layout()
-        plt.savefig(os.path.join(directory, "forecasts", forecast_name, "transformer", "loss_plot.png"))
+        filepath = Path(directory, "forecasts", forecast_name, "transformer")
+        os.makedirs(filepath, exist_ok=True)
+        plt.savefig(Path(directory, "forecasts", forecast_name, "transformer", "loss_plot.png"))
         plt.close()
 
 class TimeSeriesTransformer(nn.Module):
@@ -183,20 +185,21 @@ if __name__ == '__main__':
         '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen', '24-Bly',
         '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
 
-    data_dir = "../data/output/regression/Koliforms48hr"  # Parent directory of test/train sample folder
+    data_dir = "../data/output/regression/Koliforms96Full"  # Parent directory of test/train sample folder
     historic = "../data/output/regression/Consolidated.csv"  # Path to file with baseline model input
     input_columns = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
                         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
                         'Pfl - fDOM (QSU)', "Wind speed, x (m/s)", "Wind speed, y (m/s)",
                         'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
                         'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
-                        '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)'
-                     ]  # Default: all different-dimensioned profiler and weather params, no SCADA
+                        '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
+                     'SCADA - Temperature (°C)']  # Default: all different-dimensioned profiler and weather params, no SCADA
     output_columns = ['09-Koliforme bakterier 37°C']
     forecast_name = "nowcast"
+    model_name = "transformer"
     output_rows = -1  # Default: -1 (increase value to increase forecast length, but decrease input_row_2 accordingly)
     input_row_1 = 0  # Default: 0
-    input_row_2 = 47  # Default: len(sample) - abs(output_rows)
+    input_row_2 = 95  # Default: len(sample) - abs(output_rows)
 
     # Model hyperparameters
     model_dim = 128  # Model size
@@ -208,7 +211,7 @@ if __name__ == '__main__':
     random_state = 35  # Random seed which deterministically sets the test/train split
     test_size = 0.2  # Fraction of samples saved for evaluation after training
     batch_size = 1  # Minibatch size. Smaller batches -> noisier, but escapes local minima quicker
-    num_epochs = 12  # Training duration (excessive epochs can cause overfitting to training data)
+    num_epochs = 15  # Training duration (excessive epochs can cause overfitting to training data)
     loss_threshold = 0.000001  # Threshold of acceptably small loss to terminate training early
     learning_rate = 1e-4  # Limit on parameter adjustment size per epoch
 
@@ -235,7 +238,7 @@ if __name__ == '__main__':
     }
 
     # Write model configuration dictionary to file so it can be re-run and re-used for other model types
-    filepath = Path(data_dir, 'forecasts', forecast_name, 'model_config.json')
+    filepath = Path(data_dir, 'forecasts', forecast_name, model_name, 'model_config.json')
     filepath.parent.mkdir(parents=True, exist_ok=True)
     with open(filepath, 'w') as f:
         json.dump(config, f)
@@ -262,5 +265,5 @@ if __name__ == '__main__':
     model = TimeSeriesTransformer(config).to(device)
 
     train_model(data_dir, model, forecast_name, dataloader, num_epochs, learning_rate, loss_threshold)
-    os.makedirs(os.path.join(data_dir, "forecasts", forecast_name, "transformer"), exist_ok=True)
-    torch.save(model.state_dict(), Path(data_dir, "forecasts", forecast_name, "transformer", "transformer_model.pt"))
+    os.makedirs(os.path.join(data_dir, "forecasts", forecast_name, model_name), exist_ok=True)
+    torch.save(model.state_dict(), Path(data_dir, "forecasts", forecast_name, model_name, "transformer_model.pt"))

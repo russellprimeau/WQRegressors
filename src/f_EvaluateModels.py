@@ -16,7 +16,7 @@ import xgboost as xgb
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score, accuracy_score, precision_score,
                              recall_score, f1_score, confusion_matrix, roc_curve, precision_recall_curve, auc)
-from a_CleanCombine import normalize_columns
+from a1_CleanCombine import normalize_columns
 from e1_TrainTransformer import load_samples
 from e1_TrainTransformer import TimeSeriesTransformer
 from e1_TrainTransformer import TimeSeriesTargetDataset
@@ -679,14 +679,14 @@ if __name__ == '__main__':
     ##################################################################################################################
     ## Load input, output and model hyperparameters from data_dir
     # data_dir = "../data/output/regression/Kimtall12hr"  # Parent directory of test/train sample folder
-    data_dir = "../data/output/regression/Koliforms48hr"
+    data_dir = "../data/output/regression/Koliforms96Sparse"
     forecast_name = "nowcast"
-    # model_name = "transformer"
-    #
-    # with open(Path(data_dir, 'forecasts', forecast_name, model_name, 'model_config.json'), 'r') as f:
-    #     config = json.load(f)
-    with open(Path(data_dir, 'forecasts', forecast_name, 'model_config.json'), 'r') as f:
+    model_name = "xgbregressor"
+
+    with open(Path(data_dir, 'forecasts', forecast_name, model_name, 'model_config.json'), 'r') as f:
         config = json.load(f)
+    # with open(Path(data_dir, 'forecasts', forecast_name, 'model_config.json'), 'r') as f:
+    #     config = json.load(f)
 
     input_columns = config["input_columns"]
     output_columns = config["output_columns"]
@@ -713,7 +713,7 @@ if __name__ == '__main__':
     with open(reloadset) as f:
         test_files = [line.strip() for line in f]
     test_samples = load_samples(os.path.join(data_dir,"samples"),input_columns=input_columns,output_columns=output_columns,
-        input_rows=input_rows, output_rows=output_rows, file_list=test_files)
+        input_rows=input_rows, output_rows=output_rows, file_list=test_files, fault_tolerant=True)
     test_dataset = TimeSeriesTargetDataset(test_samples)
 
     ## Alternative: for full-coverage plotting of sparse data, evaluate forecasts on complete sample set (train + test)
@@ -727,10 +727,10 @@ if __name__ == '__main__':
 
     ################################################################################################################
     ## Prepare transformer model for evaluation
-    model = TimeSeriesTransformer(config).to(device)
-    model.load_state_dict(torch.load(os.path.join(data_dir, "forecasts", forecast_name, "transformer",
-                                                  "transformer_model.pt"), map_location=device))
-    model.eval()  # Set to evaluation mode
+    # model = TimeSeriesTransformer(config).to(device)
+    # model.load_state_dict(torch.load(os.path.join(data_dir, "forecasts", forecast_name, "transformer",
+    #                                               "transformer_model.pt"), map_location=device))
+    # model.eval()  # Set to evaluation mode
 
     # Prepare XGBRegresssor model for evaluation
     xgbr_model = xgb.XGBRegressor()
@@ -739,7 +739,7 @@ if __name__ == '__main__':
 
     ##################################################################################################################
     # Evaluate regression forecasts
-    model_preds, model_targets = evaluate_model(model, test_dataset)
+    # model_preds, model_targets = evaluate_model(model, test_dataset)
     naive_preds, naive_targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
                                                 output_rows=output_rows, gap_hours=gap_hours)
     linear_preds, linear_targets = evaluate_linear(data_dir, forecast_name, test_dataset, historic, output_columns,
@@ -760,9 +760,13 @@ if __name__ == '__main__':
     xgbr_pred = xgbr_pred_flat.reshape(-1, output_dim)
     xgbr_target = y_test.reshape(-1, output_dim)
 
-    alternatives = [(model_preds, model_targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
-                    (seasonal_preds, seasonal_targets), (xgbr_pred, xgbr_target)]
-    labels = ["Transformer", "Naive", "Linear", "Seasonal", "XGBRegressor"]
+    # alternatives = [(model_preds, model_targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
+    #                 (seasonal_preds, seasonal_targets), (xgbr_pred, xgbr_target)]
+    # labels = ["Transformer", "Naive", "Linear", "Seasonal", "XGBRegressor"]
+
+    alternatives = [(xgbr_pred, xgbr_target), (naive_preds, naive_targets), (linear_preds, linear_targets),
+                    (seasonal_preds, seasonal_targets)]
+    labels = ["XGBRegressor", "Naive", "Linear", "Seasonal"]
 
     reconstituted = []
     for preds, targets in alternatives:
