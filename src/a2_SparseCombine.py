@@ -665,16 +665,16 @@ if __name__ == '__main__':
     # Merge data from other sources into the dataset.
     merge1_df = add_source(aligned_dfs[0], aligned_dfs[1], include_NAs=True, max_gap=6)
     merge2_df = add_source(merge1_df, aligned_dfs[2], include_NAs=True, max_gap=6)
-    merge3_df = add_source(merge2_df, aligned_dfs[3], include_NAs=True, max_gap=6, binarize=False)  # For regression
-    # merge3_df = add_source(merge2_df, aligned_dfs[3], include_NAs=True, max_gap=6, binarize=True)  # For classification
+    # merge3_df = add_source(merge2_df, aligned_dfs[3], include_NAs=True, max_gap=6, binarize=False)  # For regression
+    merge3_df = add_source(merge2_df, aligned_dfs[3], include_NAs=True, max_gap=6, binarize=True)  # For classification
     merge3_df = merge3_df.reset_index(names="TIMESTAMP")
 
     # segmented_df = count_segs(merge3_df)  # Add column with index for continuous segments
 
     ## Save the cleaned and merged dataset
     # For regression (with optional post-process classification)
-    output_dir = "../data/output/regression"
-    filename = "Consolidated_sparse.csv"
+    output_dir = "../data/output/classification"
+    filename = "Consolidated_sparse_binarized.csv"
 
     # For classification only:
     # output_dir = "../data/output/classification"
@@ -686,4 +686,4 @@ if __name__ == '__main__':
     merge3_df.to_csv(Path(output_dir, filename), index=False)
 
     ## Visualize datasets in a browser window:
-    explore_data(merge3_df, clean_df, weather_simp_df, scada_df, eurofins_df)
+    # explore_data(merge3_df, clean_df, weather_simp_df, scada_df, eurofins_df)

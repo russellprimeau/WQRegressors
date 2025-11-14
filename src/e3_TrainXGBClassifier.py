@@ -18,7 +18,7 @@ if __name__ == "__main__":
     matplotlib.use('Agg')  # Non-interactive backend
 
     # Configuration parameters
-    data_dir = "../data/output/classification/Anomaly24hr"
+    data_dir = "../data/output/classification/Koliforms96Sparse"
     forecast_name = "nowcast"
     model_name = "xgbclassifier"
     input_columns = [
@@ -29,13 +29,13 @@ if __name__ == "__main__":
                         'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
                         '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)'
     ]
-    output_columns = ['anomaly']
+    output_columns = ['09-Koliforme bakterier 37°C']
     output_rows = -1
     input_row_1 = 0
     input_row_2 = 23
     input_rows = slice(input_row_1, input_row_2)
     random_state = 32
-    test_size = 0.22
+    test_size = 0.2
 
     # Generate additional model dimensions parametrically based on selection
     input_rows = slice(input_row_1, input_row_2)
@@ -67,7 +67,7 @@ if __name__ == "__main__":
     # Pre-process dataset
     samples = load_samples(os.path.join(data_dir, 'samples'), input_columns=input_columns,
                            output_columns=output_columns,
-                           input_rows=input_rows, output_rows=output_rows)
+                           input_rows=input_rows, output_rows=output_rows, fault_tolerant=True)
     all_filenames = sorted([f for f in os.listdir(os.path.join(data_dir, 'samples')) if f.endswith(".csv")])
     train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=random_state)
     os.makedirs(os.path.join(data_dir, "forecasts", forecast_name), exist_ok=True)
@@ -95,20 +95,25 @@ if __name__ == "__main__":
     X_train = np.array([s[0].flatten() for s in train_samples])
     y_train = np.array([int(round(s[1].flatten()[0])) for s in train_samples])  # ensure 0/1 ints
 
+    X_test = np.array([s[0].flatten() for s in test_samples])
+    y_test = np.array([int(round(s[1].flatten()[0])) for s in test_samples])  # ensure 0/1 ints
+
     # Initialize and train XGBoost Classifier
     model = xgb.XGBClassifier(
         tree_method='hist',
         objective='binary:logistic',
-        n_estimators=100000,
+        n_estimators=1200,
         max_depth=10,
-        subsample=0.5,
+        subsample=0.2,
         colsample_bytree=0.8,
         learning_rate=0.01,
         n_jobs=1,
         eval_metric='logloss'
     )
 
-    model.fit(X_train, y_train)
+    model.fit(X_train, y_train,
+              eval_set=[(X_train, y_train), (X_test, y_test)],
+              verbose=True)
 
     # Save model
     save_path = Path(data_dir, "forecasts", forecast_name, model_name)
@@ -116,3 +121,19 @@ if __name__ == "__main__":
     model.save_model(save_path / "xgboost_model.json")
 
     print("Model training complete. Model saved to:", save_path)
+
+    # Get evaluation results
+    results = model.evals_result()
+
+    # Plot training vs validation loss
+    epochs = len(results['validation_0']['logloss'])
+    plt.figure(figsize=(8, 5))
+    plt.loglog(range(epochs), results['validation_0']['logloss'], label='Train logloss')
+    plt.loglog(range(epochs), results['validation_1']['logloss'], label='Validation logloss')
+    plt.xlabel('Boosting Rounds')
+    plt.ylabel('Logloss')
+    plt.grid(True, which="both", ls="--")
+    plt.title('Training vs Validation Loss')
+    plt.legend()
+    plt.savefig(os.path.join(data_dir, "forecasts", forecast_name, model_name, "loss_plot.png"))
+    plt.close()

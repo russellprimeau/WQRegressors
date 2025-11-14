@@ -388,7 +388,7 @@ def binarize_predictions(preds, output_columns, thresholds_df):
         binarized[:, i] = (preds[:, i] > threshold).astype(int)
     return binarized
 
-def visualizer(*pred_target_pairs, labels=None, directory, forecast_name, num_samples=100):
+def visualizer(*pred_target_pairs, labels=None, directory, forecast_name, num_samples=200):
     """
     Visualize predictions and targets for a range of gaps from time series.
     :param pred_target_pairs:
@@ -422,6 +422,7 @@ def visualizer(*pred_target_pairs, labels=None, directory, forecast_name, num_sa
             r2 = r2_score(targets[mask], preds[mask])
             metrics.append((label, mae, rmse, r2))
             print(f"{label}: MAE={mae:.4f}, RMSE={rmse:.4f}, R²={r2:.4f}")
+            print()
         else:
             metrics.append((label, np.nan, np.nan, np.nan))
             print(f"{label}: no valid data for metrics")
@@ -429,7 +430,7 @@ def visualizer(*pred_target_pairs, labels=None, directory, forecast_name, num_sa
     ax.plot([min_val, max_val], [min_val, max_val], color="red", linestyle="--")
     ax.set_xlabel("Ground truth")
     ax.set_ylabel("Predicted Value")
-    ax.set_title("Seasonal baseline model")
+    ax.set_title("ML & Baseline Models")
     ax.set_xlim(min_val, max_val)
     ax.set_ylim(min_val, max_val)
     ax.set_aspect("equal", adjustable="box")
@@ -464,7 +465,6 @@ def visualizer(*pred_target_pairs, labels=None, directory, forecast_name, num_sa
         plt.savefig(Path(directory, "forecasts", forecast_name, "metrics_summary.png"))
         plt.close(fig)
 
-    # === NEW: RMSE vs Forecast Horizon ===
     fig, ax = plt.subplots(figsize=(10, 6))
     for i, (preds, targets) in enumerate(pred_target_pairs):
         preds = np.array(preds)
@@ -495,6 +495,71 @@ def visualizer(*pred_target_pairs, labels=None, directory, forecast_name, num_sa
     plt.tight_layout()
     plt.savefig(Path(directory, "forecasts", forecast_name, "horizon_rmse.png"))
     plt.close(fig)
+
+    n_sets = len(pred_target_pairs)
+    if labels is None:
+        labels = [f"Set {i+1}" for i in range(n_sets)]
+    elif len(labels) != n_sets:
+        raise ValueError("Length of labels must match number of result sets.")
+
+    # Prepare combined error data
+    combined_errors = []
+    for (pred, target) in pred_target_pairs:
+        errors = (pred - target).flatten()
+        combined_errors.append(errors)
+
+    # Combined DataFrame for all errors
+    df_combined = pd.DataFrame({label: data for label, data in zip(labels, combined_errors)})
+    df_long_combined = df_combined.melt(var_name="Dataset", value_name="Error")
+
+    # Combined figure: emphasize points, de-emphasize boxplot
+    plt.figure(figsize=(8, 6))
+    ax = plt.gca()
+    sns.boxplot(x="Dataset", y="Error", data=df_long_combined,
+                showcaps=True, boxprops={'facecolor': 'lightgray', 'alpha': 0.3, 'linewidth': 0.5},
+                whiskerprops={'linewidth': 0.5}, medianprops={'color': 'blue', 'linewidth': 1}, ax=ax)
+
+    sns.stripplot(x="Dataset", y="Error", data=df_long_combined,
+                  jitter=True, size=6, color='black', alpha=0.8, ax=ax)
+
+    ax.set_title("Prediction Error Distribution")
+    ax.set_ylabel("Error (Absolute)")
+    ax.set_xlabel("Model")
+    plt.tight_layout()
+    plt.savefig(Path(directory, "forecasts", forecast_name, "boxplot.png"))
+    plt.close()
+
+    # Individual figures per pair comparing columns
+    for (pred, target), label in zip(pred_target_pairs, labels):
+        errors_matrix = pred - target
+
+        # Skip if 1D or single column
+        if errors_matrix.ndim == 1 or errors_matrix.shape[1] == 1:
+            continue
+
+        n_cols = errors_matrix.shape[1]
+        col_labels = [f"Col {i + 1}" for i in range(n_cols)]
+
+        # Prepare DataFrame for this pair
+        df_pair = pd.DataFrame({col_label: errors_matrix[:, i] for i, col_label in enumerate(col_labels)})
+        df_long_pair = df_pair.melt(var_name="Column", value_name="Error")
+
+        # Overlay boxplot and jitterplot on one axis
+        plt.figure(figsize=(8, 6))
+        ax = plt.gca()
+        sns.boxplot(x="Column", y="Error", data=df_long_pair,
+                    showcaps=True, boxprops={'facecolor': 'lightgray', 'alpha': 0.3, 'linewidth': 0.5},
+                    whiskerprops={'linewidth': 0.5}, ax=ax)
+
+        sns.stripplot(x="Column", y="Error", data=df_long_pair,
+                      jitter=True, size=6, color='black', alpha=0.8, ax=ax)
+
+        ax.set_title(f"Error by Column for {label}")
+        ax.set_ylabel("Error")
+        ax.set_xlabel("Column")
+        plt.tight_layout()
+        plt.savefig(Path(directory, "forecasts", forecast_name, f"{label.replace(' ', '_')}_overlay_emphasized.png"))
+        plt.close()
 
 def classification_visualizer(*pred_target_pairs, labels=None, directory='.', forecast_name='Classifier',
                               num_samples=200):
@@ -679,9 +744,9 @@ if __name__ == '__main__':
     ##################################################################################################################
     ## Load input, output and model hyperparameters from data_dir
     # data_dir = "../data/output/regression/Kimtall12hr"  # Parent directory of test/train sample folder
-    data_dir = "../data/output/regression/Koliforms96Sparse"
+    data_dir = "../data/output/regression/Koliforms96Full"
     forecast_name = "nowcast"
-    model_name = "xgbregressor"
+    model_name = "transformer"
 
     with open(Path(data_dir, 'forecasts', forecast_name, model_name, 'model_config.json'), 'r') as f:
         config = json.load(f)
@@ -716,30 +781,31 @@ if __name__ == '__main__':
         input_rows=input_rows, output_rows=output_rows, file_list=test_files, fault_tolerant=True)
     test_dataset = TimeSeriesTargetDataset(test_samples)
 
-    ## Alternative: for full-coverage plotting of sparse data, evaluate forecasts on complete sample set (train + test)
+    # Alternative: for full-coverage plotting of sparse data, evaluate forecasts on complete sample set (train + test)
     # samples = load_samples(os.path.join(data_dir, 'samples'), input_columns=input_columns,
     #                        output_columns=output_columns,
-    #                        input_rows=input_rows, output_rows=output_rows)
+    #                        input_rows=input_rows, output_rows=output_rows, fault_tolerant=True)
     # test_dataset = TimeSeriesTargetDataset(samples)
+    # test_samples = samples
 
     X_test = np.array([s[0].flatten() for s in test_samples])
     y_test = np.array([s[1].flatten()[0] for s in test_samples])
 
     ################################################################################################################
     ## Prepare transformer model for evaluation
-    # model = TimeSeriesTransformer(config).to(device)
-    # model.load_state_dict(torch.load(os.path.join(data_dir, "forecasts", forecast_name, "transformer",
-    #                                               "transformer_model.pt"), map_location=device))
-    # model.eval()  # Set to evaluation mode
+    model = TimeSeriesTransformer(config).to(device)
+    model.load_state_dict(torch.load(os.path.join(data_dir, "forecasts", forecast_name, "transformer",
+                                                  "transformer_model.pt"), map_location=device))
+    model.eval()  # Set to evaluation mode
 
-    # Prepare XGBRegresssor model for evaluation
+    ## Prepare XGBRegresssor model for evaluation
     xgbr_model = xgb.XGBRegressor()
     xgbr_path = Path(data_dir, "forecasts", forecast_name, "XGBRegressor", "xgboost_model.json")
     xgbr_model.load_model(xgbr_path)
 
     ##################################################################################################################
     # Evaluate regression forecasts
-    # model_preds, model_targets = evaluate_model(model, test_dataset)
+    model_preds, model_targets = evaluate_model(model, test_dataset)
     naive_preds, naive_targets = evaluate_naive(test_dataset, historic, output_columns, data_dir,
                                                 output_rows=output_rows, gap_hours=gap_hours)
     linear_preds, linear_targets = evaluate_linear(data_dir, forecast_name, test_dataset, historic, output_columns,
@@ -756,37 +822,38 @@ if __name__ == '__main__':
     sample_df = pd.read_csv(Path(data_dir, 'samples', sorted(os.listdir(Path(data_dir, 'samples')))[0]))
     output_dim = len(output_columns) * len(sample_df.iloc[output_rows:])
 
-    # Reshape y_pred to [num_samples, output_dim]
+    ## Reshape y_pred to [num_samples, output_dim]
     xgbr_pred = xgbr_pred_flat.reshape(-1, output_dim)
     xgbr_target = y_test.reshape(-1, output_dim)
 
-    # alternatives = [(model_preds, model_targets), (naive_preds, naive_targets), (linear_preds, linear_targets),
-    #                 (seasonal_preds, seasonal_targets), (xgbr_pred, xgbr_target)]
-    # labels = ["Transformer", "Naive", "Linear", "Seasonal", "XGBRegressor"]
+    alternatives = [(model_preds, model_targets), (xgbr_pred, xgbr_target), (naive_preds, naive_targets),
+                    (linear_preds, linear_targets), (seasonal_preds, seasonal_targets)]
+    labels = ["Transformer", "XGBRegressor", "Naive", "Linear", "Seasonal"]
 
-    alternatives = [(xgbr_pred, xgbr_target), (naive_preds, naive_targets), (linear_preds, linear_targets),
-                    (seasonal_preds, seasonal_targets)]
-    labels = ["XGBRegressor", "Naive", "Linear", "Seasonal"]
+    # alternatives = [(naive_preds, naive_targets), (linear_preds, linear_targets),
+    #                 (seasonal_preds, seasonal_targets)]
+    # labels = ["Naive", "Linear", "Seasonal"]
 
     reconstituted = []
     for preds, targets in alternatives:
         preds_original = reverse_normalize(preds, output_columns, Path('../data/input', "normalization.json"))
         targets_original = reverse_normalize(targets, output_columns, Path('../data/input', "normalization.json"))
         reconstituted.append((preds_original, targets_original))
-    visualizer(*reconstituted, labels=labels, forecast_name=forecast_name, directory=data_dir, num_samples=200)
+    visualizer(*alternatives, labels=labels, forecast_name=forecast_name, directory=data_dir, num_samples=200)
+    # visualizer((xgbr_pred, xgbr_target), labels=labels, forecast_name=forecast_name, directory=data_dir, num_samples=200)
 
     #################################################################################################################
     ## Convert regression model outputs to classes based on thresholds for each output column, and
     # evaluate success of regressors on classification problem
 
-    class_results = []
-    for preds, targets in reconstituted:
-        bin_preds = binarize_predictions(preds, output_columns=output_columns, thresholds_df=thresholds_df)
-        bin_targets = binarize_predictions(targets, output_columns=output_columns, thresholds_df=thresholds_df)
-        class_results.append((bin_preds, bin_targets))
+    # class_pred_target_pairs = []
+    # for preds, targets in reconstituted:
+    #     bin_preds = binarize_predictions(preds, output_columns=output_columns, thresholds_df=thresholds_df)
+    #     bin_targets = binarize_predictions(targets, output_columns=output_columns, thresholds_df=thresholds_df)
+    #     class_results.append((bin_preds, bin_targets))
 
-    classification_visualizer(*class_results, labels=labels, directory=data_dir, forecast_name=forecast_name,
-                              num_samples=200)
+    # classification_visualizer(*class_results, labels=labels, directory=data_dir, forecast_name=forecast_name,
+    #                           num_samples=200)
 
     ##################################################################################################################
     ## Explore linear model parameter space
@@ -821,7 +888,7 @@ if __name__ == '__main__':
 
     ##################################################################################################################
     ## Pure classification
-    # ## Prepare XGBClassifier model for evaluation
+    ## Prepare XGBClassifier model for evaluation
     # xgbc_model = xgb.XGBClassifier()
     # xgbc_path = Path(data_dir, "forecasts", forecast_name, "xgbclassifier", "xgboost_model.json")
     # xgbc_model.load_model(xgbc_path)
@@ -835,7 +902,9 @@ if __name__ == '__main__':
     # ## Reshape y_pred to [num_samples, output_dim]
     # xgbc_pred = xgbc_pred_flat.reshape(-1, output_dim)
     # xgbc_target = y_test.reshape(-1, output_dim)
-    # labels = ['XGBClassifier']
+    # labels = labels + ['XGBClassifier']
     #
-    # classification_visualizer((xgbc_pred, xgbc_target), labels=labels, directory=data_dir, forecast_name=forecast_name,
+    # class_results = class_results + [(xgbc_pred, xgbc_target)]
+    #
+    # classification_visualizer(*class_results, labels=labels, directory=data_dir, forecast_name=forecast_name,
     #                           num_samples=200)

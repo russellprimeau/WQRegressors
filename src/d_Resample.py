@@ -232,7 +232,7 @@ if __name__ == '__main__':
     # df = pd.read_csv("../data/output/classification/Consolidated_binarized.csv",
     #                  parse_dates=["TIMESTAMP"])
     ## For regression (of any parameters:
-    df = pd.read_csv("../data/output/regression/Consolidated.csv",parse_dates=["TIMESTAMP"])
+    df = pd.read_csv("../data/output/classification/Consolidated_sparse_binarized.csv",parse_dates=["TIMESTAMP"])
     df = df.sort_values("TIMESTAMP")
 
     ## Identify prediction target columns. Output will only include samples with valid value in last row.
@@ -266,9 +266,9 @@ if __name__ == '__main__':
     # analyze_valid(df, ['09-Koliforme bakterier 37°C'], predictor_cols, [12, 24, 48, 96, 168], 1, name="Koli_Max_Input_Set_v_Length")
 
     ## Name the dataset and select the size of each sample (# of timesteps/rows)
-    set_name  = "Koliforms96Full"  # Name of subdirectory where samples will be organized
+    set_name  = "Koliforms96Sparse"  # Name of subdirectory where samples will be organized
     length = 96  # Hours of contiguous data per sample
-    output_dir = os.path.join("../data/output/regression", set_name)
+    output_dir = os.path.join("../data/output/classification", set_name)
 
     ## Select columns where values in samples will be normalized, which helps with calculating loss accurately
     # to_normalize = df.columns[3:]
@@ -292,4 +292,4 @@ if __name__ == '__main__':
 
     # split(df, output_dir, target_columns, length, to_normalize, 0)
 
-    split(df, output_dir, ['09-Koliforme bakterier 37°C'], length, 100, to_normalize, False)
+    split(df, output_dir, ['09-Koliforme bakterier 37°C'], length, 90, to_normalize, True)
