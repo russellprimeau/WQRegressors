@@ -830,30 +830,12 @@ if __name__ == '__main__':
                     (linear_preds, linear_targets), (seasonal_preds, seasonal_targets)]
     labels = ["Transformer", "XGBRegressor", "Naive", "Linear", "Seasonal"]
 
-    # alternatives = [(naive_preds, naive_targets), (linear_preds, linear_targets),
-    #                 (seasonal_preds, seasonal_targets)]
-    # labels = ["Naive", "Linear", "Seasonal"]
-
     reconstituted = []
     for preds, targets in alternatives:
         preds_original = reverse_normalize(preds, output_columns, Path('../data/input', "normalization.json"))
         targets_original = reverse_normalize(targets, output_columns, Path('../data/input', "normalization.json"))
         reconstituted.append((preds_original, targets_original))
     visualizer(*alternatives, labels=labels, forecast_name=forecast_name, directory=data_dir, num_samples=200)
-    # visualizer((xgbr_pred, xgbr_target), labels=labels, forecast_name=forecast_name, directory=data_dir, num_samples=200)
-
-    #################################################################################################################
-    ## Convert regression model outputs to classes based on thresholds for each output column, and
-    # evaluate success of regressors on classification problem
-
-    # class_pred_target_pairs = []
-    # for preds, targets in reconstituted:
-    #     bin_preds = binarize_predictions(preds, output_columns=output_columns, thresholds_df=thresholds_df)
-    #     bin_targets = binarize_predictions(targets, output_columns=output_columns, thresholds_df=thresholds_df)
-    #     class_results.append((bin_preds, bin_targets))
-
-    # classification_visualizer(*class_results, labels=labels, directory=data_dir, forecast_name=forecast_name,
-    #                           num_samples=200)
 
     ##################################################################################################################
     ## Explore linear model parameter space
@@ -885,26 +867,3 @@ if __name__ == '__main__':
     #
     #
     # visualizer(*results, labels=labels, forecast_name=Path(forecast_name, space_name), directory=data_dir, num_samples=200)
-
-    ##################################################################################################################
-    ## Pure classification
-    ## Prepare XGBClassifier model for evaluation
-    # xgbc_model = xgb.XGBClassifier()
-    # xgbc_path = Path(data_dir, "forecasts", forecast_name, "xgbclassifier", "xgboost_model.json")
-    # xgbc_model.load_model(xgbc_path)
-    #
-    # xgbc_pred_flat = xgbc_model.predict(X_test)
-    #
-    # # Compute output_dim dynamically
-    # sample_df = pd.read_csv(Path(data_dir, 'samples', sorted(os.listdir(Path(data_dir, 'samples')))[0]))
-    # output_dim = len(output_columns) * len(sample_df.iloc[output_rows:])
-    #
-    # ## Reshape y_pred to [num_samples, output_dim]
-    # xgbc_pred = xgbc_pred_flat.reshape(-1, output_dim)
-    # xgbc_target = y_test.reshape(-1, output_dim)
-    # labels = labels + ['XGBClassifier']
-    #
-    # class_results = class_results + [(xgbc_pred, xgbc_target)]
-    #
-    # classification_visualizer(*class_results, labels=labels, directory=data_dir, forecast_name=forecast_name,
-    #                           num_samples=200)

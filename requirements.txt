@@ -8,3 +8,4 @@ scikit-learn
 xgboost
 pathlib2
 dash
+pyyaml
