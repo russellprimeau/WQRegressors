@@ -8,7 +8,7 @@ import os
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from utils.preprocessing import (clean_profiler, add_source, decompose_direction, rolling_sum)
+from utils.preprocessing import (clean_profiler, add_source, decompose_direction, count_segs, rolling_sum, explore_data)
 
 if __name__ == '__main__':
     ## Load and pre-process data from source files
@@ -141,10 +141,10 @@ if __name__ == '__main__':
     # output_dir = "../data/output/classification"
     # filename = "Consolidated_binarized.csv"
 
-    ## Write a combined dataset to file (either regression or classification)
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    merge3_df.to_csv(Path(output_dir, filename), index=False)
+    # ## Write a combined dataset to file (either regression or classification)
+    # if not os.path.exists(output_dir):
+    #     os.makedirs(output_dir)
+    # merge3_df.to_csv(Path(output_dir, filename), index=False)
 
     ## Visualize datasets in a browser window:
-    # explore_data(merge3_df, clean_df, weather_simp_df, scada_df, eurofins_df)
+    explore_data(merge3_df, clean_df, weather_simp_df, scada_df, eurofins_df)

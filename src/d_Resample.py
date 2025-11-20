@@ -11,7 +11,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import plotly.express as px
 from pathlib import Path
-from a1_CleanCombine import normalize_columns
+from utils.preprocessing import normalize_columns
 
 def clean_directory(directory_path):
     """
