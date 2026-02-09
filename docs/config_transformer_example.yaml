@@ -1,0 +1,56 @@
+# Transformer Model Configuration
+# Example configuration for training a PyTorch Transformer for time series forecasting
+
+model_type: transformer
+model_name: transformer
+
+# Data configuration
+data:
+  data_dir: "../data/output/regression/Kimtall72Trans"
+  forecast_name: "nowcast"
+  input_columns:
+    - 'Pfl - Water temperature (°C)'
+    - 'Pfl - Sp Cond (microS_cm)'
+    - 'Pfl - pH'
+    - 'Pfl - DO (% Sat)'
+    - 'Pfl - Turbidity (FNU)'
+    - 'Pfl - fDOM (RFU)'
+    - 'Pfl - fDOM (QSU)'
+    - 'Wind speed, x (m/s)'
+    - 'Wind speed, y (m/s)'
+    - 'Maximum 3s wind gust (m/s)'
+    - 'Atmospheric pressure (mBar)'
+    - 'Longwave (IR) radiation (W/m2)'
+    - 'Shortwave (solar) radiation (W/m2)'
+    - '24hr precipitation total (mm)'
+    - 'Air temperature (°C)'
+    - 'Humidity (%)'
+    - 'SCADA - Temperature (°C)'
+  output_columns:
+    - '09-Koliforme bakterier 37°C_res'
+  input_row_1: 0
+  input_row_2: 70
+  output_rows: -1
+
+# Data split configuration
+data_split:
+  random_state: 35
+  test_size: 0.2
+  reuse_split: false
+  split_source: null
+  split_type: random
+
+# Device configuration
+device: cuda  # or 'cpu'
+
+# Model hyperparameters (leave blank to use defaults)
+hyperparameters:
+  model_dim: 128
+  num_heads: 4
+  num_layers: 8
+  dropout: 0.1
+  batch_size: 10
+  num_epochs: 100
+  loss_threshold: 0.000001
+  learning_rate: 0.0001
+  patience: 10

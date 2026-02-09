@@ -9,6 +9,7 @@ from sklearn.model_selection import train_test_split
 def load_samples(directory, input_columns, output_columns, input_rows, output_rows, file_list=None,
                  fault_tolerant=False, source=None):
     samples = []
+
     if source is not None:
         with open(source) as f:
             file_list = [line.strip() for line in f]
@@ -16,14 +17,16 @@ def load_samples(directory, input_columns, output_columns, input_rows, output_ro
         if not filename.endswith(".csv"):
             continue
         if file_list is not None and filename not in file_list:
+            print(f"Sample {filename} skipped - not in list")
             continue  # Skip files not in the provided list
         df = pd.read_csv(os.path.join(directory, filename))
         if not set(input_columns + output_columns).issubset(df.columns):
+            print(f"Sample {filename} skipped - contains missing columns")
+            print('Contains only:', df.columns)
             continue  # skip files with missing columns
         if len(df) < input_rows.stop:
             print(f"Sample {filename} skipped — not enough rows ({len(df)} < {input_rows.stop})")
             continue  # skip files without enough rows
-
         input_seq = df.iloc[input_rows, :][input_columns].values
         output_seq = df.iloc[output_rows:, :][output_columns].values
         if not fault_tolerant:
@@ -72,6 +75,7 @@ def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns,
         samples = load_samples(os.path.join(data_dir, 'samples'), input_columns=input_columns,
                                output_columns=output_columns, input_rows=input_rows, output_rows=output_rows,
                                fault_tolerant=fault_tolerant)
+        print('samples', samples)
         if split_type == 'temporal':
             ## Time-based split
             samples_sorted = sorted(samples, key=extract_index)

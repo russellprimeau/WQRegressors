@@ -5,6 +5,8 @@ from pathlib import Path
 import dash
 from dash import dcc, html, Output, Input
 import plotly.graph_objects as go
+from sklearn.manifold import TSNE
+from sklearn.preprocessing import StandardScaler
 
 def clean_profiler(full_df, max_gap=6):
     """
@@ -311,7 +313,7 @@ def rolling_sum(df, time_col, target_col, interval_hours):
 def explore_data(full, *raw):
     app = dash.Dash(__name__)
     app.layout = html.Div([
-        html.H3("Configure plat area"),
+        html.H3("Configure plot area"),
         html.H4("Upstream datasets:"),
         dcc.Checklist(
             id='in_sets',
@@ -403,7 +405,7 @@ def explore_data(full, *raw):
                         'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
                         '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)']
         SCADA_cols = ['SCADA - pH', 'SCADA - Temperature (°C)']
-        Eurofins_phys = ['01-Farge', '04-Turbiditet']
+        Eurofins_phys = ['01-Farge', '04-Turbiditet', '44-pH']
         Eurofins_bio = ['06-E.coli', '07-Intestinale enterokokker', '08-Kimtall 22°C',
                          '09-Koliforme bakterier 37°C']
         Eurofins_metal = ['21-Arsen', '24-Bly', '32-Kadmium', '36-Kopper filtrert',
@@ -542,3 +544,199 @@ def explore_data(full, *raw):
                                   xaxis_range=[0, 8760])
         return fig
     app.run(debug=True)
+
+
+import pandas as pd
+
+
+def forward_fill_columns(df: pd.DataFrame, columns: list) -> pd.DataFrame:
+    """
+    For each column in 'columns' that exists in 'df', create a new column
+    where NaN values are replaced by the last non-NaN value (forward fill).
+    The new column will have the suffix '_filled'.
+
+    Parameters:
+        df (pd.DataFrame): The input dataframe.
+        columns (list): List of column names to forward fill.
+
+    Returns:
+        pd.DataFrame: Modified dataframe with new forward-filled columns.
+    """
+    final_df = df.copy()
+
+    for col in columns:
+        if col in final_df.columns:
+            final_df[f"{col}_state"] = final_df[col].ffill()
+
+    return final_df
+
+
+import pandas as pd
+import numpy as np
+
+import pandas as pd
+import numpy as np
+
+
+def add_res(df: pd.DataFrame, columns: list) -> pd.DataFrame:
+    """
+    For each column in 'columns' that exists in 'df', create a new column 'col_res'.
+    Rules:
+      - If the value in col is NaN, col_res is NaN.
+      - For the first non-NaN value in col, col_res is NaN.
+      - Otherwise, col_res is the difference between the current value and the previous non-NaN value.
+    Values in the new column are rounded to 3 decimal places.
+
+    Parameters:
+        df (pd.DataFrame): The input dataframe.
+        columns (list): List of column names to process.
+
+    Returns:
+        pd.DataFrame: Modified dataframe with new difference columns.
+    """
+    final_df = df.copy()
+
+    for col in columns:
+        if col in final_df.columns:
+            # Forward fill to get previous non-NaN values
+            prev_vals = final_df[col].ffill()
+
+            # Compute difference
+            diffs = final_df[col] - prev_vals.shift(1)
+
+            # Ensure first non-NaN gets NaN
+            first_non_nan_idx = final_df[col].first_valid_index()
+            if first_non_nan_idx is not None:
+                diffs.iloc[first_non_nan_idx] = np.nan
+
+            # Round to 3 decimal places
+            final_df[f"{col}_res"] = diffs.round(3)
+
+    return final_df
+
+
+def prepare_tsne_plot(
+    df_or_path: pd.DataFrame | str | Path,
+    feature_columns: list | None = None,
+    timestamp_col: str = "TIMESTAMP",
+    perplexity: int = 30,
+    learning_rate: str | float = "auto",
+    n_iter: int = 1000,
+    random_state: int = 42,
+    init: str = "pca",
+    scale: bool = True,
+    drop_all_nan_cols: bool = True,
+    return_fig: bool = True,
+    include_time_features: bool = False,
+):
+    """
+    Prepare a t-SNE embedding (and optional Plotly scatter) for multivariate datasets
+    such as Eurofins.csv. Handles missing values, numeric coercion, and scaling.
+    
+    Args:
+        include_time_features: If True, extract temporal features (month, day_of_year) 
+                              from timestamp and include them in the t-SNE analysis.
+
+    Returns:
+        embedding_df (pd.DataFrame): Contains tsne_1, tsne_2, original_index, timestamp,
+                                     and all original feature values for traceability.
+        fig (plotly.graph_objects.Figure | None): Interactive plot if return_fig=True.
+    """
+    if isinstance(df_or_path, (str, Path)):
+        work_df = pd.read_csv(df_or_path, sep=";", decimal=".")
+    else:
+        work_df = df_or_path.copy()
+
+    if timestamp_col not in work_df.columns and "Time" in work_df.columns:
+        work_df = work_df.rename(columns={"Time": timestamp_col})
+
+    work_df = work_df.replace([r"^\s*$", "NA", "#N/A"], np.nan, regex=True)
+
+    if feature_columns is None:
+        numeric_df = work_df.apply(pd.to_numeric, errors="coerce")
+        if timestamp_col in numeric_df.columns:
+            numeric_df = numeric_df.drop(columns=[timestamp_col])
+        feature_columns = numeric_df.columns.tolist()
+        work_df[feature_columns] = numeric_df
+    else:
+        work_df[feature_columns] = work_df[feature_columns].apply(pd.to_numeric, errors="coerce")
+
+    if drop_all_nan_cols:
+        all_nan_cols = [col for col in feature_columns if work_df[col].isna().all()]
+        if all_nan_cols:
+            work_df = work_df.drop(columns=all_nan_cols)
+            feature_columns = [col for col in feature_columns if col not in all_nan_cols]
+
+    if not feature_columns:
+        raise ValueError("No valid numeric feature columns available for t-SNE.")
+
+    # Store original index before filtering
+    work_df = work_df.reset_index(drop=False).rename(columns={'index': 'original_index'})
+    
+    # Add temporal features if requested
+    time_features = []
+    if include_time_features and timestamp_col in work_df.columns:
+        work_df[timestamp_col] = pd.to_datetime(work_df[timestamp_col], errors='coerce')
+        work_df['month'] = work_df[timestamp_col].dt.month
+        work_df['day_of_year'] = work_df[timestamp_col].dt.dayofyear
+        time_features = ['month', 'day_of_year']
+        feature_columns = feature_columns + time_features
+    
+    work_df = work_df.dropna(subset=feature_columns, how="any")
+
+    X = work_df[feature_columns].to_numpy()
+
+    if scale:
+        scaler = StandardScaler()
+        X = scaler.fit_transform(X)
+
+    n_samples = X.shape[0]
+    if n_samples < 2:
+        raise ValueError("t-SNE requires at least 2 samples.")
+    max_perplexity = max(1, (n_samples - 1) // 3)
+    effective_perplexity = min(perplexity, max_perplexity)
+
+    tsne = TSNE(
+        n_components=2,
+        perplexity=effective_perplexity,
+        learning_rate=learning_rate,
+        max_iter=n_iter,
+        random_state=random_state,
+        init=init,
+    )
+    embedding = tsne.fit_transform(X)
+
+    embedding_df = pd.DataFrame(embedding, columns=["tsne_1", "tsne_2"])
+    embedding_df['original_index'] = work_df['original_index'].values
+    
+    if timestamp_col in work_df.columns:
+        embedding_df[timestamp_col] = pd.to_datetime(work_df[timestamp_col].values, errors="coerce")
+    
+    # Include all original feature values for full traceability
+    for col in feature_columns:
+        embedding_df[col] = work_df[col].values
+
+    fig = None
+    if return_fig:
+        # Build comprehensive hover text
+        hover_text = []
+        for idx, row in embedding_df.iterrows():
+            text = f"Index: {row['original_index']}<br>"
+            if timestamp_col in embedding_df.columns and pd.notna(row[timestamp_col]):
+                text += f"Time: {row[timestamp_col]}<br>"
+            text += f"t-SNE 1: {row['tsne_1']:.3f}<br>t-SNE 2: {row['tsne_2']:.3f}"
+            hover_text.append(text)
+        
+        fig = go.Figure(
+            data=go.Scatter(
+                x=embedding_df["tsne_1"],
+                y=embedding_df["tsne_2"],
+                mode="markers",
+                marker=dict(size=6, opacity=0.75),
+                text=hover_text,
+                hovertemplate="%{text}<extra></extra>",
+            )
+        )
+        fig.update_layout(title="t-SNE embedding", xaxis_title="t-SNE 1", yaxis_title="t-SNE 2")
+
+    return embedding_df, fig

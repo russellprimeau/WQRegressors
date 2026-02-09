@@ -1,0 +1,56 @@
+# XGBoost Classifier Model Configuration
+# Example configuration for training an XGBoost Classifier for binary classification tasks
+
+model_type: xgb_classifier
+model_name: xgbclassifier
+
+# Data configuration
+data:
+  data_dir: "../data/output/classification/Koliforms96Sparse"
+  forecast_name: "nowcast"
+  input_columns:
+    - 'Pfl - Water temperature (°C)'
+    - 'Pfl - Sp Cond (microS_cm)'
+    - 'Pfl - pH'
+    - 'Pfl - DO (% Sat)'
+    - 'Pfl - Turbidity (FNU)'
+    - 'Pfl - fDOM (RFU)'
+    - 'Pfl - fDOM (QSU)'
+    - 'Wind speed, x (m/s)'
+    - 'Wind speed, y (m/s)'
+    - 'Maximum 3s wind gust (m/s)'
+    - 'Atmospheric pressure (mBar)'
+    - 'Longwave (IR) radiation (W/m2)'
+    - 'Shortwave (solar) radiation (W/m2)'
+    - '24hr precipitation total (mm)'
+    - 'Air temperature (°C)'
+    - 'Humidity (%)'
+  output_columns:
+    - '09-Koliforme bakterier 37°C'
+  input_row_1: 0
+  input_row_2: 95
+  output_rows: -1
+
+# Data split configuration
+data_split:
+  random_state: 35
+  test_size: 0.2
+  reuse_split: false
+  split_source: null
+  split_type: random
+
+# Device configuration
+device: cuda  # or 'cpu'
+
+# Model hyperparameters (leave blank to use defaults)
+hyperparameters:
+  eval_metric: logloss
+  tree_method: hist
+  objective: binary:logistic
+  n_estimators: 1500
+  max_depth: 10
+  subsample: 0.2
+  colsample_bytree: 0.8
+  learning_rate: 0.01
+  n_jobs: -1
+  early_stopping_rounds: 50
