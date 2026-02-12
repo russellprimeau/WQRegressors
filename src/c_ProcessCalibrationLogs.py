@@ -107,11 +107,11 @@ def parse_calibration_files(directory):
                 chapter_name = metadata.get("Parameter Type", "Unknown")
                 print(f"Creating chapter '{chapter_name}' from file: {filename}")
 
-                # Extract data paragraphs
+                # Extract data paragraphs - combine all Cal Points into single entry
+                data_entry = metadata.copy()
+                field_counter = defaultdict(int)
                 for para in paragraphs[1:]:
                     lines = para.strip().splitlines()
-                    data_entry = metadata.copy()
-                    field_counter = defaultdict(int)
                     for line in lines[1:]:  # Skip first line (e.g., [Cal Point 1])
                         if '=,' in line:
                             key, value = map(str.strip, line.split('=,', 1))
@@ -120,7 +120,7 @@ def parse_calibration_files(directory):
                                 data_entry[key] = value
                             else:
                                 data_entry[f"{key} {field_counter[key]}"] = value
-                    chapter_dataframes[chapter_name].append(data_entry)
+                chapter_dataframes[chapter_name].append(data_entry)
 
     # Convert lists of dicts to DataFrames
     for chapter in chapter_dataframes:
@@ -161,7 +161,7 @@ def summarize(relative_dir):
     for chapter, entries in chapter_dfs.items():
         df = pd.DataFrame(entries)
 
-        for col in ['Calibration End Time', 'Last Calibration Time']:
+        for col in ['Calibration End Time', 'Last Calibration Time', 'Calibration Start Time']:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors='coerce')
         if 'Calibration End Time' in df.columns and 'Last Calibration Time' in df.columns:
@@ -186,59 +186,24 @@ def summarize(relative_dir):
 
     # Print preview of each dataframe
     for chapter, df in final_dataframes.items():
+        # Skip sensors not of interest
+        if (chapter.startswith("Cond") and "Sp Cond" not in chapter) or chapter == "Depth (m)":
+            print(f"Skipping {chapter} (not of interest)")
+            continue
+        
         # print(f"\nChapter: {chapter}")
         # print(df.shape)
         # print(df.columns)
         # print(df.head(20))
 
-        output_dir = '../data/output/calibration/summaries2'
+        output_dir = '../data/output/calibration/summaries'
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
         sanitized_name = sanitize_filename(chapter)
         filename = os.path.join(output_dir, f"{sanitized_name}.csv")
         df.to_csv(filename, index=False)
 
-        if 'Timespan' in df.columns:
-            # Convert Timespan to total seconds for plotting
-            df['Timespan_seconds'] = df['Timespan'].dt.total_seconds()
-
-            # if 'Correction2' not in df.columns:
-            #     y_columns = ['Correction1']
-            # if 'Correction3' not in df.columns:
-            #     y_columns = ['Correction1', 'Correction2']
-            # else:
-            #     y_columns = ['Correction1', 'Correction2', 'Correction3']
-
-            y_columns = ['Correction1']
-            if 'Correction2' in df.columns:
-                y_columns = ['Correction1', 'Correction2']
-            if 'Correction3' in df.columns:
-                y_columns = ['Correction1', 'Correction2', 'Correction3']
-
-            melted_df = df[['Timespan_seconds'] + y_columns].melt(id_vars='Timespan_seconds',
-                                                                  value_vars=y_columns,
-                                                                  var_name='Series',
-                                                                  value_name='Value')
-            # Convert to numeric
-            melted_df['Value'] = pd.to_numeric(melted_df['Value'], errors='coerce')
-
-            plt.figure(figsize=(10, 6))
-            for col in y_columns:
-                sns.scatterplot(x='Timespan_seconds', y=col, data=df, label=col)
-
-            plt.title(f"{chapter} - Timespan vs Selected Values")
-            plt.xlabel("Timespan (seconds)")
-            plt.ylabel("Value")
-            # plt.xscale('log')
-            # plt.yscale('log')
-            plt.grid()
-            plt.legend()
-            plt.tight_layout()
-            plt.show()
-
-            # Conclusions: Neither timespan nor temperature have much predictive power for sensor drift.
-            # Could fit linear function in certain cases, but would need to ignore lots of examples.
-            # Therefore, prefer to use simple linear correction based on error at time of calibration.
+        # Plotting removed - now handled by c2_uncertainty.py
 
 if __name__ == '__main__':
     # Define the relative path to the directory containing CSV files
@@ -260,13 +225,41 @@ def correct(sensor_df, summary_dir):
     for file in summaries:
         param = file.replace(".csv", "")
         profiler_var = (f"Pfl - {param}")
-        # Load the second CSV file with calibration times
-        print("param", param)
-        calibration_df = pd.read_csv(f"../data/output/calibration/summaries/{file}", sep=',', decimal='.', parse_dates=["Last Calibration Time", "Calibration Start Time", "Calibration End Time"])
+        
+        # Load the calibration summary CSV
+        try:
+            calibration_df = pd.read_csv(f"../data/output/calibration/summaries/{file}", sep=',', decimal='.')
+            
+            # Check if required datetime columns exist before parsing
+            required_cols = ["Last Calibration Time", "Calibration Start Time", "Calibration End Time"]
+            if not all(col in calibration_df.columns for col in required_cols):
+                # Skip files that don't have the required calibration columns (e.g., statistics outputs)
+                continue
+            
+            # Parse the datetime columns
+            for col in required_cols:
+                calibration_df[col] = pd.to_datetime(calibration_df[col], errors='coerce')
+        except Exception as e:
+            print(f"Skipping {file}: {e}")
+            continue
+        
+        # Check if the profiler variable exists in sensor_df
+        if profiler_var not in sensor_df.columns:
+            # Try alternative spelling: replace µS_cm with microS_cm
+            profiler_var_alt = profiler_var.replace("µS_cm", "microS_cm")
+            if profiler_var_alt in sensor_df.columns:
+                profiler_var = profiler_var_alt
+            else:
+                print(f"Skipping {file}: sensor column '{profiler_var}' not found in sensor data")
+                continue
+        
+        print(f"Processing {file}")
 
         # Initialize lists to store results
         before_values = []
         after_values = []
+        before_time_deltas = []
+        after_time_deltas = []
         differences = []
         between_counts = []
 
@@ -299,66 +292,72 @@ def correct(sensor_df, summary_dir):
                     ]
                 if len(between_rows) < 13:
                     before_val = after_val = diff = np.nan
+                    before_time_delta = after_time_delta = pd.NaT
                 else:
                     if not before.empty and not after.empty:
-                        before_val = before.iloc[-1][profiler_var]
-                        after_val = after.iloc[0][profiler_var]
+                        before_row = before.iloc[-1]
+                        after_row = after.iloc[0]
+                        before_val = before_row[profiler_var]
+                        after_val = after_row[profiler_var]
                         diff = abs(after_val - before_val)
+                        # Calculate time differences
+                        before_time_delta = calibration_time - before_row["TIMESTAMP"]
+                        after_time_delta = after_row["TIMESTAMP"] - calibration_time
                     else:
                         before_val = after_val = diff = np.nan
+                        before_time_delta = after_time_delta = pd.NaT
             else:
                 between_count = 0
                 before_val = after_val = diff = np.nan
+                before_time_delta = after_time_delta = pd.NaT
 
             previous_time = calibration_time
             before_values.append(before_val)
             after_values.append(after_val)
+            before_time_deltas.append(before_time_delta)
+            after_time_deltas.append(after_time_delta)
             differences.append(diff)
             between_counts.append(between_count)
 
         # Add new columns to the summary dataframe
         calibration_df["Before Value"] = before_values
         calibration_df["After Value"] = after_values
+        calibration_df["Before Time Delta"] = before_time_deltas
+        calibration_df["After Time Delta"] = after_time_deltas
         calibration_df["Difference"] = differences
         calibration_df["Between Count"] = between_counts
         keepers = ["Last Calibration Time","Calibration Start Time","Calibration End Time","Calibration Status",
                    "Standard","Pre Calibration Value","Post Calibration Value","Raw Value","Temperature","Timespan",
-                   "Correction1","Before Value","After Value","Difference", "Between Count"]
+                   "Correction1","Before Value","After Value","Before Time Delta","After Time Delta","Difference", "Between Count"]
 
         calibration_df = calibration_df[keepers]
         calibration_df.to_csv(f"../data/output/calibration/corrections/{param}.csv", index=False)
 
-        calibration_df["Span"] = calibration_df["Calibration Start Time"] - calibration_df["Last Calibration Time"]
-
-        plt.figure(figsize=(10, 6))
-        ax = sns.scatterplot(x="Span", y="Difference", data=calibration_df, label=profiler_var)
-        ax.grid()
-
-        # for i, row in calibration_df.iterrows():
-        #     ax.annotate(f"{row['Calibration End Time'].strftime('%Y-%m-%d %H:%M')}\nCount: {row['Points']}",
-        #                 row["Span"], row["Difference"])
-
-
-        plt.title("")
-        plt.xlabel("Timespan")
-        plt.ylabel(f"Absolute Error, {profiler_var}")
-        # plt.xscale('log')
-        # plt.yscale('log')
-        plt.legend()
-        plt.tight_layout()
-        plt.xticks(rotation=45)  # Rotate x-axis labels by 45 degrees
-        plt.show()
-
-
-        # calibration_df = calibration_df["Calibration End Time", "Last Calibration Time", "Before Value", "After Value", "Difference"]
-        # calibration_df = calibration_df["Calibration End Time"]
+        # Plotting removed - now handled by c2_uncertainty.py
 
     # Save the updated dataframe to a new CSV file
     # calibration_df.to_csv("../data/calibration_data_updated.csv", index=False)
 
 if __name__ == '__main__':
-    # Load the sensor data
-    sensor_df = pd.read_csv("../data/output/regression/Consolidated.csv", parse_dates=["TIMESTAMP"])
+    # Load the raw sensor data (not cleaned/adjusted)
+    sensor_df = pd.read_csv("../data/input/sensors/FullHourly.csv")
+    
+    # Apply column renaming to match calibration parameter names
+    column_names = {
+        "sensorParms(1)": "Pfl - Water temperature (°C)",
+        "sensorParms(2)": "Pfl - Cond (microS_cm)",
+        "sensorParms(3)": "Pfl - Sp Cond (microS_cm)",
+        "sensorParms(4)": "Pfl - Salinity (ppt)",
+        "sensorParms(5)": "Pfl - pH",
+        "sensorParms(6)": "Pfl - DO (% Sat)",
+        "sensorParms(7)": "Pfl - Turbidity (NTU)",
+        "sensorParms(8)": "Pfl - Turbidity (FNU)",
+        "sensorParms(9)": "Pfl - Vertical position (m)",
+        "sensorParms(10)": "Pfl - fDOM (RFU)",
+        "sensorParms(11)": "Pfl - fDOM (QSU)",
+    }
+    sensor_df = sensor_df.rename(columns=column_names)
+    sensor_df["TIMESTAMP"] = pd.to_datetime(sensor_df["TIMESTAMP"])
     sensor_df = sensor_df.sort_values("TIMESTAMP")
 
     # Point to the directory with the calibration log summary tables
