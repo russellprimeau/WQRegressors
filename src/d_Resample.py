@@ -27,7 +27,7 @@ def clean_directory(directory_path):
     except OSError as e:
         print(f"Error deleting files in {directory_path}: {e}")
 
-def find_valid(df, targets, predictors, span, valid):
+def find_valid(df, targets, predictors, span, nan_tol):
     valid_indices = []
 
     for i in range(len(df)):
@@ -45,10 +45,13 @@ def find_valid(df, targets, predictors, span, valid):
         # Count non-NaN predictor values in the window
         total_values = len(window) * len(predictors)
         non_nan_values = window[predictors].notna().sum().sum()
+        print(f'valid in {i}:', 100*(1 - (non_nan_values / total_values)), f'% NaN values with limit of {100*nan_tol}%')
 
         # Check if proportion meets threshold
-        if total_values > 0 and 1 - (non_nan_values / total_values) <= valid:
+        if total_values > 0 and 1- (non_nan_values / total_values) <= nan_tol:
             valid_indices.append(i)
+            print(f'{i} added')
+
 
     return valid_indices
 
@@ -174,7 +177,13 @@ def gapped(df, target_columns, seg_length, name="length_v_count_analysis"):
 def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.coli',
                         '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
                         '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)'],
-          length=1, valid=1, to_normalize=[],fault_tolerant=False, offset=0):
+          length=1, nan_tol=0.0, to_normalize=[],fault_tolerant=False, offset=0,
+          predictor_cols=['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
+                        'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
+                        'Pfl - fDOM (QSU)', "Wind speed x (m/s)", "Wind speed y (m/s)",
+                        'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
+                        'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
+                        '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)']):
     """
     Break up a dataset which contains gaps into many files of standard size, which do not contain gaps
     :param df: dataframe of consolidated dataset to be broken up
@@ -193,7 +202,7 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
 
     ## Iterate through the dataframe to find valid segments
     if fault_tolerant:
-        indices = find_valid(df, target_columns, predictor_cols, length, valid)
+        indices = find_valid(df, target_columns, predictor_cols, length, nan_tol)
         for i, idx in enumerate(indices):
             # Compute start and end of the segment
             start = max(0, idx - length)
@@ -232,29 +241,23 @@ if __name__ == '__main__':
     # df = pd.read_csv("../data/output/classification/Consolidated_binarized.csv",
     #                  parse_dates=["TIMESTAMP"])
     ## For regression (of any parameters:
-    df = pd.read_csv("../data/output/classification/Consolidated_sparse_binarized.csv",parse_dates=["TIMESTAMP"])
+    df = pd.read_csv("../data/output/regression/Consolidated_sparse.csv",parse_dates=["TIMESTAMP"])
     df = df.sort_values("TIMESTAMP")
 
     ## Identify prediction target columns. Output will only include samples with valid value in last row.
-    predictor_cols  = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
-                        'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
-                        'Pfl - fDOM (QSU)', "Wind speed, x (m/s)", "Wind speed, y (m/s)",
-                        'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
-                        'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
-                        '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)']
-    target_columns = ['01-Farge', '04-Turbiditet', '06-E.coli',
-                        '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
-                        '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']  # alternative 1: name-based selection
+    predictor_cols  = ['Pfl - Water temperature (°C)', 'Air temperature (°C)']
+    target_columns = ['01-Farge_res', '04-Turbiditet_res', '06-E.coli_res',
+    '07-Intestinale enterokokker_res', '08-Kimtall 22°C_res', '09-Koliforme bakterier 37°C_res', '21-Arsen_res',
+             '24-Bly_res', '32-Kadmium_res', '36-Kopper filtrert_res', '37-Krom_res', '41-Nikkel_res', 'Sink (Zn)_res']  # alternative 1: name-based selection
     # target_columns = df.columns[-9:]  # alternative: index-based selection
 
     ## Alternative with better coverage
-    predictor_cols_max = ["Wind speed, x (m/s)", "Wind speed, y (m/s)",
-                      'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
-                      'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
-                      '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
-                      'SCADA - Temperature (°C)']
-    target_columns_max = ['06-E.coli', '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C']
-
+    # predictor_cols_max = ["Wind speed x (m/s)", "Wind speed y (m/s)",
+    #                   'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
+    #                   'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
+    #                   '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
+    #                   'SCADA - Temperature (°C)']
+    # target_columns_max = ['06-E.coli', '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C']
 
 
     ## To analyze the impact of sample dimensions on the # of available samples:
@@ -266,30 +269,52 @@ if __name__ == '__main__':
     # analyze_valid(df, ['09-Koliforme bakterier 37°C'], predictor_cols, [12, 24, 48, 96, 168], 1, name="Koli_Max_Input_Set_v_Length")
 
     ## Name the dataset and select the size of each sample (# of timesteps/rows)
-    set_name  = "Koliforms96Sparse"  # Name of subdirectory where samples will be organized
-    length = 96  # Hours of contiguous data per sample
-    output_dir = os.path.join("../data/output/classification", set_name)
+    set_name  = "pH"  # Name of subdirectory where samples will be organized
+    length = 168  # Hours of contiguous data per sample
+    output_dir = os.path.join("../data/output/regression", set_name)
 
     ## Select columns where values in samples will be normalized, which helps with calculating loss accurately
     # to_normalize = df.columns[3:]
     to_normalize = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
                         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
-                        'Pfl - fDOM (QSU)', "Wind speed, x (m/s)", "Wind speed, y (m/s)",
+                        'Pfl - fDOM (QSU)', "Wind speed x (m/s)", "Wind speed y (m/s)",
                         'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
                         'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
                         '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
-        'SCADA - pH', 'SCADA - Temperature (°C)', '01-Farge', '04-Turbiditet', '06-E.coli',
+        'SCADA - pH', 'SCADA - Temperature (°C)', '01-Farge', '04-Turbiditet', '44-pH', '06-E.coli',
         '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
-        '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
+        '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '01-Farge_state',
+                    '04-Turbiditet_state', '44-pH_state', '06-E.coli_state',
+    '07-Intestinale enterokokker_state', '08-Kimtall 22°C_state', '09-Koliforme bakterier 37°C_state', '21-Arsen_state',
+             '24-Bly_state', '32-Kadmium_state', '36-Kopper filtrert_state', '37-Krom_state', '41-Nikkel_state',
+                    'Sink (Zn)_state', '01-Farge_res', '04-Turbiditet_res', '06-E.coli_res',
+    '07-Intestinale enterokokker_res', '08-Kimtall 22°C_res', '09-Koliforme bakterier 37°C_res', '21-Arsen_res',
+             '24-Bly_res', '32-Kadmium_res', '36-Kopper filtrert_res', '37-Krom_res', '41-Nikkel_res', 'Sink (Zn)_res']
 
     # to_normalize = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
     #                     'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
-    #                     'Pfl - fDOM (QSU)', "Wind speed, x (m/s)", "Wind speed, y (m/s)",
+    #                     'Pfl - fDOM (QSU)', "Wind speed x (m/s)", "Wind speed y (m/s)",
+    #                     'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
+    #                     'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
+    #                     '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
+    #     'SCADA - pH', 'SCADA - Temperature (°C)', '01-Farge', '04-Turbiditet', '44-pH', '06-E.coli',
+    #     '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
+    #     '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '01-Farge_state',
+    #                 '04-Turbiditet_state', '06-E.coli_state',
+    # '07-Intestinale enterokokker_state', '08-Kimtall 22°C_state', '09-Koliforme bakterier 37°C_state', '21-Arsen_state',
+    #          '24-Bly_state', '32-Kadmium_state', '36-Kopper filtrert_state', '37-Krom_state', '41-Nikkel_state',
+    #                 'Sink (Zn)_state', '01-Farge_res', '04-Turbiditet_res', '06-E.coli_res',
+    # '07-Intestinale enterokokker_res', '08-Kimtall 22°C_res', '09-Koliforme bakterier 37°C_res', '21-Arsen_res',
+    #          '24-Bly_res', '32-Kadmium_res', '36-Kopper filtrert_res', '37-Krom_res', '41-Nikkel_res', 'Sink (Zn)_res']
+
+    # to_normalize = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
+    #                     'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
+    #                     'Pfl - fDOM (QSU)', "Wind speed x (m/s)", "Wind speed y (m/s)",
     #                     'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
     #                     'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
     #                     '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
     #     'SCADA - pH', 'SCADA - Temperature (°C)']
-
     # split(df, output_dir, target_columns, length, to_normalize, 0)
 
-    split(df, output_dir, ['09-Koliforme bakterier 37°C'], length, 90, to_normalize, True)
+    split(df, output_dir, ['44-pH_res'], length, 0.8, to_normalize,
+          True, predictor_cols=predictor_cols)

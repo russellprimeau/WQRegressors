@@ -212,6 +212,3 @@ if __name__ == '__main__':
 
     print(f"Output saved to: {Path(output_dir, filename)}")
     print(f"Configuration: sparse={sparse}, mode={mode}, forward_fill={forward_fill}, add_res={add_res_cols}, count_segments={count_segments}")
-
-    ## Visualize datasets in a browser window:
-    explore_data(final_df, clean_df, weather_simp_df, scada_df, eurofins_df)
