@@ -4,7 +4,7 @@ and launches the interactive explore_data browser app.
 """
 import pandas as pd
 from pathlib import Path
-from utils.preprocessing import explore_data
+from utils.preprocessing import explore_data, prepare_tsne_plot
 
 ## Configuration Parameters
 # Path to the consolidated dataset to visualize
@@ -26,6 +26,8 @@ if __name__ == '__main__':
         df["TIMESTAMP"] = pd.to_datetime(df["TIMESTAMP"])
     else:
         raise ValueError("Input file must contain a 'TIMESTAMP' or 'Time' column.")
+    
+    x = prepare_tsne_plot(df)
 
     # Launch interactive exploration app
-    explore_data(df)
+    # explore_data(df)
