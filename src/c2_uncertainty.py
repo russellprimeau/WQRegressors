@@ -192,21 +192,22 @@ def fit_offset_gain_model(row, sensor_name):
     errors = np.array([p[1] for p in point_data])
     
     # Single point: offset only, no gain
+    # Note: Cannot estimate variance from single observation
     if len(post_cals) == 1:
-        noise_var = errors[0] ** 2
-        
         return {
             'Offset': errors[0],
             'Gain': 0.0,
-            'Noise_Variance': noise_var,
-            'Noise_Std': np.sqrt(noise_var),
+            'Noise_Variance': np.nan,
+            'Noise_Std': np.nan,
             'Model_F_stat': np.nan,
             'Model_p_value': np.nan,
             'Model_Significant': False,
             'N_Parameters': 1,
             'Fit_Type': 'Single_Point',
             'N_Points': 1,
-            'Residuals': errors
+            'Residuals': errors,
+            'PostCal_Values': post_cals,
+            'Error_Values': errors
         }
     
     # Multi-point: fit line Error = Offset + Gain * PostCal
@@ -258,7 +259,9 @@ def fit_offset_gain_model(row, sensor_name):
             'N_Parameters': 2,
             'Fit_Type': 'Multi_Point',
             'N_Points': len(post_cals),
-            'Residuals': residuals
+            'Residuals': residuals,
+            'PostCal_Values': post_cals,
+            'Error_Values': errors
         }
     except:
         return None
@@ -1079,7 +1082,13 @@ def create_offset_gain_correlations(og_df, sensor_name, output_dir=OUTPUT_DIR):
     if len(og_df) < 2:
         return
     
-    fig, axes = plt.subplots(4, 2, figsize=(18, 15))
+    # Check if we have multi-point data (Gain row)
+    has_multi_point = (og_df['Fit_Type'] == 'Multi_Point').any()
+    n_rows = 4 if has_multi_point else 3
+    fig_height = n_rows * 3  # 3 inches per row
+    noise_row = 3 if has_multi_point else 2
+    
+    fig, axes = plt.subplots(n_rows, 2, figsize=(18, fig_height))
     fig.suptitle(f'{sensor_name} - Predictor Relationships', fontsize=14, fontweight='bold', y=0.995)
     
     # ===== ROW 0: TOTAL ERROR vs Predictors =====
@@ -1193,46 +1202,47 @@ def create_offset_gain_correlations(og_df, sensor_name, output_dir=OUTPUT_DIR):
         ax.grid(True, alpha=0.25)
         ax.set_axisbelow(True)
     
-    # Row 2: Gain correlations
-    # Gain vs Temperature (multi-point only)
-    ax = axes[2, 0]
-    gain_temp = og_df[og_df['Fit_Type'] == 'Multi_Point'][['Gain', 'Temperature']].dropna()
-    if len(gain_temp) > 2:
-        ax.scatter(gain_temp['Temperature'], gain_temp['Gain'], alpha=0.65, s=50, color='#ff7f0e')
-        z = np.polyfit(gain_temp['Temperature'], gain_temp['Gain'], 1)
-        p = np.poly1d(z)
-        x_line = np.linspace(gain_temp['Temperature'].min(), gain_temp['Temperature'].max(), 100)
-        ax.plot(x_line, p(x_line), color='#d62728', linestyle='-', alpha=0.8, linewidth=2)
-        r, _ = stats.pearsonr(gain_temp['Temperature'], gain_temp['Gain'])
-        ax.set_xlabel('Temperature (°C)', fontweight='bold')
-        ax.set_ylabel('Gain', fontweight='bold')
-        ax.set_title(f'Gain vs Temperature\nr = {r:.3f}', fontweight='bold')
-        ax.grid(True, alpha=0.25)
-        ax.set_axisbelow(True)
-    else:
-        ax.axis('off')
-    
-    # Gain vs Timespan (multi-point only)
-    ax = axes[2, 1]
-    gain_time = og_df[og_df['Fit_Type'] == 'Multi_Point'][['Gain', 'Timespan_seconds']].dropna()
-    if len(gain_time) > 2:
-        ax.scatter(gain_time['Timespan_seconds'] / 86400, gain_time['Gain'], alpha=0.65, s=50, color='#ff7f0e')
-        z = np.polyfit(gain_time['Timespan_seconds'], gain_time['Gain'], 1)
-        p = np.poly1d(z)
-        x_line = np.linspace(gain_time['Timespan_seconds'].min(), gain_time['Timespan_seconds'].max(), 100)
-        ax.plot(x_line / 86400, p(x_line), color='#d62728', linestyle='-', alpha=0.8, linewidth=2)
-        r, _ = stats.pearsonr(gain_time['Timespan_seconds'], gain_time['Gain'])
-        ax.set_xlabel('Days Since Calibration', fontweight='bold')
-        ax.set_ylabel('Gain', fontweight='bold')
-        ax.set_title(f'Gain vs Timespan\nr = {r:.3f}', fontweight='bold')
-        ax.grid(True, alpha=0.25)
-        ax.set_axisbelow(True)
-    else:
-        ax.axis('off')
+    # Row 2: Gain correlations (only if multi-point data exists)
+    if has_multi_point:
+        # Gain vs Temperature (multi-point only)
+        ax = axes[2, 0]
+        gain_temp = og_df[og_df['Fit_Type'] == 'Multi_Point'][['Gain', 'Temperature']].dropna()
+        if len(gain_temp) > 2:
+            ax.scatter(gain_temp['Temperature'], gain_temp['Gain'], alpha=0.65, s=50, color='#ff7f0e')
+            z = np.polyfit(gain_temp['Temperature'], gain_temp['Gain'], 1)
+            p = np.poly1d(z)
+            x_line = np.linspace(gain_temp['Temperature'].min(), gain_temp['Temperature'].max(), 100)
+            ax.plot(x_line, p(x_line), color='#d62728', linestyle='-', alpha=0.8, linewidth=2)
+            r, _ = stats.pearsonr(gain_temp['Temperature'], gain_temp['Gain'])
+            ax.set_xlabel('Temperature (°C)', fontweight='bold')
+            ax.set_ylabel('Gain', fontweight='bold')
+            ax.set_title(f'Gain vs Temperature\nr = {r:.3f}', fontweight='bold')
+            ax.grid(True, alpha=0.25)
+            ax.set_axisbelow(True)
+        else:
+            ax.axis('off')
+        
+        # Gain vs Timespan (multi-point only)
+        ax = axes[2, 1]
+        gain_time = og_df[og_df['Fit_Type'] == 'Multi_Point'][['Gain', 'Timespan_seconds']].dropna()
+        if len(gain_time) > 2:
+            ax.scatter(gain_time['Timespan_seconds'] / 86400, gain_time['Gain'], alpha=0.65, s=50, color='#ff7f0e')
+            z = np.polyfit(gain_time['Timespan_seconds'], gain_time['Gain'], 1)
+            p = np.poly1d(z)
+            x_line = np.linspace(gain_time['Timespan_seconds'].min(), gain_time['Timespan_seconds'].max(), 100)
+            ax.plot(x_line / 86400, p(x_line), color='#d62728', linestyle='-', alpha=0.8, linewidth=2)
+            r, _ = stats.pearsonr(gain_time['Timespan_seconds'], gain_time['Gain'])
+            ax.set_xlabel('Days Since Calibration', fontweight='bold')
+            ax.set_ylabel('Gain', fontweight='bold')
+            ax.set_title(f'Gain vs Timespan\nr = {r:.3f}', fontweight='bold')
+            ax.grid(True, alpha=0.25)
+            ax.set_axisbelow(True)
+        else:
+            ax.axis('off')
 
-    # Row 3: Noise correlations
+    # Noise correlations (row 2 if no Gain, row 3 if Gain exists)
     # Noise vs Temperature
-    ax = axes[3, 0]
+    ax = axes[noise_row, 0]
     noise_temp = og_df[['Noise_Variance', 'Temperature']].dropna()
     if len(noise_temp) > 2:
         ax.scatter(noise_temp['Temperature'], noise_temp['Noise_Variance'], alpha=0.65, s=50, color='#2ca02c')
@@ -1250,7 +1260,7 @@ def create_offset_gain_correlations(og_df, sensor_name, output_dir=OUTPUT_DIR):
         ax.axis('off')
 
     # Noise vs Timespan
-    ax = axes[3, 1]
+    ax = axes[noise_row, 1]
     noise_time = og_df[['Noise_Variance', 'Timespan_seconds']].dropna()
     if len(noise_time) > 2:
         ax.scatter(noise_time['Timespan_seconds'] / 86400, noise_time['Noise_Variance'], alpha=0.65, s=50, color='#2ca02c')
@@ -1271,177 +1281,6 @@ def create_offset_gain_correlations(og_df, sensor_name, output_dir=OUTPUT_DIR):
     plt.savefig(output_dir / f'error_correlations_{sensor_name}.png', dpi=FIGURE_DPI, bbox_inches='tight')
     plt.close()
     print(f"  - Saved error_correlations_{sensor_name}.png")
-
-
-def create_significance_summary_visualization(og_df, og_stats, sensor_name, output_dir=OUTPUT_DIR):
-    """
-    Create comprehensive visualization of all significance tests.
-    Shows model significance rates, hypothesis test results, and regression significance patterns.
-    """
-    if len(og_df) < 2:
-        return
-    
-    fig = plt.figure(figsize=(20, 13))
-    gs = fig.add_gridspec(3, 3, hspace=0.38, wspace=0.32)
-    
-    fig.suptitle(f'{sensor_name} - Statistical Significance Summary', fontsize=14, fontweight='bold', y=0.995)
-    
-    # ===== ROW 1: MODEL SIGNIFICANCE =====
-    
-    # Panel 1: Model Significance Distribution (Multi-Point Only)
-    ax = fig.add_subplot(gs[0, 0])
-    multi_df = og_df[og_df['Fit_Type'] == 'Multi_Point'].copy()
-    if len(multi_df) > 0:
-        sig_counts = multi_df['Model_Significant'].value_counts()
-        sig_pct = (multi_df['Model_Significant'].sum() / len(multi_df)) * 100
-        colors_sig = ['#d62728', '#2ca02c']
-        
-        counts = [sig_counts.get(False, 0), sig_counts.get(True, 0)]
-        ax.bar([0, 1], counts, color=colors_sig, alpha=0.75, edgecolor='black', linewidth=1.2)
-        ax.set_ylabel('Count', fontweight='bold')
-        ax.set_title(f'Model Significance\n({sig_pct:.0f}% significant)', fontweight='bold', fontsize=12)
-        ax.set_xticks([0, 1])
-        ax.set_xticklabels(['Not Sig.\n(p≥0.05)', 'Significant\n(p<0.05)'], fontsize=9)
-        ax.grid(True, alpha=0.25, axis='y')
-        ax.set_axisbelow(True)
-    
-    # Panel 2: Model F-statistic Distribution
-    ax = fig.add_subplot(gs[0, 1])
-    if len(multi_df) > 0:
-        f_stats = multi_df['Model_F_stat'].dropna()
-        ax.hist(f_stats, bins=max(5, len(f_stats)//3), alpha=0.75, color='#9467bd', edgecolor='black', linewidth=0.7)
-        ax.axvline(f_stats.mean(), color='#d62728', linestyle='--', linewidth=1.8, alpha=0.8)
-        ax.axvline(np.median(f_stats), color='#1f77b4', linestyle='--', linewidth=1.8, alpha=0.8)
-        ax.set_xlabel('F-Statistic', fontweight='bold')
-        ax.set_ylabel('Count', fontweight='bold')
-        ax.set_title('F-Statistic Distribution', fontweight='bold', fontsize=12)
-        ax.grid(True, alpha=0.25, axis='y')
-        ax.set_axisbelow(True)
-    
-    # Panel 3: Model p-value Distribution
-    ax = fig.add_subplot(gs[0, 2])
-    if len(multi_df) > 0:
-        p_vals = multi_df['Model_p_value'].dropna()
-        neg_log_p = -np.log10(p_vals + 1e-10)
-        ax.hist(neg_log_p, bins=max(5, len(p_vals)//3), alpha=0.75, color='#ff7f0e', edgecolor='black', linewidth=0.7)
-        ax.axvline(-np.log10(0.05), color='#d62728', linestyle='--', linewidth=2, alpha=0.8)
-        ax.set_xlabel('-log₁₀(p-value)', fontweight='bold')
-        ax.set_ylabel('Count', fontweight='bold')
-        ax.set_title('p-Value Distribution\n(−log₁₀ scale)', fontweight='bold', fontsize=12)
-        ax.grid(True, alpha=0.25, axis='y')
-        ax.set_axisbelow(True)
-    
-    # ===== ROW 2: H1 HYPOTHESIS TESTS (Offset/Gain/Noise Stability) =====
-    
-    # Panel 4: Offset/Gain/Noise Constancy (CV)
-    ax = fig.add_subplot(gs[1, 0])
-    cv_data = {}
-    if 'Offset_CV' in og_stats:
-        cv_data['Offset'] = og_stats['Offset_CV']
-    if 'Gain_CV' in og_stats:
-        cv_data['Gain'] = og_stats['Gain_CV']
-    if 'Noise_Variance_CV' in og_stats:
-        cv_data['Noise'] = og_stats['Noise_Variance_CV']
-    
-    if cv_data:
-        keys = list(cv_data.keys())
-        vals = list(cv_data.values())
-        colors_cv = ['#1f77b4', '#ff7f0e', '#2ca02c']
-        ax.bar(keys, vals, color=colors_cv[:len(keys)], alpha=0.75, edgecolor='black', linewidth=1.2)
-        ax.axhline(0.2, color='#d62728', linestyle='--', linewidth=1.8, alpha=0.7)
-        ax.set_ylabel('Coefficient of Variation', fontweight='bold')
-        ax.set_title('Error Source Stability\n(CV < 0.2 = Stable)', fontweight='bold', fontsize=12)
-        ax.grid(True, alpha=0.25, axis='y')
-        ax.set_axisbelow(True)
-    
-    # Panel 5: Noise Distribution Tests
-    ax = fig.add_subplot(gs[1, 1])
-    ax.axis('off')
-    
-    # Panel 6: Regression Significance Heatmap
-    ax = fig.add_subplot(gs[1, 2])
-    
-    # Build significance matrix
-    responses = ['Offset', 'Gain', 'Noise']
-    predictors = ['Temperature', 'Timespan']
-    sig_matrix = np.full((len(responses), len(predictors)), np.nan)
-    
-    for i, resp in enumerate(responses):
-        for j, pred in enumerate(predictors):
-            key = f'{resp}_vs_{pred}_significant'
-            if key in og_stats:
-                sig_matrix[i, j] = 1 if og_stats[key] else 0
-    
-    # Create heatmap
-    im = ax.imshow(sig_matrix, cmap='RdYlGn', aspect='auto', vmin=0, vmax=1)
-    ax.set_xticks(np.arange(len(predictors)))
-    ax.set_yticks(np.arange(len(responses)))
-    ax.set_xticklabels(predictors, fontweight='bold')
-    ax.set_yticklabels(responses, fontweight='bold')
-    ax.set_title('Predictor Significance', fontweight='bold', fontsize=12)
-    
-    # Add text annotations
-    for i in range(len(responses)):
-        for j in range(len(predictors)):
-            if not np.isnan(sig_matrix[i, j]):
-                text = "✓" if sig_matrix[i, j] == 1 else "✗"
-                color = 'black'
-                ax.text(j, i, text, ha="center", va="center", color=color, fontsize=16, fontweight='bold')
-    
-    # ===== ROW 3: DETAILED REGRESSION RESULTS =====
-    
-    # Panel 7: Temperature Effects
-    ax = fig.add_subplot(gs[2, 0])
-    temp_results = {}
-    for resp in ['Offset', 'Noise']:
-        key_slope = f'{resp}_vs_Temperature_slope'
-        key_p = f'{resp}_vs_Temperature_pvalue'
-        if key_slope in og_stats and key_p in og_stats:
-            p_val = og_stats[key_p]
-            sig_marker = "*" if p_val < 0.05 else ""
-            temp_results[f'{resp}{sig_marker}'] = og_stats[key_slope]
-    
-    if temp_results:
-        keys = list(temp_results.keys())
-        vals = list(temp_results.values())
-        colors_temp = ['#1f77b4' if '*' in k else '#e0e0e0' for k in keys]
-        ax.barh(keys, vals, color=colors_temp, alpha=0.75, edgecolor='black', linewidth=1.2)
-        ax.axvline(0, color='black', linestyle='-', linewidth=1)
-        ax.set_xlabel('Slope', fontweight='bold')
-        ax.set_title('Temperature Effects\n(* p < 0.05)', fontweight='bold', fontsize=12)
-        ax.grid(True, alpha=0.25, axis='x')
-        ax.set_axisbelow(True)
-    
-    # Panel 8: Timespan Effects
-    ax = fig.add_subplot(gs[2, 1])
-    time_results = {}
-    for resp in ['Offset', 'Noise']:
-        key_slope = f'{resp}_vs_Timespan_slope'
-        key_p = f'{resp}_vs_Timespan_pvalue'
-        if key_slope in og_stats and key_p in og_stats:
-            p_val = og_stats[key_p]
-            sig_marker = "*" if p_val < 0.05 else ""
-            time_results[f'{resp}{sig_marker}'] = og_stats[key_slope]
-    
-    if time_results:
-        keys = list(time_results.keys())
-        vals = list(time_results.values())
-        colors_time = ['#ff7f0e' if '*' in k else '#e0e0e0' for k in keys]
-        ax.barh(keys, vals, color=colors_time, alpha=0.75, edgecolor='black', linewidth=1.2)
-        ax.axvline(0, color='black', linestyle='-', linewidth=1)
-        ax.set_xlabel('Slope', fontweight='bold')
-        ax.set_title('Timespan Effects\n(* p < 0.05)', fontweight='bold', fontsize=12)
-        ax.grid(True, alpha=0.25, axis='x')
-        ax.set_axisbelow(True)
-    
-    # Panel 9: (Reserved)
-    ax = fig.add_subplot(gs[2, 2])
-    ax.axis('off')
-    
-    clear_figure_titles(fig)
-    plt.savefig(output_dir / f'significance_tests_{sensor_name}.png', dpi=FIGURE_DPI, bbox_inches='tight')
-    plt.close()
-    print(f"  - Saved significance_tests_{sensor_name}.png")
 
 
 def create_cross_sensor_significance_summary(all_stats, output_dir=OUTPUT_DIR):
@@ -1682,35 +1521,419 @@ def create_offset_gain_visualizations(og_df, og_stats, sensor_name, output_dir=O
         ax.set_xticks([])
         ax.set_yticks([])
     
-    # Column 3: Model quality
-    # R² distribution
-    ax = axes[0, 2]
-    if 'R_squared' in og_df.columns:
-        r2_data = og_df[og_df['Fit_Type'] == 'Multi_Point']['R_squared'].dropna()
-        if len(r2_data) > 0:
-            ax.hist(r2_data, bins=10, alpha=0.75, color='#2ca02c', edgecolor='black', linewidth=0.7)
-            ax.set_xlabel('R²', fontweight='bold')
-            ax.set_ylabel('Frequency', fontweight='bold')
-            ax.set_title(f'Model Fit Quality (N={len(r2_data)})')
-            ax.grid(True, alpha=0.25, axis='y')
-            ax.set_axisbelow(True)
-        else:
-            ax.axis('off')
-    else:
-        ax.axis('off')
-    
-    # Fit type distribution
-    ax = axes[1, 2]
-    fit_counts = og_df['Fit_Type'].value_counts()
-    colors = ['#1f77b4', '#ff7f0e']
-    ax.pie(fit_counts.values, labels=fit_counts.index, autopct='%1.1f%%', colors=colors[:len(fit_counts)])
-    ax.set_title('Calibration Point Distribution')
-    
     clear_figure_titles(fig)
     plt.tight_layout()
     plt.savefig(output_dir / f'offset_gain_{sensor_name}.png', dpi=FIGURE_DPI, bbox_inches='tight')
     plt.close()
     print(f"  - Saved offset_gain_{sensor_name}.png")
+    
+    # Create separate R² histogram if informative (variance exists)
+    if 'R_squared' in og_df.columns:
+        r2_data = multi_point_df['R_squared'].dropna()
+        if len(r2_data) > 2 and r2_data.std() > 0.01:  # Skip if nearly constant
+            fig_r2, ax_r2 = plt.subplots(1, 1, figsize=(8, 6))
+            ax_r2.hist(r2_data, bins=max(5, len(r2_data)//3), alpha=0.75, color='#2ca02c', edgecolor='black', linewidth=0.7)
+            ax_r2.set_xlabel('R²', fontweight='bold')
+            ax_r2.set_ylabel('Frequency', fontweight='bold')
+            ax_r2.set_title(f'Model Fit Quality (N={len(r2_data)})')
+            ax_r2.grid(True, alpha=0.25, axis='y')
+            ax_r2.set_axisbelow(True)
+            
+            clear_figure_titles(fig_r2)
+            plt.tight_layout()
+            plt.savefig(output_dir / f'r_squared_distribution_{sensor_name}.png', dpi=FIGURE_DPI, bbox_inches='tight')
+            plt.close()
+            print(f"  - Saved r_squared_distribution_{sensor_name}.png")
+
+
+def compare_decomposed_vs_simple_model(results_df, raw_df, sensor_name):
+    """
+    Compare decomposed model vs simple model using predictive likelihood.
+    
+    Simple Model: Each calibration point has independent N(μⱼ, σⱼ) distribution
+                  Correction_j ~ N(μⱼ, σⱼ)
+    
+    Decomposed Model: Hierarchical model where for each event i:
+                      Offset_i ~ N(μ_off, σ_off)
+                      Gain_i ~ N(μ_gain, σ_gain)
+                      Correction_ji = Offset_i + Gain_i × PostCal_ji + ε_ji
+                      where ε_ji ~ N(0, σ_noise)
+                      
+                      For prediction at new correction with PostCal value pc:
+                      E[Correction] = μ_off + μ_gain × pc
+                      Var(Correction) = σ_off² + pc² × σ_gain² + σ_noise²
+    
+    Evaluates predictive likelihood at each calibration point independently.
+    Compares via AIC (lower is better).
+    
+    Returns dict with test results and recommendation.
+    """
+    # Initialize results
+    comparison = {
+        'Sensor': sensor_name,
+        'N_Events': len(results_df),
+        'N_Corrections': 0,
+        'Simple_LogLik': np.nan,
+        'Simple_K': np.nan,
+        'Simple_AIC': np.nan,
+        'Decomposed_LogLik': np.nan,
+        'Decomposed_K': np.nan,
+        'Decomposed_AIC': np.nan,
+        'Delta_AIC': np.nan,
+        'Recommendation': 'Insufficient_Data',
+        'Reasons': 'Not enough data'
+    }
+    
+    # Collect all corrections organized by calibration point column position
+    # Structure: {point_index: [(correction_value, postcal_value)]}
+    corrections_by_point = {}
+    
+    # Extract from results_df which has PostCal_Values and Error_Values
+    for idx, row in results_df.iterrows():
+        if 'PostCal_Values' not in row or 'Error_Values' not in row:
+            continue
+        
+        postcals = row['PostCal_Values']
+        errors = row['Error_Values']
+        
+        if not isinstance(postcals, np.ndarray) or not isinstance(errors, np.ndarray):
+            continue
+        
+        # Each event has 1-3 points; assign to point index based on order
+        for point_idx, (pc, err) in enumerate(zip(postcals, errors), start=1):
+            if point_idx not in corrections_by_point:
+                corrections_by_point[point_idx] = []
+            corrections_by_point[point_idx].append((err, pc))
+    
+    # Need at least some data
+    if not corrections_by_point:
+        print(f"    - WARNING: No correction data available")
+        return comparison
+    
+    n_points = len(corrections_by_point)
+    n_corrections = sum(len(v) for v in corrections_by_point.values())
+    comparison['N_Corrections'] = n_corrections
+    
+    print(f"    - Found {n_corrections} corrections across {n_points} calibration point(s): {list(corrections_by_point.keys())}")
+    for point_idx, data in corrections_by_point.items():
+        print(f"      Point {point_idx}: {len(data)} corrections")
+    
+    # ===== SIMPLE MODEL =====
+    # Fit separate N(μⱼ, σⱼ) for each calibration point
+    print(f"    - Simple Model (independent distributions per point):")
+    simple_loglik = 0
+    simple_k = 0
+    
+    for point_idx, data in corrections_by_point.items():
+        corrections = np.array([d[0] for d in data])
+        n = len(corrections)
+        
+        if n < 2:
+            # Need at least 2 points to estimate variance
+            print(f"      Point {point_idx}: SKIPPED (n={n}, insufficient data)")
+            continue
+        
+        mu = np.mean(corrections)
+        sigma = np.std(corrections, ddof=1)
+        
+        # Handle zero variance
+        if sigma < 1e-10:
+            sigma = 1e-10
+        
+        # Log-likelihood for this point
+        ll = np.sum(stats.norm.logpdf(corrections, loc=mu, scale=sigma))
+        simple_loglik += ll
+        simple_k += 2  # μ and σ for this point
+        
+        print(f"      Point {point_idx}: μ={mu:.4f}, σ={sigma:.4f}, LogLik={ll:.2f}")
+    
+    comparison['Simple_LogLik'] = simple_loglik
+    comparison['Simple_K'] = simple_k
+    comparison['Simple_AIC'] = 2 * simple_k - 2 * simple_loglik
+    
+    print(f"      TOTAL: k={simple_k}, LogLik={simple_loglik:.2f}, AIC={comparison['Simple_AIC']:.2f}")
+    
+    # ===== DECOMPOSED MODEL =====
+    print(f"    - Decomposed Model (hierarchical with offset+gain+noise):")
+    # Extract component distributions from fitted models
+    offset = results_df['Offset'].dropna().values
+    gain = results_df['Gain'].dropna().values
+    
+    # Check if we can fit decomposed model (require n≥10 for robust variance estimates)
+    if len(offset) < 10:
+        print(f"    - WARNING: Not enough events to fit decomposed model (n={len(offset)}, require n≥10)")
+        comparison['Recommendation'] = 'Simple'
+        comparison['Reasons'] = f'Insufficient events for decomposed model (n={len(offset)} < 10)'
+        return comparison
+    
+    # Fit component distributions (MLE = sample statistics for normal)
+    mu_offset = np.mean(offset)
+    sigma_offset = np.std(offset, ddof=1)
+    
+    # Check if we have multi-point data for gain estimation
+    multi_point_mask = results_df['Fit_Type'] == 'Multi_Point'
+    has_multi_point = multi_point_mask.any()
+    
+    if has_multi_point and len(gain) > 1:
+        mu_gain = np.mean(gain)
+        sigma_gain = np.std(gain, ddof=1)
+    else:
+        # No gain variation (single-point calibrations)
+        mu_gain = 0.0
+        sigma_gain = 0.0
+    
+    # Estimate noise from residuals
+    all_residuals = []
+    for idx, row in results_df.iterrows():
+        if 'Residuals' in row and isinstance(row['Residuals'], np.ndarray):
+            if row['Fit_Type'] == 'Multi_Point' and len(row['Residuals']) > 0:
+                all_residuals.extend(row['Residuals'])
+    
+    if len(all_residuals) > 1:
+        sigma_noise = np.std(all_residuals, ddof=1)
+    else:
+        # No independent noise estimate available
+        sigma_noise = 0.0
+    
+    # Check for degenerate cases (zero variance indicates model inadequacy)
+    if sigma_offset == 0.0:
+        print(f"    - WARNING: Zero offset variance detected (constant offset across events)")
+        sigma_offset = 1e-10  # Use small value to avoid division by zero
+    if sigma_gain == 0.0 and has_multi_point:
+        print(f"    - WARNING: Zero gain variance detected (constant gain across events)")
+        sigma_gain = 1e-10
+    if sigma_noise == 0.0 and len(all_residuals) > 1:
+        print(f"    - WARNING: Zero noise variance detected (perfect linear fits)")
+        sigma_noise = 1e-10
+    
+    # Calculate predictive log-likelihood at each correction point
+    decomposed_loglik = 0
+    
+    for point_idx, data in corrections_by_point.items():
+        for correction, postcal in data:
+            # Predictive distribution: Correction ~ N(μ, σ_total)
+            # where μ = μ_offset + μ_gain × postcal
+            #       σ_total² = σ_offset² + postcal² × σ_gain² + σ_noise²
+            
+            pred_mean = mu_offset + mu_gain * postcal
+            pred_var = sigma_offset**2 + (postcal**2) * (sigma_gain**2) + sigma_noise**2
+            pred_std = np.sqrt(pred_var)
+            
+            # Log-likelihood of this observation
+            ll = stats.norm.logpdf(correction, loc=pred_mean, scale=pred_std)
+            decomposed_loglik += ll
+    
+    # Number of parameters
+    decomposed_k = 2  # μ_offset, σ_offset
+    if has_multi_point and sigma_gain > 1e-10:
+        decomposed_k += 2  # μ_gain, σ_gain
+    if len(all_residuals) > 1:
+        decomposed_k += 1  # σ_noise
+    
+    comparison['Decomposed_LogLik'] = decomposed_loglik
+    comparison['Decomposed_K'] = decomposed_k
+    comparison['Decomposed_AIC'] = 2 * decomposed_k - 2 * decomposed_loglik
+    
+    print(f"      Component Statistics:")
+    print(f"        Offset: μ={mu_offset:.4f}, σ={sigma_offset:.4f} (n={len(offset)} events)")
+    print(f"        Gain: μ={mu_gain:.4f}, σ={sigma_gain:.4f} (n={len(gain)} events)")
+    if len(all_residuals) > 0:
+        print(f"        Noise: σ={sigma_noise:.4f} (n={len(all_residuals)} residuals)")
+    else:
+        print(f"        Noise: not estimated (insufficient residuals)")
+    print(f"      TOTAL: k={decomposed_k}, LogLik={decomposed_loglik:.2f}, AIC={comparison['Decomposed_AIC']:.2f}")
+
+    
+    # ===== COMPARISON =====
+    comparison['Delta_AIC'] = comparison['Decomposed_AIC'] - comparison['Simple_AIC']
+    
+    # AIC interpretation: ΔAIC > 2 indicates substantial support for lower AIC model
+    if abs(comparison['Delta_AIC']) < 2:
+        comparison['Recommendation'] = 'Equivalent'
+        comparison['Reasons'] = f'ΔAIC={comparison["Delta_AIC"]:.1f} (models equivalent)'
+    elif comparison['Delta_AIC'] < -2:
+        comparison['Recommendation'] = 'Decomposed'
+        comparison['Reasons'] = f'ΔAIC={comparison["Delta_AIC"]:.1f} (decomposed better)'
+    else:
+        comparison['Recommendation'] = 'Simple'
+        comparison['Reasons'] = f'ΔAIC={comparison["Delta_AIC"]:.1f} (simple better)'
+    
+    # Print comparison summary
+    print(f"\n  → COMPARISON SUMMARY:")
+    print(f"      ΔAIC = {comparison['Delta_AIC']:.2f} (Decomposed - Simple)")
+    print(f"      Recommendation: {comparison['Recommendation']}")
+    print(f"      Reason: {comparison['Reasons']}")
+    
+    return comparison
+
+
+def create_model_comparison_visualization(comparison_df, output_dir=OUTPUT_DIR):
+    """
+    Visualize decomposed vs simple model comparison using AIC.
+    
+    Creates a figure showing:
+    - AIC comparison (lower is better)
+    - ΔAIC values (decomposed - simple)
+    - Log-likelihoods
+    - Model complexity (number of parameters)
+    - Recommendation summary
+    """
+    fig = plt.figure(figsize=(20, 10), dpi=FIGURE_DPI)
+    gs = fig.add_gridspec(2, 3, hspace=0.35, wspace=0.35)
+    
+    sensors = comparison_df['Sensor'].values
+    n_sensors = len(sensors)
+    x = np.arange(n_sensors)
+    
+    # Panel 1: AIC comparison (lower is better)
+    ax1 = fig.add_subplot(gs[0, 0])
+    simple_aic = comparison_df['Simple_AIC'].values
+    decomp_aic = comparison_df['Decomposed_AIC'].values
+    
+    valid_idx = ~(np.isnan(simple_aic) | np.isnan(decomp_aic))
+    if valid_idx.any():
+        width = 0.35
+        ax1.bar(x[valid_idx] - width/2, simple_aic[valid_idx], width,
+                label='Simple', color='#1f77b4', alpha=0.7)
+        ax1.bar(x[valid_idx] + width/2, decomp_aic[valid_idx], width,
+                label='Decomposed', color='#ff7f0e', alpha=0.7)
+        ax1.legend(fontsize=9, framealpha=0.9)
+    else:
+        ax1.text(n_sensors/2, 0.5, 'No valid data', ha='center', va='center',
+                fontsize=14, color='red', fontweight='bold')
+    
+    ax1.set_ylabel('AIC (lower = better)', fontsize=12, fontweight='bold')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(sensors, rotation=45, ha='right', fontsize=10)
+    ax1.tick_params(axis='y', labelsize=10)
+    ax1.grid(True, alpha=0.3, linewidth=0.8)
+    ax1.set_axisbelow(True)
+    
+    # Panel 2: ΔAIC (decomposed - simple)
+    ax2 = fig.add_subplot(gs[0, 1])
+    delta_aic = comparison_df['Delta_AIC'].values
+    
+    valid_idx = ~np.isnan(delta_aic)
+    if valid_idx.any():
+        colors = ['#2ca02c' if d < -2 else '#d62728' if d > 2 else '#ff7f0e' 
+                  for d in delta_aic[valid_idx]]
+        ax2.bar(x[valid_idx], delta_aic[valid_idx], color=colors, alpha=0.7)
+        ax2.axhline(0, color='black', linestyle='-', linewidth=1.5, alpha=0.7)
+        ax2.axhline(-2, color='green', linestyle='--', linewidth=1.2, alpha=0.5, label='Decomposed better')
+        ax2.axhline(2, color='red', linestyle='--', linewidth=1.2, alpha=0.5, label='Simple better')
+        ax2.legend(fontsize=9, framealpha=0.9)
+    else:
+        ax2.text(n_sensors/2, 0, 'No valid data', ha='center', va='center',
+                fontsize=14, color='red', fontweight='bold')
+    
+    ax2.set_ylabel('ΔAIC\n(Decomposed − Simple)', fontsize=12, fontweight='bold')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(sensors, rotation=45, ha='right', fontsize=10)
+    ax2.tick_params(axis='y', labelsize=10)
+    ax2.grid(True, alpha=0.3, linewidth=0.8)
+    ax2.set_axisbelow(True)
+    
+    # Panel 3: Number of parameters
+    ax3 = fig.add_subplot(gs[0, 2])
+    simple_k = comparison_df['Simple_K'].values
+    decomp_k = comparison_df['Decomposed_K'].values
+    
+    valid_idx = ~(np.isnan(simple_k) | np.isnan(decomp_k))
+    if valid_idx.any():
+        width = 0.35
+        ax3.bar(x[valid_idx] - width/2, simple_k[valid_idx], width,
+                label='Simple', color='#1f77b4', alpha=0.7)
+        ax3.bar(x[valid_idx] + width/2, decomp_k[valid_idx], width,
+                label='Decomposed', color='#ff7f0e', alpha=0.7)
+        ax3.legend(fontsize=9, framealpha=0.9)
+    else:
+        ax3.text(n_sensors/2, 2, 'No valid data', ha='center', va='center',
+                fontsize=14, color='red', fontweight='bold')
+    
+    ax3.set_ylabel('Model Complexity\n(# parameters)', fontsize=12, fontweight='bold')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(sensors, rotation=45, ha='right', fontsize=10)
+    ax3.tick_params(axis='y', labelsize=10)
+    ax3.grid(True, alpha=0.3, linewidth=0.8)
+    ax3.set_axisbelow(True)
+    
+    # Panel 4: Log-likelihood (higher is better)
+    ax4 = fig.add_subplot(gs[1, 0])
+    simple_ll = comparison_df['Simple_LogLik'].values
+    decomp_ll = comparison_df['Decomposed_LogLik'].values
+    
+    valid_idx = ~(np.isnan(simple_ll) | np.isnan(decomp_ll))
+    if valid_idx.any():
+        width = 0.35
+        ax4.bar(x[valid_idx] - width/2, simple_ll[valid_idx], width,
+                label='Simple', color='#1f77b4', alpha=0.7)
+        ax4.bar(x[valid_idx] + width/2, decomp_ll[valid_idx], width,
+                label='Decomposed', color='#ff7f0e', alpha=0.7)
+        ax4.legend(fontsize=9, framealpha=0.9)
+    else:
+        ax4.text(n_sensors/2, 0, 'No valid data', ha='center', va='center',
+                fontsize=14, color='red', fontweight='bold')
+    
+    ax4.set_ylabel('Log-Likelihood\n(higher = better fit)', fontsize=12, fontweight='bold')
+    ax4.set_xticks(x)
+    ax4.set_xticklabels(sensors, rotation=45, ha='right', fontsize=10)
+    ax4.tick_params(axis='y', labelsize=10)
+    ax4.grid(True, alpha=0.3, linewidth=0.8)
+    ax4.set_axisbelow(True)
+    
+    # Panel 5: Recommendation summary (text table)
+    ax5 = fig.add_subplot(gs[1, 1:])
+    ax5.axis('tight')
+    ax5.axis('off')
+    
+    # Create table data
+    table_data = []
+    for i, row in comparison_df.iterrows():
+        rec = row['Recommendation']
+        reasons = row['Reasons']
+        n_corr = row.get('N_Corrections', '?')
+        # Truncate reasons if too long
+        if len(str(reasons)) > 50:
+            reasons = str(reasons)[:47] + "..."
+        table_data.append([row['Sensor'], f"n={n_corr}", rec, str(reasons)])
+    
+    table = ax5.table(cellText=table_data,
+                     colLabels=['Sensor', 'Data', 'Recommendation', 'Reason'],
+                     cellLoc='left',
+                     loc='center',
+                     colWidths=[0.2, 0.1, 0.2, 0.5])
+    
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 2)
+    
+    # Color code recommendations
+    for i in range(1, len(table_data) + 1):
+        rec_cell = table[(i, 2)]
+        rec_val = table_data[i-1][2]
+        if rec_val == 'Simple':
+            rec_cell.set_facecolor('#FFB6C1')  # Light red
+        elif rec_val == 'Decomposed':
+            rec_cell.set_facecolor('#90EE90')  # Light green
+        else:
+            rec_cell.set_facecolor('#FFFFE0')  # Light yellow (equivalent)
+    
+    # Style header
+    for j in range(4):
+        table[(0, j)].set_facecolor('#4472C4')
+        table[(0, j)].set_text_props(weight='bold', color='white')
+    
+    plt.tight_layout()
+    
+    # Remove titles before saving
+    clear_figure_titles(fig)
+    
+    output_path = output_dir / 'aggregate' / 'model_comparison_summary.png'
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, dpi=FIGURE_DPI, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  Saved: model_comparison_summary.png")
 
 
 def main():
@@ -1757,6 +1980,7 @@ def main():
     all_offset_gain_stats = []
     all_separate_stats = []
     all_distribution_fits = []
+    all_raw_data = {}  # Store raw_df for model comparison
     
     # Process each sensor
     for sensor_name, csv_file in sorted(sensor_files.items()):
@@ -1779,6 +2003,7 @@ def main():
             if len(og_df) > 0:
                 og_df['Sensor'] = sensor_name
                 all_offset_gain_results.append(og_df)
+                all_raw_data[sensor_name] = raw_df  # Store for model comparison
                 
                 # Test hypotheses
                 og_stats = test_offset_gain_statistics(og_df, sensor_name)
@@ -1854,7 +2079,39 @@ def main():
         print(f"  - Saved distribution_goodness_of_fit.csv ({len(dist_df)} components)")
         create_distribution_fit_summary(all_distribution_fits, output_dir=aggregate_dir)
     
-    print("\nAnalysis complete!")
+    # ===== MODEL COMPARISON =====
+    if all_offset_gain_results and all_raw_data:
+        print("\n" + "="*80)
+        print("MODEL COMPARISON: Decomposed vs Simple")
+        print("="*80)
+        comparison_results = []
+        
+        for sensor_name in sorted(all_raw_data.keys()):
+            print(f"Comparing models for: {sensor_name}")
+            # Get results and raw data for this sensor
+            sensor_results = og_combined[og_combined['Sensor'] == sensor_name]
+            raw_df = all_raw_data[sensor_name]
+            
+            comparison = compare_decomposed_vs_simple_model(sensor_results, raw_df, sensor_name)
+            comparison_results.append(comparison)
+            
+            rec = comparison['Recommendation']
+            print(f"  -> Recommendation: {rec}")
+            print(f"     {comparison['Reasons']}")
+        
+        comparison_df = pd.DataFrame(comparison_results)
+        
+        # Save comparison results
+        comparison_path = aggregate_dir / 'model_comparison.csv'
+        comparison_df.to_csv(comparison_path, index=False)
+        print(f"\n  - Saved model_comparison.csv ({len(comparison_df)} sensors)")
+        
+        # Create visualization
+        create_model_comparison_visualization(comparison_df, OUTPUT_DIR)
+    
+    print("\n" + "="*80)
+    print("Analysis complete!")
+    print("="*80)
     print(f"Results saved to: {OUTPUT_DIR}")
     print(f"Aggregate results saved to: {aggregate_dir}")
 
