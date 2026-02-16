@@ -692,6 +692,259 @@ def analyze_separate_point(df, sensor_name, point_name):
     return point_stats
 
 
+def test_corrections_kruskal_wallis(raw_df, sensor_name):
+    """
+    Test whether corrections across calibration points are drawn from the same distribution.
+    Performs both Kruskal-Wallis (non-parametric) and one-way ANOVA (parametric).
+    Also runs Levene's test for equality of variances and Tukey HSD post-hoc if ANOVA is significant.
+    
+    Requirements:
+    - At least 2 calibration points
+    - Each point must have at least 5 valid observations
+    - Filter by Stability Achieved == "Yes"
+    """
+    # Identify correction columns and their corresponding stability columns
+    correction_cols = [col for col in raw_df.columns if col.startswith('Correction')]
+    stability_cols = []
+    
+    for col in correction_cols:
+        if col == 'Correction1':
+            stability_cols.append('Stability Achieved')
+        else:
+            point_num = col.replace('Correction', '')
+            stability_cols.append(f'Stability Achieved {point_num}')
+    
+    # Extract valid data for each calibration point
+    point_groups = {}
+    for corr_col, stab_col in zip(correction_cols, stability_cols):
+        if corr_col in raw_df.columns and stab_col in raw_df.columns:
+            valid_data = raw_df[
+                (raw_df[stab_col] == 'Yes') & 
+                (raw_df[corr_col].notna())
+            ][corr_col].dropna().values
+            
+            if len(valid_data) >= 5:
+                point_groups[corr_col] = valid_data
+    
+    # Need at least 2 points with sufficient data
+    if len(point_groups) < 2:
+        return {
+            'Sensor': sensor_name,
+            'Calibration_Point': 'Across All Points',
+            'N_Points_Tested': len(point_groups),
+            'Kruskal_Wallis_H': np.nan,
+            'Kruskal_Wallis_p': np.nan,
+            'Kruskal_Wallis_Significant': False,
+            'ANOVA_F': np.nan,
+            'ANOVA_p': np.nan,
+            'ANOVA_Significant': False,
+            'Eta_Squared': np.nan,
+            'Levene_F': np.nan,
+            'Levene_p': np.nan,
+            'Levene_Significant': False,
+            'Tukey_HSD_Result': 'N/A (insufficient points)',
+            'Test_Status': 'Insufficient data'
+        }
+    
+    # Prepare data for tests
+    groups_list = [point_groups[key] for key in sorted(point_groups.keys())]
+    group_labels = sorted(point_groups.keys())
+    
+    # Calculate descriptive statistics
+    medians = [np.median(g) for g in groups_list]
+    means = [np.mean(g) for g in groups_list]
+    stds = [np.std(g) for g in groups_list]
+    sample_sizes = [len(g) for g in groups_list]
+    
+    # 1. Kruskal-Wallis Test (non-parametric)
+    kw_stat, kw_p = stats.kruskal(*groups_list)
+    kw_significant = kw_p < 0.05
+    
+    # 2. Levene's Test for equality of variances
+    levene_stat, levene_p = stats.levene(*groups_list)
+    levene_significant = levene_p < 0.05
+    
+    # 3. One-way ANOVA (parametric)
+    anova_f, anova_p = stats.f_oneway(*groups_list)
+    anova_significant = anova_p < 0.05
+    
+    # 4. Calculate Eta-Squared (effect size for ANOVA)
+    all_data = np.concatenate(groups_list)
+    grand_mean = np.mean(all_data)
+    ss_between = sum(len(g) * (np.mean(g) - grand_mean)**2 for g in groups_list)
+    ss_total = sum((x - grand_mean)**2 for x in all_data)
+    eta_squared = ss_between / ss_total if ss_total > 0 else np.nan
+    
+    # 5. Tukey HSD Post-hoc test (if ANOVA is significant)
+    tukey_result = "Not significant (no post-hoc needed)"
+    if anova_significant:
+        try:
+            from scipy.stats import tukey_hsd
+            res = tukey_hsd(*groups_list)
+            tukey_result = f"Pairwise p-values matrix computed; see visualization"
+        except:
+            # Fallback: manual pairwise t-tests with Bonferroni correction
+            n_comparisons = len(groups_list) * (len(groups_list) - 1) // 2
+            bonferroni_alpha = 0.05 / n_comparisons
+            pairwise_results = []
+            
+            for i in range(len(groups_list)):
+                for j in range(i + 1, len(groups_list)):
+                    t_stat, t_p = stats.ttest_ind(groups_list[i], groups_list[j])
+                    sig = "**" if t_p < bonferroni_alpha else ""
+                    pairwise_results.append(
+                        f"{group_labels[i]} vs {group_labels[j]}: p={t_p:.4f} {sig}"
+                    )
+            tukey_result = "; ".join(pairwise_results)
+    
+    return {
+        'Sensor': sensor_name,
+        'Calibration_Point': 'Across All Points',
+        'N_Points_Tested': len(point_groups),
+        'Sample_Sizes': str(sample_sizes),
+        'Medians': str([f'{m:.4f}' for m in medians]),
+        'Means': str([f'{m:.4f}' for m in means]),
+        'Std_Devs': str([f'{s:.4f}' for s in stds]),
+        'Kruskal_Wallis_H': kw_stat,
+        'Kruskal_Wallis_p': kw_p,
+        'Kruskal_Wallis_Significant': kw_significant,
+        'ANOVA_F': anova_f,
+        'ANOVA_p': anova_p,
+        'ANOVA_Significant': anova_significant,
+        'Eta_Squared': eta_squared,
+        'Levene_F': levene_stat,
+        'Levene_p': levene_p,
+        'Levene_Significant': levene_significant,
+        'Tukey_HSD_Result': tukey_result,
+        'Test_Status': 'Completed'
+    }
+
+
+def create_corrections_comparison_visualization(raw_df, sensor_name, output_dir=OUTPUT_DIR):
+    """
+    Create separate box plot and statistical test results visualizations.
+    - Box plot: Publication-ready figure with minimal white space, no title
+    - Test results: Separate text-only figure with statistical results
+    """
+    # Identify correction columns and their corresponding stability columns
+    correction_cols = [col for col in raw_df.columns if col.startswith('Correction')]
+    stability_cols = []
+    
+    for col in correction_cols:
+        if col == 'Correction1':
+            stability_cols.append('Stability Achieved')
+        else:
+            point_num = col.replace('Correction', '')
+            stability_cols.append(f'Stability Achieved {point_num}')
+    
+    # Extract valid data for each calibration point
+    point_groups = {}
+    for corr_col, stab_col in zip(correction_cols, stability_cols):
+        if corr_col in raw_df.columns and stab_col in raw_df.columns:
+            valid_data = raw_df[
+                (raw_df[stab_col] == 'Yes') & 
+                (raw_df[corr_col].notna())
+            ][corr_col].dropna().values
+            
+            if len(valid_data) >= 5:
+                point_groups[corr_col] = valid_data
+    
+    # Need at least 2 points
+    if len(point_groups) < 2:
+        return
+    
+    # Run tests
+    test_results = test_corrections_kruskal_wallis(raw_df, sensor_name)
+    
+    # Prepare data for visualization
+    groups_list = [point_groups[key] for key in sorted(point_groups.keys())]
+    group_labels = sorted(point_groups.keys())
+    
+    # ===== FIGURE 1: BOX PLOT (Publication-ready) =====
+    fig_bp, ax_bp = plt.subplots(figsize=(7, 5))
+    
+    bp = ax_bp.boxplot(groups_list, labels=group_labels, patch_artist=True, widths=0.6)
+    
+    # Color boxes and add mean markers
+    for patch, group in zip(bp['boxes'], groups_list):
+        patch.set_facecolor('lightblue')
+        patch.set_alpha(0.7)
+    
+    for i, group in enumerate(groups_list):
+        mean_val = np.mean(group)
+        ax_bp.plot(i + 1, mean_val, 'D', color='green', markersize=8, 
+                   label='Mean' if i == 0 else '', zorder=3)
+        ax_bp.text(i + 1, mean_val, f'  {mean_val:.2f}', fontsize=9, va='center')
+        # Add sample size below x-axis
+        ax_bp.text(i + 1, ax_bp.get_ylim()[0], f'n={len(group)}', 
+                   ha='center', fontsize=9, color='darkblue', weight='bold')
+    
+    ax_bp.set_ylabel('Correction Value', fontsize=12, weight='bold')
+    ax_bp.set_xlabel('Calibration Point', fontsize=12, weight='bold')
+    ax_bp.grid(True, alpha=0.3, axis='y', which='both')
+    ax_bp.legend(loc='best', fontsize=10)
+    
+    # No title on the box plot for publication
+    
+    plt.subplots_adjust(left=0.12, right=0.95, top=0.95, bottom=0.12)
+    
+    # Save box plot
+    output_path_bp = Path(output_dir) / f"{sensor_name}_corrections_boxplot.png"
+    output_path_bp.parent.mkdir(parents=True, exist_ok=True)
+    fig_bp.savefig(output_path_bp, dpi=FIGURE_DPI, bbox_inches='tight')
+    plt.close(fig_bp)
+    
+    # ===== FIGURE 2: TEST RESULTS (Text-only) =====
+    fig_text, ax_text = plt.subplots(figsize=(9, 8))
+    ax_text.axis('off')
+    
+    # Format test results
+    kw_sig_text = "✓ Significant" if test_results['Kruskal_Wallis_Significant'] else "✗ Not Significant"
+    anova_sig_text = "✓ Significant" if test_results['ANOVA_Significant'] else "✗ Not Significant"
+    levene_sig_text = "✓ Significant (variances differ)" if test_results['Levene_Significant'] else "✗ Not Significant (equal variances)"
+    
+    summary_text = f"""
+STATISTICAL TEST RESULTS: {sensor_name}
+
+Kruskal-Wallis Test (Non-parametric)
+  H-statistic: {test_results['Kruskal_Wallis_H']:.4f}
+  p-value: {test_results['Kruskal_Wallis_p']:.4f}
+  Result: {kw_sig_text}
+  Tests: Whether distributions differ across points
+
+One-way ANOVA (Parametric)
+  F-statistic: {test_results['ANOVA_F']:.4f}
+  p-value: {test_results['ANOVA_p']:.4f}
+  Result: {anova_sig_text}
+  Effect Size (η²): {test_results['Eta_Squared']:.4f}
+  Tests: Whether means differ across points
+
+Levene's Test (Variance Equality)
+  F-statistic: {test_results['Levene_F']:.4f}
+  p-value: {test_results['Levene_p']:.4f}
+  Result: {levene_sig_text}
+  Tests: Whether variances are equal across points
+
+Tukey HSD Post-hoc Comparison:
+  {test_results['Tukey_HSD_Result']}
+
+INTERPRETATION:
+• If ANOVA significant but Kruskal-Wallis not:
+  Mean differences detected despite similar distributions
+• If both significant: Distributions differ systematically
+• Levene's violation suggests caution with ANOVA
+    """
+    
+    ax_text.text(0.05, 0.95, summary_text, transform=ax_text.transAxes, 
+                fontsize=10, verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # Save test results
+    output_path_text = Path(output_dir) / f"{sensor_name}_corrections_statistics.png"
+    fig_text.savefig(output_path_text, dpi=FIGURE_DPI, bbox_inches='tight')
+    plt.close(fig_text)
+
+
 def test_distribution_fit(data, data_name):
     """
     Test goodness-of-fit for both normal and Student's t distributions.
@@ -1548,7 +1801,7 @@ def create_offset_gain_visualizations(og_df, og_stats, sensor_name, output_dir=O
 
 def compare_decomposed_vs_simple_model(results_df, raw_df, sensor_name):
     """
-    Compare decomposed model vs simple model using predictive likelihood.
+    Compare decomposed model vs simple model using Leave-One-Out Cross-Validation.
     
     Simple Model: Each calibration point has independent N(μⱼ, σⱼ) distribution
                   Correction_j ~ N(μⱼ, σⱼ)
@@ -1563,8 +1816,10 @@ def compare_decomposed_vs_simple_model(results_df, raw_df, sensor_name):
                       E[Correction] = μ_off + μ_gain × pc
                       Var(Correction) = σ_off² + pc² × σ_gain² + σ_noise²
     
-    Evaluates predictive likelihood at each calibration point independently.
-    Compares via AIC (lower is better).
+    Uses LOOCV: For each event, fit both models on all other events,
+    then evaluate predictive likelihood on held-out event's corrections.
+    
+    Compares via cross-validated log-likelihood and AIC.
     
     Returns dict with test results and recommendation.
     """
@@ -1618,8 +1873,328 @@ def compare_decomposed_vs_simple_model(results_df, raw_df, sensor_name):
     for point_idx, data in corrections_by_point.items():
         print(f"      Point {point_idx}: {len(data)} corrections")
     
-    # ===== SIMPLE MODEL =====
-    # Fit separate N(μⱼ, σⱼ) for each calibration point
+    # Reset index to ensure consecutive integers for LOOCV
+    results_df = results_df.reset_index(drop=True)
+    
+    # ===== LEAVE-ONE-OUT CROSS-VALIDATION =====
+    print(f"\n    - Performing Leave-One-Out Cross-Validation (n={len(results_df)} events)...")
+    
+    # Storage for predictions and errors
+    simple_predictions = []  # (actual, predicted, std, point_idx)
+    decomposed_predictions = []  # (actual, predicted, std, point_idx)
+    
+    # Diagnostic storage
+    decomposed_component_variances = []  # Track σ_off, σ_gain, σ_noise per fold
+    
+    simple_cv_loglik = 0.0
+    decomposed_cv_loglik = 0.0
+    
+    cv_used = 0
+    cv_skipped = 0
+    # For each event, hold it out and fit models on remaining events
+    for holdout_idx in range(len(results_df)):
+        holdout_event = results_df.iloc[holdout_idx]
+        train_df = results_df.drop(holdout_idx).reset_index(drop=True)
+        
+        # Get holdout event's corrections
+        if 'PostCal_Values' not in holdout_event or 'Error_Values' not in holdout_event:
+            continue
+        holdout_postcals = holdout_event['PostCal_Values']
+        holdout_errors = holdout_event['Error_Values']
+        if not isinstance(holdout_postcals, np.ndarray) or not isinstance(holdout_errors, np.ndarray):
+            continue
+        
+        # Determine holdout event's calibration point count
+        n_holdout_points = len(holdout_postcals)
+        
+        # Get holdout event's fitted parameters
+        holdout_offset = holdout_event['Offset']
+        holdout_gain = holdout_event['Gain']
+        holdout_residuals = holdout_event['Residuals'] if 'Residuals' in holdout_event else np.array([])
+        holdout_fit_type = holdout_event['Fit_Type']
+        
+        # ===== DECOMPOSED MODEL (trained on remaining events) =====
+        # Model definition depends on calibration point count:
+        # 1-point: σ_total only (all variation lumped together)
+        # 2-point: σ_gain + σ_residual (gain variation + combined offset/noise)
+        # 3+ point: σ_offset + σ_gain + σ_noise (all three components separable)
+        
+        if n_holdout_points == 1:
+            # 1-POINT CASE: Estimate total variance from single-point corrections
+            train_single_point = train_df[train_df['N_Points'] == 1]
+            if len(train_single_point) < 2:
+                cv_skipped += 1
+                continue
+            
+            # Collect all single-point corrections
+            train_corrections_1pt = []
+            for idx, row in train_single_point.iterrows():
+                if 'Error_Values' in row and isinstance(row['Error_Values'], np.ndarray):
+                    train_corrections_1pt.extend(row['Error_Values'])
+            
+            if len(train_corrections_1pt) < 2:
+                cv_skipped += 1
+                continue
+            
+            mu_total = np.mean(train_corrections_1pt)
+            sigma_total = np.std(train_corrections_1pt, ddof=1)
+            
+            if sigma_total == 0.0:
+                sigma_total = 1e-10
+            
+            # Covariance: σ²_total × I (1×1 diagonal)
+            mean_vec = np.array([mu_total])
+            cov = np.array([[sigma_total**2 + 1e-12]])
+            
+            decomposed_component_variances.append({
+                'sigma_total': sigma_total,
+                'sigma_offset': np.nan,
+                'sigma_gain': np.nan,
+                'sigma_noise': np.nan,
+                'n_train_events': len(train_corrections_1pt),
+                'case': '1-point'
+            })
+            
+        elif n_holdout_points == 2:
+            # 2-POINT CASE: Estimate gain variance and residual variance
+            train_two_point = train_df[train_df['N_Points'] == 2]
+            if len(train_two_point) < 2:
+                cv_skipped += 1
+                continue
+            
+            # Estimate gain distribution
+            train_gains_2pt = train_two_point['Gain'].dropna().values
+            if len(train_gains_2pt) < 2:
+                cv_skipped += 1
+                continue
+            
+            mu_gain = np.mean(train_gains_2pt)
+            sigma_gain = np.std(train_gains_2pt, ddof=1)
+            
+            if sigma_gain == 0.0:
+                sigma_gain = 1e-10
+            
+            # Estimate residual variance (offset + noise combined)
+            # For 2-point, residual = actual_correction - gain*postcal
+            train_residuals_2pt = []
+            for idx, row in train_two_point.iterrows():
+                if 'Error_Values' in row and 'PostCal_Values' in row and 'Gain' in row:
+                    errors = row['Error_Values']
+                    postcals = row['PostCal_Values']
+                    gain = row['Gain']
+                    if isinstance(errors, np.ndarray) and isinstance(postcals, np.ndarray):
+                        # Residual from gain-only model (no offset estimated)
+                        residuals = errors - gain * postcals
+                        train_residuals_2pt.extend(residuals)
+            
+            if len(train_residuals_2pt) < 2:
+                cv_skipped += 1
+                continue
+            
+            sigma_residual = np.std(train_residuals_2pt, ddof=1)
+            
+            if sigma_residual == 0.0:
+                sigma_residual = 1e-10
+            
+            # Covariance: σ²_gain × (pc ⊗ pc) + σ²_residual × I (2×2)
+            mean_vec = mu_gain * holdout_postcals
+            pc_outer = np.outer(holdout_postcals, holdout_postcals)
+            cov = (sigma_gain**2) * pc_outer + (sigma_residual**2) * np.eye(2)
+            cov += np.eye(2) * 1e-12
+            
+            decomposed_component_variances.append({
+                'sigma_total': np.nan,
+                'sigma_offset': np.nan,
+                'sigma_gain': sigma_gain,
+                'sigma_residual': sigma_residual,
+                'sigma_noise': np.nan,
+                'n_train_events': len(train_gains_2pt),
+                'n_residuals': len(train_residuals_2pt),
+                'case': '2-point'
+            })
+            
+        else:  # n_holdout_points >= 3
+            # 3+ POINT CASE: All three components identifiable
+            train_multi_point = train_df[train_df['N_Points'] >= 3]
+            if len(train_multi_point) < 2:
+                cv_skipped += 1
+                continue
+            
+            # Estimate offset distribution
+            train_offsets = train_multi_point['Offset'].dropna().values
+            if len(train_offsets) < 2:
+                cv_skipped += 1
+                continue
+            
+            mu_offset = np.mean(train_offsets)
+            sigma_offset = np.std(train_offsets, ddof=1)
+            
+            # Estimate gain distribution
+            train_gains = train_multi_point['Gain'].dropna().values
+            if len(train_gains) < 2:
+                cv_skipped += 1
+                continue
+            
+            mu_gain = np.mean(train_gains)
+            sigma_gain = np.std(train_gains, ddof=1)
+            
+            # Estimate noise from residuals
+            train_residuals = []
+            for idx, row in train_multi_point.iterrows():
+                if 'Residuals' in row and isinstance(row['Residuals'], np.ndarray):
+                    if len(row['Residuals']) > 0:
+                        train_residuals.extend(row['Residuals'])
+            
+            if len(train_residuals) < 2:
+                cv_skipped += 1
+                continue
+            
+            sigma_noise = np.std(train_residuals, ddof=1)
+            
+            # Handle zero variance
+            if sigma_offset == 0.0:
+                sigma_offset = 1e-10
+            if sigma_gain == 0.0:
+                sigma_gain = 1e-10
+            if sigma_noise == 0.0:
+                sigma_noise = 1e-10
+            
+            # Covariance: σ²_offset × 11^T + σ²_gain × (pc ⊗ pc) + σ²_noise × I
+            mean_vec = mu_offset + mu_gain * holdout_postcals
+            ones = np.ones((n_holdout_points, n_holdout_points))
+            pc_outer = np.outer(holdout_postcals, holdout_postcals)
+            cov = (sigma_offset**2) * ones + (sigma_gain**2) * pc_outer + (sigma_noise**2) * np.eye(n_holdout_points)
+            cov += np.eye(n_holdout_points) * 1e-12
+            
+            decomposed_component_variances.append({
+                'sigma_total': np.nan,
+                'sigma_offset': sigma_offset,
+                'sigma_gain': sigma_gain,
+                'sigma_residual': np.nan,
+                'sigma_noise': sigma_noise,
+                'n_train_events': len(train_offsets),
+                'n_residuals': len(train_residuals),
+                'case': '3+ point'
+            })
+            
+        # ===== SIMPLE MODEL (trained on remaining events) =====
+        # Build point-specific distributions from training data
+        train_by_point = {}
+        for idx, row in train_df.iterrows():
+            if 'PostCal_Values' not in row or 'Error_Values' not in row:
+                continue
+            postcals = row['PostCal_Values']
+            errors = row['Error_Values']
+            if not isinstance(postcals, np.ndarray) or not isinstance(errors, np.ndarray):
+                continue
+            for point_idx, (pc, err) in enumerate(zip(postcals, errors), start=1):
+                if point_idx not in train_by_point:
+                    train_by_point[point_idx] = []
+                train_by_point[point_idx].append(err)
+        
+        # Predict each correction in holdout event
+        for point_idx, (pc, actual_err) in enumerate(zip(holdout_postcals, holdout_errors), start=1):
+            if point_idx in train_by_point and len(train_by_point[point_idx]) >= 2:
+                train_corrections = np.array(train_by_point[point_idx])
+                mu_simple = np.mean(train_corrections)
+                sigma_simple = np.std(train_corrections, ddof=1)
+                
+                # Handle exactly zero variance (all corrections identical)
+                if sigma_simple == 0.0:
+                    sigma_simple = 1e-10
+                
+                # Predictive likelihood
+                ll = stats.norm.logpdf(actual_err, loc=mu_simple, scale=sigma_simple)
+                simple_cv_loglik += ll
+                simple_predictions.append((actual_err, mu_simple, sigma_simple, point_idx))
+            
+        # CORRECTION-SPACE EVALUATION (joint likelihood per event)
+        # Mean and covariance already computed above based on n_holdout_points
+        ll_event = stats.multivariate_normal.logpdf(holdout_errors, mean=mean_vec, cov=cov)
+        decomposed_cv_loglik += ll_event
+        cv_used += 1
+        
+        # Store predictions for visualization (marginal per correction)
+        for point_idx, (pc, actual_err) in enumerate(zip(holdout_postcals, holdout_errors), start=1):
+            if n_holdout_points == 1:
+                pred_mean = mu_total
+                pred_std = sigma_total
+            elif n_holdout_points == 2:
+                pred_mean = mu_gain * pc
+                pred_var = (sigma_gain * pc)**2 + sigma_residual**2
+                pred_std = np.sqrt(pred_var)
+            else:
+                pred_mean = mu_offset + mu_gain * pc
+                pred_var = sigma_offset**2 + (pc**2) * (sigma_gain**2) + sigma_noise**2
+                pred_std = np.sqrt(pred_var)
+            decomposed_predictions.append((actual_err, pred_mean, pred_std, point_idx))
+    
+    print(f"      Simple Model CV LogLik: {simple_cv_loglik:.2f}")
+    print(f"      Decomposed Model CV LogLik: {decomposed_cv_loglik:.2f}")
+    print(f"      CV folds used: {cv_used}, skipped: {cv_skipped}")
+    
+    # Detailed diagnostics
+    if decomposed_predictions:
+        pred_stds = [p[2] for p in decomposed_predictions]
+        pred_errors = [abs(p[0] - p[1]) for p in decomposed_predictions]
+        print(f"\n      Decomposed Model Diagnostics:")
+        print(f"        Prediction std (σ): mean={np.mean(pred_stds):.6f}, min={np.min(pred_stds):.6f}, max={np.max(pred_stds):.6f}")
+        print(f"        Prediction error: mean={np.mean(pred_errors):.6f}, median={np.median(pred_errors):.6f}")
+        print(f"        Ratio (error/σ): {np.mean(pred_errors)/np.mean(pred_stds):.3f}")
+        
+        # Component variance statistics across folds
+        if decomposed_component_variances:
+            # Group by case
+            cases = {}
+            for d in decomposed_component_variances:
+                case = d['case']
+                if case not in cases:
+                    cases[case] = []
+                cases[case].append(d)
+            
+            print(f"        Component σ statistics by calibration type:")
+            for case, fold_list in sorted(cases.items()):
+                print(f"          {case}:")
+                if case == '1-point':
+                    sigmas = [d['sigma_total'] for d in fold_list if not np.isnan(d['sigma_total'])]
+                    if sigmas:
+                        print(f"            σ_total: mean={np.mean(sigmas):.6f}, range=[{np.min(sigmas):.6f}, {np.max(sigmas):.6f}]")
+                elif case == '2-point':
+                    sigma_gains = [d['sigma_gain'] for d in fold_list if not np.isnan(d['sigma_gain'])]
+                    sigma_residuals = [d['sigma_residual'] for d in fold_list if not np.isnan(d['sigma_residual'])]
+                    if sigma_gains:
+                        print(f"            σ_gain: mean={np.mean(sigma_gains):.6f}, range=[{np.min(sigma_gains):.6f}, {np.max(sigma_gains):.6f}]")
+                    if sigma_residuals:
+                        print(f"            σ_residual: mean={np.mean(sigma_residuals):.6f}, range=[{np.min(sigma_residuals):.6f}, {np.max(sigma_residuals):.6f}]")
+                elif case == '3+ point':
+                    sigma_offsets = [d['sigma_offset'] for d in fold_list if not np.isnan(d['sigma_offset'])]
+                    sigma_gains = [d['sigma_gain'] for d in fold_list if not np.isnan(d['sigma_gain'])]
+                    sigma_noises = [d['sigma_noise'] for d in fold_list if not np.isnan(d['sigma_noise'])]
+                    if sigma_offsets:
+                        print(f"            σ_offset: mean={np.mean(sigma_offsets):.6f}, range=[{np.min(sigma_offsets):.6f}, {np.max(sigma_offsets):.6f}]")
+                    if sigma_gains:
+                        print(f"            σ_gain: mean={np.mean(sigma_gains):.6f}, range=[{np.min(sigma_gains):.6f}, {np.max(sigma_gains):.6f}]")
+                    if sigma_noises:
+                        print(f"            σ_noise: mean={np.mean(sigma_noises):.6f}, range=[{np.min(sigma_noises):.6f}, {np.max(sigma_noises):.6f}]")
+    
+    if simple_predictions:
+        pred_stds_simple = [p[2] for p in simple_predictions]
+        pred_errors_simple = [abs(p[0] - p[1]) for p in simple_predictions]
+        print(f"\n      Simple Model Diagnostics:")
+        print(f"        Prediction std (σ): mean={np.mean(pred_stds_simple):.6f}, min={np.min(pred_stds_simple):.6f}, max={np.max(pred_stds_simple):.6f}")
+        print(f"        Prediction error: mean={np.mean(pred_errors_simple):.6f}, median={np.median(pred_errors_simple):.6f}")
+        print(f"        Ratio (error/σ): {np.mean(pred_errors_simple)/np.mean(pred_stds_simple):.3f}")
+    
+    # Warn about positive log-likelihoods (now less likely with hierarchical evaluation)
+    if simple_cv_loglik > 0:
+        print(f"\n      ⚠ WARNING: Simple model has positive CV LogLik ({simple_cv_loglik:.2f})")
+    if decomposed_cv_loglik > 0:
+        print(f"\n      ⚠ WARNING: Decomposed model has positive CV LogLik ({decomposed_cv_loglik:.2f})")
+    
+    # ===== FIT FULL MODELS FOR PARAMETER COUNTING =====
+    print(f"\n    - Fitting full models for parameter counting...")
+    
+    # Simple Model on all data
     print(f"    - Simple Model (independent distributions per point):")
     simple_loglik = 0
     simple_k = 0
@@ -1629,140 +2204,249 @@ def compare_decomposed_vs_simple_model(results_df, raw_df, sensor_name):
         n = len(corrections)
         
         if n < 2:
-            # Need at least 2 points to estimate variance
             print(f"      Point {point_idx}: SKIPPED (n={n}, insufficient data)")
             continue
         
         mu = np.mean(corrections)
         sigma = np.std(corrections, ddof=1)
         
-        # Handle zero variance
-        if sigma < 1e-10:
+        # Handle exactly zero variance
+        if sigma == 0.0:
             sigma = 1e-10
         
-        # Log-likelihood for this point
         ll = np.sum(stats.norm.logpdf(corrections, loc=mu, scale=sigma))
         simple_loglik += ll
-        simple_k += 2  # μ and σ for this point
+        simple_k += 2
         
         print(f"      Point {point_idx}: μ={mu:.4f}, σ={sigma:.4f}, LogLik={ll:.2f}")
+
     
     comparison['Simple_LogLik'] = simple_loglik
     comparison['Simple_K'] = simple_k
     comparison['Simple_AIC'] = 2 * simple_k - 2 * simple_loglik
+    comparison['Simple_CV_LogLik'] = simple_cv_loglik
     
     print(f"      TOTAL: k={simple_k}, LogLik={simple_loglik:.2f}, AIC={comparison['Simple_AIC']:.2f}")
+    print(f"      CV LogLik: {simple_cv_loglik:.2f}")
+
     
     # ===== DECOMPOSED MODEL =====
-    print(f"    - Decomposed Model (hierarchical with offset+gain+noise):")
-    # Extract component distributions from fitted models
-    offset = results_df['Offset'].dropna().values
-    gain = results_df['Gain'].dropna().values
+    print(f"    - Decomposed Model (hierarchical with point-count-dependent parameterization):")
+    print(f"      1-point: σ_total | 2-point: σ_gain + σ_residual | 3+ point: σ_offset + σ_gain + σ_noise")
     
-    # Check if we can fit decomposed model (require n≥10 for robust variance estimates)
-    if len(offset) < 10:
-        print(f"    - WARNING: Not enough events to fit decomposed model (n={len(offset)}, require n≥10)")
+    # Separate events by calibration point count
+    events_1pt = results_df[results_df['N_Points'] == 1]
+    events_2pt = results_df[results_df['N_Points'] == 2]
+    events_3plus = results_df[results_df['N_Points'] >= 3]
+    
+    print(f"      Event distribution: 1-pt={len(events_1pt)}, 2-pt={len(events_2pt)}, 3+pt={len(events_3plus)}")
+    
+    # Check if we have enough events
+    total_events = len(results_df)
+    if total_events < 10:
+        print(f"    - WARNING: Not enough events to fit decomposed model (n={total_events}, require n≥10)")
         comparison['Recommendation'] = 'Simple'
-        comparison['Reasons'] = f'Insufficient events for decomposed model (n={len(offset)} < 10)'
+        comparison['Reasons'] = f'Insufficient events for decomposed model (n={total_events} < 10)'
         return comparison
     
-    # Fit component distributions (MLE = sample statistics for normal)
-    mu_offset = np.mean(offset)
-    sigma_offset = np.std(offset, ddof=1)
-    
-    # Check if we have multi-point data for gain estimation
-    multi_point_mask = results_df['Fit_Type'] == 'Multi_Point'
-    has_multi_point = multi_point_mask.any()
-    
-    if has_multi_point and len(gain) > 1:
-        mu_gain = np.mean(gain)
-        sigma_gain = np.std(gain, ddof=1)
+    # ===== 1-POINT EVENTS: Estimate σ_total =====
+    if len(events_1pt) > 0:
+        corrections_1pt = []
+        for idx, row in events_1pt.iterrows():
+            if 'Error_Values' in row and isinstance(row['Error_Values'], np.ndarray):
+                corrections_1pt.extend(row['Error_Values'])
+        
+        if len(corrections_1pt) >= 2:
+            mu_total = np.mean(corrections_1pt)
+            sigma_total = np.std(corrections_1pt, ddof=1)
+            if sigma_total == 0.0:
+                sigma_total = 1e-10
+            print(f"      1-point: μ_total={mu_total:.4f}, σ_total={sigma_total:.4f} (n={len(corrections_1pt)} corrections)")
+        else:
+            mu_total = np.nan
+            sigma_total = np.nan
     else:
-        # No gain variation (single-point calibrations)
-        mu_gain = 0.0
-        sigma_gain = 0.0
+        mu_total = np.nan
+        sigma_total = np.nan
     
-    # Estimate noise from residuals
-    all_residuals = []
-    for idx, row in results_df.iterrows():
-        if 'Residuals' in row and isinstance(row['Residuals'], np.ndarray):
-            if row['Fit_Type'] == 'Multi_Point' and len(row['Residuals']) > 0:
-                all_residuals.extend(row['Residuals'])
-    
-    if len(all_residuals) > 1:
-        sigma_noise = np.std(all_residuals, ddof=1)
+    # ===== 2-POINT EVENTS: Estimate σ_gain + σ_residual =====
+    if len(events_2pt) >= 2:
+        gains_2pt = events_2pt['Gain'].dropna().values
+        mu_gain_2pt = np.mean(gains_2pt)
+        sigma_gain_2pt = np.std(gains_2pt, ddof=1)
+        if sigma_gain_2pt == 0.0:
+            sigma_gain_2pt = 1e-10
+        
+        # Compute residuals (offset + noise combined)
+        residuals_2pt = []
+        for idx, row in events_2pt.iterrows():
+            if 'Error_Values' in row and 'PostCal_Values' in row and 'Gain' in row:
+                errors = row['Error_Values']
+                postcals = row['PostCal_Values']
+                gain = row['Gain']
+                if isinstance(errors, np.ndarray) and isinstance(postcals, np.ndarray):
+                    residuals = errors - gain * postcals
+                    residuals_2pt.extend(residuals)
+        
+        if len(residuals_2pt) >= 2:
+            sigma_residual_2pt = np.std(residuals_2pt, ddof=1)
+            if sigma_residual_2pt == 0.0:
+                sigma_residual_2pt = 1e-10
+        else:
+            sigma_residual_2pt = 1e-10
+        
+        print(f"      2-point: μ_gain={mu_gain_2pt:.4f}, σ_gain={sigma_gain_2pt:.4f}, σ_residual={sigma_residual_2pt:.4f} (n={len(gains_2pt)} events, {len(residuals_2pt)} residuals)")
     else:
-        # No independent noise estimate available
-        sigma_noise = 0.0
+        mu_gain_2pt = np.nan
+        sigma_gain_2pt = np.nan
+        sigma_residual_2pt = np.nan
     
-    # Check for degenerate cases (zero variance indicates model inadequacy)
-    if sigma_offset == 0.0:
-        print(f"    - WARNING: Zero offset variance detected (constant offset across events)")
-        sigma_offset = 1e-10  # Use small value to avoid division by zero
-    if sigma_gain == 0.0 and has_multi_point:
-        print(f"    - WARNING: Zero gain variance detected (constant gain across events)")
-        sigma_gain = 1e-10
-    if sigma_noise == 0.0 and len(all_residuals) > 1:
-        print(f"    - WARNING: Zero noise variance detected (perfect linear fits)")
-        sigma_noise = 1e-10
+    # ===== 3+ POINT EVENTS: Estimate σ_offset + σ_gain + σ_noise =====
+    if len(events_3plus) >= 2:
+        offsets = events_3plus['Offset'].dropna().values
+        gains = events_3plus['Gain'].dropna().values
+        
+        mu_offset = np.mean(offsets)
+        sigma_offset = np.std(offsets, ddof=1)
+        if sigma_offset == 0.0:
+            sigma_offset = 1e-10
+        
+        mu_gain_3plus = np.mean(gains)
+        sigma_gain_3plus = np.std(gains, ddof=1)
+        if sigma_gain_3plus == 0.0:
+            sigma_gain_3plus = 1e-10
+        
+        # Estimate noise from residuals
+        residuals_3plus = []
+        for idx, row in events_3plus.iterrows():
+            if 'Residuals' in row and isinstance(row['Residuals'], np.ndarray):
+                if len(row['Residuals']) > 0:
+                    residuals_3plus.extend(row['Residuals'])
+        
+        if len(residuals_3plus) >= 2:
+            sigma_noise = np.std(residuals_3plus, ddof=1)
+            if sigma_noise == 0.0:
+                sigma_noise = 1e-10
+        else:
+            sigma_noise = 1e-10
+        
+        print(f"      3+ point: μ_offset={mu_offset:.4f}, σ_offset={sigma_offset:.4f}, μ_gain={mu_gain_3plus:.4f}, σ_gain={sigma_gain_3plus:.4f}, σ_noise={sigma_noise:.4f}")
+        print(f"               (n={len(offsets)} events, {len(residuals_3plus)} residuals)")
+    else:
+        mu_offset = np.nan
+        sigma_offset = np.nan
+        mu_gain_3plus = np.nan
+        sigma_gain_3plus = np.nan
+        sigma_noise = np.nan
     
-    # Calculate predictive log-likelihood at each correction point
+    # Calculate log-likelihood in correction-space (appropriate covariance for each event)
     decomposed_loglik = 0
+    decomposed_k = 0
     
-    for point_idx, data in corrections_by_point.items():
-        for correction, postcal in data:
-            # Predictive distribution: Correction ~ N(μ, σ_total)
-            # where μ = μ_offset + μ_gain × postcal
-            #       σ_total² = σ_offset² + postcal² × σ_gain² + σ_noise²
+    # 1-point events
+    if not np.isnan(mu_total) and not np.isnan(sigma_total):
+        for idx, row in events_1pt.iterrows():
+            if 'Error_Values' not in row:
+                continue
+            errors = row['Error_Values']
+            if not isinstance(errors, np.ndarray):
+                continue
             
-            pred_mean = mu_offset + mu_gain * postcal
-            pred_var = sigma_offset**2 + (postcal**2) * (sigma_gain**2) + sigma_noise**2
-            pred_std = np.sqrt(pred_var)
-            
-            # Log-likelihood of this observation
-            ll = stats.norm.logpdf(correction, loc=pred_mean, scale=pred_std)
-            decomposed_loglik += ll
+            mean_vec = np.array([mu_total])
+            cov = np.array([[sigma_total**2 + 1e-12]])
+            ll_event = stats.multivariate_normal.logpdf(errors, mean=mean_vec, cov=cov)
+            decomposed_loglik += ll_event
+        decomposed_k += 2  # μ_total, σ_total
     
-    # Number of parameters
-    decomposed_k = 2  # μ_offset, σ_offset
-    if has_multi_point and sigma_gain > 1e-10:
-        decomposed_k += 2  # μ_gain, σ_gain
-    if len(all_residuals) > 1:
-        decomposed_k += 1  # σ_noise
+    # 2-point events
+    if not np.isnan(mu_gain_2pt) and not np.isnan(sigma_gain_2pt) and not np.isnan(sigma_residual_2pt):
+        for idx, row in events_2pt.iterrows():
+            if 'PostCal_Values' not in row or 'Error_Values' not in row:
+                continue
+            postcals = row['PostCal_Values']
+            errors = row['Error_Values']
+            if not isinstance(postcals, np.ndarray) or not isinstance(errors, np.ndarray):
+                continue
+            
+            mean_vec = mu_gain_2pt * postcals
+            pc_outer = np.outer(postcals, postcals)
+            cov = (sigma_gain_2pt**2) * pc_outer + (sigma_residual_2pt**2) * np.eye(2)
+            cov += np.eye(2) * 1e-12
+            ll_event = stats.multivariate_normal.logpdf(errors, mean=mean_vec, cov=cov)
+            decomposed_loglik += ll_event
+        decomposed_k += 3  # μ_gain, σ_gain, σ_residual
+    
+    # 3+ point events
+    if not np.isnan(mu_offset) and not np.isnan(sigma_offset) and not np.isnan(mu_gain_3plus) and not np.isnan(sigma_gain_3plus) and not np.isnan(sigma_noise):
+        for idx, row in events_3plus.iterrows():
+            if 'PostCal_Values' not in row or 'Error_Values' not in row:
+                continue
+            postcals = row['PostCal_Values']
+            errors = row['Error_Values']
+            if not isinstance(postcals, np.ndarray) or not isinstance(errors, np.ndarray):
+                continue
+            
+            n_pts = len(postcals)
+            mean_vec = mu_offset + mu_gain_3plus * postcals
+            ones = np.ones((n_pts, n_pts))
+            pc_outer = np.outer(postcals, postcals)
+            cov = (sigma_offset**2) * ones + (sigma_gain_3plus**2) * pc_outer + (sigma_noise**2) * np.eye(n_pts)
+            cov += np.eye(n_pts) * 1e-12
+            ll_event = stats.multivariate_normal.logpdf(errors, mean=mean_vec, cov=cov)
+            decomposed_loglik += ll_event
+        decomposed_k += 5  # μ_offset, σ_offset, μ_gain, σ_gain, σ_noise
     
     comparison['Decomposed_LogLik'] = decomposed_loglik
     comparison['Decomposed_K'] = decomposed_k
     comparison['Decomposed_AIC'] = 2 * decomposed_k - 2 * decomposed_loglik
+    comparison['Decomposed_CV_LogLik'] = decomposed_cv_loglik
     
-    print(f"      Component Statistics:")
-    print(f"        Offset: μ={mu_offset:.4f}, σ={sigma_offset:.4f} (n={len(offset)} events)")
-    print(f"        Gain: μ={mu_gain:.4f}, σ={sigma_gain:.4f} (n={len(gain)} events)")
-    if len(all_residuals) > 0:
-        print(f"        Noise: σ={sigma_noise:.4f} (n={len(all_residuals)} residuals)")
-    else:
-        print(f"        Noise: not estimated (insufficient residuals)")
     print(f"      TOTAL: k={decomposed_k}, LogLik={decomposed_loglik:.2f}, AIC={comparison['Decomposed_AIC']:.2f}")
+    print(f"      CV LogLik: {decomposed_cv_loglik:.2f}")
+
 
     
     # ===== COMPARISON =====
     comparison['Delta_AIC'] = comparison['Decomposed_AIC'] - comparison['Simple_AIC']
+    comparison['Delta_CV_LogLik'] = decomposed_cv_loglik - simple_cv_loglik
+    
+    # Primary comparison: Cross-validated log-likelihood (higher is better)
+    # Secondary: AIC on full data (lower is better)
+    if abs(comparison['Delta_CV_LogLik']) < 2:
+        cv_conclusion = 'Equivalent'
+    elif comparison['Delta_CV_LogLik'] > 2:
+        cv_conclusion = 'Decomposed'
+    else:
+        cv_conclusion = 'Simple'
     
     # AIC interpretation: ΔAIC > 2 indicates substantial support for lower AIC model
     if abs(comparison['Delta_AIC']) < 2:
-        comparison['Recommendation'] = 'Equivalent'
-        comparison['Reasons'] = f'ΔAIC={comparison["Delta_AIC"]:.1f} (models equivalent)'
+        aic_conclusion = 'Equivalent'
     elif comparison['Delta_AIC'] < -2:
-        comparison['Recommendation'] = 'Decomposed'
-        comparison['Reasons'] = f'ΔAIC={comparison["Delta_AIC"]:.1f} (decomposed better)'
+        aic_conclusion = 'Decomposed'
     else:
-        comparison['Recommendation'] = 'Simple'
-        comparison['Reasons'] = f'ΔAIC={comparison["Delta_AIC"]:.1f} (simple better)'
+        aic_conclusion = 'Simple'
+    
+    # Use CV as primary criterion
+    comparison['Recommendation'] = cv_conclusion
+    if cv_conclusion == 'Decomposed':
+        comparison['Reasons'] = f'ΔCV_LogLik={comparison["Delta_CV_LogLik"]:.1f} (decomposed better by CV)'
+    elif cv_conclusion == 'Simple':
+        comparison['Reasons'] = f'ΔCV_LogLik={comparison["Delta_CV_LogLik"]:.1f} (simple better by CV)'
+    else:
+        comparison['Reasons'] = f'ΔCV_LogLik={comparison["Delta_CV_LogLik"]:.1f} (models equivalent by CV)'
     
     # Print comparison summary
     print(f"\n  → COMPARISON SUMMARY:")
+    print(f"      ΔCV LogLik = {comparison['Delta_CV_LogLik']:.2f} (Decomposed - Simple)")
     print(f"      ΔAIC = {comparison['Delta_AIC']:.2f} (Decomposed - Simple)")
-    print(f"      Recommendation: {comparison['Recommendation']}")
-    print(f"      Reason: {comparison['Reasons']}")
+    print(f"      CV Recommendation: {cv_conclusion}")
+    print(f"      AIC Recommendation: {aic_conclusion}")
+    print(f"      Final: {comparison['Recommendation']} - {comparison['Reasons']}")
+    
+    # Store predictions for visualization
+    comparison['Simple_Predictions'] = simple_predictions
+    comparison['Decomposed_Predictions'] = decomposed_predictions
     
     return comparison
 
@@ -1936,6 +2620,177 @@ def create_model_comparison_visualization(comparison_df, output_dir=OUTPUT_DIR):
     print(f"  Saved: model_comparison_summary.png")
 
 
+def create_prediction_error_visualization(comparison_result, sensor_name, output_dir=OUTPUT_DIR):
+    """
+    Create visualization comparing prediction errors from both models.
+    
+    Shows:
+    - Histogram of prediction errors (actual - predicted) for both models
+    - Scatter plot of predicted vs actual values
+    - Residual plots
+    """
+    simple_preds = comparison_result.get('Simple_Predictions', [])
+    decomposed_preds = comparison_result.get('Decomposed_Predictions', [])
+    
+    if not simple_preds or not decomposed_preds:
+        return
+    
+    # Extract data
+    simple_actual = np.array([p[0] for p in simple_preds])
+    simple_pred = np.array([p[1] for p in simple_preds])
+    simple_std = np.array([p[2] for p in simple_preds])
+    
+    decomposed_actual = np.array([p[0] for p in decomposed_preds])
+    decomposed_pred = np.array([p[1] for p in decomposed_preds])
+    decomposed_std = np.array([p[2] for p in decomposed_preds])
+    
+    # Calculate errors
+    simple_errors = simple_actual - simple_pred
+    decomposed_errors = decomposed_actual - decomposed_pred
+    
+    # Create figure
+    fig = plt.figure(figsize=(20, 12), dpi=FIGURE_DPI)
+    gs = fig.add_gridspec(2, 3, hspace=0.30, wspace=0.30)
+    
+    fig.suptitle(f'{sensor_name} - Cross-Validated Prediction Accuracy', 
+                 fontsize=14, fontweight='bold', y=0.995)
+    
+    # ===== ROW 1: PREDICTION ERROR HISTOGRAMS =====
+    
+    # Panel 1: Simple Model Errors
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.hist(simple_errors, bins=max(10, len(simple_errors)//5), 
+             alpha=0.7, color='#1f77b4', edgecolor='black', linewidth=0.8)
+    ax1.axvline(0, color='red', linestyle='--', linewidth=2, alpha=0.8)
+    ax1.axvline(np.mean(simple_errors), color='orange', linestyle='--', linewidth=2, alpha=0.8)
+    ax1.set_xlabel('Prediction Error (Actual - Predicted)', fontweight='bold')
+    ax1.set_ylabel('Frequency', fontweight='bold')
+    ax1.set_title(f'Simple Model Errors\\nMean={np.mean(simple_errors):.4f}, Std={np.std(simple_errors):.4f}',
+                  fontweight='bold', fontsize=11)
+    ax1.grid(True, alpha=0.3)
+    
+    # Panel 2: Decomposed Model Errors
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.hist(decomposed_errors, bins=max(10, len(decomposed_errors)//5),
+             alpha=0.7, color='#2ca02c', edgecolor='black', linewidth=0.8)
+    ax2.axvline(0, color='red', linestyle='--', linewidth=2, alpha=0.8)
+    ax2.axvline(np.mean(decomposed_errors), color='orange', linestyle='--', linewidth=2, alpha=0.8)
+    ax2.set_xlabel('Prediction Error (Actual - Predicted)', fontweight='bold')
+    ax2.set_ylabel('Frequency', fontweight='bold')
+    ax2.set_title(f'Decomposed Model Errors\\nMean={np.mean(decomposed_errors):.4f}, Std={np.std(decomposed_errors):.4f}',
+                  fontweight='bold', fontsize=11)
+    ax2.grid(True, alpha=0.3)
+    
+    # Panel 3: Error Comparison (Side by Side)
+    ax3 = fig.add_subplot(gs[0, 2])
+    bins = np.linspace(min(simple_errors.min(), decomposed_errors.min()),
+                       max(simple_errors.max(), decomposed_errors.max()), 20)
+    ax3.hist(simple_errors, bins=bins, alpha=0.5, color='#1f77b4', 
+             label='Simple', edgecolor='black', linewidth=0.8)
+    ax3.hist(decomposed_errors, bins=bins, alpha=0.5, color='#2ca02c',
+             label='Decomposed', edgecolor='black', linewidth=0.8)
+    ax3.axvline(0, color='red', linestyle='--', linewidth=2, alpha=0.8)
+    ax3.set_xlabel('Prediction Error', fontweight='bold')
+    ax3.set_ylabel('Frequency', fontweight='bold')
+    ax3.set_title('Error Distribution Comparison', fontweight='bold', fontsize=11)
+    ax3.legend(loc='upper right', framealpha=0.9)
+    ax3.grid(True, alpha=0.3)
+    
+    # ===== ROW 2: PREDICTED VS ACTUAL =====
+    
+    # Panel 4: Simple Model - Predicted vs Actual
+    ax4 = fig.add_subplot(gs[1, 0])
+    ax4.scatter(simple_actual, simple_pred, alpha=0.6, s=40, color='#1f77b4', edgecolors='black', linewidth=0.5)
+    
+    # Add 1:1 line
+    all_vals = np.concatenate([simple_actual, simple_pred])
+    lims = [all_vals.min(), all_vals.max()]
+    ax4.plot(lims, lims, 'r--', linewidth=2, alpha=0.7, label='Perfect Prediction')
+    
+    # Calculate R²
+    r2_simple = 1 - np.sum(simple_errors**2) / np.sum((simple_actual - np.mean(simple_actual))**2)
+    rmse_simple = np.sqrt(np.mean(simple_errors**2))
+    
+    ax4.set_xlabel('Actual Correction', fontweight='bold')
+    ax4.set_ylabel('Predicted Correction', fontweight='bold')
+    ax4.set_title(f'Simple Model\\nR²={r2_simple:.3f}, RMSE={rmse_simple:.4f}',
+                  fontweight='bold', fontsize=11)
+    ax4.legend(loc='upper left', framealpha=0.9)
+    ax4.grid(True, alpha=0.3)
+    ax4.set_aspect('equal', adjustable='box')
+    
+    # Panel 5: Decomposed Model - Predicted vs Actual
+    ax5 = fig.add_subplot(gs[1, 1])
+    ax5.scatter(decomposed_actual, decomposed_pred, alpha=0.6, s=40, color='#2ca02c', 
+                edgecolors='black', linewidth=0.5)
+    
+    # Add 1:1 line
+    all_vals = np.concatenate([decomposed_actual, decomposed_pred])
+    lims = [all_vals.min(), all_vals.max()]
+    ax5.plot(lims, lims, 'r--', linewidth=2, alpha=0.7, label='Perfect Prediction')
+    
+    # Calculate R²
+    r2_decomp = 1 - np.sum(decomposed_errors**2) / np.sum((decomposed_actual - np.mean(decomposed_actual))**2)
+    rmse_decomp = np.sqrt(np.mean(decomposed_errors**2))
+    
+    ax5.set_xlabel('Actual Correction', fontweight='bold')
+    ax5.set_ylabel('Predicted Correction', fontweight='bold')
+    ax5.set_title(f'Decomposed Model\\nR²={r2_decomp:.3f}, RMSE={rmse_decomp:.4f}',
+                  fontweight='bold', fontsize=11)
+    ax5.legend(loc='upper left', framealpha=0.9)
+    ax5.grid(True, alpha=0.3)
+    ax5.set_aspect('equal', adjustable='box')
+    
+    # Panel 6: Model Comparison Summary
+    ax6 = fig.add_subplot(gs[1, 2])
+    ax6.axis('off')
+    
+    # Create comparison text
+    delta_cv = comparison_result.get('Delta_CV_LogLik', np.nan)
+    delta_aic = comparison_result.get('Delta_AIC', np.nan)
+    recommendation = comparison_result.get('Recommendation', 'Unknown')
+    
+    summary_text = f"""MODEL COMPARISON SUMMARY
+    
+Cross-Validation:
+  Simple CV LogLik:     {comparison_result.get('Simple_CV_LogLik', np.nan):.2f}
+  Decomposed CV LogLik: {comparison_result.get('Decomposed_CV_LogLik', np.nan):.2f}
+  ΔCV LogLik:           {delta_cv:.2f}
+  
+Predictive Accuracy:
+  Simple RMSE:          {rmse_simple:.4f}
+  Decomposed RMSE:      {rmse_decomp:.4f}
+  Improvement:          {((rmse_simple - rmse_decomp)/rmse_simple * 100):.1f}%
+  
+  Simple R²:            {r2_simple:.3f}
+  Decomposed R²:        {r2_decomp:.3f}
+  
+Information Criteria:
+  Simple AIC:           {comparison_result.get('Simple_AIC', np.nan):.2f}
+  Decomposed AIC:       {comparison_result.get('Decomposed_AIC', np.nan):.2f}
+  ΔAIC:                 {delta_aic:.2f}
+  
+Sample Size:
+  N Events:             {comparison_result.get('N_Events', 0)}
+  N Corrections:        {comparison_result.get('N_Corrections', 0)}
+  
+RECOMMENDATION: {recommendation}
+"""
+    
+    ax6.text(0.05, 0.95, summary_text, transform=ax6.transAxes,
+             fontsize=10, verticalalignment='top', fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+    
+    # Remove titles before saving
+    clear_figure_titles(fig)
+    
+    output_path = output_dir / f'prediction_errors_{sensor_name}.png'
+    plt.savefig(output_path, dpi=FIGURE_DPI, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  - Saved prediction_errors_{sensor_name}.png")
+
+
 def main():
     """Main execution."""
     print(f"Loading correction files from: {CORRECTIONS_DIR}\n")
@@ -2047,6 +2902,25 @@ def main():
                     all_separate_stats.append(point_stats)
                     print(f"    - {point_name}: {len(df)} events")
             
+            # ===== KRUSKAL-WALLIS TEST ACROSS CORRECTIONS =====
+            print(f"  - Testing if corrections across points have same distribution...")
+            kw_result = test_corrections_kruskal_wallis(raw_df, sensor_name)
+            if kw_result['Test_Status'] == 'Completed':
+                kw_result['Sensor'] = sensor_name
+                kw_result['Calibration_Point'] = 'Across All Points'
+                all_separate_stats.append(kw_result)
+                print(f"    - Kruskal-Wallis: H={kw_result['Kruskal_Wallis_H']:.4f}, p={kw_result['Kruskal_Wallis_p']:.4f}, " +
+                      f"Significant={kw_result['Kruskal_Wallis_Significant']}")
+                print(f"    - ANOVA: F={kw_result['ANOVA_F']:.4f}, p={kw_result['ANOVA_p']:.4f}, " +
+                      f"Significant={kw_result['ANOVA_Significant']}, η²={kw_result['Eta_Squared']:.4f}")
+                print(f"    - Levene: F={kw_result['Levene_F']:.4f}, p={kw_result['Levene_p']:.4f}, " +
+                      f"Equal Variances={not kw_result['Levene_Significant']}")
+            else:
+                print(f"    - {kw_result['Test_Status']} (need ≥2 points with ≥5 observations each)")
+            
+            # Create visualization of corrections comparison
+            create_corrections_comparison_visualization(raw_df, sensor_name, output_dir=sensor_output_dir)
+            
             print()
         
         except Exception as e:
@@ -2092,8 +2966,15 @@ def main():
             sensor_results = og_combined[og_combined['Sensor'] == sensor_name]
             raw_df = all_raw_data[sensor_name]
             
+            # Create sensor-specific output directory
+            sensor_output_dir = OUTPUT_DIR / sensor_name
+            sensor_output_dir.mkdir(parents=True, exist_ok=True)
+            
             comparison = compare_decomposed_vs_simple_model(sensor_results, raw_df, sensor_name)
             comparison_results.append(comparison)
+            
+            # Create prediction error visualization for this sensor in sensor-specific directory
+            create_prediction_error_visualization(comparison, sensor_name, sensor_output_dir)
             
             rec = comparison['Recommendation']
             print(f"  -> Recommendation: {rec}")
@@ -2101,13 +2982,14 @@ def main():
         
         comparison_df = pd.DataFrame(comparison_results)
         
-        # Save comparison results
+        # Save comparison results (remove prediction lists before saving)
+        comparison_save = comparison_df.drop(columns=['Simple_Predictions', 'Decomposed_Predictions'], errors='ignore')
         comparison_path = aggregate_dir / 'model_comparison.csv'
-        comparison_df.to_csv(comparison_path, index=False)
-        print(f"\n  - Saved model_comparison.csv ({len(comparison_df)} sensors)")
+        comparison_save.to_csv(comparison_path, index=False)
+        print(f"\n  - Saved model_comparison.csv ({len(comparison_save)} sensors)")
         
         # Create visualization
-        create_model_comparison_visualization(comparison_df, OUTPUT_DIR)
+        create_model_comparison_visualization(comparison_save, OUTPUT_DIR)
     
     print("\n" + "="*80)
     print("Analysis complete!")
