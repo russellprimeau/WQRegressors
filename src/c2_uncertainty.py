@@ -945,6 +945,89 @@ INTERPRETATION:
     plt.close(fig_text)
 
 
+def save_sensor_uncertainty_summary(og_df, sensor_name, n_calibration_points, output_dir=OUTPUT_DIR):
+    """
+    Save sensor uncertainty distribution parameters for Monte Carlo sampling in d_Resample.py.
+    
+    Outputs a CSV with:
+    - Number of calibration points available
+    - Offset distribution (mean, std, preferred distribution type)
+    - Gain distribution (if >=2 calibration points)
+    - Noise distribution (if >=3 calibration points)
+    """
+    summary = {
+        'Sensor': sensor_name,
+        'N_Calibration_Points': n_calibration_points,
+    }
+    
+    # Offset (always available)
+    offsets = og_df['Offset'].dropna().values
+    if len(offsets) > 0:
+        summary['Offset_Mean'] = np.mean(offsets)
+        summary['Offset_Std'] = np.std(offsets)
+        # Try to determine preferred distribution from AIC
+        offset_fit = test_distribution_fit(offsets, 'Offset')
+        preferred = offset_fit.get('preferred', 'normal')
+        summary['Offset_Distribution'] = preferred if preferred != 'equivalent' else 'normal'
+    else:
+        summary['Offset_Mean'] = np.nan
+        summary['Offset_Std'] = np.nan
+        summary['Offset_Distribution'] = 'normal'
+    
+    # Gain (if >=2 calibration points)
+    if n_calibration_points >= 2:
+        gains = og_df[og_df['Fit_Type'] == 'Multi_Point']['Gain'].dropna().values
+        if len(gains) > 0:
+            summary['Gain_Mean'] = np.mean(gains)
+            summary['Gain_Std'] = np.std(gains)
+            gain_fit = test_distribution_fit(gains, 'Gain')
+            preferred = gain_fit.get('preferred', 'normal')
+            summary['Gain_Distribution'] = preferred if preferred != 'equivalent' else 'normal'
+        else:
+            summary['Gain_Mean'] = np.nan
+            summary['Gain_Std'] = np.nan
+            summary['Gain_Distribution'] = 'normal'
+    else:
+        summary['Gain_Mean'] = np.nan
+        summary['Gain_Std'] = np.nan
+        summary['Gain_Distribution'] = 'normal'
+    
+    # Noise (if >=3 calibration points)
+    if n_calibration_points >= 3:
+        noise_vars = og_df['Noise_Variance'].dropna().values
+        if len(noise_vars) > 0:
+            summary['Noise_Variance_Mean'] = np.mean(noise_vars)
+            summary['Noise_Variance_Std'] = np.std(noise_vars)
+            summary['Noise_Std_Mean'] = np.sqrt(np.mean(noise_vars))  # For convenience
+            summary['Noise_Std_Std'] = np.std(np.sqrt(noise_vars))
+            noise_fit = test_distribution_fit(noise_vars, 'Noise')
+            preferred = noise_fit.get('preferred', 'normal')
+            summary['Noise_Distribution'] = preferred if preferred != 'equivalent' else 'normal'
+        else:
+            summary['Noise_Variance_Mean'] = np.nan
+            summary['Noise_Variance_Std'] = np.nan
+            summary['Noise_Std_Mean'] = np.nan
+            summary['Noise_Std_Std'] = np.nan
+            summary['Noise_Distribution'] = 'normal'
+    else:
+        summary['Noise_Variance_Mean'] = np.nan
+        summary['Noise_Variance_Std'] = np.nan
+        summary['Noise_Std_Mean'] = np.nan
+        summary['Noise_Std_Std'] = np.nan
+        summary['Noise_Distribution'] = 'normal'
+    
+    # Save to CSV in sensor-specific folder
+    sensor_output_dir = output_dir / sensor_name
+    sensor_output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = sensor_output_dir / f'{sensor_name}_uncertainty_summary.csv'
+    
+    summary_df = pd.DataFrame([summary])
+    summary_df.to_csv(output_path, index=False)
+    print(f"  ✓ Saved uncertainty summary: {output_path}")
+    
+    return summary
+
+
 def test_distribution_fit(data, data_name):
     """
     Test goodness-of-fit for both normal and Student's t distributions.
@@ -2920,6 +3003,11 @@ def main():
             
             # Create visualization of corrections comparison
             create_corrections_comparison_visualization(raw_df, sensor_name, output_dir=sensor_output_dir)
+            
+            # ===== SAVE UNCERTAINTY SUMMARY FOR MONTE CARLO SAMPLING =====
+            n_correction_cols = len([col for col in raw_df.columns if col.startswith('Correction')])
+            if len(og_df) > 0:
+                save_sensor_uncertainty_summary(og_df, sensor_name, n_correction_cols, output_dir=OUTPUT_DIR)
             
             print()
         
