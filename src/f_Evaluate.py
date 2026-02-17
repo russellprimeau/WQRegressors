@@ -1,6 +1,10 @@
 """
 Unified evaluation script for regression, transformer, and classification models.
 Uses a YAML/JSON config file to control what gets evaluated.
+
+Example terminal usage:
+    python src/f_Evaluate.py --config data/output/regression/MC_pH/forecasts/gp_01/model_gp_01/config_evaluate_model_gp_01.yaml
+    python src/f_Evaluate.py --config docs/examples/config_evaluate_example.yaml
 """
 
 import os
@@ -14,6 +18,7 @@ import pandas as pd
 import matplotlib
 import torch
 import xgboost as xgb
+import gpytorch
 
 from utils.training import load_samples
 from utils.transformer import TimeSeriesTargetDataset, TimeSeriesTransformer
@@ -90,20 +95,34 @@ def load_model_config(data_dir, forecast_name, model_name, fallback_data=None):
 
 
 def load_test_samples(data_dir, forecast_name, input_columns, output_columns, input_rows, output_rows):
-    reloadset = Path(data_dir, "forecasts", forecast_name, "test_files.txt")
-    with open(reloadset) as f:
-        test_files = [line.strip() for line in f]
+    return load_split_samples(
+        data_dir,
+        forecast_name,
+        input_columns,
+        output_columns,
+        input_rows,
+        output_rows,
+        "test_files.txt",
+    )
 
-    test_samples = load_samples(
+
+def load_split_samples(data_dir, forecast_name, input_columns, output_columns, input_rows, output_rows, split_file):
+    reloadset = Path(data_dir, "forecasts", forecast_name, "test_files.txt")
+    if split_file != "test_files.txt":
+        reloadset = Path(data_dir, "forecasts", forecast_name, split_file)
+    with open(reloadset) as f:
+        split_files = [line.strip() for line in f]
+
+    samples = load_samples(
         os.path.join(data_dir, "samples"),
         input_columns=input_columns,
         output_columns=output_columns,
         input_rows=input_rows,
         output_rows=output_rows,
-        file_list=test_files,
+        file_list=split_files,
         fault_tolerant=True,
     )
-    return test_samples
+    return samples
 
 
 def get_output_dim(data_dir, output_columns, output_rows):
@@ -112,14 +131,241 @@ def get_output_dim(data_dir, output_columns, output_rows):
     return len(output_columns) * len(sample_df.iloc[output_rows:])
 
 
-def load_model(model_type, data_dir, forecast_name, model_name, model_config, device):
-    model_path = Path(data_dir, "forecasts", forecast_name, model_name)
+def _canonical_feature_name(name):
+    text = str(name).strip().lower().replace("µ", "u")
+    text = text.replace("micro", "u")
+    text = text.replace("_", " ")
+    if " - " in text:
+        text = text.split(" - ", 1)[1].strip()
+    for token in ["(", ")", "/", "%", "°", "-", ".", ","]:
+        text = text.replace(token, " ")
+    return " ".join(text.split())
+
+
+def _resolve_summary_dir(hyper_cfg):
+    if hyper_cfg.get("uncertainty_summary_dir"):
+        return Path(hyper_cfg["uncertainty_summary_dir"])
+    return Path(__file__).parent.parent / "data" / "output" / "calibration" / "summaries"
+
+
+def _load_uncertainty_std_map(summary_dir):
+    if not summary_dir.exists():
+        return {}
+
+    summary_map = {}
+    for file_path in summary_dir.rglob("*_uncertainty_summary.csv"):
+        try:
+            df = pd.read_csv(file_path)
+            if df.empty:
+                continue
+            row = df.iloc[0]
+            sensor_name = row.get("Sensor")
+            if pd.isna(sensor_name):
+                continue
+            offset_std = row.get("Offset_Std", 0.0)
+            if pd.isna(offset_std):
+                offset_std = 0.0
+            summary_map[_canonical_feature_name(sensor_name)] = float(offset_std)
+        except Exception:
+            continue
+    return summary_map
+
+
+def _build_feature_uncertainty_variance(data_cfg, hyper_cfg):
+    input_columns = data_cfg["input_columns"]
+    seq_len = data_cfg["input_row_2"] - data_cfg["input_row_1"]
+
+    summary_std_map = _load_uncertainty_std_map(_resolve_summary_dir(hyper_cfg))
+
+    norm_path = Path(data_cfg["data_dir"]) / "normalization.json"
+    norm_params = {}
+    if norm_path.exists():
+        try:
+            with open(norm_path, "r") as f:
+                norm_params = json.load(f)
+        except Exception:
+            norm_params = {}
+
+    feature_variances = []
+    for feature in input_columns:
+        candidates = [_canonical_feature_name(feature)]
+        if " - " in feature:
+            candidates.append(_canonical_feature_name(feature.split(" - ", 1)[1]))
+
+        matched_std = None
+        for candidate in candidates:
+            if candidate in summary_std_map:
+                matched_std = summary_std_map[candidate]
+                break
+
+        if matched_std is None:
+            matched_std = 0.0
+
+        if matched_std > 0 and feature in norm_params:
+            v_min = norm_params[feature].get("min", 0)
+            v_max = norm_params[feature].get("max", 1)
+            v_range = v_max - v_min
+            if v_range not in [0, 0.0]:
+                matched_std = matched_std / v_range
+
+        feature_variances.append(float(matched_std ** 2))
+
+    return np.tile(np.array(feature_variances, dtype=np.float32), seq_len)
+
+
+def _prepare_gp_train_arrays(train_samples, split_cfg, hyper_cfg):
+    X_train_np = np.array([s[0].flatten() for s in train_samples], dtype=np.float32)
+    y_train_np = np.array([s[1].flatten() for s in train_samples], dtype=np.float32)
+    if y_train_np.ndim == 1:
+        y_train_np = y_train_np.reshape(-1, 1)
+
+    max_train_size = hyper_cfg.get("max_train_size")
+    if max_train_size is not None and len(X_train_np) > max_train_size:
+        rng = np.random.default_rng(split_cfg["random_state"])
+        keep_idx = rng.choice(len(X_train_np), size=max_train_size, replace=False)
+        X_train_np = X_train_np[keep_idx]
+        y_train_np = y_train_np[keep_idx]
+
+    return X_train_np, y_train_np
+
+
+def _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device):
+    model_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], model_name)
+    artifact = torch.load(model_path / "gp_model.pt", map_location=device, weights_only=False)
+    hyper_cfg = artifact["hyperparameters"]
+
+    X_train_np, y_train_np = _prepare_gp_train_arrays(train_samples, split_cfg, hyper_cfg)
+
+    x_mean = np.array(artifact["input_mean"], dtype=np.float32)
+    x_std = np.array(artifact["input_std"], dtype=np.float32)
+    x_std[x_std < 1e-8] = 1.0
+
+    if hyper_cfg.get("input_standardize", True):
+        X_train_used = (X_train_np - x_mean) / x_std
+    else:
+        X_train_used = X_train_np
+
+    X_train = torch.tensor(X_train_used, dtype=torch.float32, device=device)
+    kernel_name = str(hyper_cfg.get("kernel", "matern52")).lower()
+    use_uncertain_kernel = bool(hyper_cfg.get("use_uncertain_input_kernel", True))
+    ard_dims = X_train.shape[1] if (hyper_cfg.get("ard", True) or use_uncertain_kernel) else None
+
+    input_uncertainty_var = None
+    if use_uncertain_kernel:
+        input_uncertainty_var = torch.tensor(
+            _build_feature_uncertainty_variance(data_cfg, hyper_cfg), dtype=torch.float32, device=device
+        )
+
+    class UncertainInputRBFKernel(gpytorch.kernels.Kernel):
+        has_lengthscale = True
+
+        def __init__(self, input_variance, **kwargs):
+            super().__init__(**kwargs)
+            self.register_buffer("input_variance", input_variance)
+
+        def forward(self, x1, x2, diag=False, **params):
+            if diag:
+                return torch.ones(x1.shape[-2], device=x1.device, dtype=x1.dtype)
+
+            lengthscale = self.lengthscale.squeeze()
+            if lengthscale.dim() == 0:
+                lengthscale = lengthscale.repeat(x1.shape[-1])
+
+            ls2 = lengthscale.pow(2)
+            denom = torch.clamp(ls2 + 2.0 * self.input_variance, min=1e-10)
+            sq_dist = ((x1.unsqueeze(-2) - x2.unsqueeze(-3)).pow(2) / denom).sum(dim=-1)
+            det_term = torch.sqrt(torch.prod(ls2 / denom))
+            return det_term * torch.exp(-0.5 * sq_dist)
+
+    def build_base_kernel():
+        if use_uncertain_kernel:
+            return UncertainInputRBFKernel(input_variance=input_uncertainty_var, ard_num_dims=ard_dims)
+        if kernel_name == "rbf":
+            return gpytorch.kernels.RBFKernel(ard_num_dims=ard_dims)
+        if kernel_name == "matern32":
+            return gpytorch.kernels.MaternKernel(nu=1.5, ard_num_dims=ard_dims)
+        return gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=ard_dims)
+
+    class ExactGPRegressor(gpytorch.models.ExactGP):
+        def __init__(self, train_x, train_y, likelihood):
+            super().__init__(train_x, train_y, likelihood)
+            self.mean_module = gpytorch.means.ConstantMean()
+            self.covar_module = gpytorch.kernels.ScaleKernel(build_base_kernel())
+
+        def forward(self, x):
+            mean_x = self.mean_module(x)
+            covar_x = self.covar_module(x)
+            return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+    models = []
+    for state in artifact["models"]:
+        output_idx = state["output_index"]
+        y_train_col = y_train_np[:, output_idx]
+        if hyper_cfg.get("target_standardize", True):
+            y_train_used = (y_train_col - state["target_mean"]) / max(state["target_std"], 1e-8)
+        else:
+            y_train_used = y_train_col
+
+        y_train = torch.tensor(y_train_used, dtype=torch.float32, device=device)
+        likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+        model = ExactGPRegressor(X_train, y_train, likelihood).to(device)
+        model.load_state_dict(state["model_state_dict"])
+        likelihood.load_state_dict(state["likelihood_state_dict"])
+        model.eval()
+        likelihood.eval()
+
+        models.append(
+            {
+                "model": model,
+                "likelihood": likelihood,
+                "target_mean": float(state["target_mean"]),
+                "target_std": float(state["target_std"]),
+            }
+        )
+
+    return {
+        "models": models,
+        "hyperparameters": hyper_cfg,
+        "input_mean": x_mean,
+        "input_std": x_std,
+    }
+
+
+def _predict_gp_bundle(gp_bundle, X_np, device):
+    hyper_cfg = gp_bundle["hyperparameters"]
+    input_mean = gp_bundle["input_mean"]
+    input_std = gp_bundle["input_std"]
+
+    if hyper_cfg.get("input_standardize", True):
+        X_used = (X_np - input_mean) / input_std
+    else:
+        X_used = X_np
+
+    X_tensor = torch.tensor(X_used, dtype=torch.float32, device=device)
+    preds = []
+    for entry in gp_bundle["models"]:
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            pred_dist = entry["likelihood"](entry["model"](X_tensor))
+            pred_mean = pred_dist.mean.detach().cpu().numpy()
+        pred_mean = pred_mean * entry["target_std"] + entry["target_mean"]
+        preds.append(pred_mean)
+
+    return np.stack(preds, axis=1)
+
+
+def load_model(model_type, data_cfg, split_cfg, model_name, model_config, device, train_samples=None):
+    model_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], model_name)
 
     if model_type == "transformer":
         model = TimeSeriesTransformer(model_config).to(device)
         model.load_state_dict(torch.load(model_path / "transformer_model.pt", map_location=device))
         model.eval()
         return model
+
+    if model_type == "gp_regressor":
+        if train_samples is None:
+            raise ValueError("train_samples are required to evaluate gp_regressor")
+        return _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device)
 
     if model_type == "xgb_regressor":
         model = xgb.XGBRegressor()
@@ -180,13 +426,24 @@ def main():
         output_rows,
     )
     test_dataset = TimeSeriesTargetDataset(test_samples)
+    train_samples = None
+    if model_type == "gp_regressor":
+        train_samples = load_split_samples(
+            data_cfg["data_dir"],
+            data_cfg["forecast_name"],
+            input_columns,
+            output_columns,
+            input_rows,
+            output_rows,
+            "train_files.txt",
+        )
 
     X_test = np.array([s[0].flatten() for s in test_samples])
-    y_test = np.array([s[1].flatten()[0] for s in test_samples])
+    y_test = np.array([s[1].flatten() for s in test_samples])
+    output_dim = y_test.shape[1] if y_test.ndim > 1 else 1
 
-    output_dim = get_output_dim(data_cfg["data_dir"], output_columns, output_rows)
-
-    model = load_model(model_type, data_cfg["data_dir"], data_cfg["forecast_name"], model_name, model_config, device)
+    split_cfg = config.get("data_split", {"random_state": 42})
+    model = load_model(model_type, data_cfg, split_cfg, model_name, model_config, device, train_samples)
 
     regression_pairs = []
     regression_labels = []
@@ -198,10 +455,34 @@ def main():
             regression_labels.append("Transformer")
         elif model_type == "xgb_regressor":
             preds_flat = model.predict(X_test)
-            preds = preds_flat.reshape(-1, output_dim)
-            targets = y_test.reshape(-1, output_dim)
+            if np.ndim(preds_flat) == 1:
+                preds = preds_flat.reshape(-1, 1)
+            else:
+                preds = np.array(preds_flat)
+            targets = y_test.reshape(y_test.shape[0], -1)
+            if preds.shape[1] != targets.shape[1]:
+                common_dim = min(preds.shape[1], targets.shape[1])
+                print(
+                    f"[WARN] Prediction dim ({preds.shape[1]}) != target dim ({targets.shape[1]}). "
+                    f"Evaluating first {common_dim} output(s)."
+                )
+                preds = preds[:, :common_dim]
+                targets = targets[:, :common_dim]
             regression_pairs.append((preds, targets))
             regression_labels.append("XGBRegressor")
+        elif model_type == "gp_regressor":
+            preds = _predict_gp_bundle(model, X_test, device)
+            targets = y_test.reshape(y_test.shape[0], -1)
+            if preds.shape[1] != targets.shape[1]:
+                common_dim = min(preds.shape[1], targets.shape[1])
+                print(
+                    f"[WARN] Prediction dim ({preds.shape[1]}) != target dim ({targets.shape[1]}). "
+                    f"Evaluating first {common_dim} output(s)."
+                )
+                preds = preds[:, :common_dim]
+                targets = targets[:, :common_dim]
+            regression_pairs.append((preds, targets))
+            regression_labels.append("GPRegressor")
         elif model_type == "xgb_classifier":
             print("Skipping regression evaluation for xgb_classifier model_type")
 

@@ -8,7 +8,7 @@ from torch.utils.data import Dataset
 
 
 def train_model(directory, model, forecast_name, trainloader, testloader, device, num_epochs=100, learning_rate=1e-3,
-                loss_threshold=1e-3, patience=5):
+                loss_threshold=1e-3, patience=5, model_subdir='transformer'):
 
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -75,10 +75,30 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
         plt.grid(True, which="both", ls="--")
         plt.legend()
         plt.tight_layout()
-        filepath = Path(directory, "forecasts", forecast_name, "transformer")
+        filepath = Path(directory, "forecasts", forecast_name, model_subdir)
         os.makedirs(filepath, exist_ok=True)
-        plt.savefig(Path(directory, "forecasts", forecast_name, "transformer", "loss_plot.png"))
+        plt.savefig(Path(directory, "forecasts", forecast_name, model_subdir, "loss_plot.png"))
         plt.close()
+
+
+class TimeSeriesLSTM(nn.Module):
+    def __init__(self, config):
+        super(TimeSeriesLSTM, self).__init__()
+        self.lstm = nn.LSTM(
+            input_size=config['input_dim'],
+            hidden_size=config['hidden_dim'],
+            num_layers=config['num_layers'],
+            dropout=config['dropout'] if config['num_layers'] > 1 else 0.0,
+            batch_first=True,
+            bidirectional=False
+        )
+        self.output_proj = nn.Linear(config['hidden_dim'], config['output_dim'])
+
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        last_timestep = lstm_out[:, -1, :]
+        output = self.output_proj(last_timestep)
+        return output
 
 class TimeSeriesTransformer(nn.Module):
     def __init__(self, config):

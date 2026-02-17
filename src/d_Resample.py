@@ -8,6 +8,7 @@ import os
 import json
 import pandas as pd
 import numpy as np
+import yaml
 import matplotlib
 import matplotlib.pyplot as plt
 import plotly.express as px
@@ -27,6 +28,199 @@ def clean_directory(directory_path):
                 # print(f"Deleted file: {file_path}")
     except OSError as e:
         print(f"Error deleting files in {directory_path}: {e}")
+
+
+def generate_training_config_template(output_dir, forecast_name, input_columns, output_columns, sample_length, model_type='xgb'):
+    """
+    Generate a template configuration file for e_Train.py.
+    
+    :param output_dir: Output directory where config will be saved
+    :param forecast_name: Name of the forecast/dataset (used as model_name base)
+    :param input_columns: List of input column names
+    :param output_columns: List of output column names
+    :param sample_length: Length of each sample (number of rows)
+    :param model_type: Type of model for naming ('xgb' or 'transformer')
+    :return: Path to the generated config file
+    """
+    # Create the template configuration
+    config = {
+        'model_type': 'xgb_regressor',  # Options: 'transformer', 'gp_regressor', 'xgb_regressor', 'xgb_classifier'
+        'model_name': f'model_{model_type}_01',
+        'device': 'cuda',  # or 'cpu'
+        'matplotlib_backend': 'Agg',
+        'data': {
+            'data_dir': output_dir,
+            'forecast_name': forecast_name,
+            'input_columns': input_columns,
+            'input_row_1': 0,
+            'input_row_2': sample_length - 1,  # All rows except the last
+            'output_columns': output_columns,
+            'output_rows': [sample_length - 1],  # Last row is the target
+        },
+        'data_split': {
+            'random_state': 42,
+            'test_size': 0.2,
+            'reuse_split': False,
+            'split_source': None,
+            'split_type': 'temporal',
+            'fault_tolerant': True,
+        },
+        'hyperparameters': {
+            # XGBoost Regressor hyperparameters (adjust for your use case)
+            'metric': 'rmse',
+            'tree_method': 'hist',
+            'objective': 'reg:squarederror',
+            'n_estimators': 1100,
+            'max_depth': 10,
+            'subsample': 0.2,
+            'colsample_bytree': 0.8,
+            'learning_rate': 0.01,
+            'n_jobs': -1,
+            'early_stopping_rounds': 200,
+        },
+        '_comments': {
+            'model_type': "Options: 'transformer', 'gp_regressor', 'xgb_regressor', 'xgb_classifier'",
+            'hyperparameters': "Adjust based on your model_type selection",
+            'input_row_2': f"Currently {sample_length - 1} (all rows except last). Can be adjusted.",
+            'output_rows': f"Currently [sample_length - 1] to predict last row only. Can be adjusted.",
+            'split_type': "Temporal split prevents data leakage. If MC replicates detected, temporal split is auto-enforced.",
+            'fault_tolerant': "True for XGBoost (handles NaN in inputs), False for Transformer/GP (require complete data)",
+        }
+    }
+    
+    # Save as YAML
+    config_path = Path(output_dir) / f'config_{model_type}_01.yml'
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    
+    return str(config_path)
+
+
+def generate_transformer_config_template(output_dir, forecast_name, input_columns, output_columns, sample_length):
+    """
+    Generate a template configuration file for Transformer models.
+    
+    :param output_dir: Output directory where config will be saved
+    :param forecast_name: Name of the forecast/dataset
+    :param input_columns: List of input column names
+    :param output_columns: List of output column names
+    :param sample_length: Length of each sample (number of rows)
+    :return: Path to the generated config file
+    """
+    # Create the template configuration for Transformer
+    config = {
+        'model_type': 'transformer',
+        'model_name': f'model_transformer_01',
+        'device': 'cuda',  # or 'cpu'
+        'matplotlib_backend': 'Agg',
+        'data': {
+            'data_dir': output_dir,
+            'forecast_name': forecast_name,
+            'input_columns': input_columns,
+            'input_row_1': 0,
+            'input_row_2': sample_length - 1,  # All rows except the last
+            'output_columns': output_columns,
+            'output_rows': [sample_length - 1],  # Last row is the target
+        },
+        'data_split': {
+            'random_state': 42,
+            'test_size': 0.2,
+            'reuse_split': False,
+            'split_source': None,
+            'split_type': 'temporal',
+            'fault_tolerant': False,  # Transformer requires complete data
+        },
+        'hyperparameters': {
+            # Transformer hyperparameters
+            'd_model': 64,
+            'nhead': 4,
+            'num_layers': 2,
+            'dim_feedforward': 256,
+            'dropout': 0.1,
+            'learning_rate': 0.001,
+            'batch_size': 32,
+            'epochs': 100,
+            'patience': 10,
+        },
+        '_comments': {
+            'model_type': "This is a Transformer model configuration",
+            'hyperparameters': "Transformer-specific hyperparameters",
+            'input_row_2': f"Currently {sample_length - 1} (all rows except last). Can be adjusted.",
+            'output_rows': f"Currently [sample_length - 1] to predict last row only. Can be adjusted.",
+            'split_type': "Temporal split prevents data leakage. If MC replicates detected, temporal split is auto-enforced.",
+            'fault_tolerant': "False - Transformer requires complete data without NaN in inputs",
+        }
+    }
+    
+    # Save as YAML
+    config_path = Path(output_dir) / f'config_transformer_01.yml'
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    
+    return str(config_path)
+
+
+def generate_gp_config_template(output_dir, forecast_name, input_columns, output_columns, sample_length):
+    """
+    Generate a template configuration file for Gaussian Process Regressor models.
+
+    :param output_dir: Output directory where config will be saved
+    :param forecast_name: Name of the forecast/dataset
+    :param input_columns: List of input column names
+    :param output_columns: List of output column names
+    :param sample_length: Length of each sample (number of rows)
+    :return: Path to the generated config file
+    """
+    config = {
+        'model_type': 'gp_regressor',
+        'model_name': 'model_gp_01',
+        'device': 'cuda',  # or 'cpu'
+        'matplotlib_backend': 'Agg',
+        'data': {
+            'data_dir': output_dir,
+            'forecast_name': forecast_name,
+            'input_columns': input_columns,
+            'input_row_1': 0,
+            'input_row_2': sample_length - 1,  # All rows except the last
+            'output_columns': output_columns,
+            'output_rows': [sample_length - 1],  # Last row is the target
+        },
+        'data_split': {
+            'random_state': 42,
+            'test_size': 0.2,
+            'reuse_split': False,
+            'split_source': None,
+            'split_type': 'temporal',
+            'fault_tolerant': False,  # GP requires complete data
+        },
+        'hyperparameters': {
+            # Gaussian Process Regressor hyperparameters
+            'kernel': 'matern52',
+            'ard': True,
+            'input_standardize': True,
+            'target_standardize': True,
+            'use_uncertain_input_kernel': True,
+            'uncertainty_summary_dir': None,
+            'learning_rate': 0.01,
+            'num_epochs': 250,
+            'patience': 20,
+            'max_train_size': 5000,
+        },
+        '_comments': {
+            'model_type': "This is a Gaussian Process Regressor model configuration",
+            'hyperparameters': "GP-specific hyperparameters",
+            'input_row_2': f"Currently {sample_length - 1} (all rows except last). Can be adjusted.",
+            'output_rows': f"Currently [sample_length - 1] to predict last row only. Can be adjusted.",
+            'split_type': "Temporal split prevents data leakage. If MC replicates detected, temporal split is auto-enforced.",
+            'fault_tolerant': "False - GP requires complete data without NaN in inputs",
+        }
+    }
+
+    config_path = Path(output_dir) / 'config_gp_01.yml'
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    return str(config_path)
 
 
 def load_sensor_uncertainty_summary(sensor_name, corrections_dir):
@@ -184,44 +378,27 @@ def find_valid(df, targets, predictors, span, nan_tol):
     return valid_indices
 
 def analyze_valid(df, targets, predictors, span, valid, name="FaultTolerantSampleSize"):
+    """
+    Summarize availability for a single span and fault tolerance.
+    targets: list of target columns to evaluate independently.
+    span: integer window size in rows.
+    valid: fault tolerance as a fraction (e.g., 0.1 for 10%).
+    """
     plt.figure(figsize=(12, 8))
 
-    if len(targets) > 1:  # If multiple target columns specified, check each across a range of fault tolerances
-        results = {col: [] for col in target_columns}
-        for col in targets:
-            for val in range(0,101,10):
-                count = len(find_valid(df, [col], predictors, 96, val/100))
-                results[col].append((val, count))
-            fraction, counts = zip(*results[col])
-            plt.plot(fraction, counts, '--', label=col)
-        plt.xlabel(f"Fault tolerance (Maximum % missing values) in input set")
-        plt.ylabel(f"Number of {span}-hour Samples")
-        plt.title("Sample size vs. fault tolerance")
-    elif len(span) > 1:  # If multiple window sizes specified, check each across a range of fault tolerances
-        results = {duration: [] for duration in span}
-        for duration in span:
-            for val in range(0, 101, 10):
-                count = len(find_valid(df, targets, predictors, duration, val/100))
-                results[duration].append((val, count))
-            val, counts = zip(*results[duration])
-            plt.plot(val, counts, '--', label=f"{duration}-hour samples")
-        plt.xlabel(f"Fault tolerance (Maximum % missing values) in input set")
-        plt.ylabel(f"Number of Samples")
-        plt.title("Sample size vs. fault tolerance")
-    elif len(valid) > 1:  # If fault tolerances specified, check only at these values
-        results = {tol: [] for tol in valid}
-        for tol in valid:
-            for duration in range(0, 169, 12):
-                count = len(find_valid(df, targets, predictors, duration, tol/100))
-                results[duration].append((duration, count))
-            duration, counts = zip(*results[tol])
-            plt.plot(duration, counts, '--', label=f"{tol}% fault tolerance")
-        plt.xlabel(f"% faults (NaN) in input set")
-        plt.ylabel(f"Number of Samples")
-        plt.title("Sample size vs. fault tolerance")
+    results = []
+    for col in targets:
+        count = len(find_valid(df, [col], predictors, span, valid))
+        results.append((col, count))
 
-    plt.legend()
-    plt.grid(True)
+    labels, counts = zip(*results) if results else ([], [])
+    plt.bar(labels, counts)
+    plt.xlabel("Target column")
+    plt.ylabel(f"Number of {span}-hour Samples")
+    plt.title(f"Sample size at {100 * valid:.0f}% fault tolerance")
+    plt.xticks(rotation=45, ha="right")
+
+    plt.grid(True, axis="y")
     plt.tight_layout()
     plt.savefig(os.path.join("../data/output/regression/availability", name + ".png"))
     # plt.show()
@@ -385,7 +562,7 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
         segment_counter = 1
         for i, idx in enumerate(indices):
             # Compute start and end of the segment
-            start = max(0, idx - length)
+            start = max(0, idx - length + 1)
             end = idx + 1  # include the current row
 
             # Slice the DataFrame
@@ -446,6 +623,42 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
                     
                     segment_counter += 1
 
+    # Generate template configuration files for e_Train.py
+    # Use model type with index for forecast naming (not sample set directory name)
+    
+    # Generate XGBoost template
+    xgb_config_path = generate_training_config_template(
+        output_dir, 
+        'xgb_01',
+        predictor_cols,
+        target_columns,
+        length,
+        model_type='xgb'
+    )
+    print(f"\nXGBoost config file generated: {xgb_config_path}")
+    
+    # Generate Transformer template
+    transformer_config_path = generate_transformer_config_template(
+        output_dir, 
+        'transformer_01',
+        predictor_cols,
+        target_columns,
+        length
+    )
+    print(f"Transformer config file generated: {transformer_config_path}")
+
+    # Generate GP template
+    gp_config_path = generate_gp_config_template(
+        output_dir,
+        'gp_01',
+        predictor_cols,
+        target_columns,
+        length
+    )
+    print(f"GP config file generated: {gp_config_path}")
+
+    print("\nEdit the appropriate config file with your desired settings and pass it to e_Train.py")
+
 
 if __name__ == '__main__':
     matplotlib.use('Agg')  # Non-interactive backend for file output to handle remote machine installation errors
@@ -477,13 +690,13 @@ if __name__ == '__main__':
     # gapless(df, target_columns, name="Sparse_Eurofins_availability")  # Analysis function #1
     # seg_length = 24  # fixed segment length for evaluating range of lengths of gap betweeen input and output
     # gapped(df, target_columns, seg_length)  # Analysis function #2
-    # analyze_valid(df, target_columns, predictor_cols, 96, 1, name="Max_Input_96hr_Set")
-    # analyze_valid(df, target_columns_max, predictor_cols_max, 96, 1, name="Max_Coverage_96hr_Set")
-    # analyze_valid(df, ['09-Koliforme bakterier 37°C'], predictor_cols, [12, 24, 48, 96, 168], 1, name="Koli_Max_Input_Set_v_Length")
+    # analyze_valid(df, target_columns, predictor_cols, 96, 0.1, name="Max_Input_96hr_Set")
+    # analyze_valid(df, target_columns_max, predictor_cols_max, 96, 0.1, name="Max_Coverage_96hr_Set")
+    # analyze_valid(df, ['09-Koliforme bakterier 37°C'], predictor_cols, 96, 0.1, name="Koli_96hr_Set")
 
     ## Name the dataset and select the size of each sample (# of timesteps/rows)
     set_name  = "MC_pH"  # Name of subdirectory where samples will be organized
-    length = 168  # Hours of contiguous data per sample
+    length = 169  # Hours of contiguous data per sample
     output_dir = os.path.join("../data/output/regression", set_name)
 
     ## Select columns where values in samples will be normalized, which helps with calculating loss accurately
