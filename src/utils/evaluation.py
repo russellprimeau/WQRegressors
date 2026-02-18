@@ -1,4 +1,5 @@
 import os
+from functools import lru_cache
 from pathlib import Path
 import json
 import numpy as np
@@ -49,6 +50,40 @@ def evaluate_transformer(model, dataset, device):
     mask = np.isfinite(predictions).all(axis=1) & np.isfinite(targets).all(axis=1)
     return predictions[mask], targets[mask]
 
+
+@lru_cache(maxsize=4096)
+def _cached_sample_timestamps(data_dir, filename):
+    sample_path = Path(data_dir, "samples", filename)
+    sample_df = pd.read_csv(sample_path, usecols=["TIMESTAMP"], parse_dates=["TIMESTAMP"])
+    return tuple(sample_df["TIMESTAMP"].tolist())
+
+
+def _get_output_times(data_dir, filename, output_rows):
+    timestamps = pd.DatetimeIndex(_cached_sample_timestamps(str(Path(data_dir).resolve()), filename))
+    return timestamps[output_rows:]
+
+
+def _seasonal_window_mean(days, hours, values, target_day, target_hour, diurnal_window, day_windows=(4, 15)):
+    day_diff = np.abs(days - target_day)
+    day_diff = np.minimum(day_diff, 365 - day_diff)
+    hour_diff = np.abs(hours - target_hour)
+
+    mask = (day_diff <= day_windows[0]) & (hour_diff <= diurnal_window)
+    if not np.any(mask):
+        mask = day_diff <= day_windows[0]
+    if not np.any(mask):
+        mask = day_diff <= day_windows[1]
+    if not np.any(mask):
+        mask = np.ones_like(day_diff, dtype=bool)
+
+    candidate_vals = values[mask]
+    if candidate_vals.size == 0:
+        return np.nan
+    finite_vals = candidate_vals[np.isfinite(candidate_vals)]
+    if finite_vals.size == 0:
+        return np.nan
+    return float(np.mean(finite_vals))
+
 def evaluate_naive(dataset, historic, output_columns, data_dir, output_rows=-1, gap_hours=5):
 
     # Load lookup table for baseline model
@@ -56,27 +91,26 @@ def evaluate_naive(dataset, historic, output_columns, data_dir, output_rows=-1, 
     sort_df = df.sort_values("TIMESTAMP")
     historical_df = normalize_columns(sort_df, output_columns, save=False, directory=Path(data_dir, 'examples_naive'))
 
+    valid_mask = historical_df[output_columns].notna().all(axis=1)
+    valid_times = historical_df.loc[valid_mask, "TIMESTAMP"].to_numpy(dtype="datetime64[ns]")
+    valid_values = historical_df.loc[valid_mask, output_columns].to_numpy(dtype=float)
+
     predictions, targets = [], []
     for i in range(len(dataset)):
         _, y, filename = dataset[i]
 
-        # Load the sample file to get the output times
-        sample_df = pd.read_csv(os.path.join(data_dir, 'samples', filename), parse_dates=["TIMESTAMP"])
-        output_times = sample_df["TIMESTAMP"].iloc[output_rows:]
+        output_times = _get_output_times(data_dir, filename, output_rows)
+        if len(output_times) == 0:
+            continue
 
-        # Apply gap constraint (before the first output timestamp)
-        cutoff_time = output_times.iloc[0] - pd.Timedelta(hours=gap_hours)
+        cutoff_time = output_times[0] - pd.Timedelta(hours=gap_hours)
+        cutoff_np = np.datetime64(cutoff_time.to_datetime64())
+        idx = np.searchsorted(valid_times, cutoff_np, side="left") - 1
 
-        # Filter historical data before cutoff_time
-        earlier_values = historical_df[historical_df["TIMESTAMP"] < cutoff_time][output_columns]
-
-        # Drop NaN values and select the last valid row
-        valid_values = earlier_values.dropna()
-        if valid_values.empty:
+        if idx < 0:
             baseline_pred = np.full((len(output_times), len(output_columns)), np.nan)
         else:
-            last_value = valid_values.iloc[-1].values
-            # Repeat last known value for each output timestamp
+            last_value = valid_values[idx]
             baseline_pred = np.tile(last_value, (len(output_times), 1))
 
         predictions.append(baseline_pred.reshape(-1))
@@ -95,6 +129,7 @@ def evaluate_linear(data_dir, forecast_name, dataset, historic, output_columns, 
     df = pd.read_csv(historic, parse_dates=["TIMESTAMP"])
     sort_df = df.sort_values("TIMESTAMP")
     historical_df = normalize_columns(sort_df, output_columns, save=False, directory=Path(data_dir, 'linear'))
+    historical_df = historical_df.sort_values("TIMESTAMP").set_index("TIMESTAMP")
 
     if debug_plot:
         os.makedirs(os.path.join(data_dir, "forecasts", forecast_name, "linear"), exist_ok=True)
@@ -104,25 +139,22 @@ def evaluate_linear(data_dir, forecast_name, dataset, historic, output_columns, 
     for i in range(len(dataset)):
         _, y, filename = dataset[i]
 
-        # Load sample to get output timestamps
-        sample_df = pd.read_csv(os.path.join(data_dir, 'samples', filename), parse_dates=["TIMESTAMP"])
-        output_times = sample_df["TIMESTAMP"].iloc[output_rows:]
+        output_times = _get_output_times(data_dir, filename, output_rows)
+        if len(output_times) == 0:
+            continue
 
-        # Forecast window definition
-        forecast_start = output_times.iloc[0]
+        forecast_start = output_times[0]
         window_end = forecast_start - pd.Timedelta(hours=gap_hours)
         window_start = window_end - pd.Timedelta(hours=window_hours)
 
-        # Select regression window
-        window_df = historical_df[
-            (historical_df["TIMESTAMP"] >= window_start) &
-            (historical_df["TIMESTAMP"] < window_end)
-        ][["TIMESTAMP"] + output_columns].dropna(subset=output_columns)
+        window_df = historical_df.loc[window_start:window_end - pd.Timedelta(nanoseconds=1), output_columns]
+        window_df = window_df.dropna(subset=output_columns)
 
         if window_df.empty:
             pred_matrix = np.full((len(output_times), len(output_columns)), np.nan)
         else:
-            times = (window_df["TIMESTAMP"] - window_start).dt.total_seconds().values.reshape(-1, 1)
+            times = (window_df.index - window_start).total_seconds().to_numpy().reshape(-1, 1)
+            forecast_secs = (output_times - window_start).total_seconds().to_numpy().reshape(-1, 1)
             pred_matrix = np.zeros((len(output_times), len(output_columns)))
 
             for j, col in enumerate(output_columns):
@@ -133,22 +165,16 @@ def evaluate_linear(data_dir, forecast_name, dataset, historic, output_columns, 
                     model = LinearRegression()
                     model.fit(times, values)
 
-                    # Predict for each future timestamp
-                    forecast_secs = (output_times - window_start).dt.total_seconds().values.reshape(-1, 1)
                     pred_matrix[:, j] = model.predict(forecast_secs)
 
                     # === Debug plot for this variable ===
                     if debug_plot and i < examples:
                         plt.figure(figsize=(8, 5))
-                        # Historical training data
-                        plt.scatter(window_df["TIMESTAMP"], values, label="Training data", color="blue", alpha=0.6)
-                        # Regression line (continuous fit within training window)
+                        plt.scatter(window_df.index, values, label="Training data", color="blue", alpha=0.6)
                         fit_times = np.linspace(times.min(), times.max(), 100).reshape(-1, 1)
                         fit_dates = [window_start + pd.Timedelta(seconds=s) for s in fit_times.flatten()]
                         plt.plot(fit_dates, model.predict(fit_times), "k--", label="Fitted line")
-                        # Forecast predictions
                         plt.scatter(output_times, pred_matrix[:, j], color="orange", label="Predictions", zorder=5)
-                        # === NEW: plot ground truth (targets) ===
                         plt.plot(output_times, y.numpy().reshape(-1)[j::len(output_columns)],
                                  color="green", marker="o", linestyle="", label="Ground truth", zorder=6)
 
@@ -210,13 +236,31 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, forecast_name
     if secondary_df is not None:
         secondary_df = prepare_time_columns(secondary_df)
 
+    source_arrays = {}
+    for col in output_columns:
+        if secondary_df is not None and col in secondary_df.columns:
+            src_df = secondary_df
+        elif col in historical_df.columns:
+            src_df = historical_df
+        else:
+            source_arrays[col] = None
+            continue
+
+        col_vals = pd.to_numeric(src_df[col], errors="coerce").to_numpy(dtype=float)
+        valid_mask = np.isfinite(col_vals)
+        source_arrays[col] = {
+            "year": src_df["YEAR"].to_numpy(dtype=int)[valid_mask],
+            "day": src_df["DAYOFYEAR"].to_numpy(dtype=int)[valid_mask],
+            "hour": src_df["HOUR"].to_numpy(dtype=float)[valid_mask],
+            "value": col_vals[valid_mask],
+        }
+
     predictions, targets = [], []
 
     # === Predict values for each sample ===
     for i in range(len(dataset)):
         _, y, filename = dataset[i]
-        sample_df = pd.read_csv(os.path.join(data_dir, 'samples', filename), parse_dates=["TIMESTAMP"])
-        output_times = sample_df["TIMESTAMP"].iloc[output_rows:]
+        output_times = _get_output_times(data_dir, filename, output_rows)
         if len(output_times) == 0:
             continue
 
@@ -228,35 +272,24 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, forecast_name
             target_hour = ts.hour + ts.minute / 60.0
 
             for j, col in enumerate(output_columns):
-                # Select data source
-                if secondary_df is not None and col in secondary_df.columns:
-                    src_df = secondary_df
-                elif col in historical_df.columns:
-                    src_df = historical_df
-                else:
+                src = source_arrays.get(col)
+                if src is None:
                     pred_matrix[t_idx, j] = np.nan
                     continue
 
-                candidates = src_df[src_df["YEAR"] != target_year].copy()
-                if candidates.empty:
+                year_mask = src["year"] != target_year
+                if not np.any(year_mask):
                     pred_matrix[t_idx, j] = np.nan
                     continue
 
-                day_diff = np.abs(candidates["DAYOFYEAR"] - target_day)
-                day_diff = np.minimum(day_diff, 365 - day_diff)
-                candidates["DAY_DIFF"] = day_diff
-                candidates["HOUR_DIFF"] = np.abs(candidates["HOUR"] - target_hour)
-
-                subset = candidates[(candidates["DAY_DIFF"] <= 4) & (candidates["HOUR_DIFF"] <= diurnal_window)]
-                if subset.empty:
-                    subset = candidates[candidates["DAY_DIFF"] <= 4]
-                if subset.empty:
-                    subset = candidates[candidates["DAY_DIFF"] <= 15]
-                if subset.empty:
-                    subset = candidates
-
-                vals = subset[[col]].dropna()
-                pred_matrix[t_idx, j] = vals[col].mean() if not vals.empty else np.nan
+                pred_matrix[t_idx, j] = _seasonal_window_mean(
+                    src["day"][year_mask],
+                    src["hour"][year_mask],
+                    src["value"][year_mask],
+                    target_day,
+                    target_hour,
+                    diurnal_window,
+                )
 
         predictions.append(pred_matrix.reshape(-1))
         targets.append(y.numpy().reshape(-1))
@@ -284,37 +317,28 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, forecast_name
         month_labels = [d.strftime("%b") for d in month_starts]
 
         for col in output_columns:
-            # Choose data source
-            if secondary_df is not None and col in secondary_df.columns:
-                src_df = secondary_df
-            else:
-                src_df = historical_df
+            src = source_arrays.get(col)
+            if src is None:
+                continue
 
-            # --- Compute continuous predicted curve ---
             continuous_vals = []
             for idx in range(len(synthetic_times)):
                 target_day = synth_day[idx]
                 target_hour = synth_hour[idx]
 
-                candidates = src_df.copy()
-                day_diff = np.abs(candidates["DAYOFYEAR"] - target_day)
-                day_diff = np.minimum(day_diff, 365 - day_diff)
-                candidates["DAY_DIFF"] = day_diff
-                candidates["HOUR_DIFF"] = np.abs(candidates["HOUR"] - target_hour)
+                continuous_vals.append(
+                    _seasonal_window_mean(
+                        src["day"],
+                        src["hour"],
+                        src["value"],
+                        target_day,
+                        target_hour,
+                        diurnal_window,
+                    )
+                )
 
-                subset = candidates[(candidates["DAY_DIFF"] <= 4) & (candidates["HOUR_DIFF"] <= diurnal_window)]
-                if subset.empty:
-                    subset = candidates[candidates["DAY_DIFF"] <= 4]
-                if subset.empty:
-                    subset = candidates[candidates["DAY_DIFF"] <= 15]
-                if subset.empty:
-                    subset = candidates
-
-                vals = subset[[col]].dropna()
-                continuous_vals.append(vals[col].mean() if not vals.empty else np.nan)
-
-            # --- Build ground truth series for all years from source ---
-            gt_df = src_df[["YEAR", "DAYOFYEAR", "HOUR", col]].dropna()
+            gt_source_df = secondary_df if (secondary_df is not None and col in secondary_df.columns) else historical_df
+            gt_df = gt_source_df[["YEAR", "DAYOFYEAR", "HOUR", col]].dropna()
             gt_df["DAYOFYEAR"] = gt_df["DAYOFYEAR"] + gt_df["HOUR"] / 24.0
 
             # --- Plot ---

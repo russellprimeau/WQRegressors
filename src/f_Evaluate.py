@@ -9,6 +9,7 @@ python src/f_Evaluate.py --config data/output/regression/MC_pH/forecasts/xgb_01/
 """
 
 import os
+import re
 import json
 import argparse
 from pathlib import Path
@@ -52,6 +53,10 @@ DEFAULT_EVAL_CONFIG = {
     "thresholds_path": "../data/input/Limits.csv",
     "normalization_path": "../data/input/normalization.json",
     "use_normalized_thresholds": False,
+    "baseline_sample_subdir": "samples",
+    "baseline_split_file": "test_files.txt",
+    "baseline_split_source": None,
+    "baseline_match_mc_to_raw": True,
 }
 
 
@@ -79,6 +84,19 @@ def _resolve_path_from_config(path_value, config_dir):
     if path_obj.is_absolute():
         return path_obj.resolve()
     return (Path(config_dir) / path_obj).resolve()
+
+
+def _resolve_data_paths(data_cfg, config_dir):
+    configured_subdir = data_cfg.get("sample_subdir")
+    data_dir_path = _resolve_path_from_config(data_cfg["data_dir"], config_dir)
+
+    if configured_subdir:
+        return str(data_dir_path), configured_subdir
+
+    if data_dir_path.name in {"samples", "mc_replicates"}:
+        return str(data_dir_path.parent), data_dir_path.name
+
+    return str(data_dir_path), "samples"
 
 
 def merge_eval_config(cfg):
@@ -119,12 +137,37 @@ def load_test_samples(data_dir, sample_subdir, forecast_name, input_columns, out
     )
 
 
-def load_split_samples(data_dir, sample_subdir, forecast_name, input_columns, output_columns, input_rows, output_rows, split_file):
-    reloadset = Path(data_dir, "forecasts", forecast_name, "test_files.txt")
-    if split_file != "test_files.txt":
-        reloadset = Path(data_dir, "forecasts", forecast_name, split_file)
-    with open(reloadset) as f:
-        split_files = [line.strip() for line in f]
+def _read_split_files(split_source_dir, split_file):
+    split_path = Path(split_source_dir, split_file)
+    with open(split_path) as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def _map_split_files_mc_to_raw(split_files):
+    mapped = []
+    seen = set()
+    for file_name in split_files:
+        mapped_name = re.sub(r"_mc_\d+(?=\.csv$)", "", file_name)
+        if mapped_name not in seen:
+            seen.add(mapped_name)
+            mapped.append(mapped_name)
+    return mapped
+
+
+def load_split_samples(
+    data_dir,
+    sample_subdir,
+    forecast_name,
+    input_columns,
+    output_columns,
+    input_rows,
+    output_rows,
+    split_file,
+    split_source_dir=None,
+    split_files_override=None,
+):
+    source_dir = Path(split_source_dir) if split_source_dir is not None else Path(data_dir, "forecasts", forecast_name)
+    split_files = split_files_override if split_files_override is not None else _read_split_files(source_dir, split_file)
 
     samples = load_samples(
         os.path.join(data_dir, sample_subdir),
@@ -402,6 +445,14 @@ def load_thresholds(eval_cfg):
     return thresholds_df
 
 
+def _baseline_output_rows_start(output_rows):
+    if isinstance(output_rows, (list, tuple, np.ndarray)):
+        if len(output_rows) == 0:
+            return -1
+        return int(output_rows[0])
+    return output_rows
+
+
 def main():
     parser = argparse.ArgumentParser(description="Unified evaluation script")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML/JSON config")
@@ -415,11 +466,12 @@ def main():
     data_cfg = config["data"]
     eval_cfg = merge_eval_config(config)
 
-    data_cfg["data_dir"] = str(_resolve_path_from_config(data_cfg["data_dir"], config_dir))
-    data_cfg["sample_subdir"] = data_cfg.get("sample_subdir", "samples")
+    data_cfg["data_dir"], data_cfg["sample_subdir"] = _resolve_data_paths(data_cfg, config_dir)
     for key in ["historic_path", "thresholds_path", "normalization_path"]:
         if eval_cfg.get(key):
             eval_cfg[key] = str(_resolve_path_from_config(eval_cfg[key], config_dir))
+    if eval_cfg.get("baseline_split_source"):
+        eval_cfg["baseline_split_source"] = str(_resolve_path_from_config(eval_cfg["baseline_split_source"], config_dir))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -509,34 +561,105 @@ def main():
             print("Skipping regression evaluation for xgb_classifier model_type")
 
     if eval_cfg["run_baselines"]:
+        is_mc_trained_model = data_cfg["sample_subdir"] == "mc_replicates"
+        baseline_sample_subdir = eval_cfg.get("baseline_sample_subdir") or data_cfg["sample_subdir"]
+        if is_mc_trained_model and baseline_sample_subdir != "samples":
+            print(
+                "[INFO] MC-trained model detected; forcing baseline_sample_subdir='samples' "
+                "to evaluate on unique raw segments only."
+            )
+            baseline_sample_subdir = "samples"
+        baseline_split_file = eval_cfg.get("baseline_split_file", "test_files.txt")
+        baseline_split_source = eval_cfg.get("baseline_split_source") or str(
+            Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
+        )
+        baseline_split_files = None
+
+        baseline_split_path = Path(baseline_split_source, baseline_split_file)
+        if baseline_split_path.exists():
+            baseline_split_files = _read_split_files(baseline_split_source, baseline_split_file)
+            if (
+                eval_cfg.get("baseline_match_mc_to_raw", True)
+                and is_mc_trained_model
+                and baseline_sample_subdir == "samples"
+                and any("_mc_" in name for name in baseline_split_files)
+            ):
+                original_count = len(baseline_split_files)
+                baseline_split_files = _map_split_files_mc_to_raw(baseline_split_files)
+                print(
+                    "[INFO] Baseline split entries mapped from MC replicates to raw samples "
+                    f"({original_count} -> {len(baseline_split_files)} files)."
+                )
+        else:
+            model_split_files = _read_split_files(
+                Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"]), "test_files.txt"
+            )
+            if (
+                eval_cfg.get("baseline_match_mc_to_raw", True)
+                and is_mc_trained_model
+                and baseline_sample_subdir == "samples"
+            ):
+                baseline_split_files = _map_split_files_mc_to_raw(model_split_files)
+                print(
+                    "[INFO] Baseline split file not found; mapped model MC split to raw sample filenames "
+                    f"({len(model_split_files)} -> {len(baseline_split_files)} files)."
+                )
+            else:
+                baseline_split_files = model_split_files
+                print(
+                    "[WARN] Baseline split file not found; reusing model split filenames as-is: "
+                    f"{baseline_split_path}"
+                )
+
+        baseline_test_samples = load_split_samples(
+            data_cfg["data_dir"],
+            baseline_sample_subdir,
+            data_cfg["forecast_name"],
+            input_columns,
+            output_columns,
+            input_rows,
+            output_rows,
+            baseline_split_file,
+            split_source_dir=baseline_split_source,
+            split_files_override=baseline_split_files,
+        )
+        if not baseline_test_samples:
+            print(
+                "[WARN] No baseline test samples loaded after split/path resolution; "
+                "skipping baseline evaluation."
+            )
+        baseline_test_dataset = TimeSeriesTargetDataset(baseline_test_samples) if baseline_test_samples else None
+
+    if eval_cfg["run_baselines"] and baseline_test_dataset is not None:
+        baseline_output_rows = _baseline_output_rows_start(output_rows)
         secondary, eval_cfg["window_hours"] = load_secondary(output_columns, eval_cfg["window_hours"])
         naive_preds, naive_targets = evaluate_naive(
-            test_dataset,
+            baseline_test_dataset,
             eval_cfg["historic_path"],
             output_columns,
             data_cfg["data_dir"],
-            output_rows=output_rows,
+            output_rows=baseline_output_rows,
             gap_hours=eval_cfg["gap_hours"],
         )
         linear_preds, linear_targets = evaluate_linear(
             data_cfg["data_dir"],
             data_cfg["forecast_name"],
-            test_dataset,
+            baseline_test_dataset,
             eval_cfg["historic_path"],
             output_columns,
-            output_rows=output_rows,
+            output_rows=baseline_output_rows,
             window_hours=eval_cfg["window_hours"],
             gap_hours=eval_cfg["gap_hours"],
             debug_plot=eval_cfg["debug_plot"],
             examples=eval_cfg["debug_examples"],
         )
         seasonal_preds, seasonal_targets = evaluate_seasonal(
-            test_dataset,
+            baseline_test_dataset,
             eval_cfg["historic_path"],
             output_columns,
             data_cfg["data_dir"],
             data_cfg["forecast_name"],
-            output_rows=output_rows,
+            output_rows=baseline_output_rows,
             diurnal_window=eval_cfg["diurnal_window"],
             secondary=secondary,
         )
