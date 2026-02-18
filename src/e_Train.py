@@ -3,8 +3,9 @@ Consolidated training script for Transformer, XGBoost Regressor, and XGBoost Cla
 Supports configuration via YAML/JSON config files.
 
 Example terminal usage:
-    python src/e_Train.py --config data/output/regression/MC_pH/config_gp_01.yml
-    python src/e_Train.py --config docs/examples/config_transformer_example.yaml
+python src/e_Train.py --config data/output/regression/MC_pH/config_gp_01.yml
+python src/e_Train.py --config data/output/regression/MC_pH/config_transformer_01.yml
+python src/e_Train.py --config data/output/regression/MC_pH/config_xgb_01.yml
 """
 
 import os
@@ -133,6 +134,9 @@ def load_config(config_path):
             config = json.load(f)
     else:
         raise ValueError(f"Unsupported config file format: {path.suffix}")
+
+    # Store absolute config directory so all relative paths resolve from config location
+    config["__config_dir"] = str(path.resolve().parent)
     
     return config
 
@@ -187,10 +191,42 @@ def merge_with_defaults(config, model_type):
 # DATA LOADING
 # ===========================================================================================
 
+def _resolve_path_from_config(path_value, config_dir):
+    """Resolve path value relative to config file directory."""
+    path_obj = Path(path_value)
+    if path_obj.is_absolute():
+        return path_obj.resolve()
+    return (Path(config_dir) / path_obj).resolve()
+
+
+def _resolve_data_paths(data_cfg, config_dir):
+    """Resolve base data directory and sample subdirectory with backward compatibility."""
+    configured_subdir = data_cfg.get("sample_subdir")
+    data_dir_path = _resolve_path_from_config(data_cfg["data_dir"], config_dir)
+
+    if configured_subdir:
+        return str(data_dir_path), configured_subdir
+
+    # Backward compatibility: if data_dir points directly to samples folder, infer parent + subdir
+    if data_dir_path.name in {"samples", "mc_replicates"}:
+        return str(data_dir_path.parent), data_dir_path.name
+
+    return str(data_dir_path), "samples"
+
 def load_and_split_data(config):
     """Load and split data according to configuration."""
     data_cfg = config["data"]
     split_cfg = config["data_split"]
+    config_dir = config["__config_dir"]
+
+    base_data_dir, sample_subdir = _resolve_data_paths(data_cfg, config_dir)
+    data_cfg["data_dir"] = base_data_dir
+    data_cfg["sample_subdir"] = sample_subdir
+
+    if split_cfg.get("split_source") is not None:
+        split_cfg["split_source"] = str(_resolve_path_from_config(split_cfg["split_source"], config_dir))
+
+    print(f"Sample directory: {Path(base_data_dir) / sample_subdir}")
     
     input_rows = slice(data_cfg["input_row_1"], data_cfg["input_row_2"])
     
@@ -206,7 +242,8 @@ def load_and_split_data(config):
         split_cfg["split_source"],
         split_cfg["split_type"],
         split_cfg["test_size"],
-        split_cfg["random_state"]
+        split_cfg["random_state"],
+        data_cfg["sample_subdir"]
     )
     
     return train_samples, test_samples, input_rows
@@ -224,9 +261,9 @@ def _canonical_feature_name(name):
     return text
 
 
-def _resolve_summary_dir(hyper_cfg):
+def _resolve_summary_dir(hyper_cfg, config_dir):
     if hyper_cfg.get("uncertainty_summary_dir"):
-        return Path(hyper_cfg["uncertainty_summary_dir"])
+        return _resolve_path_from_config(hyper_cfg["uncertainty_summary_dir"], config_dir)
     return Path(__file__).parent.parent / "data" / "output" / "calibration" / "summaries"
 
 
@@ -270,10 +307,11 @@ def _load_uncertainty_std_map(summary_dir):
 def _build_feature_uncertainty_variance(config):
     data_cfg = config["data"]
     hyper_cfg = config["hyperparameters"]
+    config_dir = config["__config_dir"]
     input_columns = data_cfg["input_columns"]
     seq_len = data_cfg["input_row_2"] - data_cfg["input_row_1"]
 
-    summary_dir = _resolve_summary_dir(hyper_cfg)
+    summary_dir = _resolve_summary_dir(hyper_cfg, config_dir)
     summary_std_map = _load_uncertainty_std_map(summary_dir)
     print(f"[INFO] Uncertainty source directory: {summary_dir}")
 
@@ -338,6 +376,7 @@ def write_evaluation_config(config):
     model_type = config["model_type"]
     model_name = config["model_name"]
     data_cfg = config["data"]
+    config_dir = config.get("__config_dir", str(Path.cwd()))
 
     evaluation_cfg = DEFAULT_EVALUATION_CONFIG.copy()
     if model_type == "xgb_classifier":
@@ -348,11 +387,22 @@ def write_evaluation_config(config):
     if normalization_candidate.exists():
         evaluation_cfg["normalization_path"] = str(normalization_candidate)
 
+    save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
+    os.makedirs(save_path, exist_ok=True)
+
+    # Store config paths relative to evaluation config file location
+    relative_data_dir = os.path.relpath(data_cfg["data_dir"], start=save_path)
+    for key in ["historic_path", "thresholds_path", "normalization_path"]:
+        if evaluation_cfg.get(key):
+            abs_path = _resolve_path_from_config(evaluation_cfg[key], config_dir)
+            evaluation_cfg[key] = os.path.relpath(abs_path, start=save_path)
+
     eval_config = {
         "model_type": model_type,
-        "model_name": model_name,
+        "model_name": "",
         "data": {
-            "data_dir": data_cfg["data_dir"],
+            "data_dir": relative_data_dir,
+            "sample_subdir": data_cfg.get("sample_subdir", "samples"),
             "forecast_name": data_cfg["forecast_name"],
             "input_columns": data_cfg["input_columns"],
             "input_row_1": data_cfg["input_row_1"],
@@ -364,8 +414,6 @@ def write_evaluation_config(config):
         "evaluation": evaluation_cfg,
     }
 
-    save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], model_name)
-    os.makedirs(save_path, exist_ok=True)
     eval_config_path = save_path / f"config_evaluate_{model_name}.yaml"
     with open(eval_config_path, "w") as f:
         yaml.dump(eval_config, f, sort_keys=False)
@@ -393,12 +441,6 @@ def train_transformer_model(config, train_samples, test_samples):
     trainloader = DataLoader(train_dataset, batch_size=hyper_cfg["batch_size"], shuffle=True)
     testloader = DataLoader(test_dataset, batch_size=hyper_cfg["batch_size"], shuffle=True)
     
-    # Create config dictionary for model
-    input_rows = slice(data_cfg["input_row_1"], data_cfg["input_row_2"])
-    files = [f for f in os.listdir(Path(data_cfg["data_dir"], 'samples')) if
-             os.path.isfile(Path(data_cfg["data_dir"], 'samples', f))]
-    sample_df = pd.read_csv(Path(data_cfg["data_dir"], 'samples', sorted(files)[0]))
-    
     model_config = {
         'input_dim': len(data_cfg["input_columns"]),
         'model_dim': hyper_cfg["model_dim"],
@@ -415,7 +457,7 @@ def train_transformer_model(config, train_samples, test_samples):
     }
     
     # Write config
-    write_config(model_config, data_cfg["data_dir"], data_cfg["forecast_name"], config["model_name"])
+    write_config(model_config, data_cfg["data_dir"], data_cfg["forecast_name"], "")
     
     # Create and train model
     model = TimeSeriesTransformer(model_config).to(device)
@@ -431,11 +473,11 @@ def train_transformer_model(config, train_samples, test_samples):
         hyper_cfg["learning_rate"],
         hyper_cfg["loss_threshold"],
         hyper_cfg["patience"],
-        config["model_name"]
+        ""
     )
     
     # Save model
-    save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], config["model_name"])
+    save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
     os.makedirs(save_path, exist_ok=True)
     torch.save(model.state_dict(), save_path / "transformer_model.pt")
     print(f"\nModel saved to: {save_path / 'transformer_model.pt'}")
@@ -564,7 +606,7 @@ def train_gp_regressor_model(config, train_samples, test_samples):
     output_rmse = []
     models_state = []
 
-    save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], config["model_name"])
+    save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
     os.makedirs(save_path, exist_ok=True)
 
     for output_idx in range(output_dim):
@@ -662,7 +704,7 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         'target_standardize': hyper_cfg["target_standardize"],
         'use_uncertain_input_kernel': use_uncertain_kernel,
     }
-    write_config(model_config, data_cfg["data_dir"], data_cfg["forecast_name"], config["model_name"])
+    write_config(model_config, data_cfg["data_dir"], data_cfg["forecast_name"], "")
 
     artifact = {
         "model_type": "gp_regressor",
@@ -709,12 +751,6 @@ def train_xgb_regressor_model(config, train_samples, test_samples):
     X_test = np.array([s[0].flatten() for s in test_samples])
     y_test = np.array([s[1].flatten()[0] for s in test_samples])
     
-    # Create config dictionary
-    input_rows = slice(data_cfg["input_row_1"], data_cfg["input_row_2"])
-    files = [f for f in os.listdir(Path(data_cfg["data_dir"], 'samples')) if
-             os.path.isfile(Path(data_cfg["data_dir"], 'samples', f))]
-    sample_df = pd.read_csv(Path(data_cfg["data_dir"], 'samples', sorted(files)[0]))
-    
     model_config = {
         'input_dim': len(data_cfg["input_columns"]),
         'output_dim': len(data_cfg["output_columns"]) * len(data_cfg["output_rows"]),
@@ -726,7 +762,7 @@ def train_xgb_regressor_model(config, train_samples, test_samples):
         'output_rows': data_cfg["output_rows"],
     }
     
-    write_config(model_config, data_cfg["data_dir"], data_cfg["forecast_name"], config["model_name"])
+    write_config(model_config, data_cfg["data_dir"], data_cfg["forecast_name"], "")
     
     # Create and train model
     model = xgb.XGBRegressor(
@@ -745,7 +781,7 @@ def train_xgb_regressor_model(config, train_samples, test_samples):
     model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_test, y_test)], verbose=True)
     
     # Save model
-    save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], config["model_name"])
+    save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
     os.makedirs(save_path, exist_ok=True)
     model.save_model(save_path / "xgboost_model.json")
     print(f"\nModel saved to: {save_path / 'xgboost_model.json'}")
@@ -787,12 +823,6 @@ def train_xgb_classifier_model(config, train_samples, test_samples):
     X_test = np.array([s[0].flatten() for s in test_samples])
     y_test = np.array([int(round(s[1].flatten()[0])) for s in test_samples])
     
-    # Create config dictionary
-    input_rows = slice(data_cfg["input_row_1"], data_cfg["input_row_2"])
-    files = [f for f in os.listdir(Path(data_cfg["data_dir"], 'samples')) if
-             os.path.isfile(Path(data_cfg["data_dir"], 'samples', f))]
-    sample_df = pd.read_csv(Path(data_cfg["data_dir"], 'samples', sorted(files)[0]))
-    
     model_config = {
         'input_dim': len(data_cfg["input_columns"]),
         'output_dim': len(data_cfg["output_columns"]) * len(data_cfg["output_rows"]),
@@ -804,7 +834,7 @@ def train_xgb_classifier_model(config, train_samples, test_samples):
         'output_rows': data_cfg["output_rows"],
     }
     
-    write_config(model_config, data_cfg["data_dir"], data_cfg["forecast_name"], config["model_name"])
+    write_config(model_config, data_cfg["data_dir"], data_cfg["forecast_name"], "")
     
     # Create and train model
     model = xgb.XGBClassifier(
@@ -824,7 +854,7 @@ def train_xgb_classifier_model(config, train_samples, test_samples):
     model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_test, y_test)], verbose=True)
     
     # Save model
-    save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], config["model_name"])
+    save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
     os.makedirs(save_path, exist_ok=True)
     model.save_model(save_path / "xgboost_model.json")
     print(f"\nModel saved to: {save_path / 'xgboost_model.json'}")

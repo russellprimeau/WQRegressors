@@ -106,19 +106,22 @@ def write_config(config, data_dir, forecast_name, model_name, config_name='model
         json.dump(config, f)
 
 def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns, output_rows, fault_tolerant=True,
-             reuse_split=True, split_source=None, split_type='random', test_size=0.2, random_state=10):
+             reuse_split=True, split_source=None, split_type='random', test_size=0.2, random_state=10,
+             sample_subdir='samples'):
     ## If specified, reuse a train/test split previously written to file.
     train_samples = []
     test_samples = []
+    sample_dir = Path(data_dir, sample_subdir)
+
     if reuse_split:
         try:
             if split_source is None:
                 split_source = Path(data_dir, "forecasts", forecast_name)
-            train_samples = load_samples(Path(data_dir, "samples"), input_columns=input_columns,
+            train_samples = load_samples(sample_dir, input_columns=input_columns,
                                          output_columns=output_columns,
                                          input_rows=input_rows, output_rows=output_rows, file_list=None,
                                          fault_tolerant=fault_tolerant, source=Path(split_source, "train_files.txt"))
-            test_samples = load_samples(Path(data_dir, "samples"), input_columns=input_columns,
+            test_samples = load_samples(sample_dir, input_columns=input_columns,
                                         output_columns=output_columns,
                                         input_rows=input_rows, output_rows=output_rows, file_list=None,
                                         fault_tolerant=fault_tolerant, source=Path(split_source, "test_files.txt"))
@@ -127,7 +130,7 @@ def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns,
             print(f"No previous split available for reuse: {e}")
     else:
         ## Generate a new split.
-        samples = load_samples(os.path.join(data_dir, 'samples'), input_columns=input_columns,
+        samples = load_samples(sample_dir, input_columns=input_columns,
                                output_columns=output_columns, input_rows=input_rows, output_rows=output_rows,
                                fault_tolerant=fault_tolerant)
         print('samples', samples)

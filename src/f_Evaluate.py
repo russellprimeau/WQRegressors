@@ -3,8 +3,9 @@ Unified evaluation script for regression, transformer, and classification models
 Uses a YAML/JSON config file to control what gets evaluated.
 
 Example terminal usage:
-    python src/f_Evaluate.py --config data/output/regression/MC_pH/forecasts/gp_01/model_gp_01/config_evaluate_model_gp_01.yaml
-    python src/f_Evaluate.py --config docs/examples/config_evaluate_example.yaml
+python src/f_Evaluate.py --config data/output/regression/MC_pH/forecasts/gp_01/config_evaluate_model_gp_01.yaml
+python src/f_Evaluate.py --config data/output/regression/MC_pH/forecasts/transformer_01/config_evaluate_model_transformer_01.yaml
+python src/f_Evaluate.py --config data/output/regression/MC_pH/forecasts/xgb_01/config_evaluate_model_xgb_01.yaml
 """
 
 import os
@@ -61,12 +62,23 @@ def load_config(config_path):
 
     if path.suffix in [".yaml", ".yml"]:
         with open(path, "r") as f:
-            return yaml.safe_load(f)
+            config = yaml.safe_load(f)
+            config["__config_dir"] = str(path.resolve().parent)
+            return config
     if path.suffix == ".json":
         with open(path, "r") as f:
-            return json.load(f)
+            config = json.load(f)
+            config["__config_dir"] = str(path.resolve().parent)
+            return config
 
     raise ValueError(f"Unsupported config file format: {path.suffix}")
+
+
+def _resolve_path_from_config(path_value, config_dir):
+    path_obj = Path(path_value)
+    if path_obj.is_absolute():
+        return path_obj.resolve()
+    return (Path(config_dir) / path_obj).resolve()
 
 
 def merge_eval_config(cfg):
@@ -94,9 +106,10 @@ def load_model_config(data_dir, forecast_name, model_name, fallback_data=None):
     }
 
 
-def load_test_samples(data_dir, forecast_name, input_columns, output_columns, input_rows, output_rows):
+def load_test_samples(data_dir, sample_subdir, forecast_name, input_columns, output_columns, input_rows, output_rows):
     return load_split_samples(
         data_dir,
+        sample_subdir,
         forecast_name,
         input_columns,
         output_columns,
@@ -106,7 +119,7 @@ def load_test_samples(data_dir, forecast_name, input_columns, output_columns, in
     )
 
 
-def load_split_samples(data_dir, forecast_name, input_columns, output_columns, input_rows, output_rows, split_file):
+def load_split_samples(data_dir, sample_subdir, forecast_name, input_columns, output_columns, input_rows, output_rows, split_file):
     reloadset = Path(data_dir, "forecasts", forecast_name, "test_files.txt")
     if split_file != "test_files.txt":
         reloadset = Path(data_dir, "forecasts", forecast_name, split_file)
@@ -114,7 +127,7 @@ def load_split_samples(data_dir, forecast_name, input_columns, output_columns, i
         split_files = [line.strip() for line in f]
 
     samples = load_samples(
-        os.path.join(data_dir, "samples"),
+        os.path.join(data_dir, sample_subdir),
         input_columns=input_columns,
         output_columns=output_columns,
         input_rows=input_rows,
@@ -125,9 +138,9 @@ def load_split_samples(data_dir, forecast_name, input_columns, output_columns, i
     return samples
 
 
-def get_output_dim(data_dir, output_columns, output_rows):
-    sample_files = sorted(os.listdir(Path(data_dir, "samples")))
-    sample_df = pd.read_csv(Path(data_dir, "samples", sample_files[0]))
+def get_output_dim(data_dir, sample_subdir, output_columns, output_rows):
+    sample_files = sorted(os.listdir(Path(data_dir, sample_subdir)))
+    sample_df = pd.read_csv(Path(data_dir, sample_subdir, sample_files[0]))
     return len(output_columns) * len(sample_df.iloc[output_rows:])
 
 
@@ -142,9 +155,9 @@ def _canonical_feature_name(name):
     return " ".join(text.split())
 
 
-def _resolve_summary_dir(hyper_cfg):
+def _resolve_summary_dir(hyper_cfg, config_dir):
     if hyper_cfg.get("uncertainty_summary_dir"):
-        return Path(hyper_cfg["uncertainty_summary_dir"])
+        return _resolve_path_from_config(hyper_cfg["uncertainty_summary_dir"], config_dir)
     return Path(__file__).parent.parent / "data" / "output" / "calibration" / "summaries"
 
 
@@ -171,11 +184,11 @@ def _load_uncertainty_std_map(summary_dir):
     return summary_map
 
 
-def _build_feature_uncertainty_variance(data_cfg, hyper_cfg):
+def _build_feature_uncertainty_variance(data_cfg, hyper_cfg, config_dir):
     input_columns = data_cfg["input_columns"]
     seq_len = data_cfg["input_row_2"] - data_cfg["input_row_1"]
 
-    summary_std_map = _load_uncertainty_std_map(_resolve_summary_dir(hyper_cfg))
+    summary_std_map = _load_uncertainty_std_map(_resolve_summary_dir(hyper_cfg, config_dir))
 
     norm_path = Path(data_cfg["data_dir"]) / "normalization.json"
     norm_params = {}
@@ -229,7 +242,7 @@ def _prepare_gp_train_arrays(train_samples, split_cfg, hyper_cfg):
     return X_train_np, y_train_np
 
 
-def _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device):
+def _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device, config_dir):
     model_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], model_name)
     artifact = torch.load(model_path / "gp_model.pt", map_location=device, weights_only=False)
     hyper_cfg = artifact["hyperparameters"]
@@ -253,7 +266,7 @@ def _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device):
     input_uncertainty_var = None
     if use_uncertain_kernel:
         input_uncertainty_var = torch.tensor(
-            _build_feature_uncertainty_variance(data_cfg, hyper_cfg), dtype=torch.float32, device=device
+            _build_feature_uncertainty_variance(data_cfg, hyper_cfg, config_dir), dtype=torch.float32, device=device
         )
 
     class UncertainInputRBFKernel(gpytorch.kernels.Kernel):
@@ -353,7 +366,7 @@ def _predict_gp_bundle(gp_bundle, X_np, device):
     return np.stack(preds, axis=1)
 
 
-def load_model(model_type, data_cfg, split_cfg, model_name, model_config, device, train_samples=None):
+def load_model(model_type, data_cfg, split_cfg, model_name, model_config, device, train_samples=None, config_dir=None):
     model_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], model_name)
 
     if model_type == "transformer":
@@ -365,7 +378,7 @@ def load_model(model_type, data_cfg, split_cfg, model_name, model_config, device
     if model_type == "gp_regressor":
         if train_samples is None:
             raise ValueError("train_samples are required to evaluate gp_regressor")
-        return _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device)
+        return _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device, config_dir)
 
     if model_type == "xgb_regressor":
         model = xgb.XGBRegressor()
@@ -395,11 +408,18 @@ def main():
     args = parser.parse_args()
 
     config = load_config(args.config)
+    config_dir = config["__config_dir"]
 
     model_type = config["model_type"]
     model_name = config["model_name"]
     data_cfg = config["data"]
     eval_cfg = merge_eval_config(config)
+
+    data_cfg["data_dir"] = str(_resolve_path_from_config(data_cfg["data_dir"], config_dir))
+    data_cfg["sample_subdir"] = data_cfg.get("sample_subdir", "samples")
+    for key in ["historic_path", "thresholds_path", "normalization_path"]:
+        if eval_cfg.get(key):
+            eval_cfg[key] = str(_resolve_path_from_config(eval_cfg[key], config_dir))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -419,6 +439,7 @@ def main():
 
     test_samples = load_test_samples(
         data_cfg["data_dir"],
+        data_cfg["sample_subdir"],
         data_cfg["forecast_name"],
         input_columns,
         output_columns,
@@ -430,6 +451,7 @@ def main():
     if model_type == "gp_regressor":
         train_samples = load_split_samples(
             data_cfg["data_dir"],
+            data_cfg["sample_subdir"],
             data_cfg["forecast_name"],
             input_columns,
             output_columns,
@@ -443,7 +465,7 @@ def main():
     output_dim = y_test.shape[1] if y_test.ndim > 1 else 1
 
     split_cfg = config.get("data_split", {"random_state": 42})
-    model = load_model(model_type, data_cfg, split_cfg, model_name, model_config, device, train_samples)
+    model = load_model(model_type, data_cfg, split_cfg, model_name, model_config, device, train_samples, config_dir)
 
     regression_pairs = []
     regression_labels = []

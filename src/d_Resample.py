@@ -49,7 +49,8 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
         'device': 'cuda',  # or 'cpu'
         'matplotlib_backend': 'Agg',
         'data': {
-            'data_dir': output_dir,
+            'data_dir': '.',
+            'sample_subdir': 'mc_replicates',
             'forecast_name': forecast_name,
             'input_columns': input_columns,
             'input_row_1': 0,
@@ -81,6 +82,8 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
         '_comments': {
             'model_type': "Options: 'transformer', 'gp_regressor', 'xgb_regressor', 'xgb_classifier'",
             'hyperparameters': "Adjust based on your model_type selection",
+            'data_dir': "Base dataset directory, resolved relative to this config file location.",
+            'sample_subdir': "Defaults to 'mc_replicates' so XGBoost trains on uncertainty-perturbed Monte Carlo samples.",
             'input_row_2': f"Currently {sample_length - 1} (all rows except last). Can be adjusted.",
             'output_rows': f"Currently [sample_length - 1] to predict last row only. Can be adjusted.",
             'split_type': "Temporal split prevents data leakage. If MC replicates detected, temporal split is auto-enforced.",
@@ -114,7 +117,8 @@ def generate_transformer_config_template(output_dir, forecast_name, input_column
         'device': 'cuda',  # or 'cpu'
         'matplotlib_backend': 'Agg',
         'data': {
-            'data_dir': output_dir,
+            'data_dir': '.',
+            'sample_subdir': 'mc_replicates',
             'forecast_name': forecast_name,
             'input_columns': input_columns,
             'input_row_1': 0,
@@ -145,6 +149,8 @@ def generate_transformer_config_template(output_dir, forecast_name, input_column
         '_comments': {
             'model_type': "This is a Transformer model configuration",
             'hyperparameters': "Transformer-specific hyperparameters",
+            'data_dir': "Base dataset directory, resolved relative to this config file location.",
+            'sample_subdir': "Defaults to 'mc_replicates' so Transformer trains on uncertainty-perturbed Monte Carlo samples.",
             'input_row_2': f"Currently {sample_length - 1} (all rows except last). Can be adjusted.",
             'output_rows': f"Currently [sample_length - 1] to predict last row only. Can be adjusted.",
             'split_type': "Temporal split prevents data leakage. If MC replicates detected, temporal split is auto-enforced.",
@@ -177,7 +183,8 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
         'device': 'cuda',  # or 'cpu'
         'matplotlib_backend': 'Agg',
         'data': {
-            'data_dir': output_dir,
+            'data_dir': '.',
+            'sample_subdir': 'samples',
             'forecast_name': forecast_name,
             'input_columns': input_columns,
             'input_row_1': 0,
@@ -209,6 +216,8 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
         '_comments': {
             'model_type': "This is a Gaussian Process Regressor model configuration",
             'hyperparameters': "GP-specific hyperparameters",
+            'data_dir': "Base dataset directory, resolved relative to this config file location.",
+            'sample_subdir': "Defaults to 'samples' so GP trains on unperturbed baseline samples.",
             'input_row_2': f"Currently {sample_length - 1} (all rows except last). Can be adjusted.",
             'output_rows': f"Currently [sample_length - 1] to predict last row only. Can be adjusted.",
             'split_type': "Temporal split prevents data leakage. If MC replicates detected, temporal split is auto-enforced.",
@@ -503,8 +512,15 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
 
     df = normalize_columns(df, to_normalize, param_file=None, min_val=0, max_val=1, save=True, directory=output_dir)
 
-    os.makedirs(output_dir + '/samples', exist_ok=True)  # Create a directory to store the output files
-    clean_directory(output_dir + '/samples')  #
+    samples_dir = os.path.join(output_dir, 'samples')
+    perturbed_samples_dir = os.path.join(output_dir, 'mc_replicates')
+
+    os.makedirs(samples_dir, exist_ok=True)  # Create directory for unperturbed output files
+    clean_directory(samples_dir)
+
+    if use_uncertainty_perturbation:
+        os.makedirs(perturbed_samples_dir, exist_ok=True)  # Create directory for perturbed MC output files
+        clean_directory(perturbed_samples_dir)
 
     # Load sensor uncertainty summaries if perturbation is enabled
     sensor_uncertainties = {}
@@ -568,6 +584,10 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
             # Slice the DataFrame
             segment = df.iloc[start:end]
 
+            # Save unperturbed version
+            output_file = os.path.join(samples_dir, f"segment_{segment_counter:04d}.csv")
+            segment.to_csv(output_file, index=False)
+
             if use_uncertainty_perturbation:
                 # Generate K Monte Carlo replicates
                 for k in range(1, n_mc_replicates + 1):
@@ -579,14 +599,10 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
                     
                     # Save with replicate label
                     output_file = os.path.join(
-                        output_dir, 'samples', 
+                        perturbed_samples_dir,
                         f"segment_{segment_counter:04d}_mc_{k:03d}.csv"
                     )
                     segment_perturbed.to_csv(output_file, index=False)
-            else:
-                # Save single unperturbed version
-                output_file = os.path.join(output_dir, 'samples', f"segment_{segment_counter:04d}.csv")
-                segment.to_csv(output_file, index=False)
             
             segment_counter += 1
     else:
@@ -600,6 +616,9 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
 
                 # Check if the 'Segment' column has a constant value in all rows
                 if preceding_rows['Segment'].nunique() == 1:
+                    # Save unperturbed version
+                    output_file = os.path.join(samples_dir, f"segment_{segment_counter:04d}.csv")
+                    segment.to_csv(output_file, index=False)
                     
                     if use_uncertainty_perturbation:
                         # Generate K Monte Carlo replicates
@@ -612,14 +631,10 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
                             
                             # Save with replicate label
                             output_file = os.path.join(
-                                output_dir, 'samples', 
+                                perturbed_samples_dir,
                                 f"segment_{segment_counter:04d}_mc_{k:03d}.csv"
                             )
                             segment_perturbed.to_csv(output_file, index=False)
-                    else:
-                        # Save single unperturbed version
-                        output_file = os.path.join(output_dir, 'samples', f"segment_{segment_counter:04d}.csv")
-                        segment.to_csv(output_file, index=False)
                     
                     segment_counter += 1
 
@@ -671,8 +686,14 @@ if __name__ == '__main__':
     df = df.sort_values("TIMESTAMP")
 
     ## Identify prediction target columns. Output will only include samples with valid value in last row.
-    predictor_cols  = ['Pfl - Water temperature (°C)', 'Air temperature (°C)']
-    target_columns = ['Color', 'Turbidity (FNU)', 'E.coli (CFU/100mL)',
+    predictor_cols  = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
+                        'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
+                        'Pfl - fDOM (QSU)', "Wind speed x (m/s)", "Wind speed y (m/s)",
+                        'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
+                        'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
+                        '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
+        'SCADA - pH', 'SCADA - Temperature (°C)']
+    target_columns = ['Color', 'Turbidity (FNU)', 'pH', 'E.coli (CFU/100mL)',
     'Intestinal enterococci (CFU/100mL)', 'Colony Count 22°C (CFU/mL)', 'Total coliforms 37°C (CFU/100mL)', 'Arsenic (µg/L)',
              'Lead (µg/L)', 'Cadmium (µg/L)', 'Copper filtered (mg/L)', 'Chromium (µg/L)', 'Nickel (µg/L)', 'Zinc (µg/L)']  # alternative 1: name-based selection
     # target_columns = df.columns[-9:]  # alternative: index-based selection
