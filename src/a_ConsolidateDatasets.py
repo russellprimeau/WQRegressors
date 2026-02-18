@@ -174,9 +174,10 @@ if __name__ == '__main__':
         # Apply forward fill and add_res if requested
         if forward_fill:
             merge3_plain_df = merge3_df.reset_index(names="TIMESTAMP")
-            merge3_prior_df = forward_fill_columns(merge3_plain_df, eurofins_cols)
+            eurofins_cols_renamed = list(simplified_Eurofins.values())
+            merge3_prior_df = forward_fill_columns(merge3_plain_df, eurofins_cols_renamed)
             if add_res_cols:
-                final_df = add_res(merge3_prior_df, eurofins_cols)
+                final_df = add_res(merge3_prior_df, eurofins_cols_renamed)
             else:
                 final_df = merge3_prior_df
         else:

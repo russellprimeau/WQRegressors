@@ -65,6 +65,7 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
             'split_source': None,
             'split_type': 'temporal',
             'fault_tolerant': True,
+            'nan_tolerance': 0.8,
         },
         'hyperparameters': {
             # XGBoost Regressor hyperparameters (adjust for your use case)
@@ -88,6 +89,7 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
             'output_rows': f"Currently [sample_length - 1] to predict last row only. Can be adjusted.",
             'split_type': "Temporal split prevents data leakage. If MC replicates detected, temporal split is auto-enforced.",
             'fault_tolerant': "True for XGBoost (handles NaN in inputs), False for Transformer/GP (require complete data)",
+            'nan_tolerance': "Applied in e_Train.py before split when fault_tolerant=True. Maximum allowed NaN fraction in predictor windows.",
         }
     }
     
@@ -133,6 +135,7 @@ def generate_transformer_config_template(output_dir, forecast_name, input_column
             'split_source': None,
             'split_type': 'temporal',
             'fault_tolerant': False,  # Transformer requires complete data
+            'nan_tolerance': 0.0,
         },
         'hyperparameters': {
             # Transformer hyperparameters
@@ -155,6 +158,7 @@ def generate_transformer_config_template(output_dir, forecast_name, input_column
             'output_rows': f"Currently [sample_length - 1] to predict last row only. Can be adjusted.",
             'split_type': "Temporal split prevents data leakage. If MC replicates detected, temporal split is auto-enforced.",
             'fault_tolerant': "False - Transformer requires complete data without NaN in inputs",
+            'nan_tolerance': "0.0 for strict no-NaN predictor policy.",
         }
     }
     
@@ -199,6 +203,7 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
             'split_source': None,
             'split_type': 'temporal',
             'fault_tolerant': False,  # GP requires complete data
+            'nan_tolerance': 0.0,
         },
         'hyperparameters': {
             # Gaussian Process Regressor hyperparameters
@@ -222,6 +227,7 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
             'output_rows': f"Currently [sample_length - 1] to predict last row only. Can be adjusted.",
             'split_type': "Temporal split prevents data leakage. If MC replicates detected, temporal split is auto-enforced.",
             'fault_tolerant': "False - GP requires complete data without NaN in inputs",
+            'nan_tolerance': "0.0 for strict no-NaN predictor policy.",
         }
     }
 
@@ -358,53 +364,29 @@ def apply_uncertainty_perturbation(segment_df, sensor_uncertainties, random_seed
     return df_perturbed
 
 
-def find_valid(df, targets, predictors, span, nan_tol):
-    valid_indices = []
-
-    for i in range(len(df)):
-        # Check targets in current row
-        if df.loc[i, targets].isna().any():
-            continue
-
-        # Define window for previous rows
-        start = max(0, i - span)
-        window = df.iloc[start:i]
-
-        if window.empty:
-            continue
-
-        # Count non-NaN predictor values in the window
-        total_values = len(window) * len(predictors)
-        non_nan_values = window[predictors].notna().sum().sum()
-        print(f'valid in {i}:', 100*(1 - (non_nan_values / total_values)), f'% NaN values with limit of {100*nan_tol}%')
-
-        # Check if proportion meets threshold
-        if total_values > 0 and 1- (non_nan_values / total_values) <= nan_tol:
-            valid_indices.append(i)
-            print(f'{i} added')
-
-
-    return valid_indices
-
 def analyze_valid(df, targets, predictors, span, valid, name="FaultTolerantSampleSize"):
     """
-    Summarize availability for a single span and fault tolerance.
+    Summarize availability for a single span using only target validity and contiguous segment checks.
     targets: list of target columns to evaluate independently.
     span: integer window size in rows.
-    valid: fault tolerance as a fraction (e.g., 0.1 for 10%).
+    valid: retained for backward compatibility (not used).
     """
     plt.figure(figsize=(12, 8))
 
     results = []
     for col in targets:
-        count = len(find_valid(df, [col], predictors, span, valid))
+        count = 0
+        for i in range(span - 1, len(df)):
+            segment = df.iloc[i - span + 1:i + 1]
+            if pd.notnull(segment.iloc[-1][col]) and segment["Segment"].nunique() == 1:
+                count += 1
         results.append((col, count))
 
     labels, counts = zip(*results) if results else ([], [])
     plt.bar(labels, counts)
     plt.xlabel("Target column")
     plt.ylabel(f"Number of {span}-hour Samples")
-    plt.title(f"Sample size at {100 * valid:.0f}% fault tolerance")
+    plt.title("Sample size with valid target and contiguous segment")
     plt.xticks(rotation=45, ha="right")
 
     plt.grid(True, axis="y")
@@ -507,6 +489,8 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
     :param use_uncertainty_perturbation: if True, generate K Monte Carlo replicates with uncertainty
     :param n_mc_replicates: number of Monte Carlo replicates to generate (K)
     :param random_seed: seed for reproducibility
+    :param nan_tol: deprecated here; NaN filtering is handled in e_Train.py
+    :param fault_tolerant: deprecated here; NaN filtering is handled in e_Train.py
     :return:
     """
 
@@ -571,72 +555,49 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
 
     # Initialize a counter for naming output files
     segment_counter = 1
+    has_segment_col = 'Segment' in df.columns
+    if not has_segment_col:
+        print("[INFO] 'Segment' column not found. Saving all target-valid samples without segment contiguity filtering.")
 
     ## Iterate through the dataframe to find valid segments
-    if fault_tolerant:
-        indices = find_valid(df, target_columns, predictor_cols, length, nan_tol)
-        segment_counter = 1
-        for i, idx in enumerate(indices):
-            # Compute start and end of the segment
-            start = max(0, idx - length + 1)
-            end = idx + 1  # include the current row
+    ## Predictor NaN-tolerance filtering is intentionally handled later in e_Train.py
+    ## during train/test split. Here we save all samples with valid targets.
+    for i in range(len(df) - (length-1)):
+        segment = df.iloc[i:i+length]
+        last_row = segment.iloc[-1]
+        preceding_rows = segment.iloc[:-1]
 
-            # Slice the DataFrame
-            segment = df.iloc[start:end]
+        # Check if the last row has any non-null value in the target columns
+        if last_row[target_columns].notnull().all():
 
-            # Save unperturbed version
-            output_file = os.path.join(samples_dir, f"segment_{segment_counter:04d}.csv")
-            segment.to_csv(output_file, index=False)
+            # If Segment metadata exists, enforce contiguous segment consistency.
+            # Otherwise, keep all target-valid samples.
+            is_contiguous_segment = True
+            if has_segment_col and not preceding_rows.empty:
+                is_contiguous_segment = preceding_rows['Segment'].nunique() == 1
 
-            if use_uncertainty_perturbation:
-                # Generate K Monte Carlo replicates
-                for k in range(1, n_mc_replicates + 1):
-                    # Apply perturbation with a derived seed for each replicate
-                    replicate_seed = random_seed + k
-                    segment_perturbed = apply_uncertainty_perturbation(
-                        segment, sensor_uncertainties, random_seed=replicate_seed
-                    )
-                    
-                    # Save with replicate label
-                    output_file = os.path.join(
-                        perturbed_samples_dir,
-                        f"segment_{segment_counter:04d}_mc_{k:03d}.csv"
-                    )
-                    segment_perturbed.to_csv(output_file, index=False)
-            
-            segment_counter += 1
-    else:
-        for i in range(len(df) - (length-1)):
-            segment = df.iloc[i:i+length]
-            last_row = segment.iloc[-1]
-            preceding_rows = segment.iloc[:-1]
-
-            # Check if the last row has any non-null value in the target columns
-            if last_row[target_columns].notnull().all():
-
-                # Check if the 'Segment' column has a constant value in all rows
-                if preceding_rows['Segment'].nunique() == 1:
-                    # Save unperturbed version
-                    output_file = os.path.join(samples_dir, f"segment_{segment_counter:04d}.csv")
-                    segment.to_csv(output_file, index=False)
-                    
-                    if use_uncertainty_perturbation:
-                        # Generate K Monte Carlo replicates
-                        for k in range(1, n_mc_replicates + 1):
-                            # Apply perturbation with a derived seed for each replicate
-                            replicate_seed = random_seed + k
-                            segment_perturbed = apply_uncertainty_perturbation(
-                                segment, sensor_uncertainties, random_seed=replicate_seed
-                            )
-                            
-                            # Save with replicate label
-                            output_file = os.path.join(
-                                perturbed_samples_dir,
-                                f"segment_{segment_counter:04d}_mc_{k:03d}.csv"
-                            )
-                            segment_perturbed.to_csv(output_file, index=False)
-                    
-                    segment_counter += 1
+            if is_contiguous_segment:
+                # Save unperturbed version
+                output_file = os.path.join(samples_dir, f"segment_{segment_counter:04d}.csv")
+                segment.to_csv(output_file, index=False)
+                
+                if use_uncertainty_perturbation:
+                    # Generate K Monte Carlo replicates
+                    for k in range(1, n_mc_replicates + 1):
+                        # Apply perturbation with a derived seed for each replicate
+                        replicate_seed = random_seed + k
+                        segment_perturbed = apply_uncertainty_perturbation(
+                            segment, sensor_uncertainties, random_seed=replicate_seed
+                        )
+                        
+                        # Save with replicate label
+                        output_file = os.path.join(
+                            perturbed_samples_dir,
+                            f"segment_{segment_counter:04d}_mc_{k:03d}.csv"
+                        )
+                        segment_perturbed.to_csv(output_file, index=False)
+                
+                segment_counter += 1
 
     # Generate template configuration files for e_Train.py
     # Use model type with index for forecast naming (not sample set directory name)
@@ -693,9 +654,11 @@ if __name__ == '__main__':
                         'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
                         '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
         'SCADA - pH', 'SCADA - Temperature (°C)']
-    target_columns = ['Color', 'Turbidity (FNU)', 'pH', 'E.coli (CFU/100mL)',
-    'Intestinal enterococci (CFU/100mL)', 'Colony Count 22°C (CFU/mL)', 'Total coliforms 37°C (CFU/100mL)', 'Arsenic (µg/L)',
-             'Lead (µg/L)', 'Cadmium (µg/L)', 'Copper filtered (mg/L)', 'Chromium (µg/L)', 'Nickel (µg/L)', 'Zinc (µg/L)']  # alternative 1: name-based selection
+    target_columns = ['Color_res',
+        'Turbidity (FNU)_res', 'pH_res', 'E.coli (CFU/100mL)_res', 'Intestinal enterococci (CFU/100mL)_res', 
+        'Colony Count 22°C (CFU/mL)_res', 'Total coliforms 37°C (CFU/100mL)_res', 'Arsenic (µg/L)_res',
+        'Lead (µg/L)_res', 'Cadmium (µg/L)_res', 'Copper filtered (mg/L)_res', 'Chromium (µg/L)_res', 'Nickel (µg/L)_res', 
+        'Zinc (µg/L)_res']  # alternative 1: name-based selection
     # target_columns = df.columns[-9:]  # alternative: index-based selection
 
     ## Alternative with better coverage
@@ -716,9 +679,8 @@ if __name__ == '__main__':
     # analyze_valid(df, ['09-Koliforme bakterier 37°C'], predictor_cols, 96, 0.1, name="Koli_96hr_Set")
 
     ## Name the dataset and select the size of each sample (# of timesteps/rows)
-    set_name  = "MC_pH"  # Name of subdirectory where samples will be organized
+    set_name  = "MC_all"  # Name of subdirectory where samples will be organized
     length = 169  # Hours of contiguous data per sample
-    output_dir = os.path.join("../data/output/regression", set_name)
 
     ## Select columns where values in samples will be normalized, which helps with calculating loss accurately
     # to_normalize = df.columns[3:]
@@ -730,7 +692,15 @@ if __name__ == '__main__':
                         '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
         'SCADA - pH', 'SCADA - Temperature (°C)', 'Color', 'Turbidity (FNU)', 'pH', 'E.coli (CFU/100mL)',
         'Intestinal enterococci (CFU/100mL)', 'Colony Count 22°C (CFU/mL)', 'Total coliforms 37°C (CFU/100mL)', 'Arsenic (µg/L)',
-        'Lead (µg/L)', 'Cadmium (µg/L)', 'Copper filtered (mg/L)', 'Chromium (µg/L)', 'Nickel (µg/L)', 'Zinc (µg/L)']
+        'Lead (µg/L)', 'Cadmium (µg/L)', 'Copper filtered (mg/L)', 'Chromium (µg/L)', 'Nickel (µg/L)', 'Zinc (µg/L)', 'Color_state',
+        'Turbidity (FNU)_state', 'pH_state', 'E.coli (CFU/100mL)_state', 'Intestinal enterococci (CFU/100mL)_state', 
+        'Colony Count 22°C (CFU/mL)_state', 'Total coliforms 37°C (CFU/100mL)_state', 'Arsenic (µg/L)_state',
+        'Lead (µg/L)_state', 'Cadmium (µg/L)_state', 'Copper filtered (mg/L)_state', 'Chromium (µg/L)_state', 'Nickel (µg/L)_state', 
+        'Zinc (µg/L)_state', 'Color_res',
+        'Turbidity (FNU)_res', 'pH_res', 'E.coli (CFU/100mL)_res', 'Intestinal enterococci (CFU/100mL)_res', 
+        'Colony Count 22°C (CFU/mL)_res', 'Total coliforms 37°C (CFU/100mL)_res', 'Arsenic (µg/L)_res',
+        'Lead (µg/L)_res', 'Cadmium (µg/L)_res', 'Copper filtered (mg/L)_res', 'Chromium (µg/L)_res', 'Nickel (µg/L)_res', 
+        'Zinc (µg/L)_res']
 
     # to_normalize = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
     #                     'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
@@ -757,8 +727,18 @@ if __name__ == '__main__':
     #     'SCADA - pH', 'SCADA - Temperature (°C)']
     # split(df, output_dir, target_columns, length, to_normalize, 0)
 
-    split(df, output_dir, ['pH'], length, 0.8, to_normalize,
-          True, predictor_cols=predictor_cols,
+    # split(df, output_dir, target_columns, length, 0.8, to_normalize,
+    #       True, predictor_cols=predictor_cols,
+    #       use_uncertainty_perturbation=True, n_mc_replicates=10, random_seed=1)
+    
+    for target in target_columns:
+        target_slug = target.replace(" ", "_").replace("/", "_")
+        output_dir = os.path.join("../data/output/regression", f"MC_{target_slug}")
+        target_state_col = target.replace('_res', '_state') if target.endswith('_res') else f"{target}_state"
+        per_target_predictors = predictor_cols + [target_state_col] if target_state_col not in predictor_cols else predictor_cols
+        split(df, output_dir, [target], length, 0.8, to_normalize,
+          True, predictor_cols=per_target_predictors,
           use_uncertainty_perturbation=True, n_mc_replicates=10, random_seed=1)
+
     
     print("\nOK: d_Resample.py completed successfully!")

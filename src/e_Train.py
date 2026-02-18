@@ -96,6 +96,7 @@ DEFAULT_DATA_SPLIT_CONFIG = {
     "reuse_split": False,
     "split_source": None,
     "split_type": "random",
+    "nan_tolerance": 0.8,
 }
 
 DEFAULT_EVALUATION_CONFIG = {
@@ -125,13 +126,21 @@ def load_config(config_path):
     path = Path(config_path)
     if not path.exists():
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
-    
+
+    def _read_text_with_fallback(path_obj):
+        try:
+            with open(path_obj, 'r', encoding='utf-8') as f:
+                return f.read()
+        except UnicodeDecodeError:
+            with open(path_obj, 'r', encoding='cp1252') as f:
+                return f.read()
+
+    raw_text = _read_text_with_fallback(path)
+
     if path.suffix in ['.yaml', '.yml']:
-        with open(path, 'r') as f:
-            config = yaml.safe_load(f)
+        config = yaml.safe_load(raw_text)
     elif path.suffix == '.json':
-        with open(path, 'r') as f:
-            config = json.load(f)
+        config = json.loads(raw_text)
     else:
         raise ValueError(f"Unsupported config file format: {path.suffix}")
 
@@ -243,7 +252,13 @@ def load_and_split_data(config):
     if split_cfg.get("split_source") is not None:
         split_cfg["split_source"] = str(_resolve_path_from_config(split_cfg["split_source"], config_dir))
 
-    print(f"Sample directory: {Path(base_data_dir) / sample_subdir}")
+    nan_tolerance = split_cfg.get("nan_tolerance", DEFAULT_DATA_SPLIT_CONFIG["nan_tolerance"])
+    if nan_tolerance is not None:
+        nan_tolerance = float(nan_tolerance)
+        if nan_tolerance < 0 or nan_tolerance > 1:
+            raise ValueError(f"data_split.nan_tolerance must be in [0, 1], got {nan_tolerance}")
+
+    # print(f"Sample directory: {Path(base_data_dir) / sample_subdir}")
     
     input_rows = slice(data_cfg["input_row_1"], data_cfg["input_row_2"])
     
@@ -260,7 +275,8 @@ def load_and_split_data(config):
         split_cfg["split_type"],
         split_cfg["test_size"],
         split_cfg["random_state"],
-        data_cfg["sample_subdir"]
+        data_cfg["sample_subdir"],
+        nan_tolerance,
     )
     
     return train_samples, test_samples, input_rows
@@ -431,7 +447,7 @@ def write_evaluation_config(config):
         "evaluation": evaluation_cfg,
     }
 
-    model_name_for_file = model_name[6:] if str(model_name).startswith("model_") else model_name
+    model_name_for_file = Path(str(data_cfg["forecast_name"]).strip()).name
     eval_config_path = save_path / f"config_evaluate_{model_name_for_file}.yml"
     with open(eval_config_path, "w") as f:
         yaml.dump(eval_config, f, sort_keys=False)
@@ -943,8 +959,8 @@ def main():
     print("LOADING AND SPLITTING DATA")
     print("="*80)
     train_samples, test_samples, input_rows = load_and_split_data(config)
-    print(f"Training samples: {len(train_samples)}")
-    print(f"Test samples: {len(test_samples)}")
+    # print(f"Training samples: {len(train_samples)}")
+    # print(f"Test samples: {len(test_samples)}")
     
     # Train appropriate model
     if model_type == "transformer":

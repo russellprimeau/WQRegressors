@@ -60,7 +60,20 @@ def _cached_sample_timestamps(data_dir, filename):
 
 def _get_output_times(data_dir, filename, output_rows):
     timestamps = pd.DatetimeIndex(_cached_sample_timestamps(str(Path(data_dir).resolve()), filename))
-    return timestamps[output_rows:]
+
+    if isinstance(output_rows, slice):
+        return timestamps[output_rows]
+
+    if isinstance(output_rows, (list, tuple, np.ndarray)):
+        if len(output_rows) == 0:
+            return timestamps[:0]
+        idx = np.array(output_rows, dtype=int)
+        idx = np.where(idx < 0, len(timestamps) + idx, idx)
+        idx = idx[(idx >= 0) & (idx < len(timestamps))]
+        return timestamps[idx]
+
+    # Backward-compatible behavior: scalar means start row to end
+    return timestamps[int(output_rows):]
 
 
 def _seasonal_window_mean(days, hours, values, target_day, target_hour, diurnal_window, day_windows=(4, 15)):
@@ -299,7 +312,7 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, forecast_name
 
     # === Diagnostic plot ===
     try:
-        plot_dir = os.path.join(data_dir, "forecasts", forecast_name, "seasonal")
+        plot_dir = os.path.join(data_dir, "forecasts", "seasonal")
         os.makedirs(plot_dir, exist_ok=True)
         sns.set_style("whitegrid")
 
@@ -414,6 +427,15 @@ def visualizer(*pred_target_pairs, labels=None, directory, forecast_name, num_sa
     """
     sns.set_style("whitegrid")
 
+    def _aligned_flat(preds, targets, limit=None):
+        preds_flat = np.asarray(preds).reshape(-1)
+        targets_flat = np.asarray(targets).reshape(-1)
+        if limit is not None:
+            preds_flat = preds_flat[:limit]
+            targets_flat = targets_flat[:limit]
+        n = min(len(preds_flat), len(targets_flat))
+        return preds_flat[:n], targets_flat[:n]
+
     # === Scatter plot of predictions vs actuals ===
     fig, ax = plt.subplots(figsize=(8, 8))
     colors = sns.color_palette("husl", len(pred_target_pairs))
@@ -421,16 +443,18 @@ def visualizer(*pred_target_pairs, labels=None, directory, forecast_name, num_sa
     metrics = []  # store (label, MAE, RMSE, R2)
 
     for i, (preds, targets) in enumerate(pred_target_pairs):
-        preds = np.array(preds)
-        targets = np.array(targets)
-        preds = preds[:num_samples].reshape(-1)
-        targets = targets[:num_samples].reshape(-1)
+        preds, targets = _aligned_flat(preds, targets, limit=num_samples)
         label = labels[i] if labels else f"Model {i+1}"
-        ax.scatter(targets, preds, label=label, alpha=0.7, color=colors[i])
-        min_val = min(min_val, np.nanmin(targets), np.nanmin(preds))
-        max_val = max(max_val, np.nanmax(targets), np.nanmax(preds))
+        if len(preds) == 0:
+            metrics.append((label, np.nan, np.nan, np.nan))
+            print(f"{label}: no valid data for metrics")
+            continue
+
         mask = np.isfinite(preds) & np.isfinite(targets)
         if mask.any():
+            ax.scatter(targets[mask], preds[mask], label=label, alpha=0.7, color=colors[i])
+            min_val = min(min_val, np.nanmin(targets[mask]), np.nanmin(preds[mask]))
+            max_val = max(max_val, np.nanmax(targets[mask]), np.nanmax(preds[mask]))
             mae = mean_absolute_error(targets[mask], preds[mask])
             rmse = np.sqrt(mean_squared_error(targets[mask], preds[mask]))
             r2 = r2_score(targets[mask], preds[mask])
@@ -440,6 +464,9 @@ def visualizer(*pred_target_pairs, labels=None, directory, forecast_name, num_sa
         else:
             metrics.append((label, np.nan, np.nan, np.nan))
             print(f"{label}: no valid data for metrics")
+
+    if not np.isfinite(min_val) or not np.isfinite(max_val):
+        min_val, max_val = 0.0, 1.0
 
     ax.plot([min_val, max_val], [min_val, max_val], color="red", linestyle="--")
     ax.set_xlabel("Ground truth")
@@ -488,9 +515,16 @@ def visualizer(*pred_target_pairs, labels=None, directory, forecast_name, num_sa
             preds = preds.reshape(-1, 1)
         if targets.ndim == 1:
             targets = targets.reshape(-1, 1)
-        if preds.shape != targets.shape:
+        if preds.ndim != 2 or targets.ndim != 2:
             continue
-        horizon = preds.shape[1]
+        if preds.shape[0] == 0 or targets.shape[0] == 0:
+            continue
+        n_rows = min(preds.shape[0], targets.shape[0])
+        horizon = min(preds.shape[1], targets.shape[1])
+        if horizon == 0:
+            continue
+        preds = preds[:n_rows, :horizon]
+        targets = targets[:n_rows, :horizon]
         rmse_per_step = []
         for t in range(horizon):
             mask = np.isfinite(preds[:, t]) & np.isfinite(targets[:, t])
@@ -516,40 +550,63 @@ def visualizer(*pred_target_pairs, labels=None, directory, forecast_name, num_sa
     elif len(labels) != n_sets:
         raise ValueError("Length of labels must match number of result sets.")
 
-    # Prepare combined error data
-    combined_errors = []
-    for (pred, target) in pred_target_pairs:
-        errors = (pred - target).flatten()
-        combined_errors.append(errors)
+    # Prepare combined error data (supports different lengths per model)
+    combined_frames = []
+    for (pred, target), label in zip(pred_target_pairs, labels):
+        pred_flat, target_flat = _aligned_flat(pred, target)
+        if len(pred_flat) == 0:
+            continue
+        errors = pred_flat - target_flat
+        errors = errors[np.isfinite(errors)]
+        if errors.size == 0:
+            continue
+        combined_frames.append(pd.DataFrame({"Dataset": label, "Error": errors}))
 
-    # Combined DataFrame for all errors
-    df_combined = pd.DataFrame({label: data for label, data in zip(labels, combined_errors)})
-    df_long_combined = df_combined.melt(var_name="Dataset", value_name="Error")
+    if not combined_frames:
+        print("[WARN] Skipping error distribution plot: no finite errors available.")
+        df_long_combined = None
+    else:
+        df_long_combined = pd.concat(combined_frames, ignore_index=True)
 
-    # Combined figure: emphasize points, de-emphasize boxplot
-    plt.figure(figsize=(8, 6))
-    ax = plt.gca()
-    sns.boxplot(x="Dataset", y="Error", data=df_long_combined,
-                showcaps=True, boxprops={'facecolor': 'lightgray', 'alpha': 0.3, 'linewidth': 0.5},
-                whiskerprops={'linewidth': 0.5}, medianprops={'color': 'blue', 'linewidth': 1}, showfliers=False, ax=ax)
+    if df_long_combined is not None:
+        plt.figure(figsize=(8, 6))
+        ax = plt.gca()
+        sns.boxplot(x="Dataset", y="Error", data=df_long_combined,
+                    showcaps=True, boxprops={'facecolor': 'lightgray', 'alpha': 0.3, 'linewidth': 0.5},
+                    whiskerprops={'linewidth': 0.5}, medianprops={'color': 'blue', 'linewidth': 1}, showfliers=False, ax=ax)
 
-    sns.stripplot(x="Dataset", y="Error", data=df_long_combined,
-                  jitter=True, size=6, color='black', ax=ax)
+        sns.stripplot(x="Dataset", y="Error", data=df_long_combined,
+                      jitter=True, size=6, color='black', ax=ax)
 
-    for artist in ax.collections:
-        artist.set_facecolor('red')
-        artist.set_edgecolor('red')
+        for artist in ax.collections:
+            artist.set_facecolor('red')
+            artist.set_edgecolor('red')
 
-    ax.set_title("Prediction Error Distribution")
-    ax.set_ylabel("Error (Absolute)")
-    ax.set_xlabel("Model")
-    plt.tight_layout()
-    plt.savefig(Path(directory, "forecasts", forecast_name, "boxplot.png"))
-    plt.close()
+        ax.set_title("Prediction Error Distribution")
+        ax.set_ylabel("Error (Absolute)")
+        ax.set_xlabel("Model")
+        plt.tight_layout()
+        plt.savefig(Path(directory, "forecasts", forecast_name, "boxplot.png"))
+        plt.close()
 
     # Individual figures per pair comparing columns
     for (pred, target), label in zip(pred_target_pairs, labels):
-        errors_matrix = pred - target
+        pred = np.array(pred)
+        target = np.array(target)
+
+        if pred.ndim == 1:
+            pred = pred.reshape(-1, 1)
+        if target.ndim == 1:
+            target = target.reshape(-1, 1)
+        if pred.ndim != 2 or target.ndim != 2:
+            continue
+
+        n_rows = min(pred.shape[0], target.shape[0])
+        n_cols = min(pred.shape[1], target.shape[1])
+        if n_rows == 0 or n_cols <= 1:
+            continue
+
+        errors_matrix = pred[:n_rows, :n_cols] - target[:n_rows, :n_cols]
 
         # Skip if 1D or single column
         if errors_matrix.ndim == 1 or errors_matrix.shape[1] == 1:
@@ -592,9 +649,16 @@ def classification_visualizer(*pred_target_pairs, labels=None, directory='.', fo
     for i, (preds, targets) in enumerate(pred_target_pairs):
         preds = np.array(preds).reshape(-1)[:num_samples]
         targets = np.array(targets).reshape(-1)[:num_samples]
+        n = min(len(preds), len(targets))
+        preds = preds[:n]
+        targets = targets[:n]
         label = labels[i] if labels else f"Model {i+1}"
+        if n == 0:
+            continue
         mask = np.isfinite(preds) & np.isfinite(targets)
         preds, targets = preds[mask], targets[mask]
+        if len(preds) == 0:
+            continue
 
         acc = accuracy_score(targets, preds)
         prec = precision_score(targets, preds, zero_division=0)
@@ -605,14 +669,21 @@ def classification_visualizer(*pred_target_pairs, labels=None, directory='.', fo
         cm = confusion_matrix(targets, preds)
         all_conf_matrices.append((label, cm))
 
-        fpr, tpr, _ = roc_curve(targets, preds)
-        roc_auc = auc(fpr, tpr)
-        roc_data.append((label, fpr, tpr, roc_auc))
-        auc_scores.append((label, roc_auc))
+        try:
+            fpr, tpr, _ = roc_curve(targets, preds)
+            roc_auc = auc(fpr, tpr)
+            roc_data.append((label, fpr, tpr, roc_auc))
+            auc_scores.append((label, roc_auc))
 
-        precision, recall, _ = precision_recall_curve(targets, preds)
-        pr_auc = auc(recall, precision)
-        pr_data.append((label, recall, precision, pr_auc))
+            precision, recall, _ = precision_recall_curve(targets, preds)
+            pr_auc = auc(recall, precision)
+            pr_data.append((label, recall, precision, pr_auc))
+        except ValueError:
+            print(f"[WARN] Skipping ROC/PR for {label}: requires both classes in targets.")
+
+    if not all_conf_matrices:
+        print("[WARN] Skipping classification plots: no valid prediction/target pairs.")
+        return
 
     # Combined Confusion Matrix Plot
     fig, axes = plt.subplots(1, len(all_conf_matrices), figsize=(5 * len(all_conf_matrices), 4))
@@ -629,42 +700,45 @@ def classification_visualizer(*pred_target_pairs, labels=None, directory='.', fo
     plt.close()
 
     # Combined ROC Curve Plot
-    plt.figure(figsize=(6, 5))
-    for label, fpr, tpr, roc_auc in roc_data:
-        plt.plot(fpr, tpr, label=f"{label} (AUC = {roc_auc:.2f})")
-    plt.plot([0, 1], [0, 1], 'k--')
-    plt.title("ROC Curves")
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(Path(directory, "forecasts", forecast_name, "classification", f"roc.png"))
-    plt.close()
+    if roc_data:
+        plt.figure(figsize=(6, 5))
+        for label, fpr, tpr, roc_auc in roc_data:
+            plt.plot(fpr, tpr, label=f"{label} (AUC = {roc_auc:.2f})")
+        plt.plot([0, 1], [0, 1], 'k--')
+        plt.title("ROC Curves")
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(Path(directory, "forecasts", forecast_name, "classification", f"roc.png"))
+        plt.close()
 
     # Combined Precision-Recall Curve Plot
-    plt.figure(figsize=(6, 5))
-    for label, recall, precision, pr_auc in pr_data:
-        plt.plot(recall, precision, label=f"{label} (AUC = {pr_auc:.2f})")
-    plt.title("Precision-Recall Curves")
-    plt.xlabel("Recall")
-    plt.ylabel("Precision")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(Path(directory, "forecasts", forecast_name, "classification", "pr.png"))
-    plt.close()
+    if pr_data:
+        plt.figure(figsize=(6, 5))
+        for label, recall, precision, pr_auc in pr_data:
+            plt.plot(recall, precision, label=f"{label} (AUC = {pr_auc:.2f})")
+        plt.title("Precision-Recall Curves")
+        plt.xlabel("Recall")
+        plt.ylabel("Precision")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(Path(directory, "forecasts", forecast_name, "classification", "pr.png"))
+        plt.close()
 
     # AUC Bar Plot
     labels_auc = [x[0] for x in auc_scores]
     auc_vals = [x[1] for x in auc_scores]
-    plt.figure(figsize=(8, 5))
-    sns.barplot(x=labels_auc, y=auc_vals, hue=auc_scores, legend=False)
-    plt.title("AUC Scores")
-    plt.ylabel("AUC")
-    plt.xticks(rotation=30, ha="right")
-    plt.grid(True, axis="y", linestyle="--", alpha=0.6)
-    plt.tight_layout()
-    plt.savefig(Path(directory, "forecasts", forecast_name, "classification", "auc_scores.png"))
-    plt.close()
+    if auc_scores:
+        plt.figure(figsize=(8, 5))
+        sns.barplot(x=labels_auc, y=auc_vals, hue=auc_scores, legend=False)
+        plt.title("AUC Scores")
+        plt.ylabel("AUC")
+        plt.xticks(rotation=30, ha="right")
+        plt.grid(True, axis="y", linestyle="--", alpha=0.6)
+        plt.tight_layout()
+        plt.savefig(Path(directory, "forecasts", forecast_name, "classification", "auc_scores.png"))
+        plt.close()
 
 def apply_saved_normalize(df, param_file, min_val=0, max_val=1):
     """

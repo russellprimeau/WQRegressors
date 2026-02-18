@@ -98,6 +98,72 @@ def group_samples_by_segment(samples):
     # Return sorted by segment number (temporal order)
     return sorted(segment_groups.items(), key=lambda x: x[0])
 
+
+def _sample_valid_count(sample):
+    """Count non-NaN values across both inputs and targets for one sample."""
+    input_seq, output_seq = sample[0], sample[1]
+    input_valid = int(np.count_nonzero(~np.isnan(input_seq)))
+    output_valid = int(np.count_nonzero(~np.isnan(output_seq)))
+    return input_valid + output_valid
+
+
+def _input_nan_fraction(sample):
+    """Compute NaN fraction for predictor values of one sample."""
+    input_seq = np.asarray(sample[0], dtype=float)
+    total_values = int(input_seq.size)
+    if total_values == 0:
+        return 1.0
+    finite_values = int(np.count_nonzero(np.isfinite(input_seq)))
+    return 1.0 - (finite_values / total_values)
+
+
+def _filter_samples_by_nan_tolerance(samples, nan_tolerance):
+    """Keep only samples whose predictor NaN fraction is <= nan_tolerance."""
+    filtered = []
+    dropped = 0
+
+    for sample in samples:
+        if _input_nan_fraction(sample) <= nan_tolerance:
+            filtered.append(sample)
+        else:
+            dropped += 1
+
+    print(
+        f"NaN pre-filter (<= {nan_tolerance:.3f} NaN fraction): "
+        f"kept {len(filtered)}/{len(samples)} samples, dropped {dropped}"
+    )
+    return filtered
+
+
+def _split_index_from_cumulative_valid_counts(items, count_fn, train_fraction):
+    """
+    Compute temporal split index by cutting cumulative valid_count at
+    train_fraction * total_valid_count.
+
+    Returns (split_idx, total_valid, train_valid).
+    """
+    if len(items) == 0:
+        return 0, 0, 0
+
+    valid_counts = [max(0, int(count_fn(item))) for item in items]
+    total_valid = int(np.sum(valid_counts))
+
+    if total_valid > 0:
+        cutoff = float(train_fraction) * total_valid
+        cumulative = np.cumsum(valid_counts)
+        split_idx = int(np.searchsorted(cumulative, cutoff, side='left') + 1)
+    else:
+        split_idx = int(len(items) * float(train_fraction))
+
+    # Keep both sets non-empty whenever possible
+    if len(items) > 1:
+        split_idx = max(1, min(len(items) - 1, split_idx))
+    else:
+        split_idx = len(items)
+
+    train_valid = int(np.sum(valid_counts[:split_idx]))
+    return split_idx, total_valid, train_valid
+
 def write_config(config, data_dir, forecast_name, model_name, config_name='model_config.json'):
     ## Write model configuration dictionary to file so it can be re-run and re-used for other model types
     filepath = Path(data_dir, 'forecasts', forecast_name, model_name, config_name)
@@ -107,7 +173,7 @@ def write_config(config, data_dir, forecast_name, model_name, config_name='model
 
 def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns, output_rows, fault_tolerant=True,
              reuse_split=True, split_source=None, split_type='random', test_size=0.2, random_state=10,
-             sample_subdir='samples'):
+             sample_subdir='samples', nan_tolerance=None):
     ## If specified, reuse a train/test split previously written to file.
     train_samples = []
     test_samples = []
@@ -133,7 +199,15 @@ def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns,
         samples = load_samples(sample_dir, input_columns=input_columns,
                                output_columns=output_columns, input_rows=input_rows, output_rows=output_rows,
                                fault_tolerant=fault_tolerant)
-        print('samples', samples)
+
+        if fault_tolerant and nan_tolerance is not None:
+            samples = _filter_samples_by_nan_tolerance(samples, nan_tolerance)
+            if len(samples) < 2:
+                raise ValueError(
+                    "Not enough samples remain after NaN pre-filtering to create train/test split. "
+                    "Increase nan_tolerance, generate more samples, or reduce test_size."
+                )
+        # print('samples', samples)
         
         # Detect Monte Carlo replicates and adjust split strategy if needed
         is_mc_dataset, segment_groups = detect_mc_replicates(samples)
@@ -145,10 +219,15 @@ def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns,
         
         if split_type == 'temporal':
             ## Time-based split with MC-aware grouping if needed
+            train_fraction = 1 - test_size
             if is_mc_dataset:
                 # Group samples by segment number
                 segment_groups_list = group_samples_by_segment(samples)
-                split_idx = int(len(segment_groups_list) * (1 - test_size))
+                split_idx, total_valid, train_valid = _split_index_from_cumulative_valid_counts(
+                    segment_groups_list,
+                    lambda group_item: sum(_sample_valid_count(s) for s in group_item[1]),
+                    train_fraction,
+                )
                 
                 # Flatten the groups back to samples
                 train_samples = []
@@ -158,17 +237,33 @@ def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns,
                         train_samples.extend(seg_samples)
                     else:
                         test_samples.extend(seg_samples)
+
+                test_valid = total_valid - train_valid
+                achieved_train_frac = (train_valid / total_valid) if total_valid > 0 else 0.0
                 
                 print(f'Temporal split (MC-aware). Training set: {len(train_samples)} samples. '
                       f'Test set: {len(test_samples)} samples')
+                print(f'  Valid data coverage (input+target non-NaN): '
+                      f'train={train_valid}, test={test_valid}, total={total_valid}, '
+                      f'train_fraction={achieved_train_frac:.3f} (target={train_fraction:.3f})')
             else:
                 # Standard temporal split without MC grouping
                 samples_sorted = sorted(samples, key=extract_index)
-                split_idx = int(len(samples_sorted) * (1 - test_size))
+                split_idx, total_valid, train_valid = _split_index_from_cumulative_valid_counts(
+                    samples_sorted,
+                    _sample_valid_count,
+                    train_fraction,
+                )
                 train_samples = samples_sorted[:split_idx]
                 test_samples = samples_sorted[split_idx:]
+
+                test_valid = total_valid - train_valid
+                achieved_train_frac = (train_valid / total_valid) if total_valid > 0 else 0.0
                 print(f'Time-based split. Training set: {len(train_samples)} samples. '
                       f'Test set: {len(test_samples)} samples')
+                print(f'  Valid data coverage (input+target non-NaN): '
+                      f'train={train_valid}, test={test_valid}, total={total_valid}, '
+                      f'train_fraction={achieved_train_frac:.3f} (target={train_fraction:.3f})')
         else:
             ## Random shuffle
             train_samples, test_samples = train_test_split(samples, test_size=test_size, random_state=random_state)

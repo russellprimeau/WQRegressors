@@ -6,18 +6,28 @@ Example terminal usage:
 python src/f_Evaluate.py --config data/output/regression/MC_pH/forecasts/gp_01/config_evaluate_gp_01.yml
 python src/f_Evaluate.py --config data/output/regression/MC_pH/forecasts/transformer_01/config_evaluate_transformer_01.yml
 python src/f_Evaluate.py --config data/output/regression/MC_pH/forecasts/xgb_01/config_evaluate_xgb_01.yml
+
+Multiple configs in one command (single line only):
+python src/f_Evaluate.py --config data/output/regression/MC_pH/forecasts/gp_01/config_evaluate_gp_01.yml data/output/regression/MC_pH/forecasts/transformer_01/config_evaluate_model_transformer_01.yml data/output/regression/MC_pH/forecasts/xgb_01/config_evaluate_xgb_01.yml
+
+Comma-separated and glob patterns are also supported:
+python src/f_Evaluate.py --config "data/output/regression/MC_pH/forecasts/*/config_evaluate*.yml"
+python src/f_Evaluate.py --config "cfg_a.yml,cfg_b.yml"
 """
 
 import os
 import re
 import json
 import argparse
+import glob
 from pathlib import Path
 
 import yaml
 import numpy as np
 import pandas as pd
 import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 import torch
 import xgboost as xgb
 import gpytorch
@@ -65,16 +75,24 @@ def load_config(config_path):
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
+    def _read_text_with_fallback(path_obj):
+        try:
+            with open(path_obj, "r", encoding="utf-8") as f:
+                return f.read()
+        except UnicodeDecodeError:
+            with open(path_obj, "r", encoding="cp1252") as f:
+                return f.read()
+
+    raw_text = _read_text_with_fallback(path)
+
     if path.suffix in [".yaml", ".yml"]:
-        with open(path, "r") as f:
-            config = yaml.safe_load(f)
-            config["__config_dir"] = str(path.resolve().parent)
-            return config
+        config = yaml.safe_load(raw_text)
+        config["__config_dir"] = str(path.resolve().parent)
+        return config
     if path.suffix == ".json":
-        with open(path, "r") as f:
-            config = json.load(f)
-            config["__config_dir"] = str(path.resolve().parent)
-            return config
+        config = json.loads(raw_text)
+        config["__config_dir"] = str(path.resolve().parent)
+        return config
 
     raise ValueError(f"Unsupported config file format: {path.suffix}")
 
@@ -453,12 +471,361 @@ def _baseline_output_rows_start(output_rows):
     return output_rows
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Unified evaluation script")
-    parser.add_argument("--config", type=str, required=True, help="Path to YAML/JSON config")
-    args = parser.parse_args()
+def _aligned_arrays(preds, targets, row_limit=None):
+    pred_arr = np.array(preds)
+    target_arr = np.array(targets)
 
-    config = load_config(args.config)
+    if pred_arr.ndim == 1:
+        pred_arr = pred_arr.reshape(-1, 1)
+    if target_arr.ndim == 1:
+        target_arr = target_arr.reshape(-1, 1)
+
+    if row_limit is not None:
+        pred_arr = pred_arr[:row_limit]
+        target_arr = target_arr[:row_limit]
+
+    n_rows = min(pred_arr.shape[0], target_arr.shape[0])
+    n_cols = min(pred_arr.shape[1], target_arr.shape[1])
+
+    if n_rows <= 0 or n_cols <= 0:
+        return pred_arr[:0], target_arr[:0], 0, 0
+
+    pred_arr = pred_arr[:n_rows, :n_cols]
+    target_arr = target_arr[:n_rows, :n_cols]
+    return pred_arr, target_arr, n_rows, n_cols
+
+
+def _sanitize_label_for_filename(label):
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", str(label)).strip("_").lower()
+    return safe or "model"
+
+
+def _base_sample_id(file_name):
+    return re.sub(r"_mc_\d+(?=\.csv$)", "", Path(str(file_name)).name)
+
+
+def _build_replicate_groups(preds, targets, split_files, row_limit=None):
+    pred_arr, target_arr, n_rows, n_cols = _aligned_arrays(preds, targets, row_limit=row_limit)
+    if n_rows == 0 or n_cols == 0:
+        return [], {}, {}, 0
+
+    if split_files is None:
+        split_files = []
+    n_rows = min(n_rows, len(split_files))
+    if n_rows == 0:
+        return [], {}, {}, 0
+
+    pred_arr = pred_arr[:n_rows, :]
+    target_arr = target_arr[:n_rows, :]
+
+    group_order = []
+    grouped_preds = {}
+    grouped_targets = {}
+
+    for i in range(n_rows):
+        group_id = _base_sample_id(split_files[i])
+        if group_id not in grouped_preds:
+            group_order.append(group_id)
+            grouped_preds[group_id] = []
+            grouped_targets[group_id] = []
+        grouped_preds[group_id].append(pred_arr[i, :])
+        grouped_targets[group_id].append(target_arr[i, :])
+
+    return group_order, grouped_preds, grouped_targets, n_cols
+
+
+def _plot_uncertainty_boxplots(regression_pairs, regression_labels, split_files_by_pair, directory, forecast_name, num_samples):
+    if not regression_pairs:
+        return
+
+    base_dir = Path(directory, "forecasts", forecast_name) if forecast_name else Path(directory, "forecasts")
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    for (preds, targets), label, split_files in zip(regression_pairs, regression_labels, split_files_by_pair):
+        group_order, grouped_preds, grouped_targets, n_cols = _build_replicate_groups(
+            preds,
+            targets,
+            split_files,
+            row_limit=num_samples,
+        )
+        if not group_order or n_cols == 0:
+            print(f"[INFO] Skipping uncertainty boxplot for {label}: no aligned grouped samples.")
+            continue
+
+        max_outputs = min(4, n_cols)
+        fig_h = max(3.4, 2.6 * max_outputs)
+        fig_w = max(9.5, min(18.0, 0.24 * len(group_order) + 8.5))
+        fig, axes = plt.subplots(max_outputs, 1, figsize=(fig_w, fig_h), constrained_layout=True)
+        if max_outputs == 1:
+            axes = [axes]
+
+        valid_axes = 0
+        global_min = np.inf
+        global_max = -np.inf
+        for out_idx in range(max_outputs):
+            ax = axes[out_idx]
+            box_data = []
+            x_ground_truth = []
+            positions = []
+
+            for group_id in group_order:
+                pred_group = np.array(grouped_preds[group_id], dtype=float)
+                target_group = np.array(grouped_targets[group_id], dtype=float)
+                if pred_group.ndim != 2 or target_group.ndim != 2:
+                    continue
+
+                pred_vals = pred_group[:, out_idx]
+                target_vals_group = target_group[:, out_idx]
+
+                pred_vals = pred_vals[np.isfinite(pred_vals)]
+                target_vals_group = target_vals_group[np.isfinite(target_vals_group)]
+                if len(pred_vals) == 0 or len(target_vals_group) == 0:
+                    continue
+
+                gt_x = float(np.median(target_vals_group))
+                if not np.isfinite(gt_x):
+                    continue
+
+                box_data.append(pred_vals)
+                x_ground_truth.append(gt_x)
+                positions.append(gt_x)
+
+            if not box_data:
+                ax.set_visible(False)
+                continue
+
+            valid_axes += 1
+            x_span = float(np.nanmax(x_ground_truth) - np.nanmin(x_ground_truth)) if len(x_ground_truth) > 1 else 0.0
+            box_width = max(0.015, min(0.2, 0.015 * x_span)) if x_span > 0 else 0.05
+
+            ax.boxplot(box_data, positions=positions, widths=box_width, showfliers=False)
+
+            all_pred = np.concatenate([np.asarray(vals, dtype=float) for vals in box_data]) if box_data else np.array([])
+            finite_pred = all_pred[np.isfinite(all_pred)]
+            finite_gt = np.array(x_ground_truth, dtype=float)
+            finite_gt = finite_gt[np.isfinite(finite_gt)]
+            if len(finite_pred) > 0 and len(finite_gt) > 0:
+                diag_min = float(min(np.min(finite_gt), np.min(finite_pred)))
+                diag_max = float(max(np.max(finite_gt), np.max(finite_pred)))
+                if diag_max > diag_min:
+                    global_min = min(global_min, diag_min)
+                    global_max = max(global_max, diag_max)
+
+            ax.set_ylabel("Prediction")
+            ax.set_xlabel("Ground truth")
+            ax.grid(alpha=0.25)
+            if out_idx == 0:
+                ax.set_title(
+                    f"Prediction uncertainty (x=ground truth, y=prediction replicate distribution) — {label}\n"
+                    f"n_groups={len(group_order)}"
+                )
+            ax.text(0.01, 0.98, f"Output {out_idx + 1}", transform=ax.transAxes, ha="left", va="top", fontsize=9)
+
+        if valid_axes == 0:
+            plt.close(fig)
+            print(f"[INFO] Skipping uncertainty boxplot for {label}: no finite grouped values.")
+            continue
+
+        if np.isfinite(global_min) and np.isfinite(global_max) and global_max > global_min:
+            pad = 0.03 * (global_max - global_min)
+            axis_min = global_min - pad
+            axis_max = global_max + pad
+            tick_fmt = FuncFormatter(lambda val, _: f"{val:.3g}")
+
+            for ax in axes:
+                if not ax.get_visible():
+                    continue
+                ax.set_xlim(axis_min, axis_max)
+                ax.set_ylim(axis_min, axis_max)
+                ax.set_aspect("equal", adjustable="box")
+                ax.plot([axis_min, axis_max], [axis_min, axis_max], linestyle="--", linewidth=1.0, color="gray", alpha=0.7)
+                ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
+                ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
+                ax.xaxis.set_major_formatter(tick_fmt)
+                ax.yaxis.set_major_formatter(tick_fmt)
+                ax.tick_params(axis="both", labelsize=9)
+
+        if n_cols > max_outputs:
+            fig.text(0.99, 0.01, f"Showing first {max_outputs}/{n_cols} outputs", ha="right", va="bottom", fontsize=8)
+
+        out_path = base_dir / f"predictions_uncertainty_boxplot_{_sanitize_label_for_filename(label)}.png"
+        fig.savefig(out_path, dpi=180)
+        plt.close(fig)
+        print(f"[INFO] Wrote uncertainty boxplot: {out_path}")
+
+
+def _compute_regression_summary(label, preds, targets, num_samples, metadata=None):
+    metadata = metadata or {}
+    pred_arr, target_arr, n_rows, n_cols = _aligned_arrays(preds, targets, row_limit=num_samples)
+
+    pred_flat = pred_arr.reshape(-1)
+    target_flat = target_arr.reshape(-1)
+    finite_mask = np.isfinite(pred_flat) & np.isfinite(target_flat)
+    finite_count = int(np.sum(finite_mask))
+
+    if finite_count > 0:
+        errors = pred_flat[finite_mask] - target_flat[finite_mask]
+        mae = float(np.mean(np.abs(errors)))
+        rmse = float(np.sqrt(np.mean(np.square(errors))))
+        if finite_count > 1:
+            target_vals = target_flat[finite_mask]
+            ss_res = float(np.sum(np.square(errors)))
+            ss_tot = float(np.sum(np.square(target_vals - np.mean(target_vals))))
+            r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
+        else:
+            r2 = np.nan
+    else:
+        mae = np.nan
+        rmse = np.nan
+        r2 = np.nan
+
+    row = {
+        "label": label,
+        "n_pred_rows": int(np.array(preds).shape[0]) if np.array(preds).ndim > 0 else 0,
+        "n_target_rows": int(np.array(targets).shape[0]) if np.array(targets).ndim > 0 else 0,
+        "n_eval_rows": int(n_rows),
+        "n_eval_outputs": int(n_cols),
+        "n_eval_points_finite": finite_count,
+        "mae": mae,
+        "rmse": rmse,
+        "r2": r2,
+    }
+    row.update(metadata)
+    return row
+
+
+def _compute_classification_summary(label, preds, targets, num_samples, metadata=None):
+    metadata = metadata or {}
+    pred_arr = np.array(preds).reshape(-1)[:num_samples]
+    target_arr = np.array(targets).reshape(-1)[:num_samples]
+    n = min(len(pred_arr), len(target_arr))
+    pred_arr = pred_arr[:n]
+    target_arr = target_arr[:n]
+
+    finite_mask = np.isfinite(pred_arr) & np.isfinite(target_arr)
+    pred_arr = pred_arr[finite_mask]
+    target_arr = target_arr[finite_mask]
+
+    if len(pred_arr) > 0:
+        pred_bin = np.rint(pred_arr).astype(int)
+        target_bin = np.rint(target_arr).astype(int)
+
+        tp = int(np.sum((pred_bin == 1) & (target_bin == 1)))
+        tn = int(np.sum((pred_bin == 0) & (target_bin == 0)))
+        fp = int(np.sum((pred_bin == 1) & (target_bin == 0)))
+        fn = int(np.sum((pred_bin == 0) & (target_bin == 1)))
+
+        denom = tp + tn + fp + fn
+        accuracy = float((tp + tn) / denom) if denom > 0 else np.nan
+        precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+        recall = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+        f1 = float(2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+    else:
+        accuracy = np.nan
+        precision = np.nan
+        recall = np.nan
+        f1 = np.nan
+
+    row = {
+        "label": label,
+        "n_pred_rows": int(len(np.array(preds).reshape(-1))),
+        "n_target_rows": int(len(np.array(targets).reshape(-1))),
+        "n_eval_rows": int(n),
+        "n_eval_outputs": 1,
+        "n_eval_points_finite": int(np.sum(np.isfinite(np.array(preds).reshape(-1)[:n]) & np.isfinite(np.array(targets).reshape(-1)[:n]))),
+        "mae": np.nan,
+        "rmse": np.nan,
+        "r2": np.nan,
+    }
+    row.update(metadata)
+    return row
+
+
+def _write_summary_csv(rows, output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ordered_columns = [
+        "label",
+        "mae",
+        "rmse",
+        "r2",
+        "kind",
+        "n_train_samples",
+        "n_test_samples",
+        "n_pred_rows",
+        "n_target_rows",
+        "n_eval_rows",
+        "n_eval_outputs",
+        "n_eval_points_finite",
+        "input_dim",
+        "target_dim",
+        "data_dir",
+    ]
+
+    if rows:
+        df = pd.DataFrame(rows)
+        for col in ordered_columns:
+            if col not in df.columns:
+                df[col] = np.nan
+        df = df[ordered_columns]
+        df.to_csv(output_path, index=False)
+    else:
+        pd.DataFrame(columns=ordered_columns).to_csv(output_path, index=False)
+    print(f"[INFO] Wrote evaluation summary CSV: {output_path}")
+
+
+def _model_label(model_type):
+    mapping = {
+        "transformer": "Transformer",
+        "xgb_regressor": "XGBRegressor",
+        "gp_regressor": "GPRegressor",
+        "xgb_classifier": "XGBClassifier",
+    }
+    return mapping.get(model_type, model_type)
+
+
+def _combined_model_label(data_cfg, model_type):
+    base = data_cfg.get("forecast_name", "model")
+    return str(base)
+
+
+def _expand_config_inputs(config_args):
+    expanded = []
+    seen = set()
+
+    continuation_tokens = {"\\", "/", "`"}
+
+    for arg in config_args:
+        parts = [p.strip() for p in str(arg).split(",") if p.strip()]
+        for part in parts:
+            if part in continuation_tokens:
+                continue
+
+            matches = sorted(glob.glob(part)) if any(ch in part for ch in "*?[]") else [part]
+            for match in matches:
+                if str(match).strip() in continuation_tokens:
+                    continue
+
+                match_path = Path(match)
+                if match_path.is_dir():
+                    continue
+
+                resolved = str(Path(match).resolve())
+                suffix = Path(resolved).suffix.lower()
+                if suffix not in {".yml", ".yaml", ".json"}:
+                    continue
+
+                if resolved not in seen:
+                    seen.add(resolved)
+                    expanded.append(resolved)
+
+    return expanded
+
+
+def evaluate_single_config(config_path):
+    print(f"\n=== Evaluating config: {config_path} ===")
+
+    config = load_config(config_path)
     config_dir = config["__config_dir"]
 
     model_type = config["model_type"]
@@ -498,6 +865,10 @@ def main():
         input_rows,
         output_rows,
     )
+    model_split_files = _read_split_files(
+        Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"]),
+        "test_files.txt",
+    )
     test_dataset = TimeSeriesTargetDataset(test_samples)
     train_samples = None
     if model_type == "gp_regressor":
@@ -515,18 +886,26 @@ def main():
     X_test = np.array([s[0].flatten() for s in test_samples])
     y_test = np.array([s[1].flatten() for s in test_samples])
     output_dim = y_test.shape[1] if y_test.ndim > 1 else 1
+    input_dim = int(X_test.shape[1]) if X_test.ndim > 1 else (int(len(X_test[0])) if len(X_test) > 0 else 0)
+    target_dim = int(y_test.shape[1]) if y_test.ndim > 1 else (1 if len(y_test) > 0 else 0)
 
     split_cfg = config.get("data_split", {"random_state": 42})
     model = load_model(model_type, data_cfg, split_cfg, model_name, model_config, device, train_samples, config_dir)
 
     regression_pairs = []
     regression_labels = []
+    regression_split_files = []
+    model_regression_pair = None
+    summary_rows = []
+    baseline_split_files = []
 
     if eval_cfg["run_regression"]:
         if model_type == "transformer":
             preds, targets = evaluate_transformer(model, test_dataset, device)
             regression_pairs.append((preds, targets))
             regression_labels.append("Transformer")
+            regression_split_files.append(model_split_files)
+            model_regression_pair = (preds, targets)
         elif model_type == "xgb_regressor":
             preds_flat = model.predict(X_test)
             if np.ndim(preds_flat) == 1:
@@ -544,6 +923,8 @@ def main():
                 targets = targets[:, :common_dim]
             regression_pairs.append((preds, targets))
             regression_labels.append("XGBRegressor")
+            regression_split_files.append(model_split_files)
+            model_regression_pair = (preds, targets)
         elif model_type == "gp_regressor":
             preds = _predict_gp_bundle(model, X_test, device)
             targets = y_test.reshape(y_test.shape[0], -1)
@@ -557,8 +938,14 @@ def main():
                 targets = targets[:, :common_dim]
             regression_pairs.append((preds, targets))
             regression_labels.append("GPRegressor")
+            regression_split_files.append(model_split_files)
+            model_regression_pair = (preds, targets)
         elif model_type == "xgb_classifier":
             print("Skipping regression evaluation for xgb_classifier model_type")
+
+    baseline_pairs = []
+    baseline_labels = []
+    baseline_test_samples = []
 
     if eval_cfg["run_baselines"]:
         is_mc_trained_model = data_cfg["sample_subdir"] == "mc_replicates"
@@ -629,9 +1016,11 @@ def main():
                 "skipping baseline evaluation."
             )
         baseline_test_dataset = TimeSeriesTargetDataset(baseline_test_samples) if baseline_test_samples else None
+    else:
+        baseline_test_dataset = None
 
     if eval_cfg["run_baselines"] and baseline_test_dataset is not None:
-        baseline_output_rows = _baseline_output_rows_start(output_rows)
+        baseline_output_rows = output_rows
         secondary, eval_cfg["window_hours"] = load_secondary(output_columns, eval_cfg["window_hours"])
         naive_preds, naive_targets = evaluate_naive(
             baseline_test_dataset,
@@ -664,17 +1053,67 @@ def main():
             secondary=secondary,
         )
 
-        regression_pairs.extend(
-            [(naive_preds, naive_targets), (linear_preds, linear_targets), (seasonal_preds, seasonal_targets)]
-        )
-        regression_labels.extend(["Naive", "Linear", "Seasonal"])
+        baseline_pairs = [
+            (naive_preds, naive_targets),
+            (linear_preds, linear_targets),
+            (seasonal_preds, seasonal_targets),
+        ]
+        baseline_labels = ["Naive", "Linear", "Seasonal"]
+        regression_pairs.extend(baseline_pairs)
+        regression_labels.extend(baseline_labels)
+        regression_split_files.extend([baseline_split_files] * len(baseline_pairs))
 
     if eval_cfg["run_regression"] and regression_pairs:
+        common_meta = {
+            "data_dir": str(data_cfg["data_dir"]),
+            "n_train_samples": int(len(train_samples)) if train_samples is not None else np.nan,
+            "n_test_samples": int(len(test_samples)),
+            "input_dim": input_dim,
+            "target_dim": target_dim,
+        }
+
+        if model_regression_pair is not None and regression_labels:
+            summary_rows.append(
+                _compute_regression_summary(
+                    regression_labels[0],
+                    model_regression_pair[0],
+                    model_regression_pair[1],
+                    eval_cfg["num_samples"],
+                    metadata={**common_meta, "kind": "model"},
+                )
+            )
+
+        if baseline_pairs:
+            baseline_meta = {
+                **common_meta,
+                "kind": "baseline",
+                "n_train_samples": np.nan,
+                "n_test_samples": int(len(baseline_test_samples)) if baseline_test_samples else 0,
+            }
+            for (preds, targets), label in zip(baseline_pairs, baseline_labels):
+                summary_rows.append(
+                    _compute_regression_summary(
+                        label,
+                        preds,
+                        targets,
+                        eval_cfg["num_samples"],
+                        metadata=baseline_meta,
+                    )
+                )
+
         visualizer(
             *regression_pairs,
             labels=regression_labels,
             forecast_name=data_cfg["forecast_name"],
             directory=data_cfg["data_dir"],
+            num_samples=eval_cfg["num_samples"],
+        )
+        _plot_uncertainty_boxplots(
+            regression_pairs,
+            regression_labels,
+            regression_split_files,
+            directory=data_cfg["data_dir"],
+            forecast_name=data_cfg["forecast_name"],
             num_samples=eval_cfg["num_samples"],
         )
 
@@ -701,6 +1140,25 @@ def main():
             num_samples=eval_cfg["num_samples"],
         )
 
+        class_meta = {
+            "data_dir": str(data_cfg["data_dir"]),
+            "kind": "threshold_classification",
+            "n_train_samples": int(len(train_samples)) if train_samples is not None else np.nan,
+            "n_test_samples": int(len(test_samples)),
+            "input_dim": input_dim,
+            "target_dim": target_dim,
+        }
+        for (preds, targets), label in zip(class_results, regression_labels):
+            summary_rows.append(
+                _compute_classification_summary(
+                    label,
+                    preds,
+                    targets,
+                    eval_cfg["num_samples"],
+                    metadata=class_meta,
+                )
+            )
+
     if eval_cfg["run_pure_classification"]:
         if model_type != "xgb_classifier":
             print("Skipping pure classification: model_type is not xgb_classifier")
@@ -716,6 +1174,157 @@ def main():
                 forecast_name=data_cfg["forecast_name"],
                 num_samples=eval_cfg["num_samples"],
             )
+
+            summary_rows.append(
+                _compute_classification_summary(
+                    "XGBClassifier",
+                    preds,
+                    targets,
+                    eval_cfg["num_samples"],
+                    metadata={
+                        "data_dir": str(data_cfg["data_dir"]),
+                        "kind": "model",
+                        "n_train_samples": int(len(train_samples)) if train_samples is not None else np.nan,
+                        "n_test_samples": int(len(test_samples)),
+                        "input_dim": input_dim,
+                        "target_dim": target_dim,
+                    },
+                )
+            )
+
+    single_summary_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], "evaluation_summary.csv")
+    _write_summary_csv(summary_rows, single_summary_path)
+
+    return {
+        "config_path": str(config_path),
+        "data_dir": str(data_cfg["data_dir"]),
+        "forecast_name": data_cfg["forecast_name"],
+        "model_type": model_type,
+        "model_pair": model_regression_pair,
+        "model_split_files": model_split_files,
+        "model_label": _combined_model_label(data_cfg, model_type),
+        "baseline_pairs": baseline_pairs,
+        "baseline_labels": baseline_labels,
+        "baseline_split_files": baseline_split_files,
+        "num_samples": int(eval_cfg["num_samples"]),
+        "n_train_samples": int(len(train_samples)) if train_samples is not None else np.nan,
+        "n_test_samples": int(len(test_samples)),
+        "input_dim": input_dim,
+        "target_dim": target_dim,
+        "summary_rows": summary_rows,
+    }
+
+
+def write_combined_outputs(results):
+    grouped = {}
+    for result in results:
+        grouped.setdefault(result["data_dir"], []).append(result)
+
+    for data_dir, group in grouped.items():
+        combined_pairs = []
+        combined_labels = []
+        combined_split_files = []
+        combined_meta = []
+        combined_rows = []
+
+        for result in group:
+            if result["model_pair"] is not None:
+                combined_pairs.append(result["model_pair"])
+                combined_labels.append(result["model_label"])
+                combined_split_files.append(result.get("model_split_files", []))
+                combined_meta.append(
+                    {
+                        "data_dir": result["data_dir"],
+                        "kind": "model",
+                        "n_train_samples": result["n_train_samples"],
+                        "n_test_samples": result["n_test_samples"],
+                        "input_dim": result["input_dim"],
+                        "target_dim": result["target_dim"],
+                    }
+                )
+
+        baseline_source = next((r for r in group if r["baseline_pairs"]), None)
+        if baseline_source is not None:
+            combined_pairs.extend(baseline_source["baseline_pairs"])
+            combined_labels.extend(baseline_source["baseline_labels"])
+            combined_split_files.extend([baseline_source.get("baseline_split_files", [])] * len(baseline_source["baseline_labels"]))
+            for label in baseline_source["baseline_labels"]:
+                combined_meta.append(
+                    {
+                        "data_dir": baseline_source["data_dir"],
+                        "kind": "baseline",
+                        "n_train_samples": np.nan,
+                        "n_test_samples": np.nan,
+                        "input_dim": baseline_source["input_dim"],
+                        "target_dim": baseline_source["target_dim"],
+                    }
+                )
+
+        if len(combined_pairs) < 2:
+            print(
+                "[INFO] Skipping combined top-level plots for "
+                f"{data_dir}; need at least two result sets, got {len(combined_pairs)}."
+            )
+            continue
+
+        num_samples = max(r["num_samples"] for r in group)
+        visualizer(
+            *combined_pairs,
+            labels=combined_labels,
+            forecast_name="",
+            directory=data_dir,
+            num_samples=num_samples,
+        )
+        _plot_uncertainty_boxplots(
+            combined_pairs,
+            combined_labels,
+            combined_split_files,
+            directory=data_dir,
+            forecast_name="",
+            num_samples=num_samples,
+        )
+
+        for (preds, targets), label, meta in zip(combined_pairs, combined_labels, combined_meta):
+            combined_rows.append(
+                _compute_regression_summary(
+                    label,
+                    preds,
+                    targets,
+                    num_samples,
+                    metadata=meta,
+                )
+            )
+
+        _write_summary_csv(combined_rows, Path(data_dir, "forecasts", "evaluation_summary_combined.csv"))
+
+        print(
+            "[INFO] Wrote combined comparison outputs to top forecasts directory: "
+            f"{Path(data_dir, 'forecasts')}"
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Unified evaluation script")
+    parser.add_argument(
+        "--config",
+        type=str,
+        nargs="+",
+        required=True,
+        help="One or more YAML/JSON config paths on a single command line (supports comma-separated values and glob patterns)",
+    )
+    args = parser.parse_args()
+
+    config_paths = _expand_config_inputs(args.config)
+    if not config_paths:
+        raise ValueError(
+            "No valid config files found after expanding --config arguments. "
+            "Use .yml/.yaml/.json files on a single command line."
+        )
+
+    results = [evaluate_single_config(config_path) for config_path in config_paths]
+
+    if len(results) > 1:
+        write_combined_outputs(results)
 
 
 if __name__ == "__main__":
