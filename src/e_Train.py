@@ -102,7 +102,7 @@ DEFAULT_EVALUATION_CONFIG = {
     "run_regression": True,
     "run_threshold_classification": False,
     "run_pure_classification": False,
-    "run_baselines": False,
+    "run_baselines": True,
     "num_samples": 200,
     "debug_plot": False,
     "debug_examples": 10,
@@ -212,6 +212,23 @@ def _resolve_data_paths(data_cfg, config_dir):
         return str(data_dir_path.parent), data_dir_path.name
 
     return str(data_dir_path), "samples"
+
+
+def _resolve_eval_path_for_write(path_value, config_dir):
+    """Resolve evaluation reference paths for write_evaluation_config with sensible fallback."""
+    path_obj = Path(path_value)
+    if path_obj.is_absolute():
+        return path_obj.resolve()
+
+    config_based = (Path(config_dir) / path_obj).resolve()
+    if config_based.exists():
+        return config_based
+
+    src_based = (Path(__file__).parent / path_obj).resolve()
+    if src_based.exists():
+        return src_based
+
+    return config_based
 
 def load_and_split_data(config):
     """Load and split data according to configuration."""
@@ -394,7 +411,7 @@ def write_evaluation_config(config):
     relative_data_dir = os.path.relpath(data_cfg["data_dir"], start=save_path)
     for key in ["historic_path", "thresholds_path", "normalization_path"]:
         if evaluation_cfg.get(key):
-            abs_path = _resolve_path_from_config(evaluation_cfg[key], config_dir)
+            abs_path = _resolve_eval_path_for_write(evaluation_cfg[key], config_dir)
             evaluation_cfg[key] = os.path.relpath(abs_path, start=save_path)
 
     eval_config = {
@@ -414,7 +431,8 @@ def write_evaluation_config(config):
         "evaluation": evaluation_cfg,
     }
 
-    eval_config_path = save_path / f"config_evaluate_{model_name}.yaml"
+    model_name_for_file = model_name[6:] if str(model_name).startswith("model_") else model_name
+    eval_config_path = save_path / f"config_evaluate_{model_name_for_file}.yml"
     with open(eval_config_path, "w") as f:
         yaml.dump(eval_config, f, sort_keys=False)
 

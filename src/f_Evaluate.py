@@ -3,9 +3,9 @@ Unified evaluation script for regression, transformer, and classification models
 Uses a YAML/JSON config file to control what gets evaluated.
 
 Example terminal usage:
-python src/f_Evaluate.py --config data/output/regression/MC_pH/forecasts/gp_01/config_evaluate_model_gp_01.yaml
-python src/f_Evaluate.py --config data/output/regression/MC_pH/forecasts/transformer_01/config_evaluate_model_transformer_01.yaml
-python src/f_Evaluate.py --config data/output/regression/MC_pH/forecasts/xgb_01/config_evaluate_model_xgb_01.yaml
+python src/f_Evaluate.py --config data/output/regression/MC_pH/forecasts/gp_01/config_evaluate_gp_01.yml
+python src/f_Evaluate.py --config data/output/regression/MC_pH/forecasts/transformer_01/config_evaluate_transformer_01.yml
+python src/f_Evaluate.py --config data/output/regression/MC_pH/forecasts/xgb_01/config_evaluate_xgb_01.yml
 """
 
 import os
