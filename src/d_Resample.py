@@ -15,6 +15,88 @@ import plotly.express as px
 from pathlib import Path
 from utils.preprocessing import normalize_columns
 
+
+def _normalize_once(df, columns, min_val=0.0, max_val=1.0):
+    """Normalize selected columns once and return (normalized_df, normalization_params)."""
+    df_norm = df.copy()
+    normalization_params = {}
+
+    for col in columns:
+        if col not in df_norm.columns:
+            continue
+
+        series = pd.to_numeric(df_norm[col], errors='coerce')
+        col_min = series.min()
+        col_max = series.max()
+        normalization_params[col] = {"min": col_min, "max": col_max}
+
+        if pd.isna(col_min) or pd.isna(col_max) or col_max == col_min:
+            df_norm[col] = (min_val + max_val) / 2
+        else:
+            df_norm[col] = ((series - col_min) / (col_max - col_min)) * (max_val - min_val) + min_val
+
+    return df_norm, normalization_params
+
+
+def _write_normalization_params(output_dir, normalization_params, filename="normalization.json"):
+    out_path = Path(output_dir) / filename
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(normalization_params, f)
+
+
+def _load_and_prepare_sensor_uncertainties(output_dir, normalization_params=None, verbose=False):
+    """Load uncertainty summaries once and optionally convert to normalized scale."""
+    sensor_uncertainties = {}
+    if verbose:
+        print("Loading sensor uncertainty summaries for Monte Carlo sampling...")
+
+    corrections_dir = Path(__file__).parent.parent / "data" / "output" / "calibration" / "summaries"
+    sensor_names = ['Sp Cond (microS_cm)', 'pH', 'DO (% Sat)', 'Turbidity (FNU)', 'fDOM (RFU)', 'fDOM (QSU)']
+    for sensor_name in sensor_names:
+        summary = load_sensor_uncertainty_summary(sensor_name, corrections_dir)
+        if summary is not None:
+            sensor_uncertainties[sensor_name] = summary
+            if verbose:
+                print(f"  OK: Loaded {sensor_name}")
+        else:
+            if verbose:
+                print(f"  X: No uncertainty summary found for {sensor_name}")
+
+    if normalization_params is None:
+        normalization_file = Path(output_dir) / "normalization.json"
+        try:
+            with open(normalization_file, 'r') as f:
+                normalization_params = json.load(f)
+        except FileNotFoundError:
+            normalization_params = None
+
+    if normalization_params:
+        if verbose:
+            print("\nTransforming uncertainty parameters to normalized scale...")
+        sensor_column_map = {
+            'Sp Cond (microS_cm)': 'Pfl - Sp Cond (microS_cm)',
+            'pH': 'Pfl - pH',
+            'DO (% Sat)': 'Pfl - DO (% Sat)',
+            'Turbidity (FNU)': 'Pfl - Turbidity (FNU)',
+            'fDOM (RFU)': 'Pfl - fDOM (RFU)',
+            'fDOM (QSU)': 'Pfl - fDOM (QSU)',
+        }
+        for sensor_name in list(sensor_uncertainties.keys()):
+            col_name = sensor_column_map.get(sensor_name)
+            if col_name:
+                sensor_uncertainties[sensor_name] = normalize_uncertainty_params(
+                    sensor_uncertainties[sensor_name], col_name, normalization_params
+                )
+                if verbose:
+                    print(f"  OK: Transformed {sensor_name} to normalized scale")
+    else:
+        if verbose:
+            print("\n! Warning: Could not load normalization parameters.")
+            print("  Using raw-scale uncertainty parameters (may cause over-perturbation)")
+
+    return sensor_uncertainties
+
 def clean_directory(directory_path):
     """
     Deletes all files within the specified directory.
@@ -349,17 +431,9 @@ def apply_uncertainty_perturbation(segment_df, sensor_uncertainties, random_seed
             size=1
         )[0]
         
-        # Apply offset to all rows in this replicate
-        for idx in df_perturbed.index:
-            measured = df_perturbed.loc[idx, column_name]
-            
-            # Skip NaN values
-            if pd.isna(measured):
-                continue
-            
-            # Apply simple offset perturbation
-            perturbed_value = measured + offset
-            df_perturbed.loc[idx, column_name] = perturbed_value
+        mask = df_perturbed[column_name].notna()
+        if mask.any():
+            df_perturbed.loc[mask, column_name] = df_perturbed.loc[mask, column_name] + offset
     
     return df_perturbed
 
@@ -480,7 +554,9 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
                         'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
                         'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
                         '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)'],
-          use_uncertainty_perturbation=False, n_mc_replicates=10, random_seed=21):
+          use_uncertainty_perturbation=False, n_mc_replicates=10, random_seed=21,
+          pre_normalized=False, normalization_params=None, sensor_uncertainties=None,
+          verbose=False):
     """
     Break up a dataset which contains gaps into many files of standard size, which do not contain gaps
     :param df: dataframe of consolidated dataset to be broken up
@@ -493,8 +569,15 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
     :param fault_tolerant: deprecated here; NaN filtering is handled in e_Train.py
     :return:
     """
-
-    df = normalize_columns(df, to_normalize, param_file=None, min_val=0, max_val=1, save=True, directory=output_dir)
+    if pre_normalized:
+        df = df.copy()
+        if normalization_params is not None:
+            _write_normalization_params(output_dir, normalization_params)
+        else:
+            # Fallback: preserve old behavior if caller did not provide params.
+            df = normalize_columns(df, to_normalize, param_file=None, min_val=0, max_val=1, save=True, directory=output_dir)
+    else:
+        df = normalize_columns(df, to_normalize, param_file=None, min_val=0, max_val=1, save=True, directory=output_dir)
 
     samples_dir = os.path.join(output_dir, 'samples')
     perturbed_samples_dir = os.path.join(output_dir, 'mc_replicates')
@@ -507,101 +590,112 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
         clean_directory(perturbed_samples_dir)
 
     # Load sensor uncertainty summaries if perturbation is enabled
-    sensor_uncertainties = {}
     if use_uncertainty_perturbation:
-        print("Loading sensor uncertainty summaries for Monte Carlo sampling...")
-        corrections_dir = Path(__file__).parent.parent / "data" / "output" / "calibration" / "summaries"
-        sensor_names = ['Sp Cond (microS_cm)', 'pH', 'DO (% Sat)', 'Turbidity (FNU)', 'fDOM (RFU)', 'fDOM (QSU)']
-        for sensor_name in sensor_names:
-            summary = load_sensor_uncertainty_summary(sensor_name, corrections_dir)
-            if summary is not None:
-                sensor_uncertainties[sensor_name] = summary
-                print(f"  OK: Loaded {sensor_name}")
-            else:
-                print(f"  X: No uncertainty summary found for {sensor_name}")
-        
-        # Load normalization parameters and transform uncertainty parameters to normalized scale
-        print("\nTransforming uncertainty parameters to normalized scale...")
-        normalization_file = Path(output_dir) / "normalization.json"
-        try:
-            with open(normalization_file, 'r') as f:
-                norm_params = json.load(f)
-            
-            # Map sensor names to column names for normalization lookup
-            sensor_column_map = {
-                'Sp Cond (microS_cm)': 'Pfl - Sp Cond (microS_cm)',
-                'pH': 'Pfl - pH',
-                'DO (% Sat)': 'Pfl - DO (% Sat)',
-                'Turbidity (FNU)': 'Pfl - Turbidity (FNU)',
-                'fDOM (RFU)': 'Pfl - fDOM (RFU)',
-                'fDOM (QSU)': 'Pfl - fDOM (QSU)',
-            }
-            
-            # Transform each sensor's uncertainties
-            for sensor_name in list(sensor_uncertainties.keys()):
-                col_name = sensor_column_map.get(sensor_name)
-                if col_name:
-                    sensor_uncertainties[sensor_name] = normalize_uncertainty_params(
-                        sensor_uncertainties[sensor_name], col_name, norm_params
-                    )
-                    print(f"  OK: Transformed {sensor_name} to normalized scale")
-        except FileNotFoundError:
-            print(f"  ! Warning: Could not load normalization parameters from {normalization_file}")
-            print(f"    Using raw-scale uncertainty parameters (may cause over-perturbation)")
-        
+        if sensor_uncertainties is None:
+            sensor_uncertainties = _load_and_prepare_sensor_uncertainties(
+                output_dir,
+                normalization_params=normalization_params,
+                verbose=verbose,
+            )
+
         # Set random seed once for reproducibility
         np.random.seed(random_seed)
-        print(f"Monte Carlo sampling enabled: K={n_mc_replicates} replicates, seed={random_seed}\n")
+        if verbose:
+            print(f"Monte Carlo sampling enabled: K={n_mc_replicates} replicates, seed={random_seed}\n")
 
     # Initialize a counter for naming output files
     segment_counter = 1
     has_segment_col = 'Segment' in df.columns
-    if not has_segment_col:
-        print("[INFO] 'Segment' column not found. Saving all target-valid samples without segment contiguity filtering.")
 
-    ## Iterate through the dataframe to find valid segments
-    ## Predictor NaN-tolerance filtering is intentionally handled later in e_Train.py
-    ## during train/test split. Here we save all samples with valid targets.
-    for i in range(len(df) - (length-1)):
-        segment = df.iloc[i:i+length]
-        last_row = segment.iloc[-1]
-        preceding_rows = segment.iloc[:-1]
+    metadata_cols = [col for col in ["TIMESTAMP", "Segment", "Interpolated"] if col in df.columns]
+    predictor_write_cols = [col for col in predictor_cols if col in df.columns]
+    target_write_cols = [col for col in target_columns if col in df.columns]
+    sample_columns = metadata_cols + predictor_write_cols + [
+        col for col in target_write_cols if col not in metadata_cols and col not in predictor_write_cols
+    ]
 
-        # Check if the last row has any non-null value in the target columns
-        if last_row[target_columns].notnull().all():
+    if not predictor_write_cols:
+        if verbose:
+            print("[WARN] None of predictor_cols were found in dataframe; writing targets/metadata only.")
+    if not target_write_cols:
+        raise ValueError(
+            f"None of target_columns found in dataframe for output_dir={output_dir}: {target_columns}"
+        )
 
-            # If Segment metadata exists, enforce contiguous segment consistency.
-            # Otherwise, keep all target-valid samples.
-            is_contiguous_segment = True
-            if has_segment_col and not preceding_rows.empty:
-                is_contiguous_segment = preceding_rows['Segment'].nunique() == 1
+    n_rows = len(df)
+    if n_rows < length:
+        sample_count = 0
+        xgb_config_path = generate_training_config_template(
+            output_dir,
+            'xgb_01',
+            predictor_cols,
+            target_columns,
+            length,
+            model_type='xgb'
+        )
+        transformer_config_path = generate_transformer_config_template(
+            output_dir,
+            'transformer_01',
+            predictor_cols,
+            target_columns,
+            length
+        )
+        gp_config_path = generate_gp_config_template(
+            output_dir,
+            'gp_01',
+            predictor_cols,
+            target_columns,
+            length
+        )
+        return {
+            "sample_set_name": Path(output_dir).name,
+            "target_columns": list(target_columns),
+            "predictor_columns": list(predictor_cols),
+            "n_samples": sample_count,
+            "config_paths": [xgb_config_path, transformer_config_path, gp_config_path],
+        }
 
-            if is_contiguous_segment:
-                # Save unperturbed version
-                output_file = os.path.join(samples_dir, f"segment_{segment_counter:04d}.csv")
-                segment.to_csv(output_file, index=False)
-                
-                if use_uncertainty_perturbation:
-                    # Generate K Monte Carlo replicates
-                    for k in range(1, n_mc_replicates + 1):
-                        # Apply perturbation with a derived seed for each replicate
-                        replicate_seed = random_seed + k
-                        segment_perturbed = apply_uncertainty_perturbation(
-                            segment, sensor_uncertainties, random_seed=replicate_seed
-                        )
-                        
-                        # Save with replicate label
-                        output_file = os.path.join(
-                            perturbed_samples_dir,
-                            f"segment_{segment_counter:04d}_mc_{k:03d}.csv"
-                        )
-                        segment_perturbed.to_csv(output_file, index=False)
-                
-                segment_counter += 1
+    end_indices = np.arange(length - 1, n_rows)
+    target_valid = df[target_columns].notnull().all(axis=1).to_numpy()
+    valid_end_mask = target_valid[end_indices]
+
+    if has_segment_col and length > 1:
+        seg_codes = pd.factorize(df['Segment'])[0]
+        run_len = np.ones(n_rows, dtype=np.int32)
+        for idx in range(1, n_rows):
+            if seg_codes[idx] == seg_codes[idx - 1]:
+                run_len[idx] = run_len[idx - 1] + 1
+        preceding_end = end_indices - 1
+        contig_mask = run_len[preceding_end] >= (length - 1)
+        valid_end_mask &= contig_mask
+
+    valid_end_indices = end_indices[valid_end_mask]
+
+    for end_idx in valid_end_indices:
+        start_idx = int(end_idx - length + 1)
+        segment = df.iloc[start_idx:end_idx + 1]
+        segment_out = segment.loc[:, sample_columns]
+
+        output_file = os.path.join(samples_dir, f"segment_{segment_counter:04d}.csv")
+        segment_out.to_csv(output_file, index=False)
+
+        if use_uncertainty_perturbation:
+            for k in range(1, n_mc_replicates + 1):
+                replicate_seed = random_seed + k
+                segment_perturbed = apply_uncertainty_perturbation(
+                    segment_out, sensor_uncertainties, random_seed=replicate_seed
+                )
+                output_file = os.path.join(
+                    perturbed_samples_dir,
+                    f"segment_{segment_counter:04d}_mc_{k:03d}.csv"
+                )
+                segment_perturbed.to_csv(output_file, index=False)
+
+        segment_counter += 1
 
     # Generate template configuration files for e_Train.py
     # Use model type with index for forecast naming (not sample set directory name)
-    
+
     # Generate XGBoost template
     xgb_config_path = generate_training_config_template(
         output_dir, 
@@ -611,8 +705,7 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
         length,
         model_type='xgb'
     )
-    print(f"\nXGBoost config file generated: {xgb_config_path}")
-    
+
     # Generate Transformer template
     transformer_config_path = generate_transformer_config_template(
         output_dir, 
@@ -621,7 +714,6 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
         target_columns,
         length
     )
-    print(f"Transformer config file generated: {transformer_config_path}")
 
     # Generate GP template
     gp_config_path = generate_gp_config_template(
@@ -631,9 +723,13 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
         target_columns,
         length
     )
-    print(f"GP config file generated: {gp_config_path}")
-
-    print("\nEdit the appropriate config file with your desired settings and pass it to e_Train.py")
+    return {
+        "sample_set_name": Path(output_dir).name,
+        "target_columns": list(target_columns),
+        "predictor_columns": list(predictor_cols),
+        "n_samples": int(len(valid_end_indices)),
+        "config_paths": [xgb_config_path, transformer_config_path, gp_config_path],
+    }
 
 
 if __name__ == '__main__':
@@ -731,14 +827,40 @@ if __name__ == '__main__':
     #       True, predictor_cols=predictor_cols,
     #       use_uncertainty_perturbation=True, n_mc_replicates=10, random_seed=1)
     
+    # Normalize once and reuse across all per-target dataset writes.
+    df_norm, normalization_params = _normalize_once(df, to_normalize, min_val=0, max_val=1)
+    shared_sensor_uncertainties = _load_and_prepare_sensor_uncertainties(
+        output_dir="../data/output/regression",
+        normalization_params=normalization_params,
+        verbose=False,
+    )
+
     for target in target_columns:
         target_slug = target.replace(" ", "_").replace("/", "_")
         output_dir = os.path.join("../data/output/regression", f"MC_{target_slug}")
         target_state_col = target.replace('_res', '_state') if target.endswith('_res') else f"{target}_state"
         per_target_predictors = predictor_cols + [target_state_col] if target_state_col not in predictor_cols else predictor_cols
-        split(df, output_dir, [target], length, 0.8, to_normalize,
-          True, predictor_cols=per_target_predictors,
-          use_uncertainty_perturbation=True, n_mc_replicates=10, random_seed=1)
+        result = split(
+            df_norm,
+            output_dir,
+            [target],
+            length,
+            0.8,
+            to_normalize,
+            True,
+            predictor_cols=per_target_predictors,
+            use_uncertainty_perturbation=True,
+            n_mc_replicates=10,
+            random_seed=1,
+            pre_normalized=True,
+            normalization_params=normalization_params,
+            sensor_uncertainties=shared_sensor_uncertainties,
+            verbose=False,
+        )
 
-    
-    print("\nOK: d_Resample.py completed successfully!")
+        print(f"Sample set: {result['sample_set_name']}")
+        print(f"Target columns: {result['target_columns']}")
+        print(f"Predictor columns: {result['predictor_columns']}")
+        print(f"Number of samples included: {result['n_samples']}")
+        for cfg in result['config_paths']:
+            print(f"Config file generated: {cfg}")

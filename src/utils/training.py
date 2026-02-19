@@ -7,7 +7,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 
 def load_samples(directory, input_columns, output_columns, input_rows, output_rows, file_list=None,
-                 fault_tolerant=False, source=None):
+                 fault_tolerant=False, source=None, input_aggregation='none'):
     samples = []
 
     if source is not None:
@@ -17,17 +17,20 @@ def load_samples(directory, input_columns, output_columns, input_rows, output_ro
         if not filename.endswith(".csv"):
             continue
         if file_list is not None and filename not in file_list:
-            print(f"Sample {filename} skipped - not in list")
             continue  # Skip files not in the provided list
         df = pd.read_csv(os.path.join(directory, filename))
         if not set(input_columns + output_columns).issubset(df.columns):
-            print(f"Sample {filename} skipped - contains missing columns")
-            print('Contains only:', df.columns)
             continue  # skip files with missing columns
         if len(df) < input_rows.stop:
-            print(f"Sample {filename} skipped — not enough rows ({len(df)} < {input_rows.stop})")
             continue  # skip files without enough rows
         input_seq = df.iloc[input_rows, :][input_columns].values
+        if str(input_aggregation).lower() == 'mean':
+            # Require at least one finite value per predictor; otherwise sample is unusable.
+            predictor_all_nan = np.all(np.isnan(input_seq), axis=0)
+            if np.any(predictor_all_nan):
+                continue
+            with np.errstate(invalid='ignore'):
+                input_seq = np.nanmean(input_seq, axis=0, keepdims=True)
         # Handle output_rows as either a list of indices or a starting index for slicing
         if isinstance(output_rows, list):
             output_seq = df.iloc[output_rows, :][output_columns].values
@@ -35,11 +38,9 @@ def load_samples(directory, input_columns, output_columns, input_rows, output_ro
             output_seq = df.iloc[output_rows:, :][output_columns].values
         # Always skip samples with NaN in outputs/labels (no model can train with these)
         if np.isnan(output_seq).any():
-            print(f"Sample {filename} skipped - contains NaN in output/labels")
             continue
         # Only skip samples with NaN in inputs when fault_tolerant=False
         if not fault_tolerant and np.isnan(input_seq).any():
-            print(f"Sample {filename} skipped - contains NaN in input features")
             continue
         samples.append((input_seq, output_seq, filename))
     print("Samples loaded")
@@ -173,7 +174,7 @@ def write_config(config, data_dir, forecast_name, model_name, config_name='model
 
 def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns, output_rows, fault_tolerant=True,
              reuse_split=True, split_source=None, split_type='random', test_size=0.2, random_state=10,
-             sample_subdir='samples', nan_tolerance=None):
+             sample_subdir='samples', nan_tolerance=None, input_aggregation='none'):
     ## If specified, reuse a train/test split previously written to file.
     train_samples = []
     test_samples = []
@@ -186,11 +187,13 @@ def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns,
             train_samples = load_samples(sample_dir, input_columns=input_columns,
                                          output_columns=output_columns,
                                          input_rows=input_rows, output_rows=output_rows, file_list=None,
-                                         fault_tolerant=fault_tolerant, source=Path(split_source, "train_files.txt"))
+                                         fault_tolerant=fault_tolerant, source=Path(split_source, "train_files.txt"),
+                                         input_aggregation=input_aggregation)
             test_samples = load_samples(sample_dir, input_columns=input_columns,
                                         output_columns=output_columns,
                                         input_rows=input_rows, output_rows=output_rows, file_list=None,
-                                        fault_tolerant=fault_tolerant, source=Path(split_source, "test_files.txt"))
+                                        fault_tolerant=fault_tolerant, source=Path(split_source, "test_files.txt"),
+                                        input_aggregation=input_aggregation)
             print(f'Reused split in {split_source}. Training set: {len(train_samples)} samples. Test set: {len(test_samples)} samples')
         except Exception as e:
             print(f"No previous split available for reuse: {e}")
@@ -198,7 +201,7 @@ def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns,
         ## Generate a new split.
         samples = load_samples(sample_dir, input_columns=input_columns,
                                output_columns=output_columns, input_rows=input_rows, output_rows=output_rows,
-                               fault_tolerant=fault_tolerant)
+                               fault_tolerant=fault_tolerant, input_aggregation=input_aggregation)
 
         if fault_tolerant and nan_tolerance is not None:
             samples = _filter_samples_by_nan_tolerance(samples, nan_tolerance)

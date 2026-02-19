@@ -37,6 +37,7 @@ from utils.transformer import (
 DEFAULT_COMMON_CONFIG = {
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "matplotlib_backend": "Agg",
+    "save_training_plots": True,
 }
 
 DEFAULT_TRANSFORMER_CONFIG = {
@@ -114,6 +115,7 @@ DEFAULT_EVALUATION_CONFIG = {
     "thresholds_path": "../data/input/Limits.csv",
     "normalization_path": "../data/input/normalization.json",
     "use_normalized_thresholds": False,
+    "save_plots": True,
 }
 
 
@@ -192,6 +194,10 @@ def merge_with_defaults(config, model_type):
     # Add matplotlib backend if not specified
     if "matplotlib_backend" not in merged_config:
         merged_config["matplotlib_backend"] = DEFAULT_COMMON_CONFIG["matplotlib_backend"]
+
+    # Add training plot toggle if not specified
+    if "save_training_plots" not in merged_config:
+        merged_config["save_training_plots"] = DEFAULT_COMMON_CONFIG["save_training_plots"]
     
     return merged_config
 
@@ -261,6 +267,7 @@ def load_and_split_data(config):
     # print(f"Sample directory: {Path(base_data_dir) / sample_subdir}")
     
     input_rows = slice(data_cfg["input_row_1"], data_cfg["input_row_2"])
+    input_aggregation = str(data_cfg.get("input_aggregation", "none")).lower()
     
     train_samples, test_samples = splitter(
         data_cfg["data_dir"],
@@ -277,6 +284,7 @@ def load_and_split_data(config):
         split_cfg["random_state"],
         data_cfg["sample_subdir"],
         nan_tolerance,
+        input_aggregation,
     )
     
     return train_samples, test_samples, input_rows
@@ -412,6 +420,7 @@ def write_evaluation_config(config):
     config_dir = config.get("__config_dir", str(Path.cwd()))
 
     evaluation_cfg = DEFAULT_EVALUATION_CONFIG.copy()
+    evaluation_cfg.update(config.get("evaluation", {}))
     if model_type == "xgb_classifier":
         evaluation_cfg["run_regression"] = False
         evaluation_cfg["run_pure_classification"] = True
@@ -752,17 +761,18 @@ def train_gp_regressor_model(config, train_samples, test_samples):
     torch.save(artifact, save_path / "gp_model.pt")
     print(f"\nModel saved to: {save_path / 'gp_model.pt'}")
 
-    plt.figure(figsize=(8, 5))
-    for idx, losses in enumerate(output_train_losses):
-        plt.plot(range(1, len(losses) + 1), losses, label=f'Output {idx + 1} train NLL')
-    plt.xlabel('Epoch')
-    plt.ylabel('Negative Log Marginal Likelihood')
-    plt.grid(True, ls="--")
-    plt.title('GP Training Loss by Output')
-    plt.legend()
-    plt.savefig(save_path / "loss_plot.png")
-    plt.close()
-    print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")
+    if config.get("save_training_plots", True):
+        plt.figure(figsize=(8, 5))
+        for idx, losses in enumerate(output_train_losses):
+            plt.plot(range(1, len(losses) + 1), losses, label=f'Output {idx + 1} train NLL')
+        plt.xlabel('Epoch')
+        plt.ylabel('Negative Log Marginal Likelihood')
+        plt.grid(True, ls="--")
+        plt.title('GP Training Loss by Output')
+        plt.legend()
+        plt.savefig(save_path / "loss_plot.png")
+        plt.close()
+        print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")
     write_evaluation_config(config)
 
 
@@ -820,21 +830,22 @@ def train_xgb_regressor_model(config, train_samples, test_samples):
     model.save_model(save_path / "xgboost_model.json")
     print(f"\nModel saved to: {save_path / 'xgboost_model.json'}")
     
-    # Plot results
-    results = model.evals_result()
-    metric = hyper_cfg["metric"]
-    epochs = len(results['validation_0'][metric])
-    plt.figure(figsize=(8, 5))
-    plt.loglog(range(epochs), results['validation_0'][metric], label='Training Loss')
-    plt.loglog(range(epochs), results['validation_1'][metric], label='Validation Loss')
-    plt.xlabel('Boosting Rounds')
-    plt.ylabel(metric)
-    plt.grid(True, which="both", ls="--")
-    plt.title('Training vs Validation Loss')
-    plt.legend()
-    plt.savefig(save_path / "loss_plot.png")
-    plt.close()
-    print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")
+    if config.get("save_training_plots", True):
+        # Plot results
+        results = model.evals_result()
+        metric = hyper_cfg["metric"]
+        epochs = len(results['validation_0'][metric])
+        plt.figure(figsize=(8, 5))
+        plt.loglog(range(epochs), results['validation_0'][metric], label='Training Loss')
+        plt.loglog(range(epochs), results['validation_1'][metric], label='Validation Loss')
+        plt.xlabel('Boosting Rounds')
+        plt.ylabel(metric)
+        plt.grid(True, which="both", ls="--")
+        plt.title('Training vs Validation Loss')
+        plt.legend()
+        plt.savefig(save_path / "loss_plot.png")
+        plt.close()
+        print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")
     write_evaluation_config(config)
 
 
@@ -893,21 +904,22 @@ def train_xgb_classifier_model(config, train_samples, test_samples):
     model.save_model(save_path / "xgboost_model.json")
     print(f"\nModel saved to: {save_path / 'xgboost_model.json'}")
     
-    # Plot results
-    results = model.evals_result()
-    metric = hyper_cfg["eval_metric"]
-    epochs = len(results['validation_0'][metric])
-    plt.figure(figsize=(8, 5))
-    plt.loglog(range(epochs), results['validation_0'][metric], label='Train logloss')
-    plt.loglog(range(epochs), results['validation_1'][metric], label='Validation logloss')
-    plt.xlabel('Boosting Rounds')
-    plt.ylabel('Logloss')
-    plt.grid(True, which="both", ls="--")
-    plt.title('Training vs Validation Loss')
-    plt.legend()
-    plt.savefig(save_path / "loss_plot.png")
-    plt.close()
-    print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")
+    if config.get("save_training_plots", True):
+        # Plot results
+        results = model.evals_result()
+        metric = hyper_cfg["eval_metric"]
+        epochs = len(results['validation_0'][metric])
+        plt.figure(figsize=(8, 5))
+        plt.loglog(range(epochs), results['validation_0'][metric], label='Train logloss')
+        plt.loglog(range(epochs), results['validation_1'][metric], label='Validation logloss')
+        plt.xlabel('Boosting Rounds')
+        plt.ylabel('Logloss')
+        plt.grid(True, which="both", ls="--")
+        plt.title('Training vs Validation Loss')
+        plt.legend()
+        plt.savefig(save_path / "loss_plot.png")
+        plt.close()
+        print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")
     write_evaluation_config(config)
 
 

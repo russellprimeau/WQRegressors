@@ -67,6 +67,7 @@ DEFAULT_EVAL_CONFIG = {
     "baseline_split_file": "test_files.txt",
     "baseline_split_source": None,
     "baseline_match_mc_to_raw": True,
+    "save_plots": True,
 }
 
 
@@ -142,7 +143,16 @@ def load_model_config(data_dir, forecast_name, model_name, fallback_data=None):
     }
 
 
-def load_test_samples(data_dir, sample_subdir, forecast_name, input_columns, output_columns, input_rows, output_rows):
+def load_test_samples(
+    data_dir,
+    sample_subdir,
+    forecast_name,
+    input_columns,
+    output_columns,
+    input_rows,
+    output_rows,
+    input_aggregation="none",
+):
     return load_split_samples(
         data_dir,
         sample_subdir,
@@ -152,6 +162,7 @@ def load_test_samples(data_dir, sample_subdir, forecast_name, input_columns, out
         input_rows,
         output_rows,
         "test_files.txt",
+        input_aggregation=input_aggregation,
     )
 
 
@@ -183,6 +194,7 @@ def load_split_samples(
     split_file,
     split_source_dir=None,
     split_files_override=None,
+    input_aggregation="none",
 ):
     source_dir = Path(split_source_dir) if split_source_dir is not None else Path(data_dir, "forecasts", forecast_name)
     split_files = split_files_override if split_files_override is not None else _read_split_files(source_dir, split_file)
@@ -195,7 +207,9 @@ def load_split_samples(
         output_rows=output_rows,
         file_list=split_files,
         fault_tolerant=True,
+        input_aggregation=input_aggregation,
     )
+
     return samples
 
 
@@ -681,8 +695,6 @@ def _compute_regression_summary(label, preds, targets, num_samples, metadata=Non
 
     row = {
         "label": label,
-        "n_pred_rows": int(np.array(preds).shape[0]) if np.array(preds).ndim > 0 else 0,
-        "n_target_rows": int(np.array(targets).shape[0]) if np.array(targets).ndim > 0 else 0,
         "n_eval_rows": int(n_rows),
         "n_eval_outputs": int(n_cols),
         "n_eval_points_finite": finite_count,
@@ -728,8 +740,6 @@ def _compute_classification_summary(label, preds, targets, num_samples, metadata
 
     row = {
         "label": label,
-        "n_pred_rows": int(len(np.array(preds).reshape(-1))),
-        "n_target_rows": int(len(np.array(targets).reshape(-1))),
         "n_eval_rows": int(n),
         "n_eval_outputs": 1,
         "n_eval_points_finite": int(np.sum(np.isfinite(np.array(preds).reshape(-1)[:n]) & np.isfinite(np.array(targets).reshape(-1)[:n]))),
@@ -752,8 +762,6 @@ def _write_summary_csv(rows, output_path):
         "kind",
         "n_train_samples",
         "n_test_samples",
-        "n_pred_rows",
-        "n_target_rows",
         "n_eval_rows",
         "n_eval_outputs",
         "n_eval_points_finite",
@@ -822,7 +830,7 @@ def _expand_config_inputs(config_args):
     return expanded
 
 
-def evaluate_single_config(config_path):
+def evaluate_single_config(config_path, save_plots_override=None):
     print(f"\n=== Evaluating config: {config_path} ===")
 
     config = load_config(config_path)
@@ -832,6 +840,10 @@ def evaluate_single_config(config_path):
     model_name = config["model_name"]
     data_cfg = config["data"]
     eval_cfg = merge_eval_config(config)
+    if save_plots_override is None:
+        save_plots = bool(eval_cfg.get("save_plots", True))
+    else:
+        save_plots = bool(save_plots_override)
 
     data_cfg["data_dir"], data_cfg["sample_subdir"] = _resolve_data_paths(data_cfg, config_dir)
     for key in ["historic_path", "thresholds_path", "normalization_path"]:
@@ -855,6 +867,7 @@ def evaluate_single_config(config_path):
     output_columns = model_config["output_columns"]
     input_rows = slice(model_config["input_row_1"], model_config["input_row_2"])
     output_rows = model_config["output_rows"]
+    input_aggregation = str(model_config.get("input_aggregation", data_cfg.get("input_aggregation", "none"))).lower()
 
     test_samples = load_test_samples(
         data_cfg["data_dir"],
@@ -864,6 +877,7 @@ def evaluate_single_config(config_path):
         output_columns,
         input_rows,
         output_rows,
+        input_aggregation=input_aggregation,
     )
     model_split_files = _read_split_files(
         Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"]),
@@ -881,6 +895,7 @@ def evaluate_single_config(config_path):
             input_rows,
             output_rows,
             "train_files.txt",
+            input_aggregation=input_aggregation,
         )
 
     X_test = np.array([s[0].flatten() for s in test_samples])
@@ -1009,6 +1024,7 @@ def evaluate_single_config(config_path):
             baseline_split_file,
             split_source_dir=baseline_split_source,
             split_files_override=baseline_split_files,
+            input_aggregation=input_aggregation,
         )
         if not baseline_test_samples:
             print(
@@ -1101,21 +1117,22 @@ def evaluate_single_config(config_path):
                     )
                 )
 
-        visualizer(
-            *regression_pairs,
-            labels=regression_labels,
-            forecast_name=data_cfg["forecast_name"],
-            directory=data_cfg["data_dir"],
-            num_samples=eval_cfg["num_samples"],
-        )
-        _plot_uncertainty_boxplots(
-            regression_pairs,
-            regression_labels,
-            regression_split_files,
-            directory=data_cfg["data_dir"],
-            forecast_name=data_cfg["forecast_name"],
-            num_samples=eval_cfg["num_samples"],
-        )
+        if save_plots:
+            visualizer(
+                *regression_pairs,
+                labels=regression_labels,
+                forecast_name=data_cfg["forecast_name"],
+                directory=data_cfg["data_dir"],
+                num_samples=eval_cfg["num_samples"],
+            )
+            _plot_uncertainty_boxplots(
+                regression_pairs,
+                regression_labels,
+                regression_split_files,
+                directory=data_cfg["data_dir"],
+                forecast_name=data_cfg["forecast_name"],
+                num_samples=eval_cfg["num_samples"],
+            )
 
     if eval_cfg["run_threshold_classification"] and regression_pairs:
         thresholds_df = load_thresholds(eval_cfg)
@@ -1132,13 +1149,14 @@ def evaluate_single_config(config_path):
             bin_targets = binarize_predictions(targets_eval, output_columns=output_columns, thresholds_df=thresholds_df)
             class_results.append((bin_preds, bin_targets))
 
-        classification_visualizer(
-            *class_results,
-            labels=regression_labels,
-            directory=data_cfg["data_dir"],
-            forecast_name=data_cfg["forecast_name"],
-            num_samples=eval_cfg["num_samples"],
-        )
+        if save_plots:
+            classification_visualizer(
+                *class_results,
+                labels=regression_labels,
+                directory=data_cfg["data_dir"],
+                forecast_name=data_cfg["forecast_name"],
+                num_samples=eval_cfg["num_samples"],
+            )
 
         class_meta = {
             "data_dir": str(data_cfg["data_dir"]),
@@ -1167,13 +1185,14 @@ def evaluate_single_config(config_path):
             preds = preds_flat.reshape(-1, output_dim)
             targets = np.array([np.rint(s[1].flatten()) for s in test_samples]).reshape(-1, output_dim)
 
-            classification_visualizer(
-                (preds, targets),
-                labels=["XGBClassifier"],
-                directory=data_cfg["data_dir"],
-                forecast_name=data_cfg["forecast_name"],
-                num_samples=eval_cfg["num_samples"],
-            )
+            if save_plots:
+                classification_visualizer(
+                    (preds, targets),
+                    labels=["XGBClassifier"],
+                    directory=data_cfg["data_dir"],
+                    forecast_name=data_cfg["forecast_name"],
+                    num_samples=eval_cfg["num_samples"],
+                )
 
             summary_rows.append(
                 _compute_classification_summary(
@@ -1215,7 +1234,7 @@ def evaluate_single_config(config_path):
     }
 
 
-def write_combined_outputs(results):
+def write_combined_outputs(results, save_plots=True):
     grouped = {}
     for result in results:
         grouped.setdefault(result["data_dir"], []).append(result)
@@ -1268,21 +1287,22 @@ def write_combined_outputs(results):
             continue
 
         num_samples = max(r["num_samples"] for r in group)
-        visualizer(
-            *combined_pairs,
-            labels=combined_labels,
-            forecast_name="",
-            directory=data_dir,
-            num_samples=num_samples,
-        )
-        _plot_uncertainty_boxplots(
-            combined_pairs,
-            combined_labels,
-            combined_split_files,
-            directory=data_dir,
-            forecast_name="",
-            num_samples=num_samples,
-        )
+        if save_plots:
+            visualizer(
+                *combined_pairs,
+                labels=combined_labels,
+                forecast_name="",
+                directory=data_dir,
+                num_samples=num_samples,
+            )
+            _plot_uncertainty_boxplots(
+                combined_pairs,
+                combined_labels,
+                combined_split_files,
+                directory=data_dir,
+                forecast_name="",
+                num_samples=num_samples,
+            )
 
         for (preds, targets), label, meta in zip(combined_pairs, combined_labels, combined_meta):
             combined_rows.append(
@@ -1312,6 +1332,11 @@ def main():
         required=True,
         help="One or more YAML/JSON config paths on a single command line (supports comma-separated values and glob patterns)",
     )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Disable plot generation for this invocation only (does not modify config files).",
+    )
     args = parser.parse_args()
 
     config_paths = _expand_config_inputs(args.config)
@@ -1321,7 +1346,8 @@ def main():
             "Use .yml/.yaml/.json files on a single command line."
         )
 
-    results = [evaluate_single_config(config_path) for config_path in config_paths]
+    save_plots_override = False if args.no_plots else True
+    results = [evaluate_single_config(config_path, save_plots_override=save_plots_override) for config_path in config_paths]
 
     if len(results) > 1:
         write_combined_outputs(results)
