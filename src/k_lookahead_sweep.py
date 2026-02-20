@@ -24,19 +24,22 @@ def find_best_configs(data_root, dataset_prefix):
         sweep_dir = dataset_dir / 'forecasts' / 'feature_sweeps'
         if not sweep_dir.exists():
             continue
-        # Find best subset for the largest row_count
+        # Use the only feature_selected_subsets_r*.csv file
         selected_files = sorted(sweep_dir.glob('feature_selected_subsets_r*.csv'))
         if not selected_files:
             continue
-        # Use the largest row_count
-        selected = pd.read_csv(selected_files[-1])
+        selected = pd.read_csv(selected_files[0])
         if selected.empty:
             continue
-        best = selected.iloc[0]
+        # Find the row with the highest r2 value
+        if 'r2' in selected.columns:
+            best_idx = selected['r2'].idxmax()
+            best = selected.iloc[best_idx]
+        else:
+            best = selected.iloc[0]
         # Find config file for this subset
         configs_dir = sweep_dir / 'configs'
         config_name = f"config_evaluate_{best['feature_tag']}_r{int(best['row_count']):03d}.yml"
-        # Fallback: find any config with matching row_count and feature_tag
         config_path = None
         for cfg in configs_dir.glob(f"*r{int(best['row_count']):03d}_{best['feature_tag']}*.yml"):
             config_path = cfg

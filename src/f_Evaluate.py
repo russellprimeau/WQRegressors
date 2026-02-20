@@ -154,6 +154,8 @@ def load_test_samples(
     output_rows,
     input_aggregation="none",
 ):
+    # Always resolve split file relative to data_dir/forecasts/forecast_name
+    split_source_dir = os.path.join(data_dir, "forecasts", forecast_name)
     return load_split_samples(
         data_dir,
         sample_subdir,
@@ -163,13 +165,18 @@ def load_test_samples(
         input_rows,
         output_rows,
         "test_files.txt",
+        split_source_dir=split_source_dir,
         input_aggregation=input_aggregation,
     )
 
 
 def _read_split_files(split_source_dir, split_file):
-    split_path = Path(split_source_dir, split_file)
-    with open(split_path) as f:
+    split_path = Path(split_source_dir) / split_file
+    abs_split_path = split_path.resolve()
+    print(f"[DEBUG] Attempting to open split file: {abs_split_path}")
+    if not abs_split_path.exists():
+        raise FileNotFoundError(f"Split file not found: {abs_split_path}")
+    with open(abs_split_path) as f:
         return [line.strip() for line in f if line.strip()]
 
 
@@ -444,26 +451,52 @@ def _predict_gp_bundle(gp_bundle, X_np, device):
 
 def load_model(model_type, data_cfg, split_cfg, model_name, model_config, device, train_samples=None, config_dir=None):
     model_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], model_name)
+    parent_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
+
+    def try_file(path, filename):
+        file = path / filename
+        if file.exists():
+            return file
+        file = parent_path / filename
+        if file.exists():
+            return file
+        return None
 
     if model_type == "transformer":
         model = TimeSeriesTransformer(model_config).to(device)
-        model.load_state_dict(torch.load(model_path / "transformer_model.pt", map_location=device))
+        model_file = try_file(model_path, "transformer_model.pt")
+        if not model_file:
+            raise FileNotFoundError(f"transformer_model.pt not found in {model_path} or {parent_path}")
+        model.load_state_dict(torch.load(model_file, map_location=device))
         model.eval()
         return model
 
     if model_type == "gp_regressor":
         if train_samples is None:
             raise ValueError("train_samples are required to evaluate gp_regressor")
-        return _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device, config_dir)
+        # _load_gp_bundle expects model_name as subdir; try fallback if not found
+        try:
+            return _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device, config_dir)
+        except FileNotFoundError:
+            try:
+                return _load_gp_bundle(data_cfg, split_cfg, "", train_samples, device, config_dir)
+            except Exception as e:
+                raise FileNotFoundError(f"GP model not found in {model_path} or {parent_path}: {e}")
 
     if model_type == "xgb_regressor":
         model = xgb.XGBRegressor()
-        model.load_model(model_path / "xgboost_model.json")
+        model_file = try_file(model_path, "xgboost_model.json")
+        if not model_file:
+            raise FileNotFoundError(f"xgboost_model.json not found in {model_path} or {parent_path}")
+        model.load_model(model_file)
         return model
 
     if model_type == "xgb_classifier":
         model = xgb.XGBClassifier()
-        model.load_model(model_path / "xgboost_model.json")
+        model_file = try_file(model_path, "xgboost_model.json")
+        if not model_file:
+            raise FileNotFoundError(f"xgboost_model.json not found in {model_path} or {parent_path}")
+        model.load_model(model_file)
         return model
 
     raise ValueError(f"Unknown model_type: {model_type}")
@@ -896,8 +929,10 @@ def evaluate_single_config(config_path, save_plots_override=None):
     input_aggregation = str(model_config.get("input_aggregation", data_cfg.get("input_aggregation", "none"))).lower()
 
 
-    # Load test and train samples
-    test_samples = load_test_samples(
+    # Use the original forecast directory if present, else fallback to config_path.parent
+    config_path = Path(config_path)
+    split_base_dir = Path(data_cfg.get("forecast_dir", config_path.parent))
+    test_samples = load_split_samples(
         data_cfg["data_dir"],
         data_cfg["sample_subdir"],
         data_cfg["forecast_name"],
@@ -905,10 +940,12 @@ def evaluate_single_config(config_path, save_plots_override=None):
         output_columns,
         input_rows,
         output_rows,
+        "test_files.txt",
+        split_source_dir=split_base_dir,
         input_aggregation=input_aggregation,
     )
     model_split_files = _read_split_files(
-        Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"]),
+        split_base_dir,
         "test_files.txt",
     )
     test_dataset = TimeSeriesTargetDataset(test_samples)
@@ -924,10 +961,11 @@ def evaluate_single_config(config_path, save_plots_override=None):
             input_rows,
             output_rows,
             "train_files.txt",
+            split_source_dir=split_base_dir,
             input_aggregation=input_aggregation,
         )
         train_split_files = _read_split_files(
-            Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"]),
+            split_base_dir,
             "train_files.txt",
         )
     elif model_type in ("xgb_regressor", "transformer", "xgb_classifier"):
@@ -942,10 +980,11 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 input_rows,
                 output_rows,
                 "train_files.txt",
+                split_source_dir=split_base_dir,
                 input_aggregation=input_aggregation,
             )
             train_split_files = _read_split_files(
-                Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"]),
+                split_base_dir,
                 "train_files.txt",
             )
 
@@ -1002,27 +1041,39 @@ def evaluate_single_config(config_path, save_plots_override=None):
         For each unique group (raw segment), leave out all samples for that group, train on the rest, predict on the left-out group.
         Write results to a summary CSV in the forecast directory.
         """
+        print("[DEBUG] Entered run_loocv_mc_group")
         from utils.training import group_samples_by_segment
         import copy
 
-        # Group test samples by raw segment
-        group_map = group_samples_by_segment(test_samples, model_split_files)
+        # Group test samples by raw segment (fix: only pass test_samples)
+        group_map = dict(group_samples_by_segment(test_samples))
+        print(f"[DEBUG] Grouped test_samples into {len(group_map)} groups. Total test_samples: {len(test_samples)}")
         group_ids = list(group_map.keys())
         loocv_preds = []
         loocv_targets = []
         loocv_group_ids = []
+        per_fold_rows = []
 
         for left_out_group in group_ids:
-            # Prepare train/test split for this fold
-            test_idx = group_map[left_out_group]
-            train_idx = [i for g, idxs in group_map.items() if g != left_out_group for i in idxs]
-            if not train_idx or not test_idx:
+            test_samples_fold = group_map[left_out_group]
+            # Indices of all other groups
+            train_samples_fold = [s for gid, seg_samples in group_map.items() if gid != left_out_group for s in seg_samples]
+            print(f"[DEBUG] LOOCV fold {left_out_group}: train_samples_fold={len(train_samples_fold)}, test_samples_fold={len(test_samples_fold)}")
+            # Debug: check for data leakage
+            train_groups = set(gid for gid, seg_samples in group_map.items() if gid != left_out_group)
+            test_groups = set([left_out_group])
+            train_ids = set(id(s) for s in train_samples_fold)
+            test_ids = set(id(s) for s in test_samples_fold)
+            overlap = train_ids & test_ids
+            if overlap:
+                print(f"[ERROR] DATA LEAKAGE: {len(overlap)} samples from left-out group {left_out_group} are present in training set!")
+            else:
+                print(f"[DEBUG] LOOCV fold {left_out_group}: train groups = {sorted(train_groups)}, test group = {left_out_group}, train size = {len(train_samples_fold)}, test size = {len(test_samples_fold)} (no leakage)")
+            if not train_samples_fold or not test_samples_fold:
+                print(f"[WARN] LOOCV fold skipped: group {left_out_group} has empty train or test split.")
                 continue
-            train_samples_fold = [test_samples[i] for i in train_idx]
-            test_samples_fold = [test_samples[i] for i in test_idx]
 
             # Retrain model on train_samples_fold
-            # Only supporting xgb_regressor and gp_regressor for now
             if model_type == "xgb_regressor":
                 X_train = np.array([s[0].flatten() for s in train_samples_fold])
                 y_train = np.array([s[1].flatten() for s in train_samples_fold])
@@ -1033,12 +1084,10 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 if np.ndim(preds) == 1:
                     preds = preds.reshape(-1, 1)
                 targets = np.array([s[1].flatten() for s in test_samples_fold])
+                print(f"[DEBUG] XGBRegressor preds: {preds[:5]}, targets: {targets[:5]}")
             elif model_type == "gp_regressor":
-                # Use the same logic as in _prepare_gp_train_arrays and _load_gp_bundle
                 X_train = np.array([s[0].flatten() for s in train_samples_fold], dtype=np.float32)
                 y_train = np.array([s[1].flatten() for s in train_samples_fold], dtype=np.float32)
-                # Use the same model config as before
-                # For simplicity, use the first output only if multi-output
                 y_train_col = y_train[:, 0] if y_train.ndim > 1 else y_train
                 likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
                 class DummyGP(gpytorch.models.ExactGP):
@@ -1071,6 +1120,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
                     pred_dist = likelihood(gp_model(X_test_tensor))
                     preds = pred_dist.mean.cpu().numpy().reshape(-1, 1)
                 targets = np.array([s[1].flatten() for s in test_samples_fold])
+                print(f"[DEBUG] GPRegressor preds: {preds[:5]}, targets: {targets[:5]}")
             else:
                 print(f"[WARN] LOOCV not implemented for model_type={model_type}")
                 continue
@@ -1079,11 +1129,29 @@ def evaluate_single_config(config_path, save_plots_override=None):
             loocv_targets.append(targets)
             loocv_group_ids.extend([left_out_group] * len(preds))
 
+            # Per-fold metrics for debugging
+            fold_row = _compute_regression_summary(
+                f"LOOCV_fold_{left_out_group}_{model_type}",
+                preds,
+                targets,
+                num_samples=len(preds),
+                metadata={
+                    "kind": "loocv_fold",
+                    "group": left_out_group,
+                    "data_dir": str(data_cfg["data_dir"]),
+                    "n_test_samples": len(preds),
+                    "input_dim": input_dim,
+                    "target_dim": target_dim,
+                },
+            )
+            per_fold_rows.append(fold_row)
+
         # Concatenate all predictions and targets
         if loocv_preds:
             all_preds = np.vstack(loocv_preds)
             all_targets = np.vstack(loocv_targets)
-            # Write summary CSV
+            print(f"[DEBUG] All LOOCV preds shape: {all_preds.shape}, targets shape: {all_targets.shape}")
+            # Write summary CSV (aggregate + per-fold)
             summary = _compute_regression_summary(
                 f"LOOCV_{model_type}",
                 all_preds,
@@ -1098,15 +1166,25 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 },
             )
             summary_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], "loocv_summary.csv")
-            _write_summary_csv([summary], summary_path)
+            # Print what will be written
+            print("[DEBUG] Writing LOOCV summary (first row):", summary)
+            print("[DEBUG] Writing LOOCV per-fold rows (count):", len(per_fold_rows))
+            # Write both the aggregate summary and all per-fold rows to the same file
+            _write_summary_csv([summary] + per_fold_rows, summary_path)
+            # Still write per-fold metrics to a separate file for debugging
+            per_fold_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], "loocv_folds.csv")
+            _write_summary_csv(per_fold_rows, per_fold_path)
             print(f"[INFO] LOOCV summary written to {summary_path}")
+            print(f"[INFO] LOOCV per-fold metrics written to {per_fold_path}")
         else:
             print("[WARN] No LOOCV predictions generated.")
 
     # --- End LOOCV logic ---
 
     # Run LOOCV if requested in config
+    print(f"[DEBUG] eval_cfg.get('run_loocv', False) = {eval_cfg.get('run_loocv', False)}")
     if eval_cfg.get("run_loocv", False):
+        print("[DEBUG] Calling run_loocv_mc_group()...")
         run_loocv_mc_group()
 
     # --- Regression metrics for train, test, and combined sets ---
