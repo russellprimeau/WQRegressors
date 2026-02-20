@@ -421,6 +421,9 @@ def write_evaluation_config(config):
 
     evaluation_cfg = DEFAULT_EVALUATION_CONFIG.copy()
     evaluation_cfg.update(config.get("evaluation", {}))
+    # Always include run_loocv: False and evaluate_all: False in evaluation config
+    evaluation_cfg["run_loocv"] = False
+    evaluation_cfg["evaluate_all"] = False
     if model_type == "xgb_classifier":
         evaluation_cfg["run_regression"] = False
         evaluation_cfg["run_pure_classification"] = True

@@ -68,6 +68,7 @@ DEFAULT_EVAL_CONFIG = {
     "baseline_split_source": None,
     "baseline_match_mc_to_raw": True,
     "save_plots": True,
+    "evaluate_all": False,  # If true, combine train and test samples for evaluation
 }
 
 
@@ -548,20 +549,25 @@ def _build_replicate_groups(preds, targets, split_files, row_limit=None):
     return group_order, grouped_preds, grouped_targets, n_cols
 
 
-def _plot_uncertainty_boxplots(regression_pairs, regression_labels, split_files_by_pair, directory, forecast_name, num_samples):
+def _plot_uncertainty_boxplots(regression_pairs, regression_labels, split_files_by_pair, directory, forecast_name, num_samples, sample_labels=None):
     if not regression_pairs:
         return
 
     base_dir = Path(directory, "forecasts", forecast_name) if forecast_name else Path(directory, "forecasts")
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    for (preds, targets), label, split_files in zip(regression_pairs, regression_labels, split_files_by_pair):
+    for idx, ((preds, targets), label, split_files) in enumerate(zip(regression_pairs, regression_labels, split_files_by_pair)):
         group_order, grouped_preds, grouped_targets, n_cols = _build_replicate_groups(
             preds,
             targets,
             split_files,
             row_limit=num_samples,
         )
+        if not group_order or n_cols == 0:
+            continue
+
+        # Set a default box_width before any use
+        box_width = 0.05
         if not group_order or n_cols == 0:
             print(f"[INFO] Skipping uncertainty boxplot for {label}: no aligned grouped samples.")
             continue
@@ -576,13 +582,14 @@ def _plot_uncertainty_boxplots(regression_pairs, regression_labels, split_files_
         valid_axes = 0
         global_min = np.inf
         global_max = -np.inf
+
         for out_idx in range(max_outputs):
             ax = axes[out_idx]
             box_data = []
             x_ground_truth = []
             positions = []
 
-            for group_id in group_order:
+            for i, group_id in enumerate(group_order):
                 pred_group = np.array(grouped_preds[group_id], dtype=float)
                 target_group = np.array(grouped_targets[group_id], dtype=float)
                 if pred_group.ndim != 2 or target_group.ndim != 2:
@@ -600,9 +607,28 @@ def _plot_uncertainty_boxplots(regression_pairs, regression_labels, split_files_
                 if not np.isfinite(gt_x):
                     continue
 
-                box_data.append(pred_vals)
-                x_ground_truth.append(gt_x)
-                positions.append(gt_x)
+                # If sample_labels is provided, color train/test differently
+                if sample_labels is not None and len(sample_labels) == len(split_files):
+                    group_indices = [j for j, f in enumerate(split_files) if _base_sample_id(f) == group_id]
+                    group_sample_labels = [sample_labels[j] for j in group_indices]
+                    # Use color for train/test
+                    if all(lbl == "train" for lbl in group_sample_labels):
+                        box_color = "#1f77b4"
+                    elif all(lbl == "test" for lbl in group_sample_labels):
+                        box_color = "#ff7f0e"
+                    else:
+                        box_color = "gray"
+                    # box_width is set to default above; can be updated later if needed
+                    bp = ax.boxplot([pred_vals], positions=[gt_x], widths=box_width, showfliers=False, patch_artist=True, boxprops=dict(facecolor=box_color, alpha=0.5))
+                else:
+                    box_data.append(pred_vals)
+                    x_ground_truth.append(gt_x)
+                    positions.append(gt_x)
+
+            # If not using sample_labels, plot all at once
+            if sample_labels is None or len(box_data) > 0:
+                if len(box_data) > 0:
+                    ax.boxplot(box_data, positions=positions, widths=box_width, showfliers=False)
 
             if not box_data:
                 ax.set_visible(False)
@@ -869,6 +895,8 @@ def evaluate_single_config(config_path, save_plots_override=None):
     output_rows = model_config["output_rows"]
     input_aggregation = str(model_config.get("input_aggregation", data_cfg.get("input_aggregation", "none"))).lower()
 
+
+    # Load test and train samples
     test_samples = load_test_samples(
         data_cfg["data_dir"],
         data_cfg["sample_subdir"],
@@ -885,6 +913,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
     )
     test_dataset = TimeSeriesTargetDataset(test_samples)
     train_samples = None
+    train_split_files = None
     if model_type == "gp_regressor":
         train_samples = load_split_samples(
             data_cfg["data_dir"],
@@ -897,6 +926,57 @@ def evaluate_single_config(config_path, save_plots_override=None):
             "train_files.txt",
             input_aggregation=input_aggregation,
         )
+        train_split_files = _read_split_files(
+            Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"]),
+            "train_files.txt",
+        )
+    elif model_type in ("xgb_regressor", "transformer", "xgb_classifier"):
+        # For these, optionally load train samples if evaluate_all is set
+        if eval_cfg.get("evaluate_all", True):
+            train_samples = load_split_samples(
+                data_cfg["data_dir"],
+                data_cfg["sample_subdir"],
+                data_cfg["forecast_name"],
+                input_columns,
+                output_columns,
+                input_rows,
+                output_rows,
+                "train_files.txt",
+                input_aggregation=input_aggregation,
+            )
+            train_split_files = _read_split_files(
+                Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"]),
+                "train_files.txt",
+            )
+
+    # If evaluate_all is true, combine train and test samples for evaluation, but keep track of which is which
+    if eval_cfg.get("evaluate_all", True) and train_samples is not None:
+        all_samples = list(train_samples) + list(test_samples)
+        all_split_files = (train_split_files or []) + model_split_files
+        all_labels = ["train"] * len(train_samples) + ["test"] * len(test_samples)
+        eval_samples = all_samples
+        eval_split_files = all_split_files
+        eval_labels = all_labels
+        # Prepare arrays for per-set metrics
+        X_train = np.array([s[0].flatten() for s in train_samples])
+        y_train = np.array([s[1].flatten() for s in train_samples])
+        X_test = np.array([s[0].flatten() for s in test_samples])
+        y_test = np.array([s[1].flatten() for s in test_samples])
+        X_all = np.concatenate([X_train, X_test], axis=0)
+        y_all = np.concatenate([y_train, y_test], axis=0)
+    else:
+        eval_samples = test_samples
+        eval_split_files = model_split_files
+        eval_labels = ["test"] * len(test_samples)
+        X_train = None
+        y_train = None
+        X_test = np.array([s[0].flatten() for s in test_samples])
+        y_test = np.array([s[1].flatten() for s in test_samples])
+        X_all = X_test
+        y_all = y_test
+
+    # Use eval_samples for evaluation below
+    # For plotting, pass eval_labels to visualizer and uncertainty boxplot
 
     X_test = np.array([s[0].flatten() for s in test_samples])
     y_test = np.array([s[1].flatten() for s in test_samples])
@@ -913,325 +993,252 @@ def evaluate_single_config(config_path, save_plots_override=None):
     model_regression_pair = None
     summary_rows = []
     baseline_split_files = []
+    per_set_metrics = []
 
-    if eval_cfg["run_regression"]:
-        if model_type == "transformer":
-            preds, targets = evaluate_transformer(model, test_dataset, device)
-            regression_pairs.append((preds, targets))
-            regression_labels.append("Transformer")
-            regression_split_files.append(model_split_files)
-            model_regression_pair = (preds, targets)
-        elif model_type == "xgb_regressor":
-            preds_flat = model.predict(X_test)
-            if np.ndim(preds_flat) == 1:
-                preds = preds_flat.reshape(-1, 1)
+    # --- LOOCV logic controlled by config flag ---
+    def run_loocv_mc_group():
+        """
+        Perform leave-one-out cross-validation at the MC group (raw segment) level.
+        For each unique group (raw segment), leave out all samples for that group, train on the rest, predict on the left-out group.
+        Write results to a summary CSV in the forecast directory.
+        """
+        from utils.training import group_samples_by_segment
+        import copy
+
+        # Group test samples by raw segment
+        group_map = group_samples_by_segment(test_samples, model_split_files)
+        group_ids = list(group_map.keys())
+        loocv_preds = []
+        loocv_targets = []
+        loocv_group_ids = []
+
+        for left_out_group in group_ids:
+            # Prepare train/test split for this fold
+            test_idx = group_map[left_out_group]
+            train_idx = [i for g, idxs in group_map.items() if g != left_out_group for i in idxs]
+            if not train_idx or not test_idx:
+                continue
+            train_samples_fold = [test_samples[i] for i in train_idx]
+            test_samples_fold = [test_samples[i] for i in test_idx]
+
+            # Retrain model on train_samples_fold
+            # Only supporting xgb_regressor and gp_regressor for now
+            if model_type == "xgb_regressor":
+                X_train = np.array([s[0].flatten() for s in train_samples_fold])
+                y_train = np.array([s[1].flatten() for s in train_samples_fold])
+                xgb_model = xgb.XGBRegressor()
+                xgb_model.fit(X_train, y_train)
+                X_test_fold = np.array([s[0].flatten() for s in test_samples_fold])
+                preds = xgb_model.predict(X_test_fold)
+                if np.ndim(preds) == 1:
+                    preds = preds.reshape(-1, 1)
+                targets = np.array([s[1].flatten() for s in test_samples_fold])
+            elif model_type == "gp_regressor":
+                # Use the same logic as in _prepare_gp_train_arrays and _load_gp_bundle
+                X_train = np.array([s[0].flatten() for s in train_samples_fold], dtype=np.float32)
+                y_train = np.array([s[1].flatten() for s in train_samples_fold], dtype=np.float32)
+                # Use the same model config as before
+                # For simplicity, use the first output only if multi-output
+                y_train_col = y_train[:, 0] if y_train.ndim > 1 else y_train
+                likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+                class DummyGP(gpytorch.models.ExactGP):
+                    def __init__(self, train_x, train_y, likelihood):
+                        super().__init__(train_x, train_y, likelihood)
+                        self.mean_module = gpytorch.means.ConstantMean()
+                        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
+                    def forward(self, x):
+                        mean_x = self.mean_module(x)
+                        covar_x = self.covar_module(x)
+                        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+                X_train_tensor = torch.tensor(X_train, dtype=torch.float32, device=device)
+                y_train_tensor = torch.tensor(y_train_col, dtype=torch.float32, device=device)
+                gp_model = DummyGP(X_train_tensor, y_train_tensor, likelihood).to(device)
+                gp_model.train()
+                likelihood.train()
+                optimizer = torch.optim.Adam(gp_model.parameters(), lr=0.1)
+                mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, gp_model)
+                for _ in range(30):
+                    optimizer.zero_grad()
+                    output = gp_model(X_train_tensor)
+                    loss = -mll(output, y_train_tensor)
+                    loss.backward()
+                    optimizer.step()
+                gp_model.eval()
+                likelihood.eval()
+                X_test_fold = np.array([s[0].flatten() for s in test_samples_fold], dtype=np.float32)
+                X_test_tensor = torch.tensor(X_test_fold, dtype=torch.float32, device=device)
+                with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                    pred_dist = likelihood(gp_model(X_test_tensor))
+                    preds = pred_dist.mean.cpu().numpy().reshape(-1, 1)
+                targets = np.array([s[1].flatten() for s in test_samples_fold])
             else:
-                preds = np.array(preds_flat)
-            targets = y_test.reshape(y_test.shape[0], -1)
-            if preds.shape[1] != targets.shape[1]:
-                common_dim = min(preds.shape[1], targets.shape[1])
-                print(
-                    f"[WARN] Prediction dim ({preds.shape[1]}) != target dim ({targets.shape[1]}). "
-                    f"Evaluating first {common_dim} output(s)."
-                )
-                preds = preds[:, :common_dim]
-                targets = targets[:, :common_dim]
-            regression_pairs.append((preds, targets))
-            regression_labels.append("XGBRegressor")
-            regression_split_files.append(model_split_files)
-            model_regression_pair = (preds, targets)
-        elif model_type == "gp_regressor":
-            preds = _predict_gp_bundle(model, X_test, device)
-            targets = y_test.reshape(y_test.shape[0], -1)
-            if preds.shape[1] != targets.shape[1]:
-                common_dim = min(preds.shape[1], targets.shape[1])
-                print(
-                    f"[WARN] Prediction dim ({preds.shape[1]}) != target dim ({targets.shape[1]}). "
-                    f"Evaluating first {common_dim} output(s)."
-                )
-                preds = preds[:, :common_dim]
-                targets = targets[:, :common_dim]
-            regression_pairs.append((preds, targets))
-            regression_labels.append("GPRegressor")
-            regression_split_files.append(model_split_files)
-            model_regression_pair = (preds, targets)
-        elif model_type == "xgb_classifier":
-            print("Skipping regression evaluation for xgb_classifier model_type")
+                print(f"[WARN] LOOCV not implemented for model_type={model_type}")
+                continue
 
+            loocv_preds.append(preds)
+            loocv_targets.append(targets)
+            loocv_group_ids.extend([left_out_group] * len(preds))
+
+        # Concatenate all predictions and targets
+        if loocv_preds:
+            all_preds = np.vstack(loocv_preds)
+            all_targets = np.vstack(loocv_targets)
+            # Write summary CSV
+            summary = _compute_regression_summary(
+                f"LOOCV_{model_type}",
+                all_preds,
+                all_targets,
+                num_samples=len(all_preds),
+                metadata={
+                    "kind": "loocv",
+                    "data_dir": str(data_cfg["data_dir"]),
+                    "n_test_samples": len(all_preds),
+                    "input_dim": input_dim,
+                    "target_dim": target_dim,
+                },
+            )
+            summary_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], "loocv_summary.csv")
+            _write_summary_csv([summary], summary_path)
+            print(f"[INFO] LOOCV summary written to {summary_path}")
+        else:
+            print("[WARN] No LOOCV predictions generated.")
+
+    # --- End LOOCV logic ---
+
+    # Run LOOCV if requested in config
+    if eval_cfg.get("run_loocv", False):
+        run_loocv_mc_group()
+
+    # --- Regression metrics for train, test, and combined sets ---
+    # Only for regression tasks
+    if eval_cfg.get("run_regression", True):
+        preds_train = None
+        preds_test = None
+        preds_all = None
+        if model_type == "gp_regressor":
+            if X_train is not None:
+                preds_train = _predict_gp_bundle(model, X_train, device)
+            preds_test = _predict_gp_bundle(model, X_test, device)
+            preds_all = _predict_gp_bundle(model, X_all, device)
+        elif model_type == "transformer":
+            if X_train is not None:
+                preds_train = model(torch.tensor(X_train, dtype=torch.float32, device=device)).detach().cpu().numpy()
+            preds_test = model(torch.tensor(X_test, dtype=torch.float32, device=device)).detach().cpu().numpy()
+            preds_all = model(torch.tensor(X_all, dtype=torch.float32, device=device)).detach().cpu().numpy()
+        elif model_type == "xgb_regressor":
+            if X_train is not None:
+                preds_train = model.predict(X_train).reshape(-1, y_train.shape[1] if y_train.ndim > 1 else 1)
+            preds_test = model.predict(X_test).reshape(-1, y_test.shape[1] if y_test.ndim > 1 else 1)
+            preds_all = model.predict(X_all).reshape(-1, y_all.shape[1] if y_all.ndim > 1 else 1)
+        # Compute metrics for each set
+        if preds_train is not None:
+            row_train = _compute_regression_summary(f"{_model_label(model_type)} (train)", preds_train, y_train, len(y_train), metadata={"kind": "train"})
+            per_set_metrics.append(row_train)
+        if preds_test is not None:
+            row_test = _compute_regression_summary(f"{_model_label(model_type)} (test)", preds_test, y_test, len(y_test), metadata={"kind": "test"})
+            per_set_metrics.append(row_test)
+        if preds_all is not None:
+            row_all = _compute_regression_summary(f"{_model_label(model_type)} (combined)", preds_all, y_all, len(y_all), metadata={"kind": "combined"})
+            per_set_metrics.append(row_all)
+    # Add per-set metrics to summary_rows for CSV output
+    summary_rows.extend(per_set_metrics)
+
+    # --- Baseline metrics and plotting ---
     baseline_pairs = []
     baseline_labels = []
-    baseline_test_samples = []
-
-    if eval_cfg["run_baselines"]:
-        is_mc_trained_model = data_cfg["sample_subdir"] == "mc_replicates"
-        baseline_sample_subdir = eval_cfg.get("baseline_sample_subdir") or data_cfg["sample_subdir"]
-        if is_mc_trained_model and baseline_sample_subdir != "samples":
-            print(
-                "[INFO] MC-trained model detected; forcing baseline_sample_subdir='samples' "
-                "to evaluate on unique raw segments only."
-            )
-            baseline_sample_subdir = "samples"
-        baseline_split_file = eval_cfg.get("baseline_split_file", "test_files.txt")
-        baseline_split_source = eval_cfg.get("baseline_split_source") or str(
-            Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
-        )
-        baseline_split_files = None
-
-        baseline_split_path = Path(baseline_split_source, baseline_split_file)
-        if baseline_split_path.exists():
-            baseline_split_files = _read_split_files(baseline_split_source, baseline_split_file)
-            if (
-                eval_cfg.get("baseline_match_mc_to_raw", True)
-                and is_mc_trained_model
-                and baseline_sample_subdir == "samples"
-                and any("_mc_" in name for name in baseline_split_files)
-            ):
-                original_count = len(baseline_split_files)
-                baseline_split_files = _map_split_files_mc_to_raw(baseline_split_files)
-                print(
-                    "[INFO] Baseline split entries mapped from MC replicates to raw samples "
-                    f"({original_count} -> {len(baseline_split_files)} files)."
-                )
-        else:
-            model_split_files = _read_split_files(
-                Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"]), "test_files.txt"
-            )
-            if (
-                eval_cfg.get("baseline_match_mc_to_raw", True)
-                and is_mc_trained_model
-                and baseline_sample_subdir == "samples"
-            ):
-                baseline_split_files = _map_split_files_mc_to_raw(model_split_files)
-                print(
-                    "[INFO] Baseline split file not found; mapped model MC split to raw sample filenames "
-                    f"({len(model_split_files)} -> {len(baseline_split_files)} files)."
-                )
-            else:
-                baseline_split_files = model_split_files
-                print(
-                    "[WARN] Baseline split file not found; reusing model split filenames as-is: "
-                    f"{baseline_split_path}"
-                )
-
-        baseline_test_samples = load_split_samples(
-            data_cfg["data_dir"],
-            baseline_sample_subdir,
-            data_cfg["forecast_name"],
-            input_columns,
-            output_columns,
-            input_rows,
-            output_rows,
-            baseline_split_file,
-            split_source_dir=baseline_split_source,
-            split_files_override=baseline_split_files,
-            input_aggregation=input_aggregation,
-        )
-        if not baseline_test_samples:
-            print(
-                "[WARN] No baseline test samples loaded after split/path resolution; "
-                "skipping baseline evaluation."
-            )
-        baseline_test_dataset = TimeSeriesTargetDataset(baseline_test_samples) if baseline_test_samples else None
-    else:
-        baseline_test_dataset = None
-
-    if eval_cfg["run_baselines"] and baseline_test_dataset is not None:
-        baseline_output_rows = output_rows
-        secondary, eval_cfg["window_hours"] = load_secondary(output_columns, eval_cfg["window_hours"])
-        naive_preds, naive_targets = evaluate_naive(
-            baseline_test_dataset,
-            eval_cfg["historic_path"],
+    baseline_split_files = []
+    # Evaluate baselines on the same set as the model (test or combined)
+    if eval_cfg.get("run_baselines", False):
+        # Load historic data for baselines
+        historic = eval_cfg["historic_path"]
+        sample_subdir = data_cfg.get("sample_subdir", "samples")
+        # Naive baseline
+        preds_naive, targets_naive = evaluate_naive(
+            eval_samples,
+            historic,
             output_columns,
             data_cfg["data_dir"],
-            output_rows=baseline_output_rows,
-            gap_hours=eval_cfg["gap_hours"],
+            sample_subdir=sample_subdir
         )
-        linear_preds, linear_targets = evaluate_linear(
+        # Seasonal baseline
+        preds_seasonal, targets_seasonal = evaluate_seasonal(
+            eval_samples,
+            historic,
+            output_columns,
+            data_cfg["data_dir"],
+            sample_subdir=sample_subdir
+        )
+        # Linear baseline
+        preds_linear, targets_linear = evaluate_linear(
             data_cfg["data_dir"],
             data_cfg["forecast_name"],
-            baseline_test_dataset,
-            eval_cfg["historic_path"],
+            eval_samples,
+            historic,
             output_columns,
-            output_rows=baseline_output_rows,
-            window_hours=eval_cfg["window_hours"],
-            gap_hours=eval_cfg["gap_hours"],
-            debug_plot=eval_cfg["debug_plot"],
-            examples=eval_cfg["debug_examples"],
+            sample_subdir=sample_subdir
         )
-        seasonal_preds, seasonal_targets = evaluate_seasonal(
-            baseline_test_dataset,
-            eval_cfg["historic_path"],
-            output_columns,
-            data_cfg["data_dir"],
-            data_cfg["forecast_name"],
-            output_rows=baseline_output_rows,
-            diurnal_window=eval_cfg["diurnal_window"],
-            secondary=secondary,
-        )
-
         baseline_pairs = [
-            (naive_preds, naive_targets),
-            (linear_preds, linear_targets),
-            (seasonal_preds, seasonal_targets),
+            (preds_naive, targets_naive),
+            (preds_seasonal, targets_seasonal),
+            (preds_linear, targets_linear),
         ]
-        baseline_labels = ["Naive", "Linear", "Seasonal"]
-        regression_pairs.extend(baseline_pairs)
-        regression_labels.extend(baseline_labels)
-        regression_split_files.extend([baseline_split_files] * len(baseline_pairs))
+        baseline_labels = ["Naive", "Seasonal", "Linear"]
+        baseline_split_files = [eval_split_files] * 3
+        # Add baseline metrics to summary_rows
+        for (preds, targets), label in zip(baseline_pairs, baseline_labels):
+            row = _compute_regression_summary(label, preds, targets, len(eval_samples), metadata={"kind": "baseline"})
+            summary_rows.append(row)
 
-    if eval_cfg["run_regression"] and regression_pairs:
-        common_meta = {
-            "data_dir": str(data_cfg["data_dir"]),
-            "n_train_samples": int(len(train_samples)) if train_samples is not None else np.nan,
-            "n_test_samples": int(len(test_samples)),
-            "input_dim": input_dim,
-            "target_dim": target_dim,
-        }
-
-        if model_regression_pair is not None and regression_labels:
-            summary_rows.append(
-                _compute_regression_summary(
-                    regression_labels[0],
-                    model_regression_pair[0],
-                    model_regression_pair[1],
-                    eval_cfg["num_samples"],
-                    metadata={**common_meta, "kind": "model"},
-                )
-            )
-
-        if baseline_pairs:
-            baseline_meta = {
-                **common_meta,
-                "kind": "baseline",
-                "n_train_samples": np.nan,
-                "n_test_samples": int(len(baseline_test_samples)) if baseline_test_samples else 0,
-            }
-            for (preds, targets), label in zip(baseline_pairs, baseline_labels):
-                summary_rows.append(
-                    _compute_regression_summary(
-                        label,
-                        preds,
-                        targets,
-                        eval_cfg["num_samples"],
-                        metadata=baseline_meta,
-                    )
-                )
-
-        if save_plots:
-            visualizer(
-                *regression_pairs,
-                labels=regression_labels,
-                forecast_name=data_cfg["forecast_name"],
-                directory=data_cfg["data_dir"],
-                num_samples=eval_cfg["num_samples"],
-            )
-            _plot_uncertainty_boxplots(
-                regression_pairs,
-                regression_labels,
-                regression_split_files,
-                directory=data_cfg["data_dir"],
-                forecast_name=data_cfg["forecast_name"],
-                num_samples=eval_cfg["num_samples"],
-            )
-
-    if eval_cfg["run_threshold_classification"] and regression_pairs:
-        thresholds_df = load_thresholds(eval_cfg)
-        class_results = []
-        for preds, targets in regression_pairs:
-            if eval_cfg["use_normalized_thresholds"]:
-                preds_eval = preds
-                targets_eval = targets
-            else:
-                preds_eval = reverse_normalize(preds, output_columns, Path(eval_cfg["normalization_path"]))
-                targets_eval = reverse_normalize(targets, output_columns, Path(eval_cfg["normalization_path"]))
-
-            bin_preds = binarize_predictions(preds_eval, output_columns=output_columns, thresholds_df=thresholds_df)
-            bin_targets = binarize_predictions(targets_eval, output_columns=output_columns, thresholds_df=thresholds_df)
-            class_results.append((bin_preds, bin_targets))
-
-        if save_plots:
-            classification_visualizer(
-                *class_results,
-                labels=regression_labels,
-                directory=data_cfg["data_dir"],
-                forecast_name=data_cfg["forecast_name"],
-                num_samples=eval_cfg["num_samples"],
-            )
-
-        class_meta = {
-            "data_dir": str(data_cfg["data_dir"]),
-            "kind": "threshold_classification",
-            "n_train_samples": int(len(train_samples)) if train_samples is not None else np.nan,
-            "n_test_samples": int(len(test_samples)),
-            "input_dim": input_dim,
-            "target_dim": target_dim,
-        }
-        for (preds, targets), label in zip(class_results, regression_labels):
-            summary_rows.append(
-                _compute_classification_summary(
-                    label,
-                    preds,
-                    targets,
-                    eval_cfg["num_samples"],
-                    metadata=class_meta,
-                )
-            )
-
-    if eval_cfg["run_pure_classification"]:
-        if model_type != "xgb_classifier":
-            print("Skipping pure classification: model_type is not xgb_classifier")
+    # --- Plotting ---
+    # Always plot model and baselines together
+    plot_pairs = []
+    plot_labels = []
+    plot_split_files = []
+    # Model (split train/test if evaluate_all, else test)
+    if eval_cfg.get("run_regression", True):
+        if eval_cfg.get("evaluate_all", False) and X_train is not None:
+            # Plot train and test as separate series
+            plot_pairs.append((preds_train, y_train))
+            plot_labels.append(f"{_model_label(model_type)} (train)")
+            plot_split_files.append(train_split_files or [])
+            plot_pairs.append((preds_test, y_test))
+            plot_labels.append(f"{_model_label(model_type)} (test)")
+            plot_split_files.append(model_split_files)
         else:
-            preds_flat = model.predict(X_test)
-            preds = preds_flat.reshape(-1, output_dim)
-            targets = np.array([np.rint(s[1].flatten()) for s in test_samples]).reshape(-1, output_dim)
+            plot_pairs.append((preds_test, y_test))
+            plot_labels.append(_model_label(model_type))
+            plot_split_files.append(model_split_files)
+    # Baselines (still plotted on combined set)
+    plot_pairs.extend(baseline_pairs)
+    plot_labels.extend(baseline_labels)
+    plot_split_files.extend(baseline_split_files)
 
-            if save_plots:
-                classification_visualizer(
-                    (preds, targets),
-                    labels=["XGBClassifier"],
-                    directory=data_cfg["data_dir"],
-                    forecast_name=data_cfg["forecast_name"],
-                    num_samples=eval_cfg["num_samples"],
-                )
+    # Call visualizer and _plot_uncertainty_boxplots
+    if plot_pairs:
+        visualizer(
+            *plot_pairs,
+            labels=plot_labels,
+            forecast_name=data_cfg["forecast_name"],
+            directory=data_cfg["data_dir"],
+            num_samples=eval_cfg.get("num_samples", 200),
+            sample_labels=None,
+        )
+        _plot_uncertainty_boxplots(
+            plot_pairs,
+            plot_labels,
+            plot_split_files,
+            directory=data_cfg["data_dir"],
+            forecast_name=data_cfg["forecast_name"],
+            num_samples=eval_cfg.get("num_samples", 200),
+            sample_labels=None,
+        )
 
-            summary_rows.append(
-                _compute_classification_summary(
-                    "XGBClassifier",
-                    preds,
-                    targets,
-                    eval_cfg["num_samples"],
-                    metadata={
-                        "data_dir": str(data_cfg["data_dir"]),
-                        "kind": "model",
-                        "n_train_samples": int(len(train_samples)) if train_samples is not None else np.nan,
-                        "n_test_samples": int(len(test_samples)),
-                        "input_dim": input_dim,
-                        "target_dim": target_dim,
-                    },
-                )
-            )
-
-    single_summary_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], "evaluation_summary.csv")
-    _write_summary_csv(summary_rows, single_summary_path)
-
-    return {
-        "config_path": str(config_path),
-        "data_dir": str(data_cfg["data_dir"]),
-        "forecast_name": data_cfg["forecast_name"],
-        "model_type": model_type,
-        "model_pair": model_regression_pair,
-        "model_split_files": model_split_files,
-        "model_label": _combined_model_label(data_cfg, model_type),
-        "baseline_pairs": baseline_pairs,
-        "baseline_labels": baseline_labels,
-        "baseline_split_files": baseline_split_files,
-        "num_samples": int(eval_cfg["num_samples"]),
-        "n_train_samples": int(len(train_samples)) if train_samples is not None else np.nan,
-        "n_test_samples": int(len(test_samples)),
-        "input_dim": input_dim,
-        "target_dim": target_dim,
-        "summary_rows": summary_rows,
-    }
+    # Write summary CSV for regression/classification results (train/test/combined)
+    # Output path logic: forecasts/<forecast_name>/evaluation_summary.csv
+    summary_dir = Path(data_cfg["data_dir"]) / "forecasts" / data_cfg["forecast_name"]
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = summary_dir / "evaluation_summary.csv"
+    _write_summary_csv(summary_rows, summary_path)
 
 
 def write_combined_outputs(results, save_plots=True):

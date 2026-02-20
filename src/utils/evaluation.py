@@ -52,14 +52,14 @@ def evaluate_transformer(model, dataset, device):
 
 
 @lru_cache(maxsize=4096)
-def _cached_sample_timestamps(data_dir, filename):
-    sample_path = Path(data_dir, "samples", filename)
+def _cached_sample_timestamps(data_dir, filename, sample_subdir="samples"):
+    sample_path = Path(data_dir, sample_subdir, filename)
     sample_df = pd.read_csv(sample_path, usecols=["TIMESTAMP"], parse_dates=["TIMESTAMP"])
     return tuple(sample_df["TIMESTAMP"].tolist())
 
 
-def _get_output_times(data_dir, filename, output_rows):
-    timestamps = pd.DatetimeIndex(_cached_sample_timestamps(str(Path(data_dir).resolve()), filename))
+def _get_output_times(data_dir, filename, output_rows, sample_subdir="samples"):
+    timestamps = pd.DatetimeIndex(_cached_sample_timestamps(str(Path(data_dir).resolve()), filename, sample_subdir=sample_subdir))
 
     if isinstance(output_rows, slice):
         return timestamps[output_rows]
@@ -97,7 +97,7 @@ def _seasonal_window_mean(days, hours, values, target_day, target_hour, diurnal_
         return np.nan
     return float(np.mean(finite_vals))
 
-def evaluate_naive(dataset, historic, output_columns, data_dir, output_rows=-1, gap_hours=5):
+def evaluate_naive(dataset, historic, output_columns, data_dir, output_rows=-1, gap_hours=5, sample_subdir="samples"):
 
     # Load lookup table for baseline model
     df = pd.read_csv(historic,parse_dates=["TIMESTAMP"])
@@ -112,7 +112,7 @@ def evaluate_naive(dataset, historic, output_columns, data_dir, output_rows=-1, 
     for i in range(len(dataset)):
         _, y, filename = dataset[i]
 
-        output_times = _get_output_times(data_dir, filename, output_rows)
+        output_times = _get_output_times(data_dir, filename, output_rows, sample_subdir=sample_subdir)
         if len(output_times) == 0:
             continue
 
@@ -127,12 +127,12 @@ def evaluate_naive(dataset, historic, output_columns, data_dir, output_rows=-1, 
             baseline_pred = np.tile(last_value, (len(output_times), 1))
 
         predictions.append(baseline_pred.reshape(-1))
-        targets.append(y.numpy().reshape(-1))  # Ensure target is flattened
+        targets.append(y.reshape(-1))  # Ensure target is flattened
 
     return np.array(predictions), np.array(targets)
 
 def evaluate_linear(data_dir, forecast_name, dataset, historic, output_columns, output_rows=-1, window_hours=6,
-                    gap_hours=5, debug_plot=False, examples=10):
+                    gap_hours=5, debug_plot=False, examples=10, sample_subdir="samples"):
     """
     Linear baseline with causal gap constraint and optional debug visualization.
 
@@ -152,7 +152,7 @@ def evaluate_linear(data_dir, forecast_name, dataset, historic, output_columns, 
     for i in range(len(dataset)):
         _, y, filename = dataset[i]
 
-        output_times = _get_output_times(data_dir, filename, output_rows)
+        output_times = _get_output_times(data_dir, filename, output_rows, sample_subdir=sample_subdir)
         if len(output_times) == 0:
             continue
 
@@ -205,12 +205,12 @@ def evaluate_linear(data_dir, forecast_name, dataset, historic, output_columns, 
                         plt.close()
 
         predictions.append(pred_matrix.reshape(-1))
-        targets.append(y.numpy().reshape(-1))
+        targets.append(y.reshape(-1))
 
     return np.array(predictions), np.array(targets)
 
-def evaluate_seasonal(dataset, historic, output_columns, data_dir, forecast_name, output_rows=-1, diurnal_window=2,
-                      secondary=None):
+def evaluate_seasonal(dataset, historic, output_columns, data_dir, output_rows=-1, diurnal_window=2,
+                      secondary=None, sample_subdir="samples"):
     """
     Seasonal baseline using either full `historical_df` or, if available,
     a secondary CSV file for specific output columns.
@@ -273,7 +273,7 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, forecast_name
     # === Predict values for each sample ===
     for i in range(len(dataset)):
         _, y, filename = dataset[i]
-        output_times = _get_output_times(data_dir, filename, output_rows)
+        output_times = _get_output_times(data_dir, filename, output_rows, sample_subdir=sample_subdir)
         if len(output_times) == 0:
             continue
 
@@ -305,7 +305,7 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, forecast_name
                 )
 
         predictions.append(pred_matrix.reshape(-1))
-        targets.append(y.numpy().reshape(-1))
+        targets.append(y.reshape(-1))
 
     predictions = np.array(predictions)
     targets = np.array(targets)
@@ -415,7 +415,7 @@ def binarize_predictions(preds, output_columns, thresholds_df):
         binarized[:, i] = (preds[:, i] > threshold).astype(int)
     return binarized
 
-def visualizer(*pred_target_pairs, labels=None, directory, forecast_name, num_samples=200):
+def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=None, num_samples=200, sample_labels=None):
     """
     Visualize predictions and targets for a range of gaps from time series.
     :param pred_target_pairs:
@@ -442,6 +442,7 @@ def visualizer(*pred_target_pairs, labels=None, directory, forecast_name, num_sa
     min_val, max_val = float("inf"), float("-inf")
     metrics = []  # store (label, MAE, RMSE, R2)
 
+
     for i, (preds, targets) in enumerate(pred_target_pairs):
         preds, targets = _aligned_flat(preds, targets, limit=num_samples)
         label = labels[i] if labels else f"Model {i+1}"
@@ -451,10 +452,20 @@ def visualizer(*pred_target_pairs, labels=None, directory, forecast_name, num_sa
             continue
 
         mask = np.isfinite(preds) & np.isfinite(targets)
+        # If sample_labels is provided, plot train/test with different symbology
+        if sample_labels is not None and len(sample_labels) == len(preds):
+            for group, marker, color in [("train", "o", "#1f77b4"), ("test", "s", "#ff7f0e")]:
+                group_mask = (np.array(sample_labels) == group) & mask
+                if np.any(group_mask):
+                    ax.scatter(targets[group_mask], preds[group_mask], label=f"{label} ({group})", alpha=0.7, marker=marker, color=color)
+                    min_val = min(min_val, np.nanmin(targets[group_mask]), np.nanmin(preds[group_mask]))
+                    max_val = max(max_val, np.nanmax(targets[group_mask]), np.nanmax(preds[group_mask]))
+        else:
+            if mask.any():
+                ax.scatter(targets[mask], preds[mask], label=label, alpha=0.7, color=colors[i])
+                min_val = min(min_val, np.nanmin(targets[mask]), np.nanmin(preds[mask]))
+                max_val = max(max_val, np.nanmax(targets[mask]), np.nanmax(preds[mask]))
         if mask.any():
-            ax.scatter(targets[mask], preds[mask], label=label, alpha=0.7, color=colors[i])
-            min_val = min(min_val, np.nanmin(targets[mask]), np.nanmin(preds[mask]))
-            max_val = max(max_val, np.nanmax(targets[mask]), np.nanmax(preds[mask]))
             mae = mean_absolute_error(targets[mask], preds[mask])
             rmse = np.sqrt(mean_squared_error(targets[mask], preds[mask]))
             r2 = r2_score(targets[mask], preds[mask])
