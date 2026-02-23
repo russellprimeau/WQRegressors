@@ -1605,11 +1605,15 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                                 model_dir = plan.dataset_dir / "forecasts" / forecast_name
                             else:
                                 # Construct model directory name with model type and index
+                                # Use consistent abbreviation for model_dir_name
+                                model_abbrev_map = {
+                                    'transformer': 'transformer',
+                                    'xgbregressor': 'xgb',
+                                    'gpregressor': 'gp',
+                                }
                                 model_name = str(model).strip().lower()
-                                if model_name in ["transformer", "gpregressor", "xgbregressor"]:
-                                    model_dir_name = f"{model_name}_01_r{row_count_val:03d}_{feature_tag}_k{subset_rank:02d}"
-                                else:
-                                    model_dir_name = f"{model_name}_r{row_count_val:03d}_{feature_tag}_k{subset_rank:02d}"
+                                abbrev = model_abbrev_map.get(model_name, model_name)
+                                model_dir_name = f"{abbrev}_01_r{row_count_val:03d}_{feature_tag}_k{subset_rank:02d}"
                                 model_dir = plan.dataset_dir / "forecasts" / "feature_sweeps" / model_dir_name
                             subset_rank_str = f"_k{subset_rank:02d}.yml"
                             search_pattern = f"config_evaluate*{subset_rank_str}"
@@ -1642,8 +1646,9 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                                     print(f"[DEBUG] model_dir does not exist!")
                                 continue
                             cfg_path = cfg_candidates[0]
-                            import json
-                            import re
+                            # --- PATCH: Always use model_dir for LOOCV summary lookup ---
+                            loocv_summary_path = model_dir / "loocv_summary.csv"
+                            print(f"[DEBUG] Checking for loocv_summary.csv at: {loocv_summary_path}")
                             # For all models, including transformers, patch config YAML from configs subdirectory for LOOCV
                             print(f"[DEBUG] Loading config for LOOCV from: {cfg_path}")
                             with open(cfg_path, "r", encoding="utf-8") as f:
@@ -1653,11 +1658,13 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                             if "evaluation" not in cfg:
                                 cfg["evaluation"] = {}
                             cfg["evaluation"]["run_loocv"] = True
-                            import tempfile
-                            with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False, encoding="utf-8") as tmpf:
-                                yaml.safe_dump(cfg, tmpf, sort_keys=False, allow_unicode=True)
-                                tmp_cfg_path = tmpf.name
-                            # Evaluate with LOOCV enabled using importlib to load f_Evaluate.py by file path
+                            loocv_cfg_path = model_dir / "config_loocv.yml"
+                            with open(loocv_cfg_path, "w", encoding="utf-8") as f:
+                                yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+                            print(f"[DEBUG] About to run LOOCV evaluation:")
+                            print(f"[DEBUG]   loocv_cfg_path: {loocv_cfg_path}")
+                            print(f"[DEBUG]   model_dir: {model_dir}")
+                            print(f"[DEBUG]   Should expect split files at: {model_dir / 'test_files.txt'} and {model_dir / 'train_files.txt'}")
                             try:
                                 import importlib.util
                                 import sys
@@ -1670,20 +1677,22 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                                 import contextlib
                                 import os
                                 with open(os.devnull, 'w') as devnull, contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-                                    feval.evaluate_single_config(tmp_cfg_path, save_plots_override=False)
+                                    feval.evaluate_single_config(str(loocv_cfg_path), save_plots_override=False)
                             except Exception as e:
                                 import traceback
                                 print(f"[WARN] Error during LOOCV evaluation for {plan.dataset_dir.name}: {e}")
+                                print(f"[WARN]   loocv_cfg_path: {loocv_cfg_path}")
+                                print(f"[WARN]   model_dir: {model_dir}")
+                                print(f"[WARN]   Expected split files at: {model_dir / 'test_files.txt'} and {model_dir / 'train_files.txt'}")
                                 traceback.print_exc()
-                            # Try to read LOOCV aggregate row from the model-specific subdirectory
-                            # Find correct output dir for LOOCV summary (where f_Evaluate.py writes it)
-                            # Use data_dir and forecast_name from the config
-                            data_dir = Path(cfg['data']['data_dir'])
-                            forecast_name = cfg['data']['forecast_name']
-                            loocv_summary_path = data_dir / "forecasts" / forecast_name / "loocv_summary.csv"
+                            # Always use the already-resolved model_dir for LOOCV and split file lookups
+                            loocv_summary_path = model_dir / "loocv_summary.csv"
+                            test_files_path = model_dir / "test_files.txt"
+                            train_files_path = model_dir / "train_files.txt"
                             print(f"[DEBUG] Checking for loocv_summary.csv at: {loocv_summary_path}")
                             print(f"[DEBUG] File exists: {loocv_summary_path.exists()}")
                             loocv_r2 = loocv_rmse = loocv_mae = float('nan')
+                            loocv_skill_v_naive = float('nan')
                             if loocv_summary_path.exists():
                                 try:
                                     print(f"[DEBUG] Attempting to read LOOCV summary from: {loocv_summary_path}")
@@ -1713,14 +1722,18 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                                         loocv_r2 = safe_float(agg_row['r2']) if 'r2' in agg_row else float('nan')
                                         loocv_rmse = safe_float(agg_row['rmse']) if 'rmse' in agg_row else float('nan')
                                         loocv_mae = safe_float(agg_row['mae']) if 'mae' in agg_row else float('nan')
-                                        print(f"[DEBUG] Extracted LOOCV values: r2={loocv_r2}, rmse={loocv_rmse}, mae={loocv_mae}")
+                                        if 'skill_v_naive' in agg_row:
+                                            loocv_skill_v_naive = safe_float(agg_row['skill_v_naive'])
+                                        print(f"[DEBUG] Extracted LOOCV values: r2={loocv_r2}, rmse={loocv_rmse}, mae={loocv_mae}, skill_v_naive={loocv_skill_v_naive}")
                                 except Exception as e:
                                     print(f"[WARN] Could not parse LOOCV summary for {plan.dataset_dir.name}: {e}")
                             # Write LOOCV results into feature_sweep_final_metrics.csv for the best model row only (column-based match)
+
+                            # Robust: Always append a row, even if LOOCV or update fails
                             try:
                                 df_metrics = pd.read_csv(final_metrics_csv)
                                 # Add columns if missing
-                                for col in ['loocv_r2', 'loocv_rmse', 'loocv_mae']:
+                                for col in ['loocv_r2', 'loocv_rmse', 'loocv_mae', 'loocv_skill_v_naive']:
                                     if col not in df_metrics.columns:
                                         df_metrics[col] = float('nan')
                                 # Use column-based matching to find the correct row using best_row values
@@ -1740,6 +1753,7 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                                     df_metrics.loc[row_mask, 'loocv_r2'] = loocv_r2
                                     df_metrics.loc[row_mask, 'loocv_rmse'] = loocv_rmse
                                     df_metrics.loc[row_mask, 'loocv_mae'] = loocv_mae
+                                    df_metrics.loc[row_mask, 'loocv_skill_v_naive'] = loocv_skill_v_naive
                                     print(f"[DEBUG] Row(s) after update: {df_metrics.loc[row_mask].to_dict('records')}")
                                     print(f"[POST] Wrote LOOCV results to feature_sweep_final_metrics.csv for best model in {plan.dataset_dir.name}")
                                 else:
@@ -1747,16 +1761,65 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                                 df_metrics.to_csv(final_metrics_csv, index=False)
                             except Exception as e:
                                 print(f"[WARN] Could not write LOOCV results to feature_sweep_final_metrics.csv for {plan.dataset_dir.name}: {e}")
-                            best_model_performance.append({
-                                'dataset': plan.dataset_dir.name,
-                                'nrmse': nrmse,
-                                'rmse': rmse,
-                                'r2': r2,
-                                'n_test_samples': n_test_samples,
-                                'loocv_r2': loocv_r2,
-                                'loocv_rmse': loocv_rmse,
-                                'loocv_mae': loocv_mae,
-                            })
+                            finally:
+                                # Always append a row, even if LOOCV failed
+                                try:
+                                    # Re-read the best row from the updated metrics file to ensure LOOCV values are included
+                                    try:
+                                        df_metrics_updated = pd.read_csv(final_metrics_csv)
+                                        # Use the same selection logic as above
+                                        df_valid = df_metrics_updated.copy()
+                                        if 'std_target' in df_valid.columns:
+                                            df_valid = df_valid[(df_valid['std_target'].notnull()) & (df_valid['std_target'] > 0)]
+                                        if 'r2' in df_valid.columns:
+                                            df_valid = df_valid[df_valid['r2'].notnull()]
+                                        if 'std_target' in df_valid.columns:
+                                            df_valid['nrmse'] = df_valid['rmse'] / df_valid['std_target']
+                                        else:
+                                            df_valid['nrmse'] = np.nan
+                                        valid_r2 = df_valid[df_valid['r2'].notnull() & np.isfinite(df_valid['r2'])]
+                                        if not valid_r2.empty:
+                                            idx_in_valid = valid_r2['r2'].idxmax()
+                                            best_row_updated = valid_r2.loc[idx_in_valid]
+                                            best_model_performance.append({
+                                                'dataset': plan.dataset_dir.name,
+                                                'nrmse': best_row_updated['nrmse'] if 'nrmse' in best_row_updated and pd.notnull(best_row_updated['nrmse']) else float('nan'),
+                                                'rmse': best_row_updated['rmse'] if 'rmse' in best_row_updated and pd.notnull(best_row_updated['rmse']) else float('nan'),
+                                                'r2': best_row_updated['r2'] if 'r2' in best_row_updated and pd.notnull(best_row_updated['r2']) else float('nan'),
+                                                'n_test_samples': best_row_updated['n_samples'] if 'n_samples' in best_row_updated and pd.notnull(best_row_updated['n_samples']) else float('nan'),
+                                                'loocv_r2': best_row_updated['loocv_r2'] if 'loocv_r2' in best_row_updated and pd.notnull(best_row_updated['loocv_r2']) else float('nan'),
+                                                'loocv_rmse': best_row_updated['loocv_rmse'] if 'loocv_rmse' in best_row_updated and pd.notnull(best_row_updated['loocv_rmse']) else float('nan'),
+                                                'loocv_mae': best_row_updated['loocv_mae'] if 'loocv_mae' in best_row_updated and pd.notnull(best_row_updated['loocv_mae']) else float('nan'),
+                                                'loocv_skill_v_naive': best_row_updated['loocv_skill_v_naive'] if 'loocv_skill_v_naive' in best_row_updated and pd.notnull(best_row_updated['loocv_skill_v_naive']) else float('nan'),
+                                            })
+                                        else:
+                                            # fallback: use previous values
+                                            best_model_performance.append({
+                                                'dataset': plan.dataset_dir.name,
+                                                'nrmse': nrmse,
+                                                'rmse': rmse,
+                                                'r2': r2,
+                                                'n_test_samples': n_test_samples,
+                                                'loocv_r2': loocv_r2,
+                                                'loocv_rmse': loocv_rmse,
+                                                'loocv_mae': loocv_mae,
+                                                'loocv_skill_v_naive': loocv_skill_v_naive,
+                                            })
+                                    except Exception as reread_exc:
+                                        print(f"[WARN] Could not re-read updated metrics for LOOCV: {reread_exc}")
+                                        best_model_performance.append({
+                                            'dataset': plan.dataset_dir.name,
+                                            'nrmse': nrmse,
+                                            'rmse': rmse,
+                                            'r2': r2,
+                                            'n_test_samples': n_test_samples,
+                                            'loocv_r2': loocv_r2,
+                                            'loocv_rmse': loocv_rmse,
+                                            'loocv_mae': loocv_mae,
+                                            'loocv_skill_v_naive': loocv_skill_v_naive,
+                                        })
+                                except Exception as append_exc:
+                                    print(f"[ERROR] Could not append best model performance for {plan.dataset_dir.name}: {append_exc}")
             except Exception as e:
                 print(f"[WARN] Could not process best model performance for {plan.dataset_dir.name}: {e}")
 
@@ -1794,17 +1857,17 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                 for bar in bars2:
                     height = bar.get_height()
                     ax2.text(bar.get_x() + bar.get_width()/2, height, f'{height:.2f}', ha='center', va='bottom', fontsize=8, rotation=90)
-                # LOOCV RMSE subplot
-                bars3 = ax3.bar(x, perf_df['loocv_rmse'], color='tab:green')
-                ax3.set_ylabel('LOOCV RMSE')
+                # LOOCV skill_v_naive subplot
+                bars3 = ax3.bar(x, perf_df['loocv_skill_v_naive'], color='tab:red')
+                ax3.set_ylabel('LOOCV Skill vs Naive')
                 ax3.grid(axis='y', alpha=0.3)
                 for bar in bars3:
                     height = bar.get_height()
-                    ax3.text(bar.get_x() + bar.get_width()/2, height, f'{height:.2e}', ha='center', va='bottom', fontsize=8, rotation=90)
+                    ax3.text(bar.get_x() + bar.get_width()/2, height, f'{height:.2f}', ha='center', va='bottom', fontsize=8, rotation=90)
                 # X axis
                 ax3.set_xticks(x)
                 ax3.set_xticklabels(perf_df['dataset'], rotation=45, ha='right')
-                fig.suptitle('Best Model Performance per Dataset (nRMSE, R², LOOCV RMSE)')
+                fig.suptitle('Best Model Performance per Dataset (nRMSE, R², Skill vs Naive)')
                 plot_path = output_dir / "summary_best_model_performance.png"
                 fig.savefig(plot_path, dpi=180, bbox_inches='tight')
                 plt.close(fig)
@@ -1841,13 +1904,13 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
         print(f"DATASET: {plan.dataset_dir.name}")
         print("=" * 100)
 
-        try:
-            surrogate_cfg = _select_surrogate_config(plan.train_configs)
-            surrogate_data = train_module.load_config(str(surrogate_cfg))["data"]
-            base_span = int(surrogate_data["input_row_2"]) - int(surrogate_data["input_row_1"])
-            row_counts = _parse_row_counts(args.row_counts, default_span=base_span)
+        surrogate_cfg = _select_surrogate_config(plan.train_configs)
+        surrogate_data = train_module.load_config(str(surrogate_cfg))["data"]
+        base_span = int(surrogate_data["input_row_2"]) - int(surrogate_data["input_row_1"])
+        row_counts = _parse_row_counts(args.row_counts, default_span=base_span)
 
-            for row_count in row_counts:
+        for row_count in row_counts:
+            try:
                 print(f"\n[SEARCH] rows={row_count} surrogate={surrogate_cfg.name}")
                 top_sorted, trace, feature_sensitivities = _beam_search_subsets(
                     dataset_dir=plan.dataset_dir,
@@ -1867,7 +1930,6 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     suppress_training_logs=not args.show_training_logs,
                     seed=args.seed,
                 )
-                
                 # Track feature importance for multi-target comparison
                 target_name = _derive_target_name(plan.dataset_dir.name, args.dataset_prefix)
                 if target_name not in sweep_results:
@@ -1899,92 +1961,96 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
 
                 # --- LOOCV for best model (highest R2) ---
                 if selected:
-                    # Pick the best by R2
-                    best_model = max(selected, key=lambda c: c.r2 if np.isfinite(c.r2) else float('-inf'))
-                    # Find config path for best model
-                    best_cfg_path = None
-                    for cfg in plan.train_configs:
-                        if best_model.feature_tag in str(cfg):
-                            best_cfg_path = cfg
-                            break
-                    if best_cfg_path is None:
-                        best_cfg_path = plan.train_configs[0]
-                    # --- PATCH START: Write LOOCV config to correct model dir and run f_Evaluate.py ---
-                    # Map model names to directory short names
-                    model_map = {
-                        'Transformer': 'transformer_01',
-                        'XGBRegressor': 'xgb_01',
-                        'GPRegressor': 'gp_01',
-                    }
-                    model_name = str(best_model.model) if hasattr(best_model, 'model') else None
-                    mapped_model_name = model_map.get(model_name, model_name.lower() if model_name else "unknown")
-                    row_count_val = int(best_model.row_count)
-                    feature_tag = str(best_model.feature_tag)
-                    subset_rank_val = int(getattr(best_model, 'subset_rank', 1))
-                    subset_rank_str = f"k{subset_rank_val:02d}"
-                    model_dir = plan.dataset_dir / 'forecasts' / 'feature_sweeps' / f"{mapped_model_name}_r{row_count_val}_{feature_tag}_{subset_rank_str}"
-                    model_dir.mkdir(parents=True, exist_ok=True)
-                    # Find config file for this subset and model
-                    configs_dir = plan.dataset_dir / 'forecasts' / 'feature_sweeps' / 'configs'
-                    config_path = None
-                    for cfg_file in configs_dir.glob(f"*{mapped_model_name}*r{row_count_val:03d}_{feature_tag}*.yml"):
-                        config_path = cfg_file
-                        break
-                    if config_path is None:
-                        for cfg_file in configs_dir.glob(f"*r{row_count_val:03d}_{feature_tag}*.yml"):
+                    try:
+                        # Pick the best by R2
+                        best_model = max(selected, key=lambda c: c.r2 if np.isfinite(c.r2) else float('-inf'))
+                        # Find config path for best model
+                        best_cfg_path = None
+                        for cfg in plan.train_configs:
+                            if best_model.feature_tag in str(cfg):
+                                best_cfg_path = cfg
+                                break
+                        if best_cfg_path is None:
+                            best_cfg_path = plan.train_configs[0]
+                        # --- PATCH START: Write LOOCV config to correct model dir and run f_Evaluate.py ---
+                        # Consistent model abbreviation mapping
+                        model_abbrev_map = {
+                            'Transformer': 'transformer',
+                            'XGBRegressor': 'xgb',
+                            'GPRegressor': 'gp',
+                        }
+                        model_name = str(best_model.model) if hasattr(best_model, 'model') else None
+                        abbrev = model_abbrev_map.get(model_name, model_name.lower() if model_name else "unknown")
+                        mapped_model_name = f"{abbrev}_01"
+                        row_count_val = int(best_model.row_count)
+                        feature_tag = str(best_model.feature_tag)
+                        subset_rank_val = int(getattr(best_model, 'subset_rank', 1))
+                        subset_rank_str = f"k{subset_rank_val:02d}"
+                        model_dir = plan.dataset_dir / 'forecasts' / 'feature_sweeps' / f"{mapped_model_name}_r{row_count_val}_{feature_tag}_{subset_rank_str}"
+                        model_dir.mkdir(parents=True, exist_ok=True)
+                        configs_dir = plan.dataset_dir / 'forecasts' / 'feature_sweeps' / 'configs'
+                        config_path = None
+                        for cfg_file in configs_dir.glob(f"*{abbrev}*r{row_count_val:03d}_{feature_tag}*.yml"):
                             config_path = cfg_file
                             break
-                    if config_path is None:
-                        print(f"[WARN] Could not find config for LOOCV: {mapped_model_name}, r{row_count_val}, {feature_tag}")
-                        continue
-                    import yaml
-                    with open(config_path, 'r', encoding='utf-8') as f:
-                        cfg = yaml.safe_load(f)
-                    if 'evaluation' not in cfg:
-                        cfg['evaluation'] = {}
-                    cfg['evaluation']['run_loocv'] = True
-                    # Set forecast_name to match the model_dir relative to forecasts/
-                    cfg['data']['forecast_name'] = f"feature_sweeps/{mapped_model_name}_r{row_count_val}_{feature_tag}_{subset_rank_str}"
-                    loocv_cfg_path = model_dir / "config_loocv.yml"
-                    with open(loocv_cfg_path, 'w', encoding='utf-8') as f:
-                        yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
-                    # Call f_Evaluate.py on this config
-                    import subprocess
-                    eval_cmd = [sys.executable, 'src/f_Evaluate.py', '--config', str(loocv_cfg_path)]
-                    print(f"[INFO] Running LOOCV via f_Evaluate.py: {' '.join(eval_cmd)}")
-                    subprocess.run(eval_cmd, check=True)
-                    print(f"[INFO] LOOCV complete for best model: {loocv_cfg_path}")
-                    # --- PATCH END ---
-
-                    # --- Parse LOOCV metrics and store for summary ---
-                    # Try to find a loocv metrics file in the same directory as temp_cfg_path
-                    loocv_metrics_path = temp_cfg_path.parent / f"loocv_metrics_{best_model.feature_tag}.csv"
-                    loocv_metrics = {}
-                    import os
-                    if loocv_metrics_path.exists():
-                        import pandas as pd
-                        try:
-                            df_loocv = pd.read_csv(loocv_metrics_path)
-                            # Use the first row if present
-                            if not df_loocv.empty:
-                                for col in df_loocv.columns:
-                                    loocv_metrics[f"loocv_{col}"] = df_loocv.iloc[0][col]
-                        except Exception as e:
-                            print(f"[WARN] Could not parse LOOCV metrics: {e}")
-                    else:
-                        print(f"[WARN] LOOCV metrics file not found: {loocv_metrics_path}")
-                    # Attach loocv_metrics to best_model_performance entry for this dataset
-                    if best_model_performance:
-                        for entry in best_model_performance:
-                            if entry['dataset'] == plan.dataset_dir.name:
-                                entry.update(loocv_metrics)
+                        if config_path is None:
+                            for cfg_file in configs_dir.glob(f"*r{row_count_val:03d}_{feature_tag}*.yml"):
+                                config_path = cfg_file
                                 break
-        except Exception as exc:
-            failed += 1
-            print(f"[ERROR] Dataset failed: {plan.dataset_dir.name}")
-            print(f"[ERROR] {exc}")
-            if args.stop_on_error:
-                raise
+                        if config_path is None:
+                            print(f"[WARN] Could not find config for LOOCV: {mapped_model_name}, r{row_count_val}, {feature_tag}")
+                            continue
+                        import yaml
+                        with open(config_path, 'r', encoding='utf-8') as f:
+                            cfg = yaml.safe_load(f)
+                        if 'evaluation' not in cfg:
+                            cfg['evaluation'] = {}
+                        cfg['evaluation']['run_loocv'] = True
+                        cfg['data']['forecast_name'] = f"feature_sweeps/{mapped_model_name}_r{row_count_val}_{feature_tag}_{subset_rank_str}"
+                        loocv_cfg_path = model_dir / "config_loocv.yml"
+                        with open(loocv_cfg_path, 'w', encoding='utf-8') as f:
+                            yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+                        import subprocess
+                        eval_cmd = [sys.executable, 'src/f_Evaluate.py', '--config', str(loocv_cfg_path)]
+                        print(f"[INFO] Running LOOCV via f_Evaluate.py: {' '.join(eval_cmd)}")
+                        subprocess.run(eval_cmd, check=True)
+                        print(f"[INFO] LOOCV complete for best model: {loocv_cfg_path}")
+                        # --- PATCH END ---
+                        # Always use model_dir for LOOCV metrics and split files
+                        loocv_metrics_path = model_dir / f"loocv_metrics_{best_model.feature_tag}.csv"
+                        test_files_path = model_dir / "test_files.txt"
+                        train_files_path = model_dir / "train_files.txt"
+                        loocv_metrics = {}
+                        import os
+                        if loocv_metrics_path.exists():
+                            import pandas as pd
+                            try:
+                                df_loocv = pd.read_csv(loocv_metrics_path)
+                                if not df_loocv.empty:
+                                    for col in df_loocv.columns:
+                                        loocv_metrics[f"loocv_{col}"] = df_loocv.iloc[0][col]
+                            except Exception as e:
+                                print(f"[WARN] Could not parse LOOCV metrics: {e}")
+                        else:
+                            print(f"[WARN] LOOCV metrics file not found: {loocv_metrics_path}")
+                        # Check for split files in model_dir
+                        if not test_files_path.exists():
+                            print(f"[WARN] test_files.txt not found in model_dir: {test_files_path}")
+                        if not train_files_path.exists():
+                            print(f"[WARN] train_files.txt not found in model_dir: {train_files_path}")
+                        if best_model_performance:
+                            for entry in best_model_performance:
+                                if entry['dataset'] == plan.dataset_dir.name:
+                                    entry.update(loocv_metrics)
+                                    break
+                    except Exception as exc:
+                        print(f"[WARN] LOOCV or LOOCV summary failed for dataset {plan.dataset_dir.name}, row_count {row_count}: {exc}")
+            except Exception as exc:
+                failed += 1
+                print(f"[ERROR] Dataset failed: {plan.dataset_dir.name}, row_count {row_count}")
+                print(f"[ERROR] {exc}")
+                if args.stop_on_error:
+                    raise
 
     print("\nRun summary")
     print("-" * 100)

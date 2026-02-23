@@ -841,6 +841,7 @@ def _write_summary_csv(rows, output_path):
         "mae",
         "rmse",
         "r2",
+        "skill_v_naive",
         "kind",
         "n_train_samples",
         "n_test_samples",
@@ -1190,6 +1191,21 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 print(f"[WARN] LOOCV not implemented for model_type={model_type}")
                 continue
 
+            # Naive baseline using evaluate_naive for this fold
+            preds_naive, targets_naive = evaluate_naive(
+                test_samples_fold,
+                eval_cfg.get("historic_path", ""),
+                output_columns,
+                data_cfg["data_dir"],
+                sample_subdir=data_cfg.get("sample_subdir", "samples")
+            )
+            preds_naive_arr, targets_naive_arr, _, _ = _aligned_arrays(preds_naive, targets_naive)
+            if preds_naive_arr.size > 0 and targets_naive_arr.size > 0:
+                naive_errors = preds_naive_arr - targets_naive_arr
+                rmse_naive = float(np.sqrt(np.mean(np.square(naive_errors))))
+            else:
+                rmse_naive = float('nan')
+
             loocv_preds.append(preds)
             loocv_targets.append(targets)
             loocv_group_ids.extend([left_out_group] * len(preds))
@@ -1207,8 +1223,16 @@ def evaluate_single_config(config_path, save_plots_override=None):
                     "n_test_samples": len(preds),
                     "input_dim": input_dim,
                     "target_dim": target_dim,
+                    "rmse_naive": rmse_naive,
                 },
             )
+            # Add skill_v_naive after fold_row is created
+            try:
+                rmse_val = fold_row["rmse"]
+            except Exception:
+                rmse_val = float('nan')
+            skill_v_naive = 1.0 - (rmse_val / rmse_naive) if rmse_naive and rmse_naive > 0 else float('nan')
+            fold_row["skill_v_naive"] = skill_v_naive
             per_fold_rows.append(fold_row)
 
         # Concatenate all predictions and targets
@@ -1216,7 +1240,21 @@ def evaluate_single_config(config_path, save_plots_override=None):
             all_preds = np.vstack(loocv_preds)
             all_targets = np.vstack(loocv_targets)
             print(f"[DEBUG] All LOOCV preds shape: {all_preds.shape}, targets shape: {all_targets.shape}")
-            # Write summary CSV (aggregate + per-fold)
+            # Naive baseline for aggregate using evaluate_naive
+            preds_naive_agg, targets_naive_agg = evaluate_naive(
+                [s for group in group_map.values() for s in group],
+                eval_cfg.get("historic_path", ""),
+                output_columns,
+                data_cfg["data_dir"],
+                sample_subdir=data_cfg.get("sample_subdir", "samples")
+            )
+            preds_naive_agg_arr, targets_naive_agg_arr, _, _ = _aligned_arrays(preds_naive_agg, targets_naive_agg)
+            if preds_naive_agg_arr.size > 0 and targets_naive_agg_arr.size > 0:
+                naive_errors_agg = preds_naive_agg_arr - targets_naive_agg_arr
+                rmse_naive_agg = float(np.sqrt(np.mean(np.square(naive_errors_agg))))
+            else:
+                rmse_naive_agg = float('nan')
+
             summary = _compute_regression_summary(
                 f"LOOCV_{model_type}",
                 all_preds,
@@ -1228,8 +1266,16 @@ def evaluate_single_config(config_path, save_plots_override=None):
                     "n_test_samples": len(all_preds),
                     "input_dim": input_dim,
                     "target_dim": target_dim,
+                    "rmse_naive": rmse_naive_agg,
                 },
             )
+            # Add skill_v_naive after summary is created
+            try:
+                rmse_val_agg = summary["rmse"]
+            except Exception:
+                rmse_val_agg = float('nan')
+            skill_v_naive_agg = 1.0 - (rmse_val_agg / rmse_naive_agg) if rmse_naive_agg and rmse_naive_agg > 0 else float('nan')
+            summary["skill_v_naive"] = skill_v_naive_agg
             summary_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], "loocv_summary.csv")
             # Print what will be written
             print("[DEBUG] Writing LOOCV summary (first row):", summary)
