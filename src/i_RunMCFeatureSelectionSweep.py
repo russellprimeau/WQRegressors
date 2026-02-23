@@ -1909,23 +1909,52 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                             break
                     if best_cfg_path is None:
                         best_cfg_path = plan.train_configs[0]
-                    # Load config, set run_loocv: true, save to temp file
-                    import yaml, tempfile, shutil
-                    with open(best_cfg_path, 'r', encoding='utf-8') as f:
+                    # --- PATCH START: Write LOOCV config to correct model dir and run f_Evaluate.py ---
+                    # Map model names to directory short names
+                    model_map = {
+                        'Transformer': 'transformer_01',
+                        'XGBRegressor': 'xgb_01',
+                        'GPRegressor': 'gp_01',
+                    }
+                    model_name = str(best_model.model) if hasattr(best_model, 'model') else None
+                    mapped_model_name = model_map.get(model_name, model_name.lower() if model_name else "unknown")
+                    row_count_val = int(best_model.row_count)
+                    feature_tag = str(best_model.feature_tag)
+                    subset_rank_val = int(getattr(best_model, 'subset_rank', 1))
+                    subset_rank_str = f"k{subset_rank_val:02d}"
+                    model_dir = plan.dataset_dir / 'forecasts' / 'feature_sweeps' / f"{mapped_model_name}_r{row_count_val}_{feature_tag}_{subset_rank_str}"
+                    model_dir.mkdir(parents=True, exist_ok=True)
+                    # Find config file for this subset and model
+                    configs_dir = plan.dataset_dir / 'forecasts' / 'feature_sweeps' / 'configs'
+                    config_path = None
+                    for cfg_file in configs_dir.glob(f"*{mapped_model_name}*r{row_count_val:03d}_{feature_tag}*.yml"):
+                        config_path = cfg_file
+                        break
+                    if config_path is None:
+                        for cfg_file in configs_dir.glob(f"*r{row_count_val:03d}_{feature_tag}*.yml"):
+                            config_path = cfg_file
+                            break
+                    if config_path is None:
+                        print(f"[WARN] Could not find config for LOOCV: {mapped_model_name}, r{row_count_val}, {feature_tag}")
+                        continue
+                    import yaml
+                    with open(config_path, 'r', encoding='utf-8') as f:
                         cfg = yaml.safe_load(f)
                     if 'evaluation' not in cfg:
                         cfg['evaluation'] = {}
                     cfg['evaluation']['run_loocv'] = True
-                    # Save to a temp config file in the same directory
-                    temp_cfg_path = plan.dataset_dir / 'forecasts' / 'feature_sweeps' / f"loocv_config_{best_model.feature_tag}.yml"
-                    with open(temp_cfg_path, 'w', encoding='utf-8') as f:
-                        yaml.safe_dump(cfg, f)
+                    # Set forecast_name to match the model_dir relative to forecasts/
+                    cfg['data']['forecast_name'] = f"feature_sweeps/{mapped_model_name}_r{row_count_val}_{feature_tag}_{subset_rank_str}"
+                    loocv_cfg_path = model_dir / "config_loocv.yml"
+                    with open(loocv_cfg_path, 'w', encoding='utf-8') as f:
+                        yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
                     # Call f_Evaluate.py on this config
                     import subprocess
-                    eval_cmd = [sys.executable, 'src/f_Evaluate.py', '--config', str(temp_cfg_path)]
+                    eval_cmd = [sys.executable, 'src/f_Evaluate.py', '--config', str(loocv_cfg_path)]
                     print(f"[INFO] Running LOOCV via f_Evaluate.py: {' '.join(eval_cmd)}")
                     subprocess.run(eval_cmd, check=True)
-                    print(f"[INFO] LOOCV complete for best model: {temp_cfg_path}")
+                    print(f"[INFO] LOOCV complete for best model: {loocv_cfg_path}")
+                    # --- PATCH END ---
 
                     # --- Parse LOOCV metrics and store for summary ---
                     # Try to find a loocv metrics file in the same directory as temp_cfg_path

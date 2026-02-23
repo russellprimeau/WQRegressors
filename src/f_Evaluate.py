@@ -127,14 +127,30 @@ def merge_eval_config(cfg):
 
 
 def load_model_config(data_dir, forecast_name, model_name, fallback_data=None):
-    config_path = Path(data_dir, "forecasts", forecast_name, model_name, "model_config.json")
-    if config_path.exists():
-        with open(config_path, "r") as f:
-            return json.load(f)
+    # First, look for model_config.json directly in the forecast_name directory
+    direct_path = Path(data_dir, "forecasts", forecast_name, "model_config.json")
+    print(f"[TRACE] Looking for model_config.json at: {direct_path}")
+    if direct_path.exists():
+        print(f"[TRACE] Found model_config.json at: {direct_path}")
+        with open(direct_path, "r") as f:
+            config_json = json.load(f)
+        print(f"[TRACE] Loaded model_config.json: {config_json}")
+        return config_json
+
+    # Fallback: look for model_config.json in a model_name subdirectory (legacy)
+    subdir_path = Path(data_dir, "forecasts", forecast_name, model_name, "model_config.json")
+    print(f"[TRACE] model_config.json not found at: {direct_path}, trying: {subdir_path}")
+    if subdir_path.exists():
+        print(f"[TRACE] Found model_config.json at: {subdir_path}")
+        with open(subdir_path, "r") as f:
+            config_json = json.load(f)
+        print(f"[TRACE] Loaded model_config.json: {config_json}")
+        return config_json
 
     if fallback_data is None:
-        raise FileNotFoundError(f"model_config.json not found at {config_path}")
+        raise FileNotFoundError(f"model_config.json not found at {direct_path} or {subdir_path}")
 
+    print(f"[TRACE] Using fallback_data for model_config: {fallback_data}")
     return {
         "input_columns": fallback_data["input_columns"],
         "output_columns": fallback_data["output_columns"],
@@ -205,8 +221,11 @@ def load_split_samples(
     input_aggregation="none",
 ):
     source_dir = Path(split_source_dir) if split_source_dir is not None else Path(data_dir, "forecasts", forecast_name)
+    print(f"[TRACE] load_split_samples: source_dir={source_dir}, split_file={split_file}")
     split_files = split_files_override if split_files_override is not None else _read_split_files(source_dir, split_file)
+    print(f"[TRACE] load_split_samples: split_files={split_files}")
 
+    print(f"[TRACE] load_samples: data_dir={data_dir}, sample_subdir={sample_subdir}, input_columns={input_columns}, output_columns={output_columns}, input_rows={input_rows}, output_rows={output_rows}, input_aggregation={input_aggregation}")
     samples = load_samples(
         os.path.join(data_dir, sample_subdir),
         input_columns=input_columns,
@@ -218,6 +237,7 @@ def load_split_samples(
         input_aggregation=input_aggregation,
     )
 
+    print(f"[TRACE] load_samples returned {len(samples)} samples")
     return samples
 
 
@@ -450,23 +470,26 @@ def _predict_gp_bundle(gp_bundle, X_np, device):
 
 
 def load_model(model_type, data_cfg, split_cfg, model_name, model_config, device, train_samples=None, config_dir=None):
-    model_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], model_name)
-    parent_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
+    # First, look for model files directly in the forecast_name directory
+    direct_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
+    subdir_path = direct_path / model_name
 
-    def try_file(path, filename):
-        file = path / filename
+    def try_file(filename):
+        # Try direct path first
+        file = direct_path / filename
         if file.exists():
             return file
-        file = parent_path / filename
+        # Fallback: try model_name subdirectory
+        file = subdir_path / filename
         if file.exists():
             return file
         return None
 
     if model_type == "transformer":
         model = TimeSeriesTransformer(model_config).to(device)
-        model_file = try_file(model_path, "transformer_model.pt")
+        model_file = try_file("transformer_model.pt")
         if not model_file:
-            raise FileNotFoundError(f"transformer_model.pt not found in {model_path} or {parent_path}")
+            raise FileNotFoundError(f"transformer_model.pt not found in {direct_path} or {subdir_path}")
         model.load_state_dict(torch.load(model_file, map_location=device))
         model.eval()
         return model
@@ -474,28 +497,28 @@ def load_model(model_type, data_cfg, split_cfg, model_name, model_config, device
     if model_type == "gp_regressor":
         if train_samples is None:
             raise ValueError("train_samples are required to evaluate gp_regressor")
-        # _load_gp_bundle expects model_name as subdir; try fallback if not found
+        # Try direct path first (no model_name subdir)
         try:
-            return _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device, config_dir)
+            return _load_gp_bundle(data_cfg, split_cfg, "", train_samples, device, config_dir)
         except FileNotFoundError:
             try:
-                return _load_gp_bundle(data_cfg, split_cfg, "", train_samples, device, config_dir)
+                return _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device, config_dir)
             except Exception as e:
-                raise FileNotFoundError(f"GP model not found in {model_path} or {parent_path}: {e}")
+                raise FileNotFoundError(f"GP model not found in {direct_path} or {subdir_path}: {e}")
 
     if model_type == "xgb_regressor":
         model = xgb.XGBRegressor()
-        model_file = try_file(model_path, "xgboost_model.json")
+        model_file = try_file("xgboost_model.json")
         if not model_file:
-            raise FileNotFoundError(f"xgboost_model.json not found in {model_path} or {parent_path}")
+            raise FileNotFoundError(f"xgboost_model.json not found in {direct_path} or {subdir_path}")
         model.load_model(model_file)
         return model
 
     if model_type == "xgb_classifier":
         model = xgb.XGBClassifier()
-        model_file = try_file(model_path, "xgboost_model.json")
+        model_file = try_file("xgboost_model.json")
         if not model_file:
-            raise FileNotFoundError(f"xgboost_model.json not found in {model_path} or {parent_path}")
+            raise FileNotFoundError(f"xgboost_model.json not found in {direct_path} or {subdir_path}")
         model.load_model(model_file)
         return model
 
@@ -915,13 +938,18 @@ def evaluate_single_config(config_path, save_plots_override=None):
     print(f"Using device: {device}")
     matplotlib.use("Agg")
 
+    print(f"[TRACE] data_cfg['data_dir']: {data_cfg['data_dir']}")
+    print(f"[TRACE] data_cfg['forecast_name']: {data_cfg['forecast_name']}")
+    print(f"[TRACE] model_name: {model_name}")
     model_config = load_model_config(
         data_cfg["data_dir"],
         data_cfg["forecast_name"],
         model_name,
         fallback_data=data_cfg,
     )
+    print(f"[TRACE] model_config loaded: {model_config}")
 
+    print(f"[TRACE] model_config keys: {list(model_config.keys())}")
     input_columns = model_config["input_columns"]
     output_columns = model_config["output_columns"]
     input_rows = slice(model_config["input_row_1"], model_config["input_row_2"])
@@ -1017,13 +1045,50 @@ def evaluate_single_config(config_path, save_plots_override=None):
     # Use eval_samples for evaluation below
     # For plotting, pass eval_labels to visualizer and uncertainty boxplot
 
-    X_test = np.array([s[0].flatten() for s in test_samples])
-    y_test = np.array([s[1].flatten() for s in test_samples])
-    output_dim = y_test.shape[1] if y_test.ndim > 1 else 1
-    input_dim = int(X_test.shape[1]) if X_test.ndim > 1 else (int(len(X_test[0])) if len(X_test) > 0 else 0)
-    target_dim = int(y_test.shape[1]) if y_test.ndim > 1 else (1 if len(y_test) > 0 else 0)
+    # Prepare input arrays differently for transformer vs other models
+    if model_type == "transformer":
+        X_test = np.array([s[0] for s in test_samples])  # shape: (n_samples, seq_len, n_features)
+        y_test = np.array([s[1] for s in test_samples])
+        print(f"[DEBUG] X_test shape for transformer: {X_test.shape}")
+        print(f"[DEBUG] y_test shape for transformer: {y_test.shape}")
+        print(f"[DEBUG] First X_test sample: {X_test[0] if len(X_test) > 0 else 'EMPTY'}")
+        input_dim = X_test.shape[2] if X_test.ndim == 3 else 0
+        output_dim = y_test.shape[1] if y_test.ndim > 1 else 1
+        target_dim = int(y_test.shape[1]) if y_test.ndim > 1 else (1 if len(y_test) > 0 else 0)
+        # Also handle X_train and X_all for transformer
+        if eval_cfg.get("evaluate_all", True) and train_samples is not None:
+            X_train = np.array([s[0] for s in train_samples])
+            y_train = np.array([s[1] for s in train_samples])
+            X_all = np.concatenate([X_train, X_test], axis=0)
+            y_all = np.concatenate([y_train, y_test], axis=0)
+        else:
+            X_train = None
+            y_train = None
+            X_all = X_test
+            y_all = y_test
+    else:
+        X_test = np.array([s[0].flatten() for s in test_samples])
+        y_test = np.array([s[1].flatten() for s in test_samples])
+        print(f"[DEBUG] X_test shape after flatten: {X_test.shape}")
+        print(f"[DEBUG] y_test shape after flatten: {y_test.shape}")
+        print(f"[DEBUG] First X_test sample: {X_test[0] if len(X_test) > 0 else 'EMPTY'}")
+        input_dim = int(X_test.shape[1]) if X_test.ndim > 1 else (int(len(X_test[0])) if len(X_test) > 0 else 0)
+        output_dim = y_test.shape[1] if y_test.ndim > 1 else 1
+        target_dim = int(y_test.shape[1]) if y_test.ndim > 1 else (1 if len(y_test) > 0 else 0)
+        if eval_cfg.get("evaluate_all", True) and train_samples is not None:
+            X_train = np.array([s[0].flatten() for s in train_samples])
+            y_train = np.array([s[1].flatten() for s in train_samples])
+            X_all = np.concatenate([X_train, X_test], axis=0)
+            y_all = np.concatenate([y_train, y_test], axis=0)
+        else:
+            X_train = None
+            y_train = None
+            X_all = X_test
+            y_all = y_test
 
     split_cfg = config.get("data_split", {"random_state": 42})
+    print(f"[TRACE] Calling load_model with model_type={model_type}, model_name={model_name}")
+    print(f"[TRACE] model_config passed to load_model: {model_config}")
     model = load_model(model_type, data_cfg, split_cfg, model_name, model_config, device, train_samples, config_dir)
 
     regression_pairs = []
@@ -1199,10 +1264,14 @@ def evaluate_single_config(config_path, save_plots_override=None):
             preds_test = _predict_gp_bundle(model, X_test, device)
             preds_all = _predict_gp_bundle(model, X_all, device)
         elif model_type == "transformer":
+            print(f"[DEBUG] X_test shape before transformer: {X_test.shape}")
             if X_train is not None:
+                print(f"[DEBUG] X_train shape before transformer: {X_train.shape}")
                 preds_train = model(torch.tensor(X_train, dtype=torch.float32, device=device)).detach().cpu().numpy()
             preds_test = model(torch.tensor(X_test, dtype=torch.float32, device=device)).detach().cpu().numpy()
+            print(f"[DEBUG] preds_test shape after transformer: {preds_test.shape}")
             preds_all = model(torch.tensor(X_all, dtype=torch.float32, device=device)).detach().cpu().numpy()
+            print(f"[DEBUG] preds_all shape after transformer: {preds_all.shape}")
         elif model_type == "xgb_regressor":
             if X_train is not None:
                 preds_train = model.predict(X_train).reshape(-1, y_train.shape[1] if y_train.ndim > 1 else 1)
