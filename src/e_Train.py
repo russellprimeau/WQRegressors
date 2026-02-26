@@ -13,7 +13,6 @@ import sys
 from pathlib import Path
 import argparse
 import yaml
-import json
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -28,6 +27,16 @@ from utils.transformer import (
     TimeSeriesTransformer,
     TimeSeriesTargetDataset,
 )
+from utils.config_utils import (
+    load_config,
+    _resolve_path_from_config,
+    _resolve_data_paths,
+    _canonical_feature_name,
+    _resolve_summary_dir,
+    _load_uncertainty_std_map,
+    _build_feature_uncertainty_variance,
+)
+from utils.gp_utils import UncertainInputRBFKernel, build_base_kernel, ExactGPRegressor
 
 
 # ===========================================================================================
@@ -123,34 +132,6 @@ DEFAULT_EVALUATION_CONFIG = {
 # CONFIG LOADING AND MERGING
 # ===========================================================================================
 
-def load_config(config_path):
-    """Load configuration from YAML or JSON file."""
-    path = Path(config_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Configuration file not found: {config_path}")
-
-    def _read_text_with_fallback(path_obj):
-        try:
-            with open(path_obj, 'r', encoding='utf-8') as f:
-                return f.read()
-        except UnicodeDecodeError:
-            with open(path_obj, 'r', encoding='cp1252') as f:
-                return f.read()
-
-    raw_text = _read_text_with_fallback(path)
-
-    if path.suffix in ['.yaml', '.yml']:
-        config = yaml.safe_load(raw_text)
-    elif path.suffix == '.json':
-        config = json.loads(raw_text)
-    else:
-        raise ValueError(f"Unsupported config file format: {path.suffix}")
-
-    # Store absolute config directory so all relative paths resolve from config location
-    config["__config_dir"] = str(path.resolve().parent)
-    
-    return config
-
 
 def merge_with_defaults(config, model_type):
     """Merge provided config with defaults, printing when defaults are applied."""
@@ -206,29 +187,6 @@ def merge_with_defaults(config, model_type):
 # DATA LOADING
 # ===========================================================================================
 
-def _resolve_path_from_config(path_value, config_dir):
-    """Resolve path value relative to config file directory."""
-    path_obj = Path(path_value)
-    if path_obj.is_absolute():
-        return path_obj.resolve()
-    return (Path(config_dir) / path_obj).resolve()
-
-
-def _resolve_data_paths(data_cfg, config_dir):
-    """Resolve base data directory and sample subdirectory with backward compatibility."""
-    configured_subdir = data_cfg.get("sample_subdir")
-    data_dir_path = _resolve_path_from_config(data_cfg["data_dir"], config_dir)
-
-    if configured_subdir:
-        return str(data_dir_path), configured_subdir
-
-    # Backward compatibility: if data_dir points directly to samples folder, infer parent + subdir
-    if data_dir_path.name in {"samples", "mc_replicates"}:
-        return str(data_dir_path.parent), data_dir_path.name
-
-    return str(data_dir_path), "samples"
-
-
 def _resolve_eval_path_for_write(path_value, config_dir):
     """Resolve evaluation reference paths for write_evaluation_config with sensible fallback."""
     path_obj = Path(path_value)
@@ -264,8 +222,6 @@ def load_and_split_data(config):
         if nan_tolerance < 0 or nan_tolerance > 1:
             raise ValueError(f"data_split.nan_tolerance must be in [0, 1], got {nan_tolerance}")
 
-    # print(f"Sample directory: {Path(base_data_dir) / sample_subdir}")
-    
     input_rows = slice(data_cfg["input_row_1"], data_cfg["input_row_2"])
     input_aggregation = str(data_cfg.get("input_aggregation", "none")).lower()
     
@@ -287,129 +243,7 @@ def load_and_split_data(config):
         input_aggregation,
     )
     
-    return train_samples, test_samples, input_rows
-
-
-def _canonical_feature_name(name):
-    text = str(name).strip().lower().replace("µ", "u")
-    text = text.replace("micro", "u")
-    text = text.replace("_", " ")
-    if " - " in text:
-        text = text.split(" - ", 1)[1].strip()
-    for token in ["(", ")", "/", "%", "°", "-", ".", ","]:
-        text = text.replace(token, " ")
-    text = " ".join(text.split())
-    return text
-
-
-def _resolve_summary_dir(hyper_cfg, config_dir):
-    if hyper_cfg.get("uncertainty_summary_dir"):
-        return _resolve_path_from_config(hyper_cfg["uncertainty_summary_dir"], config_dir)
-    return Path(__file__).parent.parent / "data" / "output" / "calibration" / "summaries"
-
-
-def _load_uncertainty_std_map(summary_dir):
-    if not summary_dir.exists():
-        print(f"[WARN] Uncertainty summary directory not found: {summary_dir}")
-        return {}
-
-    summary_map = {}
-    summary_files = list(summary_dir.rglob("*_uncertainty_summary.csv"))
-    for file_path in summary_files:
-        try:
-            df = pd.read_csv(file_path)
-            if df.empty:
-                continue
-            row = df.iloc[0]
-            sensor_name = row.get("Sensor")
-            if pd.isna(sensor_name):
-                continue
-            offset_std = row.get("Offset_Std", 0.0)
-            if pd.isna(offset_std):
-                offset_std = 0.0
-            canonical_name = _canonical_feature_name(sensor_name)
-            if canonical_name in summary_map:
-                print(
-                    f"[WARN] Duplicate uncertainty entry for '{sensor_name}' "
-                    f"(canonical='{canonical_name}'). Keeping first source: "
-                    f"{summary_map[canonical_name]['source_file']}"
-                )
-                continue
-            summary_map[canonical_name] = {
-                "offset_std": float(offset_std),
-                "sensor_name": str(sensor_name),
-                "source_file": str(file_path)
-            }
-        except Exception as exc:
-            print(f"[WARN] Could not parse uncertainty summary file {file_path}: {exc}")
-    return summary_map
-
-
-def _build_feature_uncertainty_variance(config):
-    data_cfg = config["data"]
-    hyper_cfg = config["hyperparameters"]
-    config_dir = config["__config_dir"]
-    input_columns = data_cfg["input_columns"]
-    seq_len = data_cfg["input_row_2"] - data_cfg["input_row_1"]
-
-    summary_dir = _resolve_summary_dir(hyper_cfg, config_dir)
-    summary_std_map = _load_uncertainty_std_map(summary_dir)
-    print(f"[INFO] Uncertainty source directory: {summary_dir}")
-
-    norm_path = Path(data_cfg["data_dir"]) / "normalization.json"
-    norm_params = {}
-    if norm_path.exists():
-        try:
-            with open(norm_path, "r") as f:
-                norm_params = json.load(f)
-        except Exception as exc:
-            print(f"[WARN] Could not read normalization.json at {norm_path}: {exc}")
-
-    feature_variances = []
-    for feature in input_columns:
-        candidates = [_canonical_feature_name(feature)]
-        if " - " in feature:
-            candidates.append(_canonical_feature_name(feature.split(" - ", 1)[1]))
-
-        matched_entry = None
-        matched_key = None
-        for candidate in candidates:
-            if candidate in summary_std_map:
-                matched_entry = summary_std_map[candidate]
-                matched_key = candidate
-                break
-
-        raw_std = 0.0 if matched_entry is None else float(matched_entry["offset_std"])
-        applied_std = raw_std
-        scaling_applied = False
-
-        if applied_std > 0 and feature in norm_params:
-            v_min = norm_params[feature].get("min", 0)
-            v_max = norm_params[feature].get("max", 1)
-            v_range = v_max - v_min
-            if v_range not in [0, 0.0]:
-                applied_std = applied_std / v_range
-                scaling_applied = True
-
-        variance = float(applied_std ** 2)
-        feature_variances.append(variance)
-
-        if matched_entry is None:
-            print(
-                f"  [UNCERTAINTY] feature='{feature}' | source='none' | "
-                f"matched_key='none' | raw_offset_std=0 | applied_std=0 | var=0"
-            )
-        else:
-            scaling_note = "scaled_by_normalization" if scaling_applied else "no_scaling"
-            print(
-                f"  [UNCERTAINTY] feature='{feature}' | source='{matched_entry['source_file']}' | "
-                f"sensor='{matched_entry['sensor_name']}' | matched_key='{matched_key}' | "
-                f"raw_offset_std={raw_std:.6g} | applied_std={applied_std:.6g} | "
-                f"var={variance:.6g} | {scaling_note}"
-            )
-
-    flattened_variances = np.tile(np.array(feature_variances, dtype=np.float32), seq_len)
-    return flattened_variances
+    return train_samples, test_samples
 
 
 def write_evaluation_config(config):
@@ -421,8 +255,6 @@ def write_evaluation_config(config):
 
     evaluation_cfg = DEFAULT_EVALUATION_CONFIG.copy()
     evaluation_cfg.update(config.get("evaluation", {}))
-    # Always include run_loocv: False and evaluate_all: False in evaluation config
-    evaluation_cfg["run_loocv"] = False
     evaluation_cfg["evaluate_all"] = False
     if model_type == "xgb_classifier":
         evaluation_cfg["run_regression"] = False
@@ -594,58 +426,10 @@ def train_gp_regressor_model(config, train_samples, test_samples):
     input_uncertainty_var = None
     if use_uncertain_kernel:
         input_uncertainty_var = torch.tensor(
-            _build_feature_uncertainty_variance(config),
+            _build_feature_uncertainty_variance(data_cfg, hyper_cfg, config["__config_dir"]),
             dtype=torch.float32,
             device=device
         )
-
-    class UncertainInputRBFKernel(gpytorch.kernels.Kernel):
-        has_lengthscale = True
-
-        def __init__(self, input_variance, **kwargs):
-            super().__init__(**kwargs)
-            self.register_buffer("input_variance", input_variance)
-
-        def forward(self, x1, x2, diag=False, **params):
-            if diag:
-                return torch.ones(x1.shape[-2], device=x1.device, dtype=x1.dtype)
-
-            lengthscale = self.lengthscale.squeeze()
-            if lengthscale.dim() == 0:
-                lengthscale = lengthscale.repeat(x1.shape[-1])
-
-            ls2 = lengthscale.pow(2)
-            denom = ls2 + 2.0 * self.input_variance
-            denom = torch.clamp(denom, min=1e-10)
-
-            x1_exp = x1.unsqueeze(-2)
-            x2_exp = x2.unsqueeze(-3)
-            sq_dist = ((x1_exp - x2_exp).pow(2) / denom).sum(dim=-1)
-
-            det_term = torch.sqrt(torch.prod(ls2 / denom))
-            return det_term * torch.exp(-0.5 * sq_dist)
-
-    def build_base_kernel():
-        if use_uncertain_kernel:
-            if kernel_name != "rbf":
-                print(f"[WARN] Uncertain-input kernel currently supports RBF closed form. Overriding kernel '{kernel_name}' -> 'rbf'.")
-            return UncertainInputRBFKernel(input_variance=input_uncertainty_var, ard_num_dims=ard_dims)
-        if kernel_name == "rbf":
-            return gpytorch.kernels.RBFKernel(ard_num_dims=ard_dims)
-        if kernel_name == "matern32":
-            return gpytorch.kernels.MaternKernel(nu=1.5, ard_num_dims=ard_dims)
-        return gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=ard_dims)
-
-    class ExactGPRegressor(gpytorch.models.ExactGP):
-        def __init__(self, train_x, train_y, likelihood):
-            super().__init__(train_x, train_y, likelihood)
-            self.mean_module = gpytorch.means.ConstantMean()
-            self.covar_module = gpytorch.kernels.ScaleKernel(build_base_kernel())
-
-        def forward(self, x):
-            mean_x = self.mean_module(x)
-            covar_x = self.covar_module(x)
-            return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
     output_dim = y_train_np.shape[1]
     output_train_losses = []
@@ -674,7 +458,10 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         y_train = torch.tensor(y_train_used, dtype=torch.float32, device=device)
 
         likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
-        model = ExactGPRegressor(X_train, y_train, likelihood).to(device)
+        model = ExactGPRegressor(
+            X_train, y_train, likelihood,
+            build_base_kernel(kernel_name, use_uncertain_kernel, input_uncertainty_var, ard_dims)
+        ).to(device)
 
         model.train()
         likelihood.train()
@@ -783,21 +570,24 @@ def train_gp_regressor_model(config, train_samples, test_samples):
 # XGBOOST REGRESSOR TRAINING
 # ===========================================================================================
 
-def train_xgb_regressor_model(config, train_samples, test_samples):
-    """Train XGBoost Regressor model."""
+def _train_xgb_model(config, train_samples, test_samples, model_cls, metric_key, cast_y=None):
+    """Shared XGBoost training implementation for regressor and classifier."""
     print("\n" + "="*80)
-    print("TRAINING XGBOOST REGRESSOR MODEL")
+    print(f"TRAINING {model_cls.__name__.upper()}")
     print("="*80)
-    
+
     data_cfg = config["data"]
     hyper_cfg = config["hyperparameters"]
-    
-    # Prepare data
+
     X_train = np.array([s[0].flatten() for s in train_samples])
-    y_train = np.array([s[1].flatten()[0] for s in train_samples])
     X_test = np.array([s[0].flatten() for s in test_samples])
-    y_test = np.array([s[1].flatten()[0] for s in test_samples])
-    
+    if cast_y is not None:
+        y_train = np.array([cast_y(s[1].flatten()[0]) for s in train_samples])
+        y_test = np.array([cast_y(s[1].flatten()[0]) for s in test_samples])
+    else:
+        y_train = np.array([s[1].flatten()[0] for s in train_samples])
+        y_test = np.array([s[1].flatten()[0] for s in test_samples])
+
     model_config = {
         'input_dim': len(data_cfg["input_columns"]),
         'output_dim': len(data_cfg["output_columns"]) * len(data_cfg["output_rows"]),
@@ -808,11 +598,11 @@ def train_xgb_regressor_model(config, train_samples, test_samples):
         'output_columns': data_cfg["output_columns"],
         'output_rows': data_cfg["output_rows"],
     }
-    
     write_config(model_config, data_cfg["data_dir"], data_cfg["forecast_name"], "")
-    
-    # Create and train model
-    model = xgb.XGBRegressor(
+
+    metric = hyper_cfg[metric_key]
+    extra_kwargs = {"eval_metric": metric} if metric_key == "eval_metric" else {}
+    model = model_cls(
         tree_method=hyper_cfg["tree_method"],
         objective=hyper_cfg["objective"],
         n_estimators=hyper_cfg["n_estimators"],
@@ -821,22 +611,20 @@ def train_xgb_regressor_model(config, train_samples, test_samples):
         colsample_bytree=hyper_cfg["colsample_bytree"],
         learning_rate=hyper_cfg["learning_rate"],
         n_jobs=hyper_cfg["n_jobs"],
-        early_stopping_rounds=hyper_cfg["early_stopping_rounds"]
+        early_stopping_rounds=hyper_cfg["early_stopping_rounds"],
+        **extra_kwargs
     )
-    
-    print("Training XGBRegressor...")
+
+    print(f"Training {model_cls.__name__}...")
     model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_test, y_test)], verbose=True)
-    
-    # Save model
+
     save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
     os.makedirs(save_path, exist_ok=True)
     model.save_model(save_path / "xgboost_model.json")
     print(f"\nModel saved to: {save_path / 'xgboost_model.json'}")
-    
+
     if config.get("save_training_plots", True):
-        # Plot results
         results = model.evals_result()
-        metric = hyper_cfg["metric"]
         epochs = len(results['validation_0'][metric])
         plt.figure(figsize=(8, 5))
         plt.loglog(range(epochs), results['validation_0'][metric], label='Training Loss')
@@ -853,77 +641,20 @@ def train_xgb_regressor_model(config, train_samples, test_samples):
 
 
 # ===========================================================================================
-# XGBOOST CLASSIFIER TRAINING
+# XGBOOST REGRESSOR / CLASSIFIER TRAINING
 # ===========================================================================================
+
+def train_xgb_regressor_model(config, train_samples, test_samples):
+    """Train XGBoost Regressor model."""
+    _train_xgb_model(config, train_samples, test_samples, xgb.XGBRegressor, "metric")
+
 
 def train_xgb_classifier_model(config, train_samples, test_samples):
     """Train XGBoost Classifier model."""
-    print("\n" + "="*80)
-    print("TRAINING XGBOOST CLASSIFIER MODEL")
-    print("="*80)
-    
-    data_cfg = config["data"]
-    hyper_cfg = config["hyperparameters"]
-    
-    # Prepare data and ensure binary outputs
-    X_train = np.array([s[0].flatten() for s in train_samples])
-    y_train = np.array([int(round(s[1].flatten()[0])) for s in train_samples])
-    X_test = np.array([s[0].flatten() for s in test_samples])
-    y_test = np.array([int(round(s[1].flatten()[0])) for s in test_samples])
-    
-    model_config = {
-        'input_dim': len(data_cfg["input_columns"]),
-        'output_dim': len(data_cfg["output_columns"]) * len(data_cfg["output_rows"]),
-        'seq_len': data_cfg["input_row_2"] - data_cfg["input_row_1"],
-        'input_columns': data_cfg["input_columns"],
-        'input_row_1': data_cfg["input_row_1"],
-        'input_row_2': data_cfg["input_row_2"],
-        'output_columns': data_cfg["output_columns"],
-        'output_rows': data_cfg["output_rows"],
-    }
-    
-    write_config(model_config, data_cfg["data_dir"], data_cfg["forecast_name"], "")
-    
-    # Create and train model
-    model = xgb.XGBClassifier(
-        eval_metric=hyper_cfg["eval_metric"],
-        tree_method=hyper_cfg["tree_method"],
-        objective=hyper_cfg["objective"],
-        n_estimators=hyper_cfg["n_estimators"],
-        max_depth=hyper_cfg["max_depth"],
-        subsample=hyper_cfg["subsample"],
-        colsample_bytree=hyper_cfg["colsample_bytree"],
-        learning_rate=hyper_cfg["learning_rate"],
-        n_jobs=hyper_cfg["n_jobs"],
-        early_stopping_rounds=hyper_cfg["early_stopping_rounds"],
+    _train_xgb_model(
+        config, train_samples, test_samples,
+        xgb.XGBClassifier, "eval_metric", cast_y=lambda v: int(round(v))
     )
-    
-    print("Training XGBClassifier...")
-    model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_test, y_test)], verbose=True)
-    
-    # Save model
-    save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
-    os.makedirs(save_path, exist_ok=True)
-    model.save_model(save_path / "xgboost_model.json")
-    print(f"\nModel saved to: {save_path / 'xgboost_model.json'}")
-    
-    if config.get("save_training_plots", True):
-        # Plot results
-        results = model.evals_result()
-        metric = hyper_cfg["eval_metric"]
-        epochs = len(results['validation_0'][metric])
-        plt.figure(figsize=(8, 5))
-        plt.loglog(range(epochs), results['validation_0'][metric], label='Train logloss')
-        plt.loglog(range(epochs), results['validation_1'][metric], label='Validation logloss')
-        plt.xlabel('Boosting Rounds')
-        plt.ylabel('Logloss')
-        plt.grid(True, which="both", ls="--")
-        plt.title('Training vs Validation Loss')
-        plt.legend()
-        plt.savefig(save_path / "loss_plot.png")
-        plt.close()
-        print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")
-    write_evaluation_config(config)
 
 
 # ===========================================================================================
@@ -973,9 +704,7 @@ def main():
     print("\n" + "="*80)
     print("LOADING AND SPLITTING DATA")
     print("="*80)
-    train_samples, test_samples, input_rows = load_and_split_data(config)
-    # print(f"Training samples: {len(train_samples)}")
-    # print(f"Test samples: {len(test_samples)}")
+    train_samples, test_samples = load_and_split_data(config)
     
     # Train appropriate model
     if model_type == "transformer":

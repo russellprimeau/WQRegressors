@@ -51,10 +51,6 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
             print(f"Stopping early at epoch {epoch + 1} because loss reached {avg_loss:.6f}")
             break
 
-        # Early stopping checks
-        if loss_threshold and avg_loss <= loss_threshold:
-            print("Stopping early due to training loss threshold.")
-            break
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
@@ -64,21 +60,21 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
                 print("Stopping early due to validation loss plateau.")
                 break
 
-        # Plotting loss vs. epochs on log-log scale
-        plt.figure(figsize=(8, 6))
-        x_vals = list(range(1, len(train_losses) + 1))
-        plt.loglog(x_vals, train_losses, marker='o', label='Training Loss')
-        plt.loglog(x_vals, val_losses, marker='s', label='Validation Loss')
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.title("Training and Validation Loss vs. Epochs (Log-Log Scale)")
-        plt.grid(True, which="both", ls="--")
-        plt.legend()
-        plt.tight_layout()
-        filepath = Path(directory, "forecasts", forecast_name, model_subdir)
-        os.makedirs(filepath, exist_ok=True)
-        plt.savefig(Path(directory, "forecasts", forecast_name, model_subdir, "loss_plot.png"))
-        plt.close()
+    # Plotting loss vs. epochs on log-log scale
+    filepath = Path(directory, "forecasts", forecast_name, model_subdir)
+    os.makedirs(filepath, exist_ok=True)
+    plt.figure(figsize=(8, 6))
+    x_vals = list(range(1, len(train_losses) + 1))
+    plt.loglog(x_vals, train_losses, marker='o', label='Training Loss')
+    plt.loglog(x_vals, val_losses, marker='s', label='Validation Loss')
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training and Validation Loss vs. Epochs (Log-Log Scale)")
+    plt.grid(True, which="both", ls="--")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(filepath / "loss_plot.png")
+    plt.close()
 
 
 class TimeSeriesLSTM(nn.Module):

@@ -329,9 +329,9 @@ def _train_single_config(
 
     if suppress_training_logs:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            train_samples, test_samples, _ = train_module.load_and_split_data(config)
+            train_samples, test_samples = train_module.load_and_split_data(config)
     else:
-        train_samples, test_samples, _ = train_module.load_and_split_data(config)
+        train_samples, test_samples = train_module.load_and_split_data(config)
         print(f"  [TRAIN] Samples loaded: train={len(train_samples)} test={len(test_samples)}")
 
     def _run_train():

@@ -22,7 +22,6 @@ import argparse
 import glob
 from pathlib import Path
 
-import yaml
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -46,6 +45,16 @@ from utils.evaluation import (
     binarize_predictions,
     apply_saved_normalize,
 )
+from utils.config_utils import (
+    load_config,
+    _resolve_path_from_config,
+    _resolve_data_paths,
+    _canonical_feature_name,
+    _resolve_summary_dir,
+    _load_uncertainty_std_map,
+    _build_feature_uncertainty_variance,
+)
+from utils.gp_utils import build_base_kernel, ExactGPRegressor
 
 
 DEFAULT_EVAL_CONFIG = {
@@ -72,52 +81,6 @@ DEFAULT_EVAL_CONFIG = {
 }
 
 
-def load_config(config_path):
-    path = Path(config_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    def _read_text_with_fallback(path_obj):
-        try:
-            with open(path_obj, "r", encoding="utf-8") as f:
-                return f.read()
-        except UnicodeDecodeError:
-            with open(path_obj, "r", encoding="cp1252") as f:
-                return f.read()
-
-    raw_text = _read_text_with_fallback(path)
-
-    if path.suffix in [".yaml", ".yml"]:
-        config = yaml.safe_load(raw_text)
-        config["__config_dir"] = str(path.resolve().parent)
-        return config
-    if path.suffix == ".json":
-        config = json.loads(raw_text)
-        config["__config_dir"] = str(path.resolve().parent)
-        return config
-
-    raise ValueError(f"Unsupported config file format: {path.suffix}")
-
-
-def _resolve_path_from_config(path_value, config_dir):
-    path_obj = Path(path_value)
-    if path_obj.is_absolute():
-        return path_obj.resolve()
-    return (Path(config_dir) / path_obj).resolve()
-
-
-def _resolve_data_paths(data_cfg, config_dir):
-    configured_subdir = data_cfg.get("sample_subdir")
-    data_dir_path = _resolve_path_from_config(data_cfg["data_dir"], config_dir)
-
-    if configured_subdir:
-        return str(data_dir_path), configured_subdir
-
-    if data_dir_path.name in {"samples", "mc_replicates"}:
-        return str(data_dir_path.parent), data_dir_path.name
-
-    return str(data_dir_path), "samples"
-
 
 def merge_eval_config(cfg):
     eval_cfg = cfg.get("evaluation", {})
@@ -129,28 +92,21 @@ def merge_eval_config(cfg):
 def load_model_config(data_dir, forecast_name, model_name, fallback_data=None):
     # First, look for model_config.json directly in the forecast_name directory
     direct_path = Path(data_dir, "forecasts", forecast_name, "model_config.json")
-    print(f"[TRACE] Looking for model_config.json at: {direct_path}")
     if direct_path.exists():
-        print(f"[TRACE] Found model_config.json at: {direct_path}")
         with open(direct_path, "r") as f:
             config_json = json.load(f)
-        print(f"[TRACE] Loaded model_config.json: {config_json}")
         return config_json
 
     # Fallback: look for model_config.json in a model_name subdirectory (legacy)
     subdir_path = Path(data_dir, "forecasts", forecast_name, model_name, "model_config.json")
-    print(f"[TRACE] model_config.json not found at: {direct_path}, trying: {subdir_path}")
     if subdir_path.exists():
-        print(f"[TRACE] Found model_config.json at: {subdir_path}")
         with open(subdir_path, "r") as f:
             config_json = json.load(f)
-        print(f"[TRACE] Loaded model_config.json: {config_json}")
         return config_json
 
     if fallback_data is None:
         raise FileNotFoundError(f"model_config.json not found at {direct_path} or {subdir_path}")
 
-    print(f"[TRACE] Using fallback_data for model_config: {fallback_data}")
     return {
         "input_columns": fallback_data["input_columns"],
         "output_columns": fallback_data["output_columns"],
@@ -189,7 +145,6 @@ def load_test_samples(
 def _read_split_files(split_source_dir, split_file):
     split_path = Path(split_source_dir) / split_file
     abs_split_path = split_path.resolve()
-    print(f"[DEBUG] Attempting to open split file: {abs_split_path}")
     if not abs_split_path.exists():
         raise FileNotFoundError(f"Split file not found: {abs_split_path}")
     with open(abs_split_path) as f:
@@ -221,11 +176,8 @@ def load_split_samples(
     input_aggregation="none",
 ):
     source_dir = Path(split_source_dir) if split_source_dir is not None else Path(data_dir, "forecasts", forecast_name)
-    print(f"[TRACE] load_split_samples: source_dir={source_dir}, split_file={split_file}")
     split_files = split_files_override if split_files_override is not None else _read_split_files(source_dir, split_file)
-    print(f"[TRACE] load_split_samples: split_files={split_files}")
 
-    print(f"[TRACE] load_samples: data_dir={data_dir}, sample_subdir={sample_subdir}, input_columns={input_columns}, output_columns={output_columns}, input_rows={input_rows}, output_rows={output_rows}, input_aggregation={input_aggregation}")
     samples = load_samples(
         os.path.join(data_dir, sample_subdir),
         input_columns=input_columns,
@@ -237,7 +189,6 @@ def load_split_samples(
         input_aggregation=input_aggregation,
     )
 
-    print(f"[TRACE] load_samples returned {len(samples)} samples")
     return samples
 
 
@@ -245,88 +196,6 @@ def get_output_dim(data_dir, sample_subdir, output_columns, output_rows):
     sample_files = sorted(os.listdir(Path(data_dir, sample_subdir)))
     sample_df = pd.read_csv(Path(data_dir, sample_subdir, sample_files[0]))
     return len(output_columns) * len(sample_df.iloc[output_rows:])
-
-
-def _canonical_feature_name(name):
-    text = str(name).strip().lower().replace("µ", "u")
-    text = text.replace("micro", "u")
-    text = text.replace("_", " ")
-    if " - " in text:
-        text = text.split(" - ", 1)[1].strip()
-    for token in ["(", ")", "/", "%", "°", "-", ".", ","]:
-        text = text.replace(token, " ")
-    return " ".join(text.split())
-
-
-def _resolve_summary_dir(hyper_cfg, config_dir):
-    if hyper_cfg.get("uncertainty_summary_dir"):
-        return _resolve_path_from_config(hyper_cfg["uncertainty_summary_dir"], config_dir)
-    return Path(__file__).parent.parent / "data" / "output" / "calibration" / "summaries"
-
-
-def _load_uncertainty_std_map(summary_dir):
-    if not summary_dir.exists():
-        return {}
-
-    summary_map = {}
-    for file_path in summary_dir.rglob("*_uncertainty_summary.csv"):
-        try:
-            df = pd.read_csv(file_path)
-            if df.empty:
-                continue
-            row = df.iloc[0]
-            sensor_name = row.get("Sensor")
-            if pd.isna(sensor_name):
-                continue
-            offset_std = row.get("Offset_Std", 0.0)
-            if pd.isna(offset_std):
-                offset_std = 0.0
-            summary_map[_canonical_feature_name(sensor_name)] = float(offset_std)
-        except Exception:
-            continue
-    return summary_map
-
-
-def _build_feature_uncertainty_variance(data_cfg, hyper_cfg, config_dir):
-    input_columns = data_cfg["input_columns"]
-    seq_len = data_cfg["input_row_2"] - data_cfg["input_row_1"]
-
-    summary_std_map = _load_uncertainty_std_map(_resolve_summary_dir(hyper_cfg, config_dir))
-
-    norm_path = Path(data_cfg["data_dir"]) / "normalization.json"
-    norm_params = {}
-    if norm_path.exists():
-        try:
-            with open(norm_path, "r") as f:
-                norm_params = json.load(f)
-        except Exception:
-            norm_params = {}
-
-    feature_variances = []
-    for feature in input_columns:
-        candidates = [_canonical_feature_name(feature)]
-        if " - " in feature:
-            candidates.append(_canonical_feature_name(feature.split(" - ", 1)[1]))
-
-        matched_std = None
-        for candidate in candidates:
-            if candidate in summary_std_map:
-                matched_std = summary_std_map[candidate]
-                break
-
-        if matched_std is None:
-            matched_std = 0.0
-
-        if matched_std > 0 and feature in norm_params:
-            v_min = norm_params[feature].get("min", 0)
-            v_max = norm_params[feature].get("max", 1)
-            v_range = v_max - v_min
-            if v_range not in [0, 0.0]:
-                matched_std = matched_std / v_range
-
-        feature_variances.append(float(matched_std ** 2))
-
-    return np.tile(np.array(feature_variances, dtype=np.float32), seq_len)
 
 
 def _prepare_gp_train_arrays(train_samples, split_cfg, hyper_cfg):
@@ -372,47 +241,6 @@ def _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device, conf
             _build_feature_uncertainty_variance(data_cfg, hyper_cfg, config_dir), dtype=torch.float32, device=device
         )
 
-    class UncertainInputRBFKernel(gpytorch.kernels.Kernel):
-        has_lengthscale = True
-
-        def __init__(self, input_variance, **kwargs):
-            super().__init__(**kwargs)
-            self.register_buffer("input_variance", input_variance)
-
-        def forward(self, x1, x2, diag=False, **params):
-            if diag:
-                return torch.ones(x1.shape[-2], device=x1.device, dtype=x1.dtype)
-
-            lengthscale = self.lengthscale.squeeze()
-            if lengthscale.dim() == 0:
-                lengthscale = lengthscale.repeat(x1.shape[-1])
-
-            ls2 = lengthscale.pow(2)
-            denom = torch.clamp(ls2 + 2.0 * self.input_variance, min=1e-10)
-            sq_dist = ((x1.unsqueeze(-2) - x2.unsqueeze(-3)).pow(2) / denom).sum(dim=-1)
-            det_term = torch.sqrt(torch.prod(ls2 / denom))
-            return det_term * torch.exp(-0.5 * sq_dist)
-
-    def build_base_kernel():
-        if use_uncertain_kernel:
-            return UncertainInputRBFKernel(input_variance=input_uncertainty_var, ard_num_dims=ard_dims)
-        if kernel_name == "rbf":
-            return gpytorch.kernels.RBFKernel(ard_num_dims=ard_dims)
-        if kernel_name == "matern32":
-            return gpytorch.kernels.MaternKernel(nu=1.5, ard_num_dims=ard_dims)
-        return gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=ard_dims)
-
-    class ExactGPRegressor(gpytorch.models.ExactGP):
-        def __init__(self, train_x, train_y, likelihood):
-            super().__init__(train_x, train_y, likelihood)
-            self.mean_module = gpytorch.means.ConstantMean()
-            self.covar_module = gpytorch.kernels.ScaleKernel(build_base_kernel())
-
-        def forward(self, x):
-            mean_x = self.mean_module(x)
-            covar_x = self.covar_module(x)
-            return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-
     models = []
     for state in artifact["models"]:
         output_idx = state["output_index"]
@@ -424,7 +252,10 @@ def _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device, conf
 
         y_train = torch.tensor(y_train_used, dtype=torch.float32, device=device)
         likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
-        model = ExactGPRegressor(X_train, y_train, likelihood).to(device)
+        model = ExactGPRegressor(
+            X_train, y_train, likelihood,
+            build_base_kernel(kernel_name, use_uncertain_kernel, input_uncertainty_var, ard_dims)
+        ).to(device)
         model.load_state_dict(state["model_state_dict"])
         likelihood.load_state_dict(state["likelihood_state_dict"])
         model.eval()
@@ -622,12 +453,7 @@ def _plot_uncertainty_boxplots(regression_pairs, regression_labels, split_files_
         if not group_order or n_cols == 0:
             continue
 
-        # Set a default box_width before any use
         box_width = 0.05
-        if not group_order or n_cols == 0:
-            print(f"[INFO] Skipping uncertainty boxplot for {label}: no aligned grouped samples.")
-            continue
-
         max_outputs = min(4, n_cols)
         fig_h = max(3.4, 2.6 * max_outputs)
         fig_w = max(9.5, min(18.0, 0.24 * len(group_order) + 8.5))
@@ -680,11 +506,6 @@ def _plot_uncertainty_boxplots(regression_pairs, regression_labels, split_files_
                     box_data.append(pred_vals)
                     x_ground_truth.append(gt_x)
                     positions.append(gt_x)
-
-            # If not using sample_labels, plot all at once
-            if sample_labels is None or len(box_data) > 0:
-                if len(box_data) > 0:
-                    ax.boxplot(box_data, positions=positions, widths=box_width, showfliers=False)
 
             if not box_data:
                 ax.set_visible(False)
@@ -939,18 +760,13 @@ def evaluate_single_config(config_path, save_plots_override=None):
     print(f"Using device: {device}")
     matplotlib.use("Agg")
 
-    print(f"[TRACE] data_cfg['data_dir']: {data_cfg['data_dir']}")
-    print(f"[TRACE] data_cfg['forecast_name']: {data_cfg['forecast_name']}")
-    print(f"[TRACE] model_name: {model_name}")
     model_config = load_model_config(
         data_cfg["data_dir"],
         data_cfg["forecast_name"],
         model_name,
         fallback_data=data_cfg,
     )
-    print(f"[TRACE] model_config loaded: {model_config}")
 
-    print(f"[TRACE] model_config keys: {list(model_config.keys())}")
     input_columns = model_config["input_columns"]
     output_columns = model_config["output_columns"]
     input_rows = slice(model_config["input_row_1"], model_config["input_row_2"])
@@ -999,7 +815,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
         )
     elif model_type in ("xgb_regressor", "transformer", "xgb_classifier"):
         # For these, optionally load train samples if evaluate_all is set
-        if eval_cfg.get("evaluate_all", True):
+        if eval_cfg.get("evaluate_all", False):
             train_samples = load_split_samples(
                 data_cfg["data_dir"],
                 data_cfg["sample_subdir"],
@@ -1018,30 +834,17 @@ def evaluate_single_config(config_path, save_plots_override=None):
             )
 
     # If evaluate_all is true, combine train and test samples for evaluation, but keep track of which is which
-    if eval_cfg.get("evaluate_all", True) and train_samples is not None:
+    if eval_cfg.get("evaluate_all", False) and train_samples is not None:
         all_samples = list(train_samples) + list(test_samples)
         all_split_files = (train_split_files or []) + model_split_files
         all_labels = ["train"] * len(train_samples) + ["test"] * len(test_samples)
         eval_samples = all_samples
         eval_split_files = all_split_files
         eval_labels = all_labels
-        # Prepare arrays for per-set metrics
-        X_train = np.array([s[0].flatten() for s in train_samples])
-        y_train = np.array([s[1].flatten() for s in train_samples])
-        X_test = np.array([s[0].flatten() for s in test_samples])
-        y_test = np.array([s[1].flatten() for s in test_samples])
-        X_all = np.concatenate([X_train, X_test], axis=0)
-        y_all = np.concatenate([y_train, y_test], axis=0)
     else:
         eval_samples = test_samples
         eval_split_files = model_split_files
         eval_labels = ["test"] * len(test_samples)
-        X_train = None
-        y_train = None
-        X_test = np.array([s[0].flatten() for s in test_samples])
-        y_test = np.array([s[1].flatten() for s in test_samples])
-        X_all = X_test
-        y_all = y_test
 
     # Use eval_samples for evaluation below
     # For plotting, pass eval_labels to visualizer and uncertainty boxplot
@@ -1050,14 +853,11 @@ def evaluate_single_config(config_path, save_plots_override=None):
     if model_type == "transformer":
         X_test = np.array([s[0] for s in test_samples])  # shape: (n_samples, seq_len, n_features)
         y_test = np.array([s[1] for s in test_samples])
-        print(f"[DEBUG] X_test shape for transformer: {X_test.shape}")
-        print(f"[DEBUG] y_test shape for transformer: {y_test.shape}")
-        print(f"[DEBUG] First X_test sample: {X_test[0] if len(X_test) > 0 else 'EMPTY'}")
         input_dim = X_test.shape[2] if X_test.ndim == 3 else 0
         output_dim = y_test.shape[1] if y_test.ndim > 1 else 1
         target_dim = int(y_test.shape[1]) if y_test.ndim > 1 else (1 if len(y_test) > 0 else 0)
         # Also handle X_train and X_all for transformer
-        if eval_cfg.get("evaluate_all", True) and train_samples is not None:
+        if eval_cfg.get("evaluate_all", False) and train_samples is not None:
             X_train = np.array([s[0] for s in train_samples])
             y_train = np.array([s[1] for s in train_samples])
             X_all = np.concatenate([X_train, X_test], axis=0)
@@ -1070,13 +870,10 @@ def evaluate_single_config(config_path, save_plots_override=None):
     else:
         X_test = np.array([s[0].flatten() for s in test_samples])
         y_test = np.array([s[1].flatten() for s in test_samples])
-        print(f"[DEBUG] X_test shape after flatten: {X_test.shape}")
-        print(f"[DEBUG] y_test shape after flatten: {y_test.shape}")
-        print(f"[DEBUG] First X_test sample: {X_test[0] if len(X_test) > 0 else 'EMPTY'}")
         input_dim = int(X_test.shape[1]) if X_test.ndim > 1 else (int(len(X_test[0])) if len(X_test) > 0 else 0)
         output_dim = y_test.shape[1] if y_test.ndim > 1 else 1
         target_dim = int(y_test.shape[1]) if y_test.ndim > 1 else (1 if len(y_test) > 0 else 0)
-        if eval_cfg.get("evaluate_all", True) and train_samples is not None:
+        if eval_cfg.get("evaluate_all", False) and train_samples is not None:
             X_train = np.array([s[0].flatten() for s in train_samples])
             y_train = np.array([s[1].flatten() for s in train_samples])
             X_all = np.concatenate([X_train, X_test], axis=0)
@@ -1088,8 +885,6 @@ def evaluate_single_config(config_path, save_plots_override=None):
             y_all = y_test
 
     split_cfg = config.get("data_split", {"random_state": 42})
-    print(f"[TRACE] Calling load_model with model_type={model_type}, model_name={model_name}")
-    print(f"[TRACE] model_config passed to load_model: {model_config}")
     model = load_model(model_type, data_cfg, split_cfg, model_name, model_config, device, train_samples, config_dir)
 
     regression_pairs = []
@@ -1099,204 +894,6 @@ def evaluate_single_config(config_path, save_plots_override=None):
     summary_rows = []
     baseline_split_files = []
     per_set_metrics = []
-
-    # --- LOOCV logic controlled by config flag ---
-    def run_loocv_mc_group():
-        """
-        Perform leave-one-out cross-validation at the MC group (raw segment) level.
-        For each unique group (raw segment), leave out all samples for that group, train on the rest, predict on the left-out group.
-        Write results to a summary CSV in the forecast directory.
-        """
-        print("[DEBUG] Entered run_loocv_mc_group")
-        from utils.training import group_samples_by_segment
-        import copy
-
-        # Group test samples by raw segment (fix: only pass test_samples)
-        group_map = dict(group_samples_by_segment(test_samples))
-        print(f"[DEBUG] Grouped test_samples into {len(group_map)} groups. Total test_samples: {len(test_samples)}")
-        group_ids = list(group_map.keys())
-        loocv_preds = []
-        loocv_targets = []
-        loocv_group_ids = []
-        per_fold_rows = []
-
-        for left_out_group in group_ids:
-            test_samples_fold = group_map[left_out_group]
-            # Indices of all other groups
-            train_samples_fold = [s for gid, seg_samples in group_map.items() if gid != left_out_group for s in seg_samples]
-            print(f"[DEBUG] LOOCV fold {left_out_group}: train_samples_fold={len(train_samples_fold)}, test_samples_fold={len(test_samples_fold)}")
-            # Debug: check for data leakage
-            train_groups = set(gid for gid, seg_samples in group_map.items() if gid != left_out_group)
-            test_groups = set([left_out_group])
-            train_ids = set(id(s) for s in train_samples_fold)
-            test_ids = set(id(s) for s in test_samples_fold)
-            overlap = train_ids & test_ids
-            if overlap:
-                print(f"[ERROR] DATA LEAKAGE: {len(overlap)} samples from left-out group {left_out_group} are present in training set!")
-            else:
-                print(f"[DEBUG] LOOCV fold {left_out_group}: train groups = {sorted(train_groups)}, test group = {left_out_group}, train size = {len(train_samples_fold)}, test size = {len(test_samples_fold)} (no leakage)")
-            if not train_samples_fold or not test_samples_fold:
-                print(f"[WARN] LOOCV fold skipped: group {left_out_group} has empty train or test split.")
-                continue
-
-            # Retrain model on train_samples_fold
-            if model_type == "xgb_regressor":
-                X_train = np.array([s[0].flatten() for s in train_samples_fold])
-                y_train = np.array([s[1].flatten() for s in train_samples_fold])
-                xgb_model = xgb.XGBRegressor()
-                xgb_model.fit(X_train, y_train)
-                X_test_fold = np.array([s[0].flatten() for s in test_samples_fold])
-                preds = xgb_model.predict(X_test_fold)
-                if np.ndim(preds) == 1:
-                    preds = preds.reshape(-1, 1)
-                targets = np.array([s[1].flatten() for s in test_samples_fold])
-                print(f"[DEBUG] XGBRegressor preds: {preds[:5]}, targets: {targets[:5]}")
-            elif model_type == "gp_regressor":
-                X_train = np.array([s[0].flatten() for s in train_samples_fold], dtype=np.float32)
-                y_train = np.array([s[1].flatten() for s in train_samples_fold], dtype=np.float32)
-                y_train_col = y_train[:, 0] if y_train.ndim > 1 else y_train
-                likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
-                class DummyGP(gpytorch.models.ExactGP):
-                    def __init__(self, train_x, train_y, likelihood):
-                        super().__init__(train_x, train_y, likelihood)
-                        self.mean_module = gpytorch.means.ConstantMean()
-                        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
-                    def forward(self, x):
-                        mean_x = self.mean_module(x)
-                        covar_x = self.covar_module(x)
-                        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-                X_train_tensor = torch.tensor(X_train, dtype=torch.float32, device=device)
-                y_train_tensor = torch.tensor(y_train_col, dtype=torch.float32, device=device)
-                gp_model = DummyGP(X_train_tensor, y_train_tensor, likelihood).to(device)
-                gp_model.train()
-                likelihood.train()
-                optimizer = torch.optim.Adam(gp_model.parameters(), lr=0.1)
-                mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, gp_model)
-                for _ in range(30):
-                    optimizer.zero_grad()
-                    output = gp_model(X_train_tensor)
-                    loss = -mll(output, y_train_tensor)
-                    loss.backward()
-                    optimizer.step()
-                gp_model.eval()
-                likelihood.eval()
-                X_test_fold = np.array([s[0].flatten() for s in test_samples_fold], dtype=np.float32)
-                X_test_tensor = torch.tensor(X_test_fold, dtype=torch.float32, device=device)
-                with torch.no_grad(), gpytorch.settings.fast_pred_var():
-                    pred_dist = likelihood(gp_model(X_test_tensor))
-                    preds = pred_dist.mean.cpu().numpy().reshape(-1, 1)
-                targets = np.array([s[1].flatten() for s in test_samples_fold])
-                print(f"[DEBUG] GPRegressor preds: {preds[:5]}, targets: {targets[:5]}")
-            else:
-                print(f"[WARN] LOOCV not implemented for model_type={model_type}")
-                continue
-
-            # Naive baseline using evaluate_naive for this fold
-            preds_naive, targets_naive = evaluate_naive(
-                test_samples_fold,
-                eval_cfg.get("historic_path", ""),
-                output_columns,
-                data_cfg["data_dir"],
-                sample_subdir=data_cfg.get("sample_subdir", "samples")
-            )
-            preds_naive_arr, targets_naive_arr, _, _ = _aligned_arrays(preds_naive, targets_naive)
-            if preds_naive_arr.size > 0 and targets_naive_arr.size > 0:
-                naive_errors = preds_naive_arr - targets_naive_arr
-                rmse_naive = float(np.sqrt(np.mean(np.square(naive_errors))))
-            else:
-                rmse_naive = float('nan')
-
-            loocv_preds.append(preds)
-            loocv_targets.append(targets)
-            loocv_group_ids.extend([left_out_group] * len(preds))
-
-            # Per-fold metrics for debugging
-            fold_row = _compute_regression_summary(
-                f"LOOCV_fold_{left_out_group}_{model_type}",
-                preds,
-                targets,
-                num_samples=len(preds),
-                metadata={
-                    "kind": "loocv_fold",
-                    "group": left_out_group,
-                    "data_dir": str(data_cfg["data_dir"]),
-                    "n_test_samples": len(preds),
-                    "input_dim": input_dim,
-                    "target_dim": target_dim,
-                    "rmse_naive": rmse_naive,
-                },
-            )
-            # Add skill_v_naive after fold_row is created
-            try:
-                rmse_val = fold_row["rmse"]
-            except Exception:
-                rmse_val = float('nan')
-            skill_v_naive = 1.0 - (rmse_val / rmse_naive) if rmse_naive and rmse_naive > 0 else float('nan')
-            fold_row["skill_v_naive"] = skill_v_naive
-            per_fold_rows.append(fold_row)
-
-        # Concatenate all predictions and targets
-        if loocv_preds:
-            all_preds = np.vstack(loocv_preds)
-            all_targets = np.vstack(loocv_targets)
-            print(f"[DEBUG] All LOOCV preds shape: {all_preds.shape}, targets shape: {all_targets.shape}")
-            # Naive baseline for aggregate using evaluate_naive
-            preds_naive_agg, targets_naive_agg = evaluate_naive(
-                [s for group in group_map.values() for s in group],
-                eval_cfg.get("historic_path", ""),
-                output_columns,
-                data_cfg["data_dir"],
-                sample_subdir=data_cfg.get("sample_subdir", "samples")
-            )
-            preds_naive_agg_arr, targets_naive_agg_arr, _, _ = _aligned_arrays(preds_naive_agg, targets_naive_agg)
-            if preds_naive_agg_arr.size > 0 and targets_naive_agg_arr.size > 0:
-                naive_errors_agg = preds_naive_agg_arr - targets_naive_agg_arr
-                rmse_naive_agg = float(np.sqrt(np.mean(np.square(naive_errors_agg))))
-            else:
-                rmse_naive_agg = float('nan')
-
-            summary = _compute_regression_summary(
-                f"LOOCV_{model_type}",
-                all_preds,
-                all_targets,
-                num_samples=len(all_preds),
-                metadata={
-                    "kind": "loocv",
-                    "data_dir": str(data_cfg["data_dir"]),
-                    "n_test_samples": len(all_preds),
-                    "input_dim": input_dim,
-                    "target_dim": target_dim,
-                    "rmse_naive": rmse_naive_agg,
-                },
-            )
-            # Add skill_v_naive after summary is created
-            try:
-                rmse_val_agg = summary["rmse"]
-            except Exception:
-                rmse_val_agg = float('nan')
-            skill_v_naive_agg = 1.0 - (rmse_val_agg / rmse_naive_agg) if rmse_naive_agg and rmse_naive_agg > 0 else float('nan')
-            summary["skill_v_naive"] = skill_v_naive_agg
-            summary_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], "loocv_summary.csv")
-            # Print what will be written
-            print("[DEBUG] Writing LOOCV summary (first row):", summary)
-            print("[DEBUG] Writing LOOCV per-fold rows (count):", len(per_fold_rows))
-            # Write both the aggregate summary and all per-fold rows to the same file
-            _write_summary_csv([summary] + per_fold_rows, summary_path)
-            # Still write per-fold metrics to a separate file for debugging
-            per_fold_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], "loocv_folds.csv")
-            _write_summary_csv(per_fold_rows, per_fold_path)
-            print(f"[INFO] LOOCV summary written to {summary_path}")
-            print(f"[INFO] LOOCV per-fold metrics written to {per_fold_path}")
-        else:
-            print("[WARN] No LOOCV predictions generated.")
-
-    # --- End LOOCV logic ---
-
-    # Run LOOCV if requested in config
-    print(f"[DEBUG] eval_cfg.get('run_loocv', False) = {eval_cfg.get('run_loocv', False)}")
-    if eval_cfg.get("run_loocv", False):
-        print("[DEBUG] Calling run_loocv_mc_group()...")
-        run_loocv_mc_group()
 
     # --- Regression metrics for train, test, and combined sets ---
     # Only for regression tasks
@@ -1310,14 +907,10 @@ def evaluate_single_config(config_path, save_plots_override=None):
             preds_test = _predict_gp_bundle(model, X_test, device)
             preds_all = _predict_gp_bundle(model, X_all, device)
         elif model_type == "transformer":
-            print(f"[DEBUG] X_test shape before transformer: {X_test.shape}")
             if X_train is not None:
-                print(f"[DEBUG] X_train shape before transformer: {X_train.shape}")
                 preds_train = model(torch.tensor(X_train, dtype=torch.float32, device=device)).detach().cpu().numpy()
             preds_test = model(torch.tensor(X_test, dtype=torch.float32, device=device)).detach().cpu().numpy()
-            print(f"[DEBUG] preds_test shape after transformer: {preds_test.shape}")
             preds_all = model(torch.tensor(X_all, dtype=torch.float32, device=device)).detach().cpu().numpy()
-            print(f"[DEBUG] preds_all shape after transformer: {preds_all.shape}")
         elif model_type == "xgb_regressor":
             if X_train is not None:
                 preds_train = model.predict(X_train).reshape(-1, y_train.shape[1] if y_train.ndim > 1 else 1)
@@ -1433,94 +1026,26 @@ def evaluate_single_config(config_path, save_plots_override=None):
     summary_path = summary_dir / "evaluation_summary.csv"
     _write_summary_csv(summary_rows, summary_path)
 
-
-def write_combined_outputs(results, save_plots=True):
-    grouped = {}
-    for result in results:
-        grouped.setdefault(result["data_dir"], []).append(result)
-
-    for data_dir, group in grouped.items():
-        combined_pairs = []
-        combined_labels = []
-        combined_split_files = []
-        combined_meta = []
-        combined_rows = []
-
-        for result in group:
-            if result["model_pair"] is not None:
-                combined_pairs.append(result["model_pair"])
-                combined_labels.append(result["model_label"])
-                combined_split_files.append(result.get("model_split_files", []))
-                combined_meta.append(
-                    {
-                        "data_dir": result["data_dir"],
-                        "kind": "model",
-                        "n_train_samples": result["n_train_samples"],
-                        "n_test_samples": result["n_test_samples"],
-                        "input_dim": result["input_dim"],
-                        "target_dim": result["target_dim"],
-                    }
-                )
-
-        baseline_source = next((r for r in group if r["baseline_pairs"]), None)
-        if baseline_source is not None:
-            combined_pairs.extend(baseline_source["baseline_pairs"])
-            combined_labels.extend(baseline_source["baseline_labels"])
-            combined_split_files.extend([baseline_source.get("baseline_split_files", [])] * len(baseline_source["baseline_labels"]))
-            for label in baseline_source["baseline_labels"]:
-                combined_meta.append(
-                    {
-                        "data_dir": baseline_source["data_dir"],
-                        "kind": "baseline",
-                        "n_train_samples": np.nan,
-                        "n_test_samples": np.nan,
-                        "input_dim": baseline_source["input_dim"],
-                        "target_dim": baseline_source["target_dim"],
-                    }
-                )
-
-        if len(combined_pairs) < 2:
-            print(
-                "[INFO] Skipping combined top-level plots for "
-                f"{data_dir}; need at least two result sets, got {len(combined_pairs)}."
-            )
-            continue
-
-        num_samples = max(r["num_samples"] for r in group)
-        if save_plots:
-            visualizer(
-                *combined_pairs,
-                labels=combined_labels,
-                forecast_name="",
-                directory=data_dir,
-                num_samples=num_samples,
-            )
-            _plot_uncertainty_boxplots(
-                combined_pairs,
-                combined_labels,
-                combined_split_files,
-                directory=data_dir,
-                forecast_name="",
-                num_samples=num_samples,
-            )
-
-        for (preds, targets), label, meta in zip(combined_pairs, combined_labels, combined_meta):
-            combined_rows.append(
-                _compute_regression_summary(
-                    label,
-                    preds,
-                    targets,
-                    num_samples,
-                    metadata=meta,
-                )
-            )
-
-        _write_summary_csv(combined_rows, Path(data_dir, "forecasts", "evaluation_summary_combined.csv"))
-
-        print(
-            "[INFO] Wrote combined comparison outputs to top forecasts directory: "
-            f"{Path(data_dir, 'forecasts')}"
-        )
+    # Return the main model summary row (prefer test, then combined, then train)
+    # Look for kind == 'test', else 'combined', else 'train', else first row
+    main_row = None
+    for row in summary_rows:
+        if str(row.get("kind", "")).lower() == "test":
+            main_row = row
+            break
+    if main_row is None:
+        for row in summary_rows:
+            if str(row.get("kind", "")).lower() == "combined":
+                main_row = row
+                break
+    if main_row is None:
+        for row in summary_rows:
+            if str(row.get("kind", "")).lower() == "train":
+                main_row = row
+                break
+    if main_row is None and summary_rows:
+        main_row = summary_rows[0]
+    return main_row
 
 
 def main():
@@ -1547,10 +1072,8 @@ def main():
         )
 
     save_plots_override = False if args.no_plots else True
-    results = [evaluate_single_config(config_path, save_plots_override=save_plots_override) for config_path in config_paths]
-
-    if len(results) > 1:
-        write_combined_outputs(results)
+    for config_path in config_paths:
+        evaluate_single_config(config_path, save_plots_override=save_plots_override)
 
 
 if __name__ == "__main__":

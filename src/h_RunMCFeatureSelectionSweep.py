@@ -11,13 +11,13 @@ Then:
 - Write trace, selected subsets, and final metrics to forecasts/feature_sweeps.
 
 Examples:
-python src/i_RunMCFeatureSelectionSweep.py --dry-run
-python src/i_RunMCFeatureSelectionSweep.py --limit-datasets 1 --max-rounds 8 --beam-width 6
-python src/i_RunMCFeatureSelectionSweep.py --row-counts 1,2,3,5 --limit-datasets 1
-python src/i_RunMCFeatureSelectionSweep.py --exclude=MC_Trial1,MC_Trial2
-python src/i_RunMCFeatureSelectionSweep.py --postprocess-only --keep-search-plots
+python src/h_RunMCFeatureSelectionSweep.py --dry-run
+python src/h_RunMCFeatureSelectionSweep.py --limit-datasets 1 --max-rounds 8 --beam-width 6
+python src/h_RunMCFeatureSelectionSweep.py --row-counts 1,2,3,5 --limit-datasets 1
+python src/h_RunMCFeatureSelectionSweep.py --exclude=MC_Trial1,MC_Trial2
+python src/h_RunMCFeatureSelectionSweep.py --postprocess-only --keep-search-plots
 """
-
+from __future__ import annotations
 import contextlib
 import argparse
 import copy
@@ -36,17 +36,13 @@ import torch
 import yaml
 import e_Train as train_module
 import f_Evaluate as eval_module
-import subprocess
 import os
 import unicodedata
 import seaborn as sns
-import fnmatch
 import traceback
-from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from utils.training import load_samples, group_samples_by_segment
-from utils.model_runner import ModelRunner
 
 
 SUPPORTED_CONFIG_SUFFIXES = {".yml", ".yaml", ".json"}
@@ -77,6 +73,83 @@ class CandidateResult:
     n_test_samples: float
     input_dim: float
     target_dim: float
+
+
+_MODEL_ID_ALIASES: dict[str, str] = {
+    # XGBoost class name and variants → canonical model_type
+    "xgbregressor": "xgb_regressor",
+    "xgb": "xgb_regressor",
+    # GP variants → canonical model_type
+    "gaussianprocessregressor": "gp_regressor",
+    "exactgp": "gp_regressor",
+    "gpregressor": "gp_regressor",
+    # Linear
+    "linearregression": "linear_regressor",
+    "ridge": "linear_regressor",
+    "elasticnet": "linear_regressor",
+}
+
+
+def _normalize_model_id(s: str) -> str:
+    """Normalize a model identifier to a canonical lowercase form.
+
+    Handles Python class names (e.g. 'XGBRegressor'), canonical model_type strings
+    (e.g. 'xgb_regressor'), and short model_name prefixes (e.g. 'xgb_01').
+    """
+    key = s.lower().replace("_", "").replace(" ", "")
+    return _MODEL_ID_ALIASES.get(key, key)
+
+
+def _match_model_str(raw_value: str, cfg_model_type: str, cfg_model_name: str) -> bool:
+    """Return True if *raw_value* (from the 'model' column of feature_sweep_final_metrics.csv)
+    matches the config entry described by *cfg_model_type* and *cfg_model_name*.
+
+    Handles three naming conventions that may appear in the CSV:
+      - canonical model_type  ('xgb_regressor')
+      - Python class name     ('XGBRegressor')
+      - short model_name      ('xgb_01')
+    """
+    # Direct string equality (fast path)
+    if raw_value == cfg_model_type or (cfg_model_name and raw_value == cfg_model_name):
+        return True
+    # Normalized comparison — maps class names to canonical model_type
+    if _normalize_model_id(raw_value) == _normalize_model_id(cfg_model_type):
+        return True
+    return False
+
+
+def _strip_fs_prefix(s: str) -> str:
+    """Strip a leading ``'feature_sweeps/'`` prefix from a forecast name string."""
+    return s[len("feature_sweeps/"):] if s.startswith("feature_sweeps/") else s
+
+
+def _find_matching_config(
+    model_str: str,
+    train_configs: list[Path],
+) -> "tuple[str, str, Path] | None":
+    """Return ``(resolved_model_type, base_forecast_name, config_path)`` for the first
+    entry in *train_configs* whose model_type or model_name matches *model_str*.
+    Returns ``None`` when no config matches.
+    """
+    for base_cfg in train_configs:
+        try:
+            _cfg = train_module.load_config(str(base_cfg))
+            cfg_model_type = _cfg.get("model_type", "")
+            cfg_model_name = _cfg.get("model_name", "")
+            if _match_model_str(model_str, cfg_model_type, cfg_model_name):
+                fn = _cfg.get("data", {}).get("forecast_name") or cfg_model_name or "unknown_01"
+                return cfg_model_type, _strip_fs_prefix(str(fn)), base_cfg
+        except Exception:
+            continue
+    return None
+
+
+def _format_eta(start_time: float, eval_count: int, eval_budget: int) -> str:
+    """Return a human-readable ETA string for the running search."""
+    elapsed = time.time() - start_time
+    avg = elapsed / eval_count if eval_count > 0 else 0
+    eta_s = avg * (eval_budget - eval_count)
+    return f"{int(eta_s // 60)}m {int(eta_s % 60)}s" if eta_s > 0 else "unknown"
 
 
 def _derive_target_name(dataset_name: str, dataset_prefix: str) -> str:
@@ -144,15 +217,26 @@ def discover_mc_dataset_plans(
     plans: list[DatasetPlan] = []
     for dataset_dir in dataset_dirs:
         raw_matches = sorted(dataset_dir.glob(config_pattern))
-        train_configs = [path for path in raw_matches if path.suffix.lower() in SUPPORTED_CONFIG_SUFFIXES]
+        train_configs = []
+        for path in raw_matches:
+            if path.suffix.lower() not in SUPPORTED_CONFIG_SUFFIXES:
+                continue
+            try:
+                cfg = train_module.load_config(str(path))
+                if "model_name" in cfg or "model_type" in cfg:
+                    train_configs.append(path)
+                else:
+                    print(f"[WARN] Skipping config without model_name/model_type: {path}")
+            except Exception as e:
+                print(f"[WARN] Could not load config {path}: {e}")
         if not train_configs:
+            print(f"[WARN] Skipping dataset (no matching configs found): {dataset_dir.name}")
             continue
         train_configs.sort(key=_model_sort_key)
         plans.append(DatasetPlan(dataset_dir=dataset_dir, train_configs=train_configs))
 
     if limit_datasets > 0:
         plans = plans[:limit_datasets]
-
     return plans
 
 
@@ -179,9 +263,7 @@ def _resolve_dataset_inclusion(args: argparse.Namespace) -> tuple[bool, bool]:
 
 
 def _variant_forecast_name(base_forecast_name: str, row_count: int, feature_tag: str) -> str:
-    base_name = str(base_forecast_name).replace("\\", "/")
-    if base_name.startswith("feature_sweeps/"):
-        base_name = base_name[len("feature_sweeps/") :]
+    base_name = _strip_fs_prefix(str(base_forecast_name).replace("\\", "/"))
     return f"feature_sweeps/{base_name}_r{row_count:03d}_{feature_tag}"
 
 
@@ -217,19 +299,22 @@ def _prepare_variant_config(
     data_cfg["input_row_1"] = int(base_stop - row_count)
     data_cfg["input_row_2"] = int(base_stop)
 
-
     # Always resolve forecast_name as a relative path under the correct data_dir
     # and ensure data_dir is absolute and correct
     resolved_data_dir = train_module._resolve_path_from_config(data_cfg["data_dir"], source_config_dir)
     data_cfg["data_dir"] = str(resolved_data_dir)
     # Ensure forecast_name is always relative to the correct data_dir
     data_cfg["forecast_name"] = _variant_forecast_name(str(data_cfg["forecast_name"]), row_count, feature_tag)
+    forecast_name_rel = _strip_fs_prefix(str(data_cfg["forecast_name"]))
     # Store the original forecast directory for downstream evaluation
-    forecast_dir = Path(resolved_data_dir) / "forecasts" / "feature_sweeps" / data_cfg["forecast_name"]
+    forecast_dir = Path(resolved_data_dir) / "forecasts" / "feature_sweeps" / forecast_name_rel
     data_cfg["forecast_dir"] = str(forecast_dir.resolve())
 
+    # Ensure model_name is set
+    if "model_name" not in cfg_copy or not cfg_copy["model_name"]:
+        # Try to inherit from base config, fallback to model_type
+        cfg_copy["model_name"] = cfg.get("model_name", cfg.get("model_type", "unknown"))
 
-    # Ensure evaluation config requests baselines for LOOCV
     if "evaluation" not in cfg_copy:
         cfg_copy["evaluation"] = {}
     cfg_copy["evaluation"]["run_baselines"] = True
@@ -273,9 +358,9 @@ def _train_single_config(
 
     if suppress_training_logs:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            train_samples, test_samples, _ = train_module.load_and_split_data(config)
+            train_samples, test_samples = train_module.load_and_split_data(config)
     else:
-        train_samples, test_samples, _ = train_module.load_and_split_data(config)
+        train_samples, test_samples = train_module.load_and_split_data(config)
         print(f"    [TRAIN] {config_path.name}: train={len(train_samples)} test={len(test_samples)}")
 
     def _run_train():
@@ -299,7 +384,8 @@ def _train_single_config(
     data_cfg = config["data"]
     forecast_name = data_cfg["forecast_name"]
     forecast_file_name = Path(str(forecast_name)).name
-    forecast_dir = dataset_dir / "forecasts" / "feature_sweeps" / Path(forecast_name)
+    forecast_name_rel = _strip_fs_prefix(str(forecast_name))
+    forecast_dir = dataset_dir / "forecasts" / "feature_sweeps" / Path(forecast_name_rel)
     return (forecast_dir / f"config_evaluate_{forecast_file_name}.yml").resolve()
 
 
@@ -360,27 +446,6 @@ def _count_valid_samples_raw(
     return int(valid_raw), int(all_total_raw), int(loaded_count)
 
 
-def _extract_model_summary(eval_result: dict) -> dict:
-    # Confirm baseline results are present in summary_rows
-    found_baseline = False
-    found_model = False
-    for row in eval_result.get("summary_rows", []):
-        kind = str(row.get("kind", "")).lower()
-        if kind == "model":
-            found_model = True
-        if kind in ("naive", "seasonal", "linear"):
-            found_baseline = True
-    if found_baseline:
-        print("[CHECK] Baseline results found in evaluation summary.")
-    else:
-        print("[WARN] Baseline results NOT found in evaluation summary!")
-    # Return the main model row as before
-    for row in eval_result.get("summary_rows", []):
-        if str(row.get("kind", "")).lower() == "model":
-            return row
-    return {}
-
-
 def _objective_from_metrics(rmse: float, drop_rate: float, lambda_drop: float) -> float:
     if not np.isfinite(rmse):
         return float("inf")
@@ -403,79 +468,94 @@ def _evaluate_candidate(
     disable_eval_plots: bool,
     suppress_training_logs: bool,
 ) -> CandidateResult:
-    base_cfg = train_module.load_config(str(surrogate_config_path))
-    base_data = base_cfg["data"]
-    base_stop = int(base_data["input_row_2"])
-    input_rows = slice(base_stop - row_count, base_stop)
+    try:
+        base_cfg = train_module.load_config(str(surrogate_config_path))
+        base_data = base_cfg["data"]
+        base_stop = int(base_data["input_row_2"])
+        input_rows = slice(base_stop - row_count, base_stop)
 
-    data_dir_resolved = Path(train_module._resolve_path_from_config(base_data["data_dir"], Path(base_cfg["__config_dir"])))
-    sample_subdir = str(base_data.get("sample_subdir", "samples"))
-    output_columns = list(base_data["output_columns"])
-    output_rows = list(base_data["output_rows"])
+        data_dir_resolved = Path(train_module._resolve_path_from_config(base_data["data_dir"], Path(base_cfg["__config_dir"])))
+        sample_subdir = str(base_data.get("sample_subdir", "samples"))
+        output_columns = list(base_data["output_columns"])
+        output_rows = list(base_data["output_rows"])
 
-    valid_raw, total_raw, valid_loaded = _count_valid_samples_raw(
-        data_dir_resolved,
-        sample_subdir,
-        list(features),
-        input_rows,
-        output_columns,
-        output_rows,
-    )
-    drop_rate = float(1.0 - (valid_raw / total_raw)) if total_raw > 0 else 1.0
+        valid_raw, total_raw, valid_loaded = _count_valid_samples_raw(
+            data_dir_resolved,
+            sample_subdir,
+            list(features),
+            input_rows,
+            output_columns,
+            output_rows,
+        )
+        drop_rate = float(1.0 - (valid_raw / total_raw)) if total_raw > 0 else 1.0
 
-    variant_cfg = _prepare_variant_config(
-        base_config_path=surrogate_config_path,
-        row_count=row_count,
-        features=features,
-        feature_tag=feature_tag,
-        tmp_dir=tmp_cfg_dir,
-        dataset_dir=dataset_dir,
-    )
-    eval_cfg = _train_single_config(
-        variant_cfg,
-        dataset_dir,
-        disable_training_plots=disable_training_plots,
-        disable_eval_plots=disable_eval_plots,
-        suppress_training_logs=suppress_training_logs,
-    )
-    _set_eval_overrides(
-        eval_cfg,
-        run_baselines=not disable_baselines_for_search,
-    )
+        variant_cfg = _prepare_variant_config(
+            base_config_path=surrogate_config_path,
+            row_count=row_count,
+            features=features,
+            feature_tag=feature_tag,
+            tmp_dir=tmp_cfg_dir,
+        )
+        eval_cfg = _train_single_config(
+            variant_cfg,
+            dataset_dir,
+            disable_training_plots=disable_training_plots,
+            disable_eval_plots=disable_eval_plots,
+            suppress_training_logs=suppress_training_logs,
+        )
+        _set_eval_overrides(
+            eval_cfg,
+            run_baselines=not disable_baselines_for_search,
+        )
 
-    eval_result = eval_module.evaluate_single_config(
-        str(eval_cfg),
-        save_plots_override=not disable_eval_plots,
-    )
-    model_row = _extract_model_summary(eval_result)
+        eval_result = eval_module.evaluate_single_config(
+            str(eval_cfg),
+            save_plots_override=not disable_eval_plots,
+        )
+        if eval_result is None:
+            print(f"[ERROR] Evaluation returned None for config: {eval_cfg}")
+            print(f"         Features: {features}")
+            print(f"         Row count: {row_count}")
+            print(f"         Data dir: {data_dir_resolved}")
+            print(f"         Surrogate config: {surrogate_config_path}")
+            return None
+        model_row = eval_result
 
-    rmse = float(model_row.get("rmse", np.nan))
-    r2 = float(model_row.get("r2", np.nan))
-    mae = float(model_row.get("mae", np.nan))
-    n_test_samples = float(model_row.get("n_test_samples", np.nan))
-    input_dim = float(model_row.get("input_dim", np.nan))
-    target_dim = float(model_row.get("target_dim", np.nan))
-    objective = _objective_from_metrics(rmse=rmse, drop_rate=drop_rate, lambda_drop=lambda_drop)
+        rmse = float(model_row.get("rmse", np.nan))
+        r2 = float(model_row.get("r2", np.nan))
+        mae = float(model_row.get("mae", np.nan))
+        n_test_samples = float(model_row.get("n_test_samples", np.nan))
+        input_dim = float(model_row.get("input_dim", np.nan))
+        target_dim = float(model_row.get("target_dim", np.nan))
+        objective = _objective_from_metrics(rmse=rmse, drop_rate=drop_rate, lambda_drop=lambda_drop)
 
-    return CandidateResult(
-        dataset=dataset_dir.name,
-        target=target_name,
-        row_count=int(row_count),
-        n_features=int(len(features)),
-        feature_tag=feature_tag,
-        features=tuple(features),
-        objective=objective,
-        rmse=rmse,
-        r2=r2,
-        mae=mae,
-        drop_rate=drop_rate,
-        n_valid_raw=float(valid_raw),
-        n_total_raw=float(total_raw),
-        n_valid_loaded=float(valid_loaded),
-        n_test_samples=n_test_samples,
-        input_dim=input_dim,
-        target_dim=target_dim,
-    )
+        return CandidateResult(
+            dataset=dataset_dir.name,
+            target=target_name,
+            row_count=int(row_count),
+            n_features=int(len(features)),
+            feature_tag=feature_tag,
+            features=tuple(features),
+            objective=objective,
+            rmse=rmse,
+            r2=r2,
+            mae=mae,
+            drop_rate=drop_rate,
+            n_valid_raw=float(valid_raw),
+            n_total_raw=float(total_raw),
+            n_valid_loaded=float(valid_loaded),
+            n_test_samples=n_test_samples,
+            input_dim=input_dim,
+            target_dim=target_dim,
+        )
+    except Exception as exc:
+        print(f"[ERROR] Exception in _evaluate_candidate for config: {surrogate_config_path}")
+        print(f"        Features: {features}")
+        print(f"        Row count: {row_count}")
+        print(f"        Data dir: {dataset_dir}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def _candidate_key(row_count: int, features: tuple[str, ...]) -> tuple[int, tuple[str, ...]]:
@@ -811,12 +891,6 @@ def _beam_search_subsets(
         cache[key] = result
         trace.append(result)
         eval_count += 1
-        
-        elapsed = time.time() - search_start_time
-        avg_time_per_eval = elapsed / eval_count
-        remaining_evals = eval_budget - eval_count
-        eta_seconds = avg_time_per_eval * remaining_evals
-        
         return result
 
     first = _eval(full_features)
@@ -826,13 +900,7 @@ def _beam_search_subsets(
     beam: list[CandidateResult] = [first]
     best = first
     no_improve = 0
-    
-    elapsed = time.time() - search_start_time
-    avg_time_per_eval = elapsed / eval_count if eval_count > 0 else 0
-    remaining_evals = eval_budget - eval_count
-    eta_seconds = avg_time_per_eval * remaining_evals
-    eta_str = f"{int(eta_seconds//60)}m {int(eta_seconds%60)}s" if eta_seconds > 0 else "unknown"
-    print(f"[SEARCH] Initial (all {len(full_features)} features): objective={best.objective:.4f} rmse={best.rmse:.6f} (evals: {eval_count}/{eval_budget}, ETA: {eta_str})")
+    print(f"[SEARCH] Initial (all {len(full_features)} features): objective={best.objective:.4f} rmse={best.rmse:.6f} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
 
     for _round in range(max_rounds):
         candidates: list[tuple[str, ...]] = []
@@ -885,23 +953,16 @@ def _beam_search_subsets(
         scored.sort(key=lambda x: (x.objective, x.rmse, -x.n_features))
         beam = scored[:beam_width]
         prev_best = best.objective
-        
-        elapsed = time.time() - search_start_time
-        avg_time_per_eval = elapsed / eval_count if eval_count > 0 else 0
-        remaining_evals = eval_budget - eval_count
-        eta_seconds = avg_time_per_eval * remaining_evals
-        eta_str = f"{int(eta_seconds//60)}m {int(eta_seconds%60)}s" if eta_seconds > 0 else "unknown"
-        
         if beam and beam[0].objective + 1e-12 < best.objective:
             best = beam[0]
             no_improve = 0
             # Track features in improving solution (Option A)
             for feat in best.features:
                 feature_improvement_counts[feat] += 1
-            print(f"[SEARCH] Round {_round + 1}: improved! objective={best.objective:.4f} rmse={best.rmse:.6f} n_features={best.n_features} (evals: {eval_count}/{eval_budget}, ETA: {eta_str})")
+            print(f"[SEARCH] Round {_round + 1}: improved! objective={best.objective:.4f} rmse={best.rmse:.6f} n_features={best.n_features} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
         else:
             no_improve += 1
-            print(f"[SEARCH] Round {_round + 1}: no improvement ({no_improve}/{no_improve_patience}). Best: objective={best.objective:.4f} rmse={best.rmse:.6f} (evals: {eval_count}/{eval_budget}, ETA: {eta_str})")
+            print(f"[SEARCH] Round {_round + 1}: no improvement ({no_improve}/{no_improve_patience}). Best: objective={best.objective:.4f} rmse={best.rmse:.6f} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
             if no_improve >= no_improve_patience:
                 print(f"[SEARCH] Patience exhausted, stopping.")
 
@@ -910,13 +971,7 @@ def _beam_search_subsets(
     attempts = 0
     improved = True
     swap_iter = 0
-    
-    elapsed = time.time() - search_start_time
-    avg_time_per_eval = elapsed / eval_count if eval_count > 0 else 0
-    remaining_evals = eval_budget - eval_count
-    eta_seconds = avg_time_per_eval * remaining_evals
-    eta_str = f"{int(eta_seconds//60)}m {int(eta_seconds%60)}s" if eta_seconds > 0 else "unknown"
-    print(f"[SEARCH] Starting swap refinement from: objective={current.objective:.4f} rmse={current.rmse:.6f} n_features={current.n_features} (ETA: {eta_str})")
+    print(f"[SEARCH] Starting swap refinement from: objective={current.objective:.4f} rmse={current.rmse:.6f} n_features={current.n_features} (ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
     
     while improved and attempts < max_swap_attempts and eval_count < eval_budget:
         improved = False
@@ -944,13 +999,7 @@ def _beam_search_subsets(
                 current = out
                 best = out
                 improved = True
-                
-                elapsed = time.time() - search_start_time
-                avg_time_per_eval = elapsed / eval_count if eval_count > 0 else 0
-                remaining_evals = eval_budget - eval_count
-                eta_seconds = avg_time_per_eval * remaining_evals
-                eta_str = f"{int(eta_seconds//60)}m {int(eta_seconds%60)}s" if eta_seconds > 0 else "unknown"
-                print(f"[SEARCH] Swap refinement #{swap_iter}: improved! objective={best.objective:.4f} rmse={best.rmse:.6f} n_features={best.n_features} (evals: {eval_count}/{eval_budget}, ETA: {eta_str})")
+                print(f"[SEARCH] Swap refinement #{swap_iter}: improved! objective={best.objective:.4f} rmse={best.rmse:.6f} n_features={best.n_features} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
                 break
     
     if not improved and eval_count < eval_budget:
@@ -963,42 +1012,18 @@ def _beam_search_subsets(
     avg_time_per_eval = total_elapsed / eval_count if eval_count > 0 else 0
     print(f"[SEARCH] Complete: {eval_count}/{eval_budget} evaluations in {elapsed_min}m {elapsed_sec}s ({avg_time_per_eval:.1f}s/eval). Best: objective={best.objective:.4f} rmse={best.rmse:.6f} r2={best.r2:.6f} n_features={best.n_features}")
     
-    # Print feature importance summary
-    print(f"\n[SEARCH] Feature importance (removal sensitivity — positive delta = bad to remove):")
-    
     # Compute average removal sensitivity for each feature
     feature_sensitivities: dict[str, tuple[float, int]] = {}  # (avg_removal_delta, frequency_count)
     for feat in full_features:
         deltas = feature_removal_deltas[feat]
         counts = feature_improvement_counts[feat]
-        
-        # Average removal delta (positive = valuable)
         avg_delta = float(np.mean(deltas)) if deltas else 0.0
         feature_sensitivities[feat] = (avg_delta, counts)
-    
-    # Sort by removal sensitivity descending
-    ranked_features = sorted(feature_sensitivities.items(), key=lambda x: -x[1][0])
-    
-    # Print ranked by removal sensitivity
-    print(f"\n[SEARCH] Ranked feature importance (by removal sensitivity):")
-    for rank, (feat, (avg_delta, frequency)) in enumerate(ranked_features, 1):
-        deltas = feature_removal_deltas[feat]
-        n_removals = len(deltas)
-        if n_removals > 0:
-            print(f"  {rank}. {feat:30s} | removal_sensitivity={avg_delta:+.6f} (n_tests={n_removals}, frequency={int(frequency)})")
-        else:
-            print(f"  {rank}. {feat:30s} | never removed (frequency={int(frequency)})")
-    
-    # Recommendation: Show best subset found
+
     print(f"\n[SEARCH] Recommended feature subset (from search best):")
     print(f"  Features ({best.n_features}): {', '.join(best.features)}")
     print(f"  Objective: {best.objective:.6f} (rmse={best.rmse:.6f}, r2={best.r2:.6f}, drop_rate={best.drop_rate:.4f})")
-    
-    # Optional: High-value feature recommendation (top performers by removal sensitivity)
-    top_k_features = min(len(full_features) // 2, 8)  # Show top ~half or top 8
-    essential = [feat for feat, (_, _) in ranked_features[:top_k_features]]
-    print(f"\n[SEARCH] Top {len(essential)} essential features (by removal sensitivity):")
-    print(f"  {', '.join(essential)}")
+    print(f"  (Full ranked importance written to feature_stats CSV)")
     
     # Generate feature importance visualizations
     print(f"\n[SEARCH] Generating feature importance visualizations...")
@@ -1294,40 +1319,91 @@ def _evaluate_selected_subsets_all_models(
                 tmp_dir=cfg_dir,
             )
 
-            eval_cfg = _train_single_config(
-                variant_cfg,
-                disable_training_plots=disable_training_plots,
-                disable_eval_plots=disable_eval_plots,
-                suppress_training_logs=suppress_training_logs,
-            )
-            _set_eval_overrides(
-                eval_cfg,
-                run_baselines=run_baselines_in_final,
-            )
-            eval_result = eval_module.evaluate_single_config(
-                str(eval_cfg),
-                save_plots_override=not disable_eval_plots,
-            )
+            try:
+                eval_cfg = _train_single_config(
+                    variant_cfg,
+                    dataset_plan.dataset_dir,
+                    disable_training_plots=disable_training_plots,
+                    disable_eval_plots=disable_eval_plots,
+                    suppress_training_logs=suppress_training_logs,
+                )
+                _set_eval_overrides(
+                    eval_cfg,
+                    run_baselines=run_baselines_in_final,
+                )
+                eval_result = eval_module.evaluate_single_config(
+                    str(eval_cfg),
+                    save_plots_override=not disable_eval_plots,
+                )
+                summary_rows = [eval_result] if eval_result is not None else []
+            except Exception as e:
+                print(f"[ERROR] Evaluation failed for config {variant_cfg}: {e}")
+                summary_rows = []
 
-            for srow in eval_result.get("summary_rows", []):
-                kind = str(srow.get("kind", "")).lower()
-                if kind != "model":
-                    continue
+            if not summary_rows:
+                (print(f"[WARN] No summary_rows > no evaluation results for config {variant_cfg}, writing NaNs for metrics."))
+                # Write a row with error info/NaNs
+                try:
+                    with open(variant_cfg, 'r', encoding='utf-8') as f:
+                        cfg = yaml.safe_load(f)
+                    model_name = cfg.get("model_name", "unknown")
+                except Exception:
+                    model_name = "unknown"
+                rows.append({
+                    "dataset": dataset_plan.dataset_dir.name,
+                    "target": target_name,
+                    "subset_rank": rank,
+                    "feature_tag": cand.feature_tag,
+                    "row_count": cand.row_count,
+                    "n_features": cand.n_features,
+                    "objective_search": cand.objective,
+                    "drop_rate_search": cand.drop_rate,
+                    "model": model_name,
+                    "n_samples": float('nan'),
+                    "input_dim": float('nan'),
+                    "target_dim": float('nan'),
+                    "mae": float('nan'),
+                    "rmse": float('nan'),
+                    "r2": float('nan'),
+                    "std_target": float('nan'),
+                })
+                continue
 
-                split_files = eval_result.get("model_split_files", [])
-                if split_files and any("_mc_" in str(name) for name in split_files):
-                    n_samples = len(_map_to_raw_filenames([str(name) for name in split_files]))
-                else:
-                    n_samples = len(split_files) if split_files else srow.get("n_test_samples", np.nan)
+            for srow in summary_rows:
+                # Load eval config once for all derived values
+                _eval_cfg_data = {}
+                try:
+                    with open(eval_cfg, 'r', encoding='utf-8') as f:
+                        _eval_cfg_data = yaml.safe_load(f) or {}
+                except Exception:
+                    pass
+
+                # model: write_evaluation_config always sets model_name=""; fall back to model_type
+                model_name = (
+                    _eval_cfg_data.get("model_name")
+                    or _eval_cfg_data.get("model_type")
+                    or srow.get("label", "unknown")
+                )
+
+                # n_samples: n_eval_rows is set by _compute_regression_summary to len(eval set)
+                n_samples = float(srow.get("n_eval_rows", np.nan))
+
+                # input_dim: count input_columns from the eval config
+                _input_cols = _eval_cfg_data.get("data", {}).get("input_columns") or []
+                input_dim = float(len(_input_cols)) if _input_cols else np.nan
+
+                # target_dim: n_eval_outputs is the number of output columns
+                target_dim = float(srow.get("n_eval_outputs", np.nan))
 
                 # Compute std(target) for this model/config
                 std_target = float('nan')
                 try:
-                    with open(eval_cfg, 'r', encoding='utf-8') as f:
-                        cfg = yaml.safe_load(f)
-                    target_cols = cfg['data'].get('output_columns', None)
-                    data_dir = cfg['data']['data_dir']
-                    sample_subdir = cfg['data'].get('sample_subdir', 'samples')
+                    target_cols = _eval_cfg_data.get('data', {}).get('output_columns', None)
+                    # data_dir in eval config is relative to eval config file location
+                    _raw_data_dir = _eval_cfg_data.get('data', {}).get('data_dir', '')
+                    _cfg_dir = Path(eval_cfg).parent
+                    data_dir = str((_cfg_dir / _raw_data_dir).resolve())
+                    sample_subdir = _eval_cfg_data.get('data', {}).get('sample_subdir', 'samples')
                     sample_dir = os.path.join(data_dir, sample_subdir)
                     csv_files = glob.glob(os.path.join(sample_dir, '*.csv'))
                     target_vals = []
@@ -1354,10 +1430,10 @@ def _evaluate_selected_subsets_all_models(
                         "n_features": cand.n_features,
                         "objective_search": cand.objective,
                         "drop_rate_search": cand.drop_rate,
-                        "model": srow.get("label", "unknown"),
-                        "n_samples": float(n_samples),
-                        "input_dim": float(srow.get("input_dim", np.nan)),
-                        "target_dim": float(srow.get("target_dim", np.nan)),
+                        "model": model_name,
+                        "n_samples": n_samples,
+                        "input_dim": input_dim,
+                        "target_dim": target_dim,
                         "mae": float(srow.get("mae", np.nan)),
                         "rmse": float(srow.get("rmse", np.nan)),
                         "r2": float(srow.get("r2", np.nan)),
@@ -1371,6 +1447,375 @@ def _evaluate_selected_subsets_all_models(
     return out_csv
 
 
+def _run_rolling_origin_cv(
+    plan: DatasetPlan,
+    final_metrics_csv: Path,
+    min_train_groups: int = 3,
+) -> "Path | None":
+    """
+    Run rolling-origin (expanding-window) cross-validation for the best model type
+    identified from the final evaluation metrics (highest R2 at subset_rank == 1).
+
+    Groups samples by MC segment (temporal order) and trains a fresh model on the
+    first N segments, evaluates on segment N+1, expanding the window each step.
+    Writes rolling_origin_summary.csv to the model's forecast directory.
+    """
+    # --- Determine best model type from final metrics ---
+    try:
+        df_final = pd.read_csv(final_metrics_csv)
+    except Exception as e:
+        print(f"[WARN] Rolling origin CV: could not read final metrics: {e}")
+        return
+
+    k01_rows = df_final[df_final["subset_rank"] == 1].copy()
+    if k01_rows.empty or k01_rows["r2"].isna().all():
+        print("[WARN] Rolling origin CV: no valid k01 rows in final metrics. Skipping.")
+        return
+
+    best_r2_idx = k01_rows["r2"].idxmax()
+    best_row = k01_rows.loc[best_r2_idx]
+    best_model_str = str(best_row.get("model", ""))
+    best_row_count = int(best_row["row_count"])
+    best_feature_tag = str(best_row["feature_tag"])
+
+    if not best_model_str:
+        print("[WARN] Rolling origin CV: could not determine model type. Skipping.")
+        return
+
+    # --- Find base config matching best model type OR model name ---
+    # The 'model' column may hold model_type (new sweeps) or model_name (old sweeps).
+    # Variant dirs are named after data.forecast_name, not model_name.
+    resolved_model_type = None
+    best_model_name = None
+    _matched_base_cfg = None
+    _match = _find_matching_config(best_model_str, plan.train_configs)
+    if _match is not None:
+        resolved_model_type, best_model_name, _matched_base_cfg = _match
+
+    # Fall back to treating the raw value as model_type if no config was matched
+    if resolved_model_type is None:
+        resolved_model_type = best_model_str
+
+    if resolved_model_type not in ("xgb_regressor", "gp_regressor"):
+        print(f"[WARN] Rolling origin CV not implemented for model_type={resolved_model_type!r} (column value={best_model_str!r}). Skipping.")
+        return
+
+    if best_model_name is None:
+        print(f"[WARN] Rolling origin CV: no base config found for '{best_model_str}'. Skipping.")
+        return
+
+    # --- Locate eval config (written by write_evaluation_config after training) ---
+    # :03d is required to match directory names created by _variant_forecast_name
+    variant_forecast_name = f"{best_model_name}_r{best_row_count:03d}_{best_feature_tag}_k01"
+    model_dir = plan.dataset_dir / "forecasts" / "feature_sweeps" / variant_forecast_name
+    eval_cfg_path = model_dir / f"config_evaluate_{variant_forecast_name}.yml"
+    local_train_cfg_path = model_dir / f"config_train_{variant_forecast_name}.yml"
+
+    # Try eval config → local variant train config → base train config from plan
+    _cfg_file_to_use = None
+    _cfg_dir_for_paths = None
+    if eval_cfg_path.exists():
+        _cfg_file_to_use = eval_cfg_path
+        _cfg_dir_for_paths = eval_cfg_path.parent
+        print(f"[INFO] Rolling origin CV: using eval config: {eval_cfg_path.name}")
+    elif local_train_cfg_path.exists():
+        _cfg_file_to_use = local_train_cfg_path
+        _cfg_dir_for_paths = local_train_cfg_path.parent
+        print(f"[INFO] Rolling origin CV: eval config missing; using local train config: {local_train_cfg_path.name}")
+    elif _matched_base_cfg is not None:
+        _cfg_file_to_use = _matched_base_cfg
+        _cfg_dir_for_paths = _cfg_file_to_use.parent
+        print(f"[INFO] Rolling origin CV: no local config; falling back to base train config: {_cfg_file_to_use.name}")
+    else:
+        print(f"[WARN] Rolling origin CV: no config found for variant '{variant_forecast_name}'. Skipping.")
+        return
+
+    with open(_cfg_file_to_use, "r", encoding="utf-8") as _f:
+        eval_cfg_dict = yaml.safe_load(_f) or {}
+
+    # --- Resolve data paths (data_dir is relative to the config file's location) ---
+    _data_cfg = eval_cfg_dict.get("data", {})
+    _raw_data_dir = _data_cfg.get("data_dir", ".")
+    data_dir_abs = str((_cfg_dir_for_paths / _raw_data_dir).resolve())
+    sample_subdir = _data_cfg.get("sample_subdir", "samples")
+    sample_dir = Path(data_dir_abs) / sample_subdir
+    input_columns = _data_cfg.get("input_columns", [])
+    output_columns = _data_cfg.get("output_columns", [])
+    input_row_1 = int(_data_cfg.get("input_row_1", 0))
+    input_row_2 = int(_data_cfg.get("input_row_2", 168))
+    output_rows = _data_cfg.get("output_rows", [input_row_2])
+
+    # --- Load all samples (fault_tolerant=True to maximise coverage) ---
+    print(f"[INFO] Rolling origin CV: loading all samples from {sample_dir}")
+    all_samples = load_samples(
+        str(sample_dir),
+        input_columns=input_columns,
+        output_columns=output_columns,
+        input_rows=slice(input_row_1, input_row_2),
+        output_rows=output_rows,
+        fault_tolerant=True,
+    )
+    if not all_samples:
+        print(f"[WARN] Rolling origin CV: no samples loaded from {sample_dir}. Skipping.")
+        return
+
+    # --- Group by MC segment (temporal order) ---
+    segment_groups = group_samples_by_segment(all_samples)
+    groups = [sg for _, sg in segment_groups]
+    group_labels = [seg for seg, _ in segment_groups]
+    n_groups = len(groups)
+
+    if n_groups < min_train_groups + 1:
+        print(
+            f"[WARN] Rolling origin CV: only {n_groups} segment group(s); "
+            f"need at least {min_train_groups + 1}. Skipping."
+        )
+        return
+
+    print(
+        f"[INFO] Rolling origin CV: {n_groups} segment groups, "
+        f"model={resolved_model_type}, min_train_groups={min_train_groups}"
+    )
+
+    # --- Rolling-origin folds ---
+    fold_metrics = []
+    for test_idx in range(min_train_groups, n_groups):
+        train_samples_fold = [s for g in groups[:test_idx] for s in g]
+        test_samples_fold = list(groups[test_idx])
+
+        X_train = np.array([s[0].flatten() for s in train_samples_fold], dtype=np.float32)
+        y_train = np.array([s[1].flatten() for s in train_samples_fold], dtype=np.float32)
+        X_test = np.array([s[0].flatten() for s in test_samples_fold], dtype=np.float32)
+        y_test = np.array([s[1].flatten() for s in test_samples_fold], dtype=np.float32)
+
+        try:
+            if resolved_model_type == "xgb_regressor":
+                import xgboost as _xgb
+                _model = _xgb.XGBRegressor()
+                _model.fit(X_train, y_train)
+                y_pred = _model.predict(X_test).reshape(y_test.shape)
+
+            elif resolved_model_type == "gp_regressor":
+                import gpytorch
+                _X_tr = torch.tensor(X_train)
+                _y_tr = torch.tensor(y_train[:, 0] if y_train.ndim > 1 else y_train)
+                _lk = gpytorch.likelihoods.GaussianLikelihood()
+
+                class _DummyGP(gpytorch.models.ExactGP):
+                    def __init__(self, tx, ty, lk):
+                        super().__init__(tx, ty, lk)
+                        self.mean_module = gpytorch.means.ConstantMean()
+                        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
+                    def forward(self, x):
+                        return gpytorch.distributions.MultivariateNormal(
+                            self.mean_module(x), self.covar_module(x)
+                        )
+
+                _gp = _DummyGP(_X_tr, _y_tr, _lk)
+                _gp.train(); _lk.train()
+                _opt = torch.optim.Adam(_gp.parameters(), lr=0.1)
+                _mll = gpytorch.mlls.ExactMarginalLogLikelihood(_lk, _gp)
+                for _ in range(30):
+                    _opt.zero_grad()
+                    _loss = -_mll(_gp(_X_tr), _y_tr)
+                    _loss.backward()
+                    _opt.step()
+                _gp.eval(); _lk.eval()
+                _X_te = torch.tensor(X_test)
+                with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                    y_pred = _lk(_gp(_X_te)).mean.numpy().reshape(-1, 1)
+            else:
+                # Should not reach here (checked above)
+                return
+
+        except Exception as fold_exc:
+            print(f"[WARN] Rolling origin CV fold {test_idx} failed: {fold_exc}")
+            continue
+
+        errors = y_pred - y_test
+        rmse = float(np.sqrt(np.mean(errors ** 2)))
+        mae = float(np.mean(np.abs(errors)))
+        ss_res = float(np.sum(errors ** 2))
+        ss_tot = float(np.sum((y_test - np.mean(y_test)) ** 2))
+        r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
+
+        fold_metrics.append({
+            "fold": test_idx - min_train_groups + 1,
+            "n_train_groups": test_idx,
+            "n_test_groups": 1,
+            "n_train_samples": len(train_samples_fold),
+            "n_test_samples": len(test_samples_fold),
+            "test_segment": group_labels[test_idx],
+            "rmse": rmse,
+            "mae": mae,
+            "r2": r2,
+        })
+        print(
+            f"[INFO]   fold {test_idx - min_train_groups + 1}: "
+            f"train_groups={test_idx} test_segment={group_labels[test_idx]} "
+            f"rmse={rmse:.4f} r2={r2:.4f}"
+        )
+
+    if not fold_metrics:
+        print("[WARN] Rolling origin CV: no folds completed.")
+        return
+
+    # --- Compute mean summary row ---
+    finite_r2 = [m["r2"] for m in fold_metrics if np.isfinite(m["r2"])]
+    summary_row = {
+        "fold": "mean",
+        "n_train_groups": float("nan"),
+        "n_test_groups": float("nan"),
+        "n_train_samples": float("nan"),
+        "n_test_samples": float("nan"),
+        "test_segment": "all",
+        "rmse": float(np.mean([m["rmse"] for m in fold_metrics])),
+        "mae": float(np.mean([m["mae"] for m in fold_metrics])),
+        "r2": float(np.mean(finite_r2)) if finite_r2 else float("nan"),
+    }
+
+    df_cv = pd.DataFrame([summary_row] + fold_metrics)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    cv_summary_path = model_dir / "rolling_origin_summary.csv"
+    df_cv.to_csv(cv_summary_path, index=False)
+    print(
+        f"[INFO] Rolling origin CV summary: rmse={summary_row['rmse']:.4f} "
+        f"mae={summary_row['mae']:.4f} r2={summary_row['r2']:.4f}"
+    )
+    print(f"[INFO] Rolling origin CV written: {cv_summary_path}")
+    return cv_summary_path
+
+
+def _ensure_k01_baselines(plan: DatasetPlan, final_metrics_csv: Path) -> None:
+    """Re-evaluate the best k01 model with run_baselines=True if evaluation_summary.csv
+    is missing or contains no baseline rows.
+
+    Safe to call repeatedly — exits immediately if baselines are already present.
+    Requires the variant's config_evaluate_*.yml to already exist (i.e. the model was
+    previously trained); does NOT re-train.
+    """
+    try:
+        df_final = pd.read_csv(final_metrics_csv)
+    except Exception as e:
+        print(f"[WARN] _ensure_k01_baselines: could not read {final_metrics_csv}: {e}")
+        return
+
+    k01_rows = df_final[df_final["subset_rank"] == 1].copy()
+    valid_k01 = k01_rows[k01_rows["r2"].notnull() & np.isfinite(k01_rows["r2"].astype(float))] if not k01_rows.empty else k01_rows
+    if valid_k01.empty:
+        print(f"[WARN] _ensure_k01_baselines: no valid k01 rows for {plan.dataset_dir.name}; skipping.")
+        return
+
+    best_row = valid_k01.loc[valid_k01["r2"].idxmax()]
+    best_model_str = str(best_row.get("model", ""))
+    best_row_count = int(best_row["row_count"])
+    best_feature_tag = str(best_row["feature_tag"])
+
+    # Match train config on model_type OR model_name
+    best_model_name = None
+    _match = _find_matching_config(best_model_str, plan.train_configs)
+    if _match is not None:
+        _, best_model_name, _ = _match
+
+    if best_model_name is None:
+        print(f"[WARN] _ensure_k01_baselines: no matching config for model '{best_model_str}' in {plan.dataset_dir.name}; skipping.")
+        return
+
+    variant_name = f"{best_model_name}_r{best_row_count:03d}_{best_feature_tag}_k01"
+    variant_dir = plan.dataset_dir / "forecasts" / "feature_sweeps" / variant_name
+    eval_csv = variant_dir / "evaluation_summary.csv"
+    eval_cfg_path = variant_dir / f"config_evaluate_{variant_name}.yml"
+
+    # Check if baseline rows already present
+    if eval_csv.exists():
+        try:
+            df_eval = pd.read_csv(eval_csv)
+            if "label" in df_eval.columns and df_eval["label"].str.lower().str.contains("naive").any():
+                print(f"[DEBUG] _ensure_k01_baselines: {variant_name} already has baseline rows; skipping re-evaluation.")
+                return
+        except Exception:
+            pass
+
+    if not eval_cfg_path.exists():
+        print(f"[WARN] _ensure_k01_baselines: eval config not found at {eval_cfg_path}; cannot re-evaluate without re-training.")
+        return
+
+    print(f"[INFO] _ensure_k01_baselines: re-evaluating {variant_name} with baselines for {plan.dataset_dir.name}")
+    try:
+        _set_eval_overrides(eval_cfg_path, run_baselines=True)
+        eval_module.evaluate_single_config(str(eval_cfg_path), save_plots_override=False)
+        print(f"[INFO] _ensure_k01_baselines: re-evaluation complete for {plan.dataset_dir.name}")
+    except Exception as exc:
+        print(f"[WARN] _ensure_k01_baselines: re-evaluation failed for {plan.dataset_dir.name}: {exc}")
+        import traceback as _tb
+        _tb.print_exc()
+
+
+def _write_dataset_evaluation_summary(plan: DatasetPlan, final_metrics_csv: Path) -> "Path | None":
+    """Copy the best k01 model's evaluation_summary.csv (which includes baseline rows)
+    to the dataset root as evaluation_summary.csv.
+
+    This enables i2_PostProcess.py to find baseline performance stats without having
+    to navigate into the feature_sweeps subdirectories.
+    """
+    print(f"[INFO] _write_dataset_evaluation_summary: processing {plan.dataset_dir.name}")
+
+    try:
+        df_final = pd.read_csv(final_metrics_csv)
+    except Exception as e:
+        print(f"[WARN] _write_dataset_evaluation_summary: could not read {final_metrics_csv}: {e}")
+        return None
+
+    k01_rows = df_final[df_final["subset_rank"] == 1].copy()
+    if k01_rows.empty or k01_rows["r2"].isna().all():
+        print(f"[WARN] _write_dataset_evaluation_summary: no valid k01 rows with r2 in {final_metrics_csv}")
+        return None
+
+    valid_k01 = k01_rows[k01_rows["r2"].notnull() & np.isfinite(k01_rows["r2"].astype(float))]
+    if valid_k01.empty:
+        print(f"[WARN] _write_dataset_evaluation_summary: no finite r2 values in k01 rows for {plan.dataset_dir.name}")
+        return None
+
+    best_idx = valid_k01["r2"].idxmax()
+    best_row = valid_k01.loc[best_idx]
+    best_model_type = str(best_row.get("model", ""))
+    best_row_count = int(best_row["row_count"])
+    best_feature_tag = str(best_row["feature_tag"])
+
+    # Find base forecast_name from train configs by matching model_type OR model_name.
+    # The 'model' column may hold model_type (new sweeps) or model_name (old sweeps).
+    # Variant dirs are named after data.forecast_name, NOT model_name.
+    base_model_name = None
+    _match = _find_matching_config(best_model_type, plan.train_configs)
+    if _match is not None:
+        _, base_model_name, _ = _match
+
+    if base_model_name is None:
+        print(
+            f"[WARN] _write_dataset_evaluation_summary: no base config found for "
+            f"model_type={best_model_type!r} in {plan.dataset_dir.name}"
+        )
+        return None
+
+    # Construct variant directory name (must use :03d to match _variant_forecast_name)
+    variant_name = f"{base_model_name}_r{best_row_count:03d}_{best_feature_tag}_k01"
+    variant_dir = plan.dataset_dir / "forecasts" / "feature_sweeps" / variant_name
+    src_csv = variant_dir / "evaluation_summary.csv"
+
+    if not src_csv.exists():
+        print(f"[WARN] _write_dataset_evaluation_summary: evaluation_summary.csv not found at {src_csv}")
+        return None
+
+    dst_csv = plan.dataset_dir / "evaluation_summary.csv"
+    try:
+        pd.read_csv(src_csv).to_csv(dst_csv, index=False)
+        print(f"[INFO] _write_dataset_evaluation_summary: wrote {dst_csv}")
+        return dst_csv
+    except Exception as exc:
+        print(f"[WARN] _write_dataset_evaluation_summary: failed to write {dst_csv}: {exc}")
+        return None
+
+
 def run_feature_selection_sweep(args: argparse.Namespace) -> int:
     workspace_root = Path(__file__).resolve().parent.parent
     data_root = Path(args.data_root)
@@ -1380,25 +1825,14 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
 
     include_regular, include_res = _resolve_dataset_inclusion(args)
 
-    # In postprocess-only mode, ignore limit_datasets and dataset_prefix to process all datasets
-    if args.postprocess_only:
-        plans = discover_mc_dataset_plans(
-            data_root=data_root,
-            dataset_prefix="",  # match all
-            config_pattern=args.config_pattern,
-            limit_datasets=0,   # no limit
-            include_regular=include_regular,
-            include_res=include_res,
-        )
-    else:
-        plans = discover_mc_dataset_plans(
-            data_root=data_root,
-            dataset_prefix=args.dataset_prefix,
-            config_pattern=args.config_pattern,
-            limit_datasets=args.limit_datasets,
-            include_regular=include_regular,
-            include_res=include_res,
-        )
+    plans = discover_mc_dataset_plans(
+        data_root=data_root,
+        dataset_prefix=args.dataset_prefix,
+        config_pattern=args.config_pattern,
+        limit_datasets=args.limit_datasets,
+        include_regular=include_regular,
+        include_res=include_res,
+    )
 
     # --exclude logic removed
     if not plans:
@@ -1433,597 +1867,6 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
             print(f"  - {plan.dataset_dir.name}: surrogate={surrogate.name}, row_counts={row_counts}")
         return 0
 
-
-    if args.postprocess_only:
-        for plan in plans:
-            output_dir = plan.dataset_dir / "forecasts" / "feature_sweeps"
-            metrics_csv = output_dir / "feature_sweep_final_metrics.csv"
-            if not metrics_csv.exists():
-                print(f"[WARN] No feature_sweep_final_metrics.csv found for {plan.dataset_dir.name}; skipping.")
-                continue
-            df = pd.read_csv(metrics_csv)
-            if df.empty:
-                print(f"[WARN] feature_sweep_final_metrics.csv is empty for {plan.dataset_dir.name}; skipping.")
-                continue
-            # Select the best model row using highest r2 value
-            valid_r2 = df[df['r2'].notnull() & np.isfinite(df['r2'])]
-            if not valid_r2.empty:
-                idx_best = valid_r2['r2'].idxmax()
-                best_row = valid_r2.loc[idx_best]
-            else:
-                print(f"[WARN] No valid r2 values found in feature_sweep_final_metrics.csv for {plan.dataset_dir.name}; skipping.")
-                continue
-            feature_tag = best_row["feature_tag"]
-            row_count_val = int(best_row["row_count"])
-            model_name = str(best_row["model"])
-            # Construct model directory and config path
-            model_dir = output_dir / f"{model_name}_r{row_count_val}_{feature_tag}"
-            forecast_file_name = f"{model_name}_r{row_count_val}_{feature_tag}"
-            eval_config_path = model_dir / f"config_evaluate_{forecast_file_name}.yml"
-            if not eval_config_path.exists():
-                print(f"[WARN] Evaluation config not found: {eval_config_path}")
-                continue
-            # Run evaluation with run_baselines enabled at runtime (via env var)
-            env = os.environ.copy()
-            env["RUN_BASELINES"] = "true"
-            try:
-                subprocess.run([
-                    sys.executable, 'src/f_Evaluate.py',
-                    '--config', str(eval_config_path)
-                ], check=True, env=env)
-            except Exception as e:
-                print(f"[WARN] Could not re-run evaluation for {eval_config_path}: {e}")
-
-        sweep_results: dict[str, dict[int, dict[str, tuple[float, int]]]] = {}
-        datasets_with_outputs = 0
-        best_model_performance = []
-
-        for plan in plans:
-            target_name = _derive_target_name(plan.dataset_dir.name, args.dataset_prefix)
-            surrogate_cfg = _select_surrogate_config(plan.train_configs)
-            surrogate_data = train_module.load_config(str(surrogate_cfg))['data']
-            base_span = int(surrogate_data['input_row_2']) - int(surrogate_data['input_row_1'])
-            requested_rows = _parse_row_counts(args.row_counts, default_span=base_span)
-            row_counts = requested_rows if args.row_counts else _available_row_counts_for_postprocess(plan.dataset_dir)
-
-            if not row_counts:
-                print(f"[WARN] No saved feature-sweep artifacts found for {plan.dataset_dir.name}; skipping.")
-                continue
-
-            output_dir = plan.dataset_dir / "forecasts" / "feature_sweeps"
-            metrics_csv = output_dir / "feature_sweep_final_metrics.csv"
-            if metrics_csv.exists():
-                df = pd.read_csv(metrics_csv)
-                if "std_target" not in df.columns or df["std_target"].isnull().all():
-                    std_targets = [None] * len(df)
-                    for idx, row in df.iterrows():
-                        feature_tag = row.get("feature_tag", "")
-                        row_count_val = int(row.get("row_count", 0))
-                        model = row.get("model", None)
-                        cfg_dir = output_dir / "configs"
-                        # Only compute std_target for the config/model that matches a config file AND model name
-                        cfg_candidates = [p for p in cfg_dir.glob(f"*_r{row_count_val:03d}_{feature_tag}*.yml") if model and model.lower() in p.name.lower()]
-                        if not cfg_candidates:
-                            std_targets[idx] = None
-                            continue
-                        cfg_path = cfg_candidates[0]
-                        with open(cfg_path, "r", encoding="utf-8") as f:
-                            cfg = yaml.safe_load(f)
-                        data_cfg = cfg["data"]
-                        data_dir = Path(train_module._resolve_path_from_config(data_cfg["data_dir"], Path(cfg.get("__config_dir", cfg_path.parent))))
-                        sample_subdir = str(data_cfg.get("sample_subdir", "samples"))
-                        output_columns = list(data_cfg["output_columns"])
-                        output_rows = list(data_cfg["output_rows"])
-                        samples = load_samples(
-                            str(data_dir / sample_subdir),
-                            input_columns=list(data_cfg["input_columns"]),
-                            output_columns=output_columns,
-                            input_rows=slice(data_cfg["input_row_1"], data_cfg["input_row_2"]),
-                            output_rows=output_rows,
-                            fault_tolerant=True,
-                        )
-                        if samples and len(samples) > 0:
-                            outputs = np.array([s[1] for s in samples], dtype=float)
-                            if outputs.ndim == 2 and outputs.shape[1] == 1:
-                                std_target = float(np.std(outputs[:, 0], ddof=1))
-                            elif outputs.ndim == 2:
-                                std_target = float(np.mean(np.std(outputs, axis=0, ddof=1)))
-                            else:
-                                std_target = float(np.std(outputs, ddof=1))
-                            std_targets[idx] = std_target
-                        else:
-                            std_targets[idx] = None
-                    # Only update std_target for rows where it was computed; leave others empty
-                    df["std_target"] = std_targets
-                    df.to_csv(metrics_csv, index=False)
-
-            print(f"\n[POST] Rebuilding saved outputs for {plan.dataset_dir.name}: rows={row_counts}")
-            wrote_any = False
-            for row_count in row_counts:
-                written = _regenerate_saved_outputs_for_row(
-                    dataset_dir=plan.dataset_dir,
-                    target_name=target_name,
-                    row_count=row_count,
-                    keep_search_plots=bool(args.keep_search_plots),
-                )
-
-                feature_sensitivities, _, _ = _load_feature_stats_artifacts(
-                    dataset_dir=plan.dataset_dir,
-                    row_count=row_count,
-                )
-                if feature_sensitivities:
-                    if target_name not in sweep_results:
-                        sweep_results[target_name] = {}
-                    sweep_results[target_name][row_count] = feature_sensitivities
-
-                if written:
-                    wrote_any = True
-                    for label, path in written.items():
-                        print(f"[POST] Wrote {label}: {path}")
-                else:
-                    print(
-                        f"[WARN] Could not rebuild plots for {plan.dataset_dir.name} rows={row_count}; "
-                        "missing feature stats/delta artifacts."
-                    )
-
-            # Collect best model performance for summary plot, re-evaluating best model with LOOCV at runtime
-            try:
-                final_metrics_csv = plan.dataset_dir / "forecasts" / "feature_sweeps" / "feature_sweep_final_metrics.csv"
-                if final_metrics_csv.exists():
-                    df = pd.read_csv(final_metrics_csv)
-                    if not df.empty:
-                        # Only consider rows with valid (non-NaN, >0) std_target and r2
-                        df_valid = df.copy()
-                        if 'std_target' in df_valid.columns:
-                            df_valid = df_valid[(df_valid['std_target'].notnull()) & (df_valid['std_target'] > 0)]
-                        if 'r2' in df_valid.columns:
-                            df_valid = df_valid[df_valid['r2'].notnull()]
-                        # Compute nrmse for all valid rows
-                        if 'std_target' in df_valid.columns:
-                            df_valid['nrmse'] = df_valid['rmse'] / df_valid['std_target']
-                        else:
-                            df_valid['nrmse'] = np.nan
-                        # Always select the best model by highest R², and report both nRMSE and R² from that row
-                        best_row = None
-                        best_row_idx = None
-                        valid_r2 = df_valid[df_valid['r2'].notnull() & np.isfinite(df_valid['r2'])]
-                        if not valid_r2.empty:
-                            # Find the index in the original DataFrame
-                            idx_in_valid = valid_r2['r2'].idxmax()
-                            best_row = valid_r2.loc[idx_in_valid]
-                            # Map back to the original DataFrame index
-                            if idx_in_valid in df.index:
-                                best_row_idx = idx_in_valid
-                            else:
-                                # fallback: try to match on unique columns
-                                best_row_idx = None
-                        if best_row is not None:
-                            nrmse = best_row['nrmse'] if 'nrmse' in best_row and pd.notnull(best_row['nrmse']) else float('nan')
-                            r2 = best_row['r2'] if 'r2' in best_row and pd.notnull(best_row['r2']) else float('nan')
-                            rmse = best_row['rmse'] if 'rmse' in best_row and pd.notnull(best_row['rmse']) else float('nan')
-                            n_test_samples = best_row['n_samples'] if 'n_samples' in best_row and pd.notnull(best_row['n_samples']) else float('nan')
-                            # Strictly require these fields to be present
-                            required_fields = ['feature_tag', 'row_count', 'model', 'subset_rank']
-                            for field in required_fields:
-                                if field not in best_row or pd.isnull(best_row[field]):
-                                    raise ValueError(f"Required field '{field}' is missing in best_row: {best_row}")
-                            feature_tag = best_row['feature_tag']
-                            row_count_val = int(best_row['row_count'])
-                            model = best_row['model']
-                            subset_rank = int(best_row['subset_rank'])
-                            forecast_name = best_row.get('forecast_name', None)
-                            if forecast_name:
-                                model_dir = plan.dataset_dir / "forecasts" / forecast_name
-                            else:
-                                # Construct model directory name with model type and index
-                                # Use consistent abbreviation for model_dir_name
-                                model_abbrev_map = {
-                                    'transformer': 'transformer',
-                                    'xgbregressor': 'xgb',
-                                    'gpregressor': 'gp',
-                                }
-                                model_name = str(model).strip().lower()
-                                abbrev = model_abbrev_map.get(model_name, model_name)
-                                model_dir_name = f"{abbrev}_01_r{row_count_val:03d}_{feature_tag}_k{subset_rank:02d}"
-                                model_dir = plan.dataset_dir / "forecasts" / "feature_sweeps" / model_dir_name
-                            subset_rank_str = f"_k{subset_rank:02d}.yml"
-                            search_pattern = f"config_evaluate*{subset_rank_str}"
-                            print(f"[DEBUG] Attempting to find model-specific config:")
-                            print(f"[DEBUG] Constructed model_dir: {model_dir}")
-                            resolved_model_dir = model_dir.resolve() if hasattr(model_dir, 'resolve') else model_dir
-                            print(f"[DEBUG] Resolved model_dir (actual path checked): {resolved_model_dir}")
-                            print(f"[DEBUG] search_pattern: {search_pattern}")
-                            print(f"[DEBUG] Checking if directory exists: {resolved_model_dir}")
-                            if model_dir.exists():
-                                print(f"[DEBUG] Files in model_dir: {[p.name for p in model_dir.iterdir()]}")
-                            else:
-                                print(f"[DEBUG] model_dir does not exist!")
-                            cfg_candidates = list(model_dir.glob(search_pattern))
-                            print(f"[DEBUG] cfg_candidates: {[str(p) for p in cfg_candidates]}")
-                            if not cfg_candidates:
-                                print(f"[WARN] Could not find model-specific config for best model in {plan.dataset_dir.name}")
-                                print(f"[DEBUG] Search pattern: {search_pattern}")
-                                print(f"[DEBUG] Model dir: {model_dir}")
-                                if model_dir.exists():
-                                    all_files = [p.name for p in model_dir.iterdir()]
-                                    print(f"[DEBUG] All files in model_dir: {all_files}")
-                                    # Try case-insensitive match for pattern
-                                    ci_matches = [f for f in all_files if fnmatch.fnmatch(f.lower(), search_pattern.lower())]
-                                    print(f"[DEBUG] Case-insensitive matches for pattern '{search_pattern}': {ci_matches}")
-                                    if ci_matches:
-                                        print(f"[WARN] Files exist that match the pattern case-insensitively but not case-sensitively. Filesystem may be case-sensitive.")
-                                else:
-                                    print(f"[DEBUG] model_dir does not exist!")
-                                continue
-                            cfg_path = cfg_candidates[0]
-                            # --- PATCH: Always use model_dir for LOOCV summary lookup ---
-                            loocv_summary_path = model_dir / "loocv_summary.csv"
-                            print(f"[DEBUG] Checking for loocv_summary.csv at: {loocv_summary_path}")
-                            # For all models, including transformers, patch config YAML from configs subdirectory for LOOCV
-                            print(f"[DEBUG] Loading config for LOOCV from: {cfg_path}")
-                            with open(cfg_path, "r", encoding="utf-8") as f:
-                                orig_cfg = yaml.safe_load(f)
-                            print(f"[DEBUG] Config keys loaded: {list(orig_cfg.keys())}")
-                            cfg = dict(orig_cfg)  # shallow copy
-                            if "evaluation" not in cfg:
-                                cfg["evaluation"] = {}
-                            cfg["evaluation"]["run_loocv"] = True
-                            loocv_cfg_path = model_dir / "config_loocv.yml"
-                            with open(loocv_cfg_path, "w", encoding="utf-8") as f:
-                                yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
-                            print(f"[DEBUG] About to run LOOCV evaluation:")
-                            print(f"[DEBUG]   loocv_cfg_path: {loocv_cfg_path}")
-                            print(f"[DEBUG]   model_dir: {model_dir}")
-                            print(f"[DEBUG]   Should expect split files at: {model_dir / 'test_files.txt'} and {model_dir / 'train_files.txt'}")
-                            try:
-
-                                feval_path = str((Path(__file__).parent.parent / "src" / "f_Evaluate.py").resolve())
-                                spec = importlib.util.spec_from_file_location("f_Evaluate", feval_path)
-                                feval = importlib.util.module_from_spec(spec)
-                                sys.modules["f_Evaluate"] = feval
-                                spec.loader.exec_module(feval)
-                                # Directly call LOOCV evaluation so debug output is visible
-                                feval.evaluate_single_config(str(loocv_cfg_path), save_plots_override=False)
-                            except Exception as e:
-                                print(f"[WARN] Error during LOOCV evaluation for {plan.dataset_dir.name}: {e}")
-                                print(f"[WARN]   loocv_cfg_path: {loocv_cfg_path}")
-                                print(f"[WARN]   model_dir: {model_dir}")
-                                print(f"[WARN]   Expected split files at: {model_dir / 'test_files.txt'} and {model_dir / 'train_files.txt'}")
-                                traceback.print_exc()
-                            # Always use the already-resolved model_dir for LOOCV and split file lookups
-                            loocv_summary_path = model_dir / "loocv_summary.csv"
-                            test_files_path = model_dir / "test_files.txt"
-                            train_files_path = model_dir / "train_files.txt"
-                            print(f"[DEBUG] Checking for loocv_summary.csv at: {loocv_summary_path}")
-                            print(f"[DEBUG] File exists: {loocv_summary_path.exists()}")
-                            loocv_r2 = loocv_rmse = loocv_mae = float('nan')
-                            loocv_skill_v_naive = float('nan')
-                            if loocv_summary_path.exists():
-                                try:
-                                    print(f"[DEBUG] Attempting to read LOOCV summary from: {loocv_summary_path}")
-                                    df_loocv = pd.read_csv(loocv_summary_path)
-                                    print(f"[DEBUG] loocv_summary.csv shape: {df_loocv.shape}")
-                                    print(f"[DEBUG] loocv_summary.csv columns: {df_loocv.columns.tolist()}")
-                                    print(f"[DEBUG] loocv_summary.csv head:\n{df_loocv.head()}\n")
-                                    if not df_loocv.empty:
-                                        agg_row = df_loocv.iloc[0]
-                                        def safe_float(val):
-                                            raw = val
-                                            print(f"[DEBUG] Raw LOOCV value: {raw!r} (type: {type(raw)})")
-                                            if pd.isnull(raw):
-                                                return float('nan')
-                                            if isinstance(raw, str):
-                                                raw = raw.strip()
-                                                if raw == '' or raw.lower() == 'nan':
-                                                    return float('nan')
-                                            try:
-                                                return float(raw)
-                                            except Exception:
-                                                return float('nan')
-                                        # Print raw values and types before conversion
-                                        print(f"[DEBUG] Raw r2 from CSV: {agg_row.get('r2', None)!r} (type: {type(agg_row.get('r2', None))})")
-                                        print(f"[DEBUG] Raw rmse from CSV: {agg_row.get('rmse', None)!r} (type: {type(agg_row.get('rmse', None))})")
-                                        print(f"[DEBUG] Raw mae from CSV: {agg_row.get('mae', None)!r} (type: {type(agg_row.get('mae', None))})")
-                                        loocv_r2 = safe_float(agg_row['r2']) if 'r2' in agg_row else float('nan')
-                                        loocv_rmse = safe_float(agg_row['rmse']) if 'rmse' in agg_row else float('nan')
-                                        loocv_mae = safe_float(agg_row['mae']) if 'mae' in agg_row else float('nan')
-                                        if 'skill_v_naive' in agg_row:
-                                            loocv_skill_v_naive = safe_float(agg_row['skill_v_naive'])
-                                        print(f"[DEBUG] Extracted LOOCV values: r2={loocv_r2}, rmse={loocv_rmse}, mae={loocv_mae}, skill_v_naive={loocv_skill_v_naive}")
-                                except Exception as e:
-                                    print(f"[WARN] Could not parse LOOCV summary for {plan.dataset_dir.name}: {e}")
-                            # Write LOOCV results into feature_sweep_final_metrics.csv for the best model row only (column-based match)
-
-                            # Robust: Always append a row, even if LOOCV or update fails
-                            try:
-                                df_metrics = pd.read_csv(final_metrics_csv)
-                                # Add columns if missing
-                                for col in ['loocv_r2', 'loocv_rmse', 'loocv_mae', 'loocv_skill_v_naive']:
-                                    if col not in df_metrics.columns:
-                                        df_metrics[col] = float('nan')
-                                # Use column-based matching to find the correct row using best_row values
-                                feature_tag = best_row.get('feature_tag', '')
-                                row_count_val = int(best_row.get('row_count', 0))
-                                model = best_row.get('model', None)
-                                row_mask = (
-                                    (df_metrics['feature_tag'] == feature_tag)
-                                    & (df_metrics['row_count'] == row_count_val)
-                                    & (df_metrics['model'] == model)
-                                )
-                                print(f"[DEBUG] Attempting to write LOOCV results for dataset: {plan.dataset_dir.name}")
-                                print(f"[DEBUG] feature_tag: {feature_tag}, row_count: {row_count_val}, model: {model}")
-                                print(f"[DEBUG] LOOCV values: r2={loocv_r2}, rmse={loocv_rmse}, mae={loocv_mae}")
-                                if row_mask.any():
-                                    print(f"[DEBUG] Row(s) before update: {df_metrics.loc[row_mask].to_dict('records')}")
-                                    df_metrics.loc[row_mask, 'loocv_r2'] = loocv_r2
-                                    df_metrics.loc[row_mask, 'loocv_rmse'] = loocv_rmse
-                                    df_metrics.loc[row_mask, 'loocv_mae'] = loocv_mae
-                                    df_metrics.loc[row_mask, 'loocv_skill_v_naive'] = loocv_skill_v_naive
-                                    print(f"[DEBUG] Row(s) after update: {df_metrics.loc[row_mask].to_dict('records')}")
-                                    print(f"[POST] Wrote LOOCV results to feature_sweep_final_metrics.csv for best model in {plan.dataset_dir.name}")
-                                else:
-                                    print(f"[WARN] Could not find matching row for LOOCV update in feature_sweep_final_metrics.csv for {plan.dataset_dir.name}")
-                                df_metrics.to_csv(final_metrics_csv, index=False)
-                            except Exception as e:
-                                print(f"[WARN] Could not write LOOCV results to feature_sweep_final_metrics.csv for {plan.dataset_dir.name}: {e}")
-                            finally:
-                                # Always append a row, even if LOOCV failed
-                                try:
-                                    # Re-read the best row from the updated metrics file to ensure LOOCV values are included
-                                    try:
-                                        df_metrics_updated = pd.read_csv(final_metrics_csv)
-                                        # Use the same selection logic as above
-                                        df_valid = df_metrics_updated.copy()
-                                        if 'std_target' in df_valid.columns:
-                                            df_valid = df_valid[(df_valid['std_target'].notnull()) & (df_valid['std_target'] > 0)]
-                                        if 'r2' in df_valid.columns:
-                                            df_valid = df_valid[df_valid['r2'].notnull()]
-                                        if 'std_target' in df_valid.columns:
-                                            df_valid['nrmse'] = df_valid['rmse'] / df_valid['std_target']
-                                        else:
-                                            df_valid['nrmse'] = np.nan
-                                        valid_r2 = df_valid[df_valid['r2'].notnull() & np.isfinite(df_valid['r2'])]
-                                        if not valid_r2.empty:
-                                            idx_in_valid = valid_r2['r2'].idxmax()
-                                            best_row_updated = valid_r2.loc[idx_in_valid]
-                                            best_model_performance.append({
-                                                'dataset': plan.dataset_dir.name,
-                                                'nrmse': best_row_updated['nrmse'] if 'nrmse' in best_row_updated and pd.notnull(best_row_updated['nrmse']) else float('nan'),
-                                                'rmse': best_row_updated['rmse'] if 'rmse' in best_row_updated and pd.notnull(best_row_updated['rmse']) else float('nan'),
-                                                'r2': best_row_updated['r2'] if 'r2' in best_row_updated and pd.notnull(best_row_updated['r2']) else float('nan'),
-                                                'n_test_samples': best_row_updated['n_samples'] if 'n_samples' in best_row_updated and pd.notnull(best_row_updated['n_samples']) else float('nan'),
-                                                'loocv_r2': best_row_updated['loocv_r2'] if 'loocv_r2' in best_row_updated and pd.notnull(best_row_updated['loocv_r2']) else float('nan'),
-                                                'loocv_rmse': best_row_updated['loocv_rmse'] if 'loocv_rmse' in best_row_updated and pd.notnull(best_row_updated['loocv_rmse']) else float('nan'),
-                                                'loocv_mae': best_row_updated['loocv_mae'] if 'loocv_mae' in best_row_updated and pd.notnull(best_row_updated['loocv_mae']) else float('nan'),
-                                                'loocv_skill_v_naive': best_row_updated['loocv_skill_v_naive'] if 'loocv_skill_v_naive' in best_row_updated and pd.notnull(best_row_updated['loocv_skill_v_naive']) else float('nan'),
-                                            })
-                                        else:
-                                            # fallback: use previous values
-                                            best_model_performance.append({
-                                                'dataset': plan.dataset_dir.name,
-                                                'nrmse': nrmse,
-                                                'rmse': rmse,
-                                                'r2': r2,
-                                                'n_test_samples': n_test_samples,
-                                                'loocv_r2': loocv_r2,
-                                                'loocv_rmse': loocv_rmse,
-                                                'loocv_mae': loocv_mae,
-                                                'loocv_skill_v_naive': loocv_skill_v_naive,
-                                            })
-                                    except Exception as reread_exc:
-                                        print(f"[WARN] Could not re-read updated metrics for LOOCV: {reread_exc}")
-                                        best_model_performance.append({
-                                            'dataset': plan.dataset_dir.name,
-                                            'nrmse': nrmse,
-                                            'rmse': rmse,
-                                            'r2': r2,
-                                            'n_test_samples': n_test_samples,
-                                            'loocv_r2': loocv_r2,
-                                            'loocv_rmse': loocv_rmse,
-                                            'loocv_mae': loocv_mae,
-                                            'loocv_skill_v_naive': loocv_skill_v_naive,
-                                        })
-                                except Exception as append_exc:
-                                    print(f"[ERROR] Could not append best model performance for {plan.dataset_dir.name}: {append_exc}")
-            except Exception as e:
-                print(f"[WARN] Could not process best model performance for {plan.dataset_dir.name}: {e}")
-
-            if wrote_any:
-                datasets_with_outputs += 1
-
-        # Generate summary_best_model_performance.png (nRMSE and R²)
-        try:
-            if best_model_performance:
-                # --- Augment with baseline stats ---
-                # Find the corresponding evaluation summary for each dataset
-                summaries_dir = (data_root.parent / "regression" / "summaries").resolve()
-                summaries_dir.mkdir(parents=True, exist_ok=True)
-                # Try to find the evaluation summary for each dataset
-                for entry in best_model_performance:
-                    dataset = entry['dataset']
-                    # Try to find the evaluation summary CSV for this dataset
-                    # Assume standard location: data/output/regression/<dataset>/evaluation_summary.csv
-                    eval_csv = os.path.join(data_root, dataset, 'evaluation_summary.csv')
-                    baseline_stats = {'naive': {}, 'seasonal': {}, 'linear': {}}
-                    if os.path.exists(eval_csv):
-                        try:
-                            df_eval = pd.read_csv(eval_csv)
-                            for kind in baseline_stats.keys():
-                                row = df_eval[df_eval['label'].str.lower().str.contains(kind)].iloc[0] if not df_eval[df_eval['label'].str.lower().str.contains(kind)].empty else None
-                                if row is not None:
-                                    for stat in ['mae','rmse','r2']:
-                                        baseline_stats[kind][stat] = row.get(stat, np.nan)
-                                else:
-                                    for stat in ['mae','rmse','r2']:
-                                        baseline_stats[kind][stat] = np.nan
-                        except Exception as e:
-                            print(f"[WARN] Could not read baseline stats for {dataset}: {e}")
-                            for kind in baseline_stats.keys():
-                                for stat in ['mae','rmse','r2']:
-                                    baseline_stats[kind][stat] = np.nan
-                    else:
-                        for kind in baseline_stats.keys():
-                            for stat in ['mae','rmse','r2']:
-                                baseline_stats[kind][stat] = np.nan
-                    # Add to entry
-                    for kind in baseline_stats.keys():
-                        for stat in ['mae','rmse','r2']:
-                            entry[f'{kind}_{stat}'] = baseline_stats[kind][stat]
-
-                perf_df = pd.DataFrame(best_model_performance)
-                perf_df = perf_df.sort_values('r2', ascending=False)
-                summary_csv = summaries_dir / "summary_best_model_performance.csv"
-                perf_df.to_csv(summary_csv, index=False)
-                print(f"[INFO] Wrote summary CSV: {summary_csv}")
-                # Clustered bar chart for model and baselines
-                x = np.arange(len(perf_df))
-                width = 0.2
-                labels = perf_df['dataset']
-                methods = ['model', 'naive', 'seasonal', 'linear']
-                # Prepare data for each metric
-                nrmse_data = [
-                    perf_df['nrmse'],
-                    perf_df['naive_rmse'] / perf_df['std_target'],
-                    perf_df['seasonal_rmse'] / perf_df['std_target'],
-                    perf_df['linear_rmse'] / perf_df['std_target'],
-                ]
-                r2_data = [
-                    perf_df['r2'],
-                    perf_df['naive_r2'],
-                    perf_df['seasonal_r2'],
-                    perf_df['linear_r2'],
-                ]
-                # For skill_v_naive, only model is relevant, but for completeness, show NaN for baselines
-                skill_data = [
-                    perf_df['loocv_skill_v_naive'],
-                    [float('nan')]*len(perf_df),
-                    [float('nan')]*len(perf_df),
-                    [float('nan')]*len(perf_df),
-                ]
-                colors = ['tab:blue', 'tab:gray', 'tab:green', 'tab:orange']
-                fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(max(12, len(perf_df)*0.8), 13), constrained_layout=True, sharex=True)
-                # nRMSE subplot
-                for i, (vals, color, method) in enumerate(zip(nrmse_data, colors, methods)):
-                    bars = ax1.bar(x + (i-1.5)*width, vals, width, label=method.capitalize(), color=color)
-                    for bar in bars:
-                        height = bar.get_height()
-                        if not np.isnan(height):
-                            ax1.text(bar.get_x() + bar.get_width()/2, height, f'{height:.2e}', ha='center', va='bottom', fontsize=8, rotation=90)
-                ax1.set_ylabel('nRMSE')
-                ax1.grid(axis='y', alpha=0.3)
-                ax1.legend()
-                # R2 subplot
-                for i, (vals, color, method) in enumerate(zip(r2_data, colors, methods)):
-                    bars = ax2.bar(x + (i-1.5)*width, vals, width, label=method.capitalize(), color=color)
-                    for bar in bars:
-                        height = bar.get_height()
-                        if not np.isnan(height):
-                            ax2.text(bar.get_x() + bar.get_width()/2, height, f'{height:.2f}', ha='center', va='bottom', fontsize=8, rotation=90)
-                ax2.set_ylabel('R²')
-                ax2.grid(axis='y', alpha=0.3)
-                ax2.legend()
-                # Skill vs Naive subplot
-                for i, (vals, color, method) in enumerate(zip(skill_data, colors, methods)):
-                    bars = ax3.bar(x + (i-1.5)*width, vals, width, label=method.capitalize(), color=color)
-                    for bar in bars:
-                        height = bar.get_height()
-                        if not np.isnan(height):
-                            ax3.text(bar.get_x() + bar.get_width()/2, height, f'{height:.2f}', ha='center', va='bottom', fontsize=8, rotation=90)
-                ax3.set_ylabel('LOOCV Skill vs Naive')
-                ax3.grid(axis='y', alpha=0.3)
-                ax3.legend()
-                # X axis
-                ax3.set_xticks(x)
-                ax3.set_xticklabels(labels, rotation=45, ha='right')
-                fig.suptitle('Best Model and Baseline Performance per Dataset (nRMSE, R², Skill vs Naive)')
-                plot_path = summaries_dir / "summary_best_model_performance.png"
-                fig.savefig(plot_path, dpi=180, bbox_inches='tight')
-                plt.close(fig)
-                print(f"[INFO] Wrote summary_best_model_performance.png to {plot_path}")
-
-                # --- Standalone publication-quality subplots ---
-                # nRMSE only
-                fig_nrmse, ax_nrmse = plt.subplots(figsize=(max(10, len(perf_df)*0.7), 5), constrained_layout=True)
-                for i, (vals, color, method) in enumerate(zip(nrmse_data, colors, methods)):
-                    bars = ax_nrmse.bar(x + (i-1.5)*width, vals, width, label=method.capitalize(), color=color)
-                    for bar in bars:
-                        height = bar.get_height()
-                        if not np.isnan(height):
-                            ax_nrmse.text(bar.get_x() + bar.get_width()/2, height, f'{height:.2e}', ha='center', va='bottom', fontsize=8, rotation=90)
-                ax_nrmse.set_ylabel('nRMSE')
-                ax_nrmse.set_xticks(x)
-                ax_nrmse.set_xticklabels(labels, rotation=45, ha='right')
-                ax_nrmse.grid(axis='y', alpha=0.3)
-                ax_nrmse.legend()
-                fig_nrmse.suptitle('Best Model and Baseline nRMSE per Dataset')
-                nrmse_path = summaries_dir / "summary_best_model_nrmse.png"
-                fig_nrmse.savefig(nrmse_path, dpi=300, bbox_inches='tight')
-                plt.close(fig_nrmse)
-                print(f"[INFO] Wrote nRMSE subplot: {nrmse_path}")
-
-                # R² only
-                fig_r2, ax_r2 = plt.subplots(figsize=(max(10, len(perf_df)*0.7), 5), constrained_layout=True)
-                for i, (vals, color, method) in enumerate(zip(r2_data, colors, methods)):
-                    bars = ax_r2.bar(x + (i-1.5)*width, vals, width, label=method.capitalize(), color=color)
-                    for bar in bars:
-                        height = bar.get_height()
-                        if not np.isnan(height):
-                            ax_r2.text(bar.get_x() + bar.get_width()/2, height, f'{height:.2f}', ha='center', va='bottom', fontsize=8, rotation=90)
-                ax_r2.set_ylabel('R²')
-                ax_r2.set_xticks(x)
-                ax_r2.set_xticklabels(labels, rotation=45, ha='right')
-                ax_r2.grid(axis='y', alpha=0.3)
-                ax_r2.legend()
-                fig_r2.suptitle('Best Model and Baseline R² per Dataset')
-                r2_path = summaries_dir / "summary_best_model_r2.png"
-                fig_r2.savefig(r2_path, dpi=300, bbox_inches='tight')
-                plt.close(fig_r2)
-                print(f"[INFO] Wrote R² subplot: {r2_path}")
-
-                # Skill vs Naive only
-                fig_skill, ax_skill = plt.subplots(figsize=(max(10, len(perf_df)*0.7), 5), constrained_layout=True)
-                for i, (vals, color, method) in enumerate(zip(skill_data, colors, methods)):
-                    bars = ax_skill.bar(x + (i-1.5)*width, vals, width, label=method.capitalize(), color=color)
-                    for bar in bars:
-                        height = bar.get_height()
-                        if not np.isnan(height):
-                            ax_skill.text(bar.get_x() + bar.get_width()/2, height, f'{height:.2f}', ha='center', va='bottom', fontsize=8, rotation=90)
-                ax_skill.set_ylabel('LOOCV Skill vs Naive')
-                ax_skill.set_xticks(x)
-                ax_skill.set_xticklabels(labels, rotation=45, ha='right')
-                ax_skill.grid(axis='y', alpha=0.3)
-                ax_skill.legend()
-                fig_skill.suptitle('Best Model and Baseline LOOCV Skill vs Naive per Dataset')
-                skill_path = summaries_dir / "summary_best_model_skill_vs_naive.png"
-                fig_skill.savefig(skill_path, dpi=300, bbox_inches='tight')
-                plt.close(fig_skill)
-                print(f"[INFO] Wrote Skill vs Naive subplot: {skill_path}")
-            else:
-                print("[WARN] No best model performance data found; summary plot not generated.")
-        except Exception as e:
-            print(f"[ERROR] Failed to generate summary_best_model_performance.png: {e}")
-
-        if len(sweep_results) > 1:
-            print("\n" + "=" * 100)
-            print("MULTI-TARGET FEATURE IMPORTANCE COMPARISON (POSTPROCESS)")
-            print("=" * 100)
-            try:
-                comparison_plot = _compile_multi_target_comparison(sweep_results, data_root)
-                if comparison_plot.exists():
-                    print(f"[INFO] Wrote multi-target comparison plots to {comparison_plot.parent}")
-            except Exception as e:
-                print(f"[WARN] Failed to regenerate multi-target comparison: {e}")
-
-        if datasets_with_outputs == 0:
-            print("[WARN] No dataset outputs were regenerated.")
-            return 1
-
-        print(f"[INFO] Regenerated feature-sweep outputs for {datasets_with_outputs} dataset(s).")
-        return 0
-
-    # Track feature importance across targets for multi-target comparison
-    sweep_results: dict[str, dict[int, dict[str, tuple[float, int]]]] = {}  # target -> row_count -> feature_sensitivities
-
     failed = 0
     for plan in plans:
         print("\n" + "=" * 100)
@@ -2038,7 +1881,7 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
         for row_count in row_counts:
             try:
                 print(f"\n[SEARCH] rows={row_count} surrogate={surrogate_cfg.name}")
-                top_sorted, trace, feature_sensitivities = _beam_search_subsets(
+                top_sorted, trace, _ = _beam_search_subsets(
                     dataset_dir=plan.dataset_dir,
                     dataset_prefix=args.dataset_prefix,
                     surrogate_config_path=surrogate_cfg,
@@ -2056,12 +1899,6 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     suppress_training_logs=not args.show_training_logs,
                     seed=args.seed,
                 )
-                # Track feature importance for multi-target comparison
-                target_name = _derive_target_name(plan.dataset_dir.name, args.dataset_prefix)
-                if target_name not in sweep_results:
-                    sweep_results[target_name] = {}
-                sweep_results[target_name][row_count] = feature_sensitivities
-
                 selected = top_sorted[: args.final_top_k]
                 trace_csv, selected_csv, plot_path = _write_search_outputs(
                     dataset_dir=plan.dataset_dir,
@@ -2085,88 +1922,6 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                 )
                 print(f"[INFO] Wrote final model metrics: {final_metrics_csv}")
 
-                # --- LOOCV for best model (highest R2) ---
-                if selected:
-                    try:
-                        # Pick the best by R2
-                        best_model = max(selected, key=lambda c: c.r2 if np.isfinite(c.r2) else float('-inf'))
-                        # Find config path for best model
-                        best_cfg_path = None
-                        for cfg in plan.train_configs:
-                            if best_model.feature_tag in str(cfg):
-                                best_cfg_path = cfg
-                                break
-                        if best_cfg_path is None:
-                            best_cfg_path = plan.train_configs[0]
-                        # --- PATCH START: Write LOOCV config to correct model dir and run f_Evaluate.py ---
-                        # Consistent model abbreviation mapping
-                        model_abbrev_map = {
-                            'Transformer': 'transformer',
-                            'XGBRegressor': 'xgb',
-                            'GPRegressor': 'gp',
-                        }
-                        model_name = str(best_model.model) if hasattr(best_model, 'model') else None
-                        abbrev = model_abbrev_map.get(model_name, model_name.lower() if model_name else "unknown")
-                        mapped_model_name = f"{abbrev}_01"
-                        row_count_val = int(best_model.row_count)
-                        feature_tag = str(best_model.feature_tag)
-                        subset_rank_val = int(getattr(best_model, 'subset_rank', 1))
-                        subset_rank_str = f"k{subset_rank_val:02d}"
-                        model_dir = plan.dataset_dir / 'forecasts' / 'feature_sweeps' / f"{mapped_model_name}_r{row_count_val}_{feature_tag}_{subset_rank_str}"
-                        model_dir.mkdir(parents=True, exist_ok=True)
-                        configs_dir = plan.dataset_dir / 'forecasts' / 'feature_sweeps' / 'configs'
-                        config_path = None
-                        for cfg_file in configs_dir.glob(f"*{abbrev}*r{row_count_val:03d}_{feature_tag}*.yml"):
-                            config_path = cfg_file
-                            break
-                        if config_path is None:
-                            for cfg_file in configs_dir.glob(f"*r{row_count_val:03d}_{feature_tag}*.yml"):
-                                config_path = cfg_file
-                                break
-                        if config_path is None:
-                            print(f"[WARN] Could not find config for LOOCV: {mapped_model_name}, r{row_count_val}, {feature_tag}")
-                            continue
-                        with open(config_path, 'r', encoding='utf-8') as f:
-                            cfg = yaml.safe_load(f)
-                        if 'evaluation' not in cfg:
-                            cfg['evaluation'] = {}
-                        cfg['evaluation']['run_loocv'] = True
-                        cfg['data']['forecast_name'] = f"feature_sweeps/{mapped_model_name}_r{row_count_val}_{feature_tag}_{subset_rank_str}"
-                        loocv_cfg_path = model_dir / "config_loocv.yml"
-                        with open(loocv_cfg_path, 'w', encoding='utf-8') as f:
-                            yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
-                        eval_cmd = [sys.executable, 'src/f_Evaluate.py', '--config', str(loocv_cfg_path)]
-                        print(f"[INFO] Running LOOCV via f_Evaluate.py: {' '.join(eval_cmd)}")
-                        subprocess.run(eval_cmd, check=True)
-                        print(f"[INFO] LOOCV complete for best model: {loocv_cfg_path}")
-                        # --- PATCH END ---
-                        # Always use model_dir for LOOCV metrics and split files
-                        loocv_metrics_path = model_dir / f"loocv_metrics_{best_model.feature_tag}.csv"
-                        test_files_path = model_dir / "test_files.txt"
-                        train_files_path = model_dir / "train_files.txt"
-                        loocv_metrics = {}
-                        if loocv_metrics_path.exists():
-                            try:
-                                df_loocv = pd.read_csv(loocv_metrics_path)
-                                if not df_loocv.empty:
-                                    for col in df_loocv.columns:
-                                        loocv_metrics[f"loocv_{col}"] = df_loocv.iloc[0][col]
-                            except Exception as e:
-                                print(f"[WARN] Could not parse LOOCV metrics: {e}")
-                        else:
-                            print(f"[WARN] LOOCV metrics file not found: {loocv_metrics_path}")
-                        # Check for split files in model_dir
-                        if not test_files_path.exists():
-                            print(f"[WARN] test_files.txt not found in model_dir: {test_files_path}")
-                        if not train_files_path.exists():
-                            print(f"[WARN] train_files.txt not found in model_dir: {train_files_path}")
-                        if best_model_performance:
-                            for entry in best_model_performance:
-                                if entry['dataset'] == plan.dataset_dir.name:
-                                    entry.update(loocv_metrics)
-                                    break
-                    except Exception as exc:
-                        print(f"[WARN] LOOCV or LOOCV summary failed for dataset {plan.dataset_dir.name}, row_count {row_count}: {exc}")
             except Exception as exc:
                 failed += 1
                 print(f"[ERROR] Dataset failed: {plan.dataset_dir.name}, row_count {row_count}")
@@ -2178,18 +1933,6 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
     print("-" * 100)
     print(f"Datasets completed: {len(plans) - failed}")
     print(f"Datasets failed   : {failed}")
-    
-    # Compile multi-target comparison if multiple targets found
-    if len(sweep_results) > 1:
-        print("\n" + "=" * 100)
-        print("MULTI-TARGET FEATURE IMPORTANCE COMPARISON")
-        print("=" * 100)
-        try:
-            comparison_plot = _compile_multi_target_comparison(sweep_results, data_root)
-            if comparison_plot.exists():
-                print(f"[INFO] Wrote multi-target comparison plots to {comparison_plot.parent}")
-        except Exception as e:
-            print(f"[WARN] Failed to generate multi-target comparison: {e}")
     
     return 0 if failed == 0 else 2
 
@@ -2240,11 +1983,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-training-logs",
         action="store_true",
         help="Show verbose model training logs (epoch metrics, sample-loading details).",
-    )
-    parser.add_argument(
-        "--postprocess-only",
-        action="store_true",
-        help="Regenerate feature-sweep plots from saved artifacts without running search/training.",
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--stop-on-error", action="store_true")

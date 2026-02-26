@@ -67,9 +67,9 @@ class ModelRunner:
         if suppress_training_logs:
             import contextlib, io
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                train_samples, test_samples, _ = training.load_and_split_data(config)
+                train_samples, test_samples = training.load_and_split_data(config)
         else:
-            train_samples, test_samples, _ = training.load_and_split_data(config)
+            train_samples, test_samples = training.load_and_split_data(config)
         def _run_train():
             if model_type == "transformer":
                 training.train_transformer_model(config, train_samples, test_samples)

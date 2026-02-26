@@ -131,8 +131,8 @@ def evaluate_naive(dataset, historic, output_columns, data_dir, output_rows=-1, 
 
     return np.array(predictions), np.array(targets)
 
-def evaluate_linear(data_dir, forecast_name, dataset, historic, output_columns, output_rows=-1, window_hours=6,
-                    gap_hours=5, debug_plot=False, examples=10, sample_subdir="samples"):
+def evaluate_linear(data_dir, forecast_name, dataset, historic, output_columns, output_rows=-1, window_hours=340,
+                    gap_hours=0, debug_plot=False, examples=10, sample_subdir="samples"):
     """
     Linear baseline with causal gap constraint and optional debug visualization.
 
@@ -209,6 +209,13 @@ def evaluate_linear(data_dir, forecast_name, dataset, historic, output_columns, 
 
     return np.array(predictions), np.array(targets)
 
+def _prepare_time_columns(df):
+    df["YEAR"] = df["TIMESTAMP"].dt.year
+    df["DAYOFYEAR"] = df["TIMESTAMP"].dt.dayofyear
+    df["HOUR"] = df["TIMESTAMP"].dt.hour + df["TIMESTAMP"].dt.minute / 60.0
+    return df
+
+
 def evaluate_seasonal(dataset, historic, output_columns, data_dir, output_rows=-1, diurnal_window=2,
                       secondary=None, sample_subdir="samples"):
     """
@@ -219,12 +226,6 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, output_rows=-
     (secondary or primary) as ground truth in the diagnostic plots,
     separated into yearly series.
     """
-    import os
-    import numpy as np
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-
     # --- Load and prepare data sources ---
     df = pd.read_csv(historic, parse_dates=["TIMESTAMP"]).sort_values("TIMESTAMP")
     historical_df = normalize_columns(df, output_columns, directory=data_dir)
@@ -239,15 +240,9 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, output_rows=-
         secondary_df.rename(columns={"Time": "TIMESTAMP"}, inplace=True)
         secondary_df = normalize_columns(secondary_df, output_columns, directory=data_dir)
 
-    def prepare_time_columns(df):
-        df["YEAR"] = df["TIMESTAMP"].dt.year
-        df["DAYOFYEAR"] = df["TIMESTAMP"].dt.dayofyear
-        df["HOUR"] = df["TIMESTAMP"].dt.hour + df["TIMESTAMP"].dt.minute / 60.0
-        return df
-
-    historical_df = prepare_time_columns(historical_df)
+    historical_df = _prepare_time_columns(historical_df)
     if secondary_df is not None:
-        secondary_df = prepare_time_columns(secondary_df)
+        secondary_df = _prepare_time_columns(secondary_df)
 
     source_arrays = {}
     for col in output_columns:
@@ -508,6 +503,7 @@ def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=No
         ax[2].bar(labels_m, r2_vals, color=colors, **bar_kwargs)
         ax[2].set_title("R² Score")
         ax[2].set_ylabel("R²")
+        ax[2].set_ylim(bottom=-0.1)
         for a in ax:
             a.set_xticks(range(len(labels_m)))
             a.set_xticklabels(labels_m, rotation=30, ha="right")

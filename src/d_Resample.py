@@ -514,7 +514,7 @@ def gapped(df, target_columns, seg_length, name="length_v_count_analysis"):
     results_df = pd.DataFrame({"Gap Hours", "Valid Segments", "Variable Name"})
     for column in target_columns:
         # Initialize a dictionary to store results
-        gap_results = {gap: 0 for gap in range(0, 167, 5)}
+        gapults = {gap: 0 for gap in range(0, 167, 5)}
         # print(column)
         # Iterate over each row with a non-null value in the last column
         for idx, row in df[df[column].notna()].iterrows():
@@ -529,11 +529,11 @@ def gapped(df, target_columns, seg_length, name="length_v_count_analysis"):
                     segment_value = first_row["Segment"]
                     segment_rows = df[(df["TIMESTAMP"] <= first_row["TIMESTAMP"]) & (df["Segment"] == segment_value)]
                     if len(segment_rows) >= seg_length:
-                        gap_results[gap] += 1
+                        gapults[gap] += 1
 
         result = pd.DataFrame({
-            "Gap Hours": list(gap_results.keys()),
-            "Valid Segments": list(gap_results.values()),
+            "Gap Hours": list(gapults.keys()),
+            "Valid Segments": list(gapults.values()),
             "Variable Name": column,
         })
 
@@ -750,11 +750,11 @@ if __name__ == '__main__':
                         'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
                         '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
         'SCADA - pH', 'SCADA - Temperature (°C)']
-    target_columns = ['Color_res',
-        'Turbidity (FNU)_res', 'pH_res', 'E.coli (CFU/100mL)_res', 'Intestinal enterococci (CFU/100mL)_res', 
-        'Colony Count 22°C (CFU/mL)_res', 'Total coliforms 37°C (CFU/100mL)_res', 'Arsenic (µg/L)_res',
-        'Lead (µg/L)_res', 'Cadmium (µg/L)_res', 'Copper filtered (mg/L)_res', 'Chromium (µg/L)_res', 'Nickel (µg/L)_res', 
-        'Zinc (µg/L)_res']  # alternative 1: name-based selection
+    target_columns = ['Color',
+        'Turbidity (FNU)', 'pH', 'E.coli (CFU/100mL)', 'Intestinal enterococci (CFU/100mL)', 
+        'Colony Count 22°C (CFU/mL)', 'Total coliforms 37°C (CFU/100mL)', 'Arsenic (µg/L)',
+        'Lead (µg/L)', 'Cadmium (µg/L)', 'Copper filtered (mg/L)', 'Chromium (µg/L)', 'Nickel (µg/L)', 
+        'Zinc (µg/L)']  # alternative 1: name-based selection
     # target_columns = df.columns[-9:]  # alternative: index-based selection
 
     ## Alternative with better coverage
@@ -792,11 +792,11 @@ if __name__ == '__main__':
         'Turbidity (FNU)_state', 'pH_state', 'E.coli (CFU/100mL)_state', 'Intestinal enterococci (CFU/100mL)_state', 
         'Colony Count 22°C (CFU/mL)_state', 'Total coliforms 37°C (CFU/100mL)_state', 'Arsenic (µg/L)_state',
         'Lead (µg/L)_state', 'Cadmium (µg/L)_state', 'Copper filtered (mg/L)_state', 'Chromium (µg/L)_state', 'Nickel (µg/L)_state', 
-        'Zinc (µg/L)_state', 'Color_res',
-        'Turbidity (FNU)_res', 'pH_res', 'E.coli (CFU/100mL)_res', 'Intestinal enterococci (CFU/100mL)_res', 
-        'Colony Count 22°C (CFU/mL)_res', 'Total coliforms 37°C (CFU/100mL)_res', 'Arsenic (µg/L)_res',
-        'Lead (µg/L)_res', 'Cadmium (µg/L)_res', 'Copper filtered (mg/L)_res', 'Chromium (µg/L)_res', 'Nickel (µg/L)_res', 
-        'Zinc (µg/L)_res']
+        'Zinc (µg/L)_state', 'Color',
+        'Turbidity (FNU)', 'pH', 'E.coli (CFU/100mL)', 'Intestinal enterococci (CFU/100mL)', 
+        'Colony Count 22°C (CFU/mL)', 'Total coliforms 37°C (CFU/100mL)', 'Arsenic (µg/L)',
+        'Lead (µg/L)', 'Cadmium (µg/L)', 'Copper filtered (mg/L)', 'Chromium (µg/L)', 'Nickel (µg/L)', 
+        'Zinc (µg/L)']
 
     # to_normalize = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
     #                     'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
@@ -810,9 +810,9 @@ if __name__ == '__main__':
     #                 '04-Turbiditet_state', '06-E.coli_state',
     # '07-Intestinale enterokokker_state', '08-Kimtall 22°C_state', '09-Koliforme bakterier 37°C_state', '21-Arsen_state',
     #          '24-Bly_state', '32-Kadmium_state', '36-Kopper filtrert_state', '37-Krom_state', '41-Nikkel_state',
-    #                 'Sink (Zn)_state', '01-Farge_res', '04-Turbiditet_res', '06-E.coli_res',
-    # '07-Intestinale enterokokker_res', '08-Kimtall 22°C_res', '09-Koliforme bakterier 37°C_res', '21-Arsen_res',
-    #          '24-Bly_res', '32-Kadmium_res', '36-Kopper filtrert_res', '37-Krom_res', '41-Nikkel_res', 'Sink (Zn)_res']
+    #                 'Sink (Zn)_state', '01-Farge', '04-Turbiditet', '06-E.coli',
+    # '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
+    #          '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
 
     # to_normalize = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
     #                     'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
@@ -835,11 +835,41 @@ if __name__ == '__main__':
         verbose=False,
     )
 
+    # for target in target_columns:
+    #     target_slug = target.replace(" ", "_").replace("/", "_")
+    #     output_dir = os.path.join("../data/output/regression", f"MC_{target_slug}")
+    #     target_state_col = target.replace('', '_state') if target.endswith('') else f"{target}_state"
+    #     per_target_predictors = predictor_cols + [target_state_col] if target_state_col not in predictor_cols else predictor_cols
+    #     result = split(
+    #         df_norm,
+    #         output_dir,
+    #         [target],
+    #         length,
+    #         0.8,
+    #         to_normalize,
+    #         True,
+    #         predictor_cols=per_target_predictors,
+    #         use_uncertainty_perturbation=True,
+    #         n_mc_replicates=10,
+    #         random_seed=1,
+    #         pre_normalized=True,
+    #         normalization_params=normalization_params,
+    #         sensor_uncertainties=shared_sensor_uncertainties,
+    #         verbose=False,
+    #     )
+
+    #     print(f"Sample set: {result['sample_set_name']}")
+    #     print(f"Target columns: {result['target_columns']}")
+    #     print(f"Predictor columns: {result['predictor_columns']}")
+    #     print(f"Number of samples included: {result['n_samples']}")
+    #     for cfg in result['config_paths']:
+    #         print(f"Config file generated: {cfg}")
+
     for target in target_columns:
         target_slug = target.replace(" ", "_").replace("/", "_")
         output_dir = os.path.join("../data/output/regression", f"MC_{target_slug}")
-        target_state_col = target.replace('_res', '_state') if target.endswith('_res') else f"{target}_state"
-        per_target_predictors = predictor_cols + [target_state_col] if target_state_col not in predictor_cols else predictor_cols
+        # target_state_col = target.replace('', '_state') if target.endswith('') else f"{target}_state"
+        # per_target_predictors = predictor_cols + [target_state_col] if target_state_col not in predictor_cols else predictor_cols
         result = split(
             df_norm,
             output_dir,
@@ -848,7 +878,7 @@ if __name__ == '__main__':
             0.8,
             to_normalize,
             True,
-            predictor_cols=per_target_predictors,
+            predictor_cols=predictor_cols,
             use_uncertainty_perturbation=True,
             n_mc_replicates=10,
             random_seed=1,
