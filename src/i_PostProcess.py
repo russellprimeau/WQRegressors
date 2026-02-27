@@ -86,8 +86,11 @@ def _build_perf_entry(
     rolling_cv_rmse: float = float('nan'),
     rolling_cv_mae: float = float('nan'),
     rolling_cv_n_folds: float = float('nan'),
+    n_test_samples_raw: float = float('nan'),
 ) -> dict:
     """Build a best-model-performance dict from a metrics row and rolling CV stats."""
+    n_test_samples_mc = _safe_float(row.get('n_samples', float('nan')))
+    n_test_samples = n_test_samples_raw if np.isfinite(n_test_samples_raw) else n_test_samples_mc
     return {
         'dataset': dataset_name,
         'model': str(row.get('model', '')),
@@ -95,7 +98,8 @@ def _build_perf_entry(
         'rmse': _safe_float(row.get('rmse', float('nan'))),
         'r2': _safe_float(row.get('r2', float('nan'))),
         'std_target': _safe_float(row.get('std_target', float('nan'))),
-        'n_test_samples': _safe_float(row.get('n_samples', float('nan'))),
+        'n_test_samples': n_test_samples,
+        'n_test_samples_mc': n_test_samples_mc,
         'rolling_cv_r2': rolling_cv_r2,
         'rolling_cv_rmse': rolling_cv_rmse,
         'rolling_cv_mae': rolling_cv_mae,
@@ -122,21 +126,91 @@ def _filter_valid_rows(df: "pd.DataFrame") -> "pd.DataFrame":
 def _annotate_bars_within_ylim(ax, bars, fmt: str, fontsize: int = 8) -> None:
     """Annotate bars only when the bar-top y value falls within current y-axis limits."""
     ymin, ymax = ax.get_ylim()
+    yspan = float(ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
+    pad = 0.01 * yspan
     for bar in bars:
         h = bar.get_height()
         if not np.isfinite(h):
             continue
         if h < ymin or h > ymax:
             continue
+        y_txt = h + pad
+        va = 'bottom'
+        if y_txt > (ymax - pad):
+            y_txt = h - pad
+            va = 'top'
         ax.text(
             bar.get_x() + bar.get_width() / 2,
-            h,
+            y_txt,
             f'{h:{fmt}}',
             ha='center',
-            va='bottom',
+            va=va,
             fontsize=fontsize,
             rotation=90,
         )
+
+
+def _map_to_raw_filenames(file_names: list[str]) -> list[str]:
+    mapped = []
+    seen = set()
+    for file_name in file_names:
+        mapped_name = re.sub(r"_mc_\d+(?=\.csv$)", "", str(file_name))
+        if mapped_name not in seen:
+            seen.add(mapped_name)
+            mapped.append(mapped_name)
+    return mapped
+
+
+def _count_independent_test_samples(plan: DatasetPlan, row: "pd.Series") -> float:
+    """Count unique raw test samples for the selected best-model variant."""
+    try:
+        row_count = int(row.get("row_count"))
+        feature_tag = str(row.get("feature_tag", ""))
+    except Exception:
+        return float("nan")
+
+    model_key = str(row.get("model", "")).strip().lower()
+    output_dir = _forecast_sweeps_dir(plan.dataset_dir)
+    variant_dirs = [
+        p for p in sorted(output_dir.glob(f"*_r{row_count:03d}_{feature_tag}_k*"))
+        if p.is_dir()
+    ]
+
+    def _read_test_files(split_path: Path) -> "list[str] | None":
+        try:
+            with open(split_path, "r", encoding="utf-8") as sf:
+                return [line.strip() for line in sf if line.strip()]
+        except Exception:
+            return None
+
+    for variant_dir in variant_dirs:
+        eval_cfg = variant_dir / f"config_evaluate_{variant_dir.name}.yml"
+        local_train_cfg = variant_dir / f"config_train_{variant_dir.name}.yml"
+        cfg_candidates = [p for p in (eval_cfg, local_train_cfg) if p.exists()]
+        for cfg_path in cfg_candidates:
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+            except Exception:
+                continue
+            cfg_model = str(cfg.get("model_name") or cfg.get("model_type") or "").strip().lower()
+            if model_key and cfg_model and model_key not in cfg_model and cfg_model not in model_key:
+                continue
+            split_path = variant_dir / "test_files.txt"
+            if not split_path.exists():
+                continue
+            files = _read_test_files(split_path)
+            if files:
+                return float(len(_map_to_raw_filenames(files)))
+
+    for variant_dir in variant_dirs:
+        split_path = variant_dir / "test_files.txt"
+        if split_path.exists():
+            files = _read_test_files(split_path)
+            if files:
+                return float(len(_map_to_raw_filenames(files)))
+
+    return float("nan")
 
 
 def _draw_bar_group(ax, x, width: float, data, colors, methods, fmt: str,
@@ -265,6 +339,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                         best_row = valid_r2.loc[valid_r2['r2'].idxmax()]
 
                         rolling_cv_r2 = rolling_cv_rmse = rolling_cv_mae = rolling_cv_n_folds = float('nan')
+                        n_test_samples_raw = float('nan')
 
                         # Always run rolling origin CV (recomputes on every post-process run)
                         print(f"[INFO] Running rolling origin CV for {plan.dataset_dir.name}")
@@ -288,6 +363,15 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                         except Exception as exc:
                             print(f"[WARN] Failed to write dataset evaluation summary for {plan.dataset_dir.name}: {exc}")
                             traceback.print_exc()
+
+                        try:
+                            n_test_samples_raw = _count_independent_test_samples(plan, best_row)
+                            if np.isfinite(n_test_samples_raw):
+                                print(f"[INFO] Independent raw test samples: n={int(n_test_samples_raw)}")
+                            else:
+                                print(f"[WARN] Could not determine independent raw test sample count for {plan.dataset_dir.name}")
+                        except Exception as exc:
+                            print(f"[WARN] Failed to count independent raw test samples for {plan.dataset_dir.name}: {exc}")
 
                         # Read rolling CV results
                         if cv_summary_path is not None and cv_summary_path.exists():
@@ -343,6 +427,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                                     rolling_cv_rmse=_safe_float(best_updated.get('rolling_cv_rmse')),
                                     rolling_cv_mae=_safe_float(best_updated.get('rolling_cv_mae')),
                                     rolling_cv_n_folds=rolling_cv_n_folds,
+                                    n_test_samples_raw=n_test_samples_raw,
                                 ))
                             else:
                                 # Fallback: use pre-update values
@@ -352,6 +437,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                                     rolling_cv_rmse=rolling_cv_rmse,
                                     rolling_cv_mae=rolling_cv_mae,
                                     rolling_cv_n_folds=rolling_cv_n_folds,
+                                    n_test_samples_raw=n_test_samples_raw,
                                 ))
                         except Exception as exc:
                             print(f"[WARN] Could not re-read updated metrics for {plan.dataset_dir.name}: {exc}")
@@ -361,6 +447,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                                 rolling_cv_rmse=rolling_cv_rmse,
                                 rolling_cv_mae=rolling_cv_mae,
                                 rolling_cv_n_folds=rolling_cv_n_folds,
+                                n_test_samples_raw=n_test_samples_raw,
                             ))
         except Exception as e:
             print(f"[WARN] Could not process best model performance for {plan.dataset_dir.name}: {e}")
@@ -536,7 +623,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
                 cv_panel_specs = [
                     (perf_df['rolling_cv_r2'], 'CV R²',            'tab:blue',   '.2f'),
-                    (gen_gap,                  'Generalization Gap\n(test R² − CV R²)', 'tab:red', '.2f'),
+                    (gen_gap,                  'Generalization Gap\n(test R² − CV R²)', 'tab:red', '.2e'),
                     (n_folds_col,              'CV Folds (n)',      'tab:purple', '.0f'),
                     (n_samples_col,            'Test Samples (n)',  'tab:orange', '.0f'),
                 ]
