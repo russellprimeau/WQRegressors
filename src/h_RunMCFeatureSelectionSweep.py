@@ -48,6 +48,16 @@ from utils.training import load_samples, group_samples_by_segment
 SUPPORTED_CONFIG_SUFFIXES = {".yml", ".yaml", ".json"}
 
 
+def _sweep_namespace() -> str:
+    """Return the forecast subdirectory name used by feature sweep artifacts."""
+    raw = str(os.environ.get("WQ_FEATURE_SWEEP_NAMESPACE", "")).strip()
+    return raw or "feature_sweeps"
+
+
+def _forecast_sweeps_dir(dataset_dir: Path) -> Path:
+    return dataset_dir / "forecasts" / _sweep_namespace()
+
+
 @dataclass
 class DatasetPlan:
     dataset_dir: Path
@@ -119,8 +129,18 @@ def _match_model_str(raw_value: str, cfg_model_type: str, cfg_model_name: str) -
 
 
 def _strip_fs_prefix(s: str) -> str:
-    """Strip a leading ``'feature_sweeps/'`` prefix from a forecast name string."""
-    return s[len("feature_sweeps/"):] if s.startswith("feature_sweeps/") else s
+    """Strip a leading sweep-subdir prefix from a forecast name string."""
+    normalized = str(s).replace("\\", "/")
+    prefixes = []
+    for prefix in (_sweep_namespace(), "feature_sweeps", "Shapley_sweeps"):
+        p = str(prefix).strip().strip("/")
+        if p and p not in prefixes:
+            prefixes.append(p)
+    for p in prefixes:
+        token = f"{p}/"
+        if normalized.startswith(token):
+            return normalized[len(token):]
+    return normalized
 
 
 def _find_matching_config(
@@ -264,7 +284,7 @@ def _resolve_dataset_inclusion(args: argparse.Namespace) -> tuple[bool, bool]:
 
 def _variant_forecast_name(base_forecast_name: str, row_count: int, feature_tag: str) -> str:
     base_name = _strip_fs_prefix(str(base_forecast_name).replace("\\", "/"))
-    return f"feature_sweeps/{base_name}_r{row_count:03d}_{feature_tag}"
+    return f"{_sweep_namespace()}/{base_name}_r{row_count:03d}_{feature_tag}"
 
 
 def _prepare_variant_config(
@@ -307,7 +327,7 @@ def _prepare_variant_config(
     data_cfg["forecast_name"] = _variant_forecast_name(str(data_cfg["forecast_name"]), row_count, feature_tag)
     forecast_name_rel = _strip_fs_prefix(str(data_cfg["forecast_name"]))
     # Store the original forecast directory for downstream evaluation
-    forecast_dir = Path(resolved_data_dir) / "forecasts" / "feature_sweeps" / forecast_name_rel
+    forecast_dir = Path(resolved_data_dir) / "forecasts" / _sweep_namespace() / forecast_name_rel
     data_cfg["forecast_dir"] = str(forecast_dir.resolve())
 
     # Ensure model_name is set
@@ -385,7 +405,7 @@ def _train_single_config(
     forecast_name = data_cfg["forecast_name"]
     forecast_file_name = Path(str(forecast_name)).name
     forecast_name_rel = _strip_fs_prefix(str(forecast_name))
-    forecast_dir = dataset_dir / "forecasts" / "feature_sweeps" / Path(forecast_name_rel)
+    forecast_dir = _forecast_sweeps_dir(dataset_dir) / Path(forecast_name_rel)
     return (forecast_dir / f"config_evaluate_{forecast_file_name}.yml").resolve()
 
 
@@ -674,7 +694,7 @@ def _write_feature_stats_artifacts(
     feature_removal_deltas: dict[str, list[float]],
     feature_improvement_counts: dict[str, int],
 ) -> tuple[Path, Path]:
-    out_dir = dataset_dir / "forecasts" / "feature_sweeps"
+    out_dir = _forecast_sweeps_dir(dataset_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     stats_rows = []
@@ -719,7 +739,7 @@ def _load_feature_stats_artifacts(
     dataset_dir: Path,
     row_count: int,
 ) -> tuple[dict[str, tuple[float, int]], dict[str, int], dict[str, list[float]]]:
-    out_dir = dataset_dir / "forecasts" / "feature_sweeps"
+    out_dir = _forecast_sweeps_dir(dataset_dir)
     stats_csv = out_dir / f"feature_importance_stats_r{row_count:03d}.csv"
     deltas_csv = out_dir / f"feature_removal_deltas_r{row_count:03d}.csv"
 
@@ -758,7 +778,7 @@ def _load_feature_stats_artifacts(
 
 
 def _available_row_counts_for_postprocess(dataset_dir: Path) -> list[int]:
-    out_dir = dataset_dir / "forecasts" / "feature_sweeps"
+    out_dir = _forecast_sweeps_dir(dataset_dir)
     patterns = [
         "feature_importance_stats_r*.csv",
         "feature_search_trace_r*.csv",
@@ -779,7 +799,7 @@ def _regenerate_saved_outputs_for_row(
     row_count: int,
     keep_search_plots: bool,
 ) -> dict[str, Path]:
-    out_dir = dataset_dir / "forecasts" / "feature_sweeps"
+    out_dir = _forecast_sweeps_dir(dataset_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     written: dict[str, Path] = {}
 
@@ -848,7 +868,7 @@ def _beam_search_subsets(
     seed: int,
 ) -> tuple[list[CandidateResult], list[CandidateResult], dict[str, tuple[float, int]]]:
     target_name = _derive_target_name(dataset_dir.name, dataset_prefix)
-    tmp_cfg_dir = dataset_dir / "forecasts" / "feature_sweeps" / "configs"
+    tmp_cfg_dir = _forecast_sweeps_dir(dataset_dir) / "configs"
 
     base_cfg = train_module.load_config(str(surrogate_config_path))
     full_features = tuple(base_cfg["data"]["input_columns"])
@@ -1027,7 +1047,7 @@ def _beam_search_subsets(
     
     # Generate feature importance visualizations
     print(f"\n[SEARCH] Generating feature importance visualizations...")
-    out_dir = dataset_dir / "forecasts" / "feature_sweeps"
+    out_dir = _forecast_sweeps_dir(dataset_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     
     try:
@@ -1074,9 +1094,14 @@ def _compile_multi_target_comparison(
     
     # Collect all unique features across all targets
     all_features_set = set()
-    for target_data in sweep_results.values():
+    target_feature_sets: dict[str, set[str]] = {}
+    for target, target_data in sweep_results.items():
+        feature_set = set()
         for feature_sensitivities in target_data.values():
             all_features_set.update(feature_sensitivities.keys())
+            feature_set.update(feature_sensitivities.keys())
+        # Track per-target feature presence for grouped ordering in summary figures
+        target_feature_sets[target] = feature_set
 
     # Read feature order from Consolidated_sparse.csv
     csv_path = data_root.parent / "regression" / "Consolidated_sparse.csv"
@@ -1145,6 +1170,35 @@ def _compile_multi_target_comparison(
                 if feat in feature_sensitivities:
                     matrix[i, j] = feature_sensitivities[feat][0]  # removal sensitivity
                     break
+
+    # Group feature order so common features come first, then single-target features.
+    feature_to_idx = {feat: idx for idx, feat in enumerate(all_features)}
+    summed_sensitivity_raw = matrix.sum(axis=0)
+    feature_total_score = {
+        feat: float(summed_sensitivity_raw[idx]) for feat, idx in feature_to_idx.items()
+    }
+    n_targets = len(targets)
+    presence_count = {
+        feat: sum(1 for target in targets if feat in target_feature_sets.get(target, set()))
+        for feat in all_features
+    }
+
+    common_features = [feat for feat in all_features if presence_count.get(feat, 0) == n_targets]
+    single_target_features = [feat for feat in all_features if presence_count.get(feat, 0) == 1]
+    partial_features = [
+        feat for feat in all_features
+        if 1 < presence_count.get(feat, 0) < n_targets
+    ]
+
+    common_features.sort(key=lambda feat: feature_total_score.get(feat, float("-inf")), reverse=True)
+    single_target_features.sort(key=lambda feat: feature_total_score.get(feat, float("-inf")), reverse=True)
+    partial_features.sort(key=lambda feat: feature_total_score.get(feat, float("-inf")), reverse=True)
+
+    ordered_features = common_features + single_target_features + partial_features
+    if ordered_features:
+        ordered_indices = [feature_to_idx[feat] for feat in ordered_features]
+        matrix = matrix[:, ordered_indices]
+        all_features = ordered_features
     
     fig, ax = plt.subplots(figsize=(max(12, len(all_features) * 0.4), max(8, len(targets) * 0.5)), constrained_layout=True)
     vmin = np.percentile(matrix, 5)
@@ -1183,23 +1237,26 @@ def _compile_multi_target_comparison(
     ax.set_xlabel("Feature")
     ax.set_ylabel("Target")
 
-    # Save to root output directory
+    # Save to root output directory (namespace-specific for non-default sweeps)
     summaries_dir = (data_root.parent / "regression" / "summaries").resolve()
+    namespace = _sweep_namespace()
+    if namespace != "feature_sweeps":
+        summaries_dir = (summaries_dir / namespace).resolve()
     summaries_dir.mkdir(parents=True, exist_ok=True)
     plot_path = summaries_dir / "multi_target_importance_heatmap.png"
     fig.savefig(plot_path, dpi=180, bbox_inches='tight')
     plt.close(fig)
     
-    # Create a single bar chart: sum removal sensitivities for each predictor over all targets
+    # Create a single bar chart: sum removal sensitivities for each predictor over all targets.
+    # Keep the same grouped order used by the heatmap (common first, then single-target).
     summed_sensitivity = matrix.sum(axis=0)
-    sorted_indices = np.argsort(-summed_sensitivity)
-    top_features = [all_features[i] for i in sorted_indices]
-    summed_scores = [summed_sensitivity[i] for i in sorted_indices]
+    top_features = list(all_features)
+    summed_scores = [float(v) for v in summed_sensitivity]
 
     fig, ax = plt.subplots(figsize=(max(14, len(top_features) * 0.5), 6), constrained_layout=True)
     x = np.arange(len(top_features))
     bars = ax.bar(x, summed_scores, color=plt.cm.RdYlGn((np.array(summed_scores) - np.min(summed_scores)) / (np.ptp(summed_scores) if np.ptp(summed_scores) > 0 else 1)))
-    ax.set_xlabel("Feature (sorted by total removal sensitivity)")
+    ax.set_xlabel("Feature (grouped: common across targets first, then single-target)")
     ax.set_ylabel("Total Removal Sensitivity (sum across targets)")
     ax.set_title(f"Total Feature Removal Sensitivity Across All Targets\n(Positive = valuable feature)")
     ax.set_xticks(x)
@@ -1224,7 +1281,7 @@ def _write_search_outputs(
     selected: list[CandidateResult],
     save_plots: bool,
 ) -> tuple[Path, Path, Path]:
-    out_dir = dataset_dir / "forecasts" / "feature_sweeps"
+    out_dir = _forecast_sweeps_dir(dataset_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     trace_rows = []
@@ -1303,7 +1360,7 @@ def _evaluate_selected_subsets_all_models(
     suppress_training_logs: bool,
 ) -> Path:
     rows = []
-    output_dir = dataset_plan.dataset_dir / "forecasts" / "feature_sweeps"
+    output_dir = _forecast_sweeps_dir(dataset_plan.dataset_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     cfg_dir = output_dir / "configs"
 
@@ -1507,7 +1564,7 @@ def _run_rolling_origin_cv(
     # --- Locate eval config (written by write_evaluation_config after training) ---
     # :03d is required to match directory names created by _variant_forecast_name
     variant_forecast_name = f"{best_model_name}_r{best_row_count:03d}_{best_feature_tag}_k01"
-    model_dir = plan.dataset_dir / "forecasts" / "feature_sweeps" / variant_forecast_name
+    model_dir = _forecast_sweeps_dir(plan.dataset_dir) / variant_forecast_name
     eval_cfg_path = model_dir / f"config_evaluate_{variant_forecast_name}.yml"
     local_train_cfg_path = model_dir / f"config_train_{variant_forecast_name}.yml"
 
@@ -1722,7 +1779,7 @@ def _ensure_k01_baselines(plan: DatasetPlan, final_metrics_csv: Path) -> None:
         return
 
     variant_name = f"{best_model_name}_r{best_row_count:03d}_{best_feature_tag}_k01"
-    variant_dir = plan.dataset_dir / "forecasts" / "feature_sweeps" / variant_name
+    variant_dir = _forecast_sweeps_dir(plan.dataset_dir) / variant_name
     eval_csv = variant_dir / "evaluation_summary.csv"
     eval_cfg_path = variant_dir / f"config_evaluate_{variant_name}.yml"
 
@@ -1799,7 +1856,7 @@ def _write_dataset_evaluation_summary(plan: DatasetPlan, final_metrics_csv: Path
 
     # Construct variant directory name (must use :03d to match _variant_forecast_name)
     variant_name = f"{base_model_name}_r{best_row_count:03d}_{best_feature_tag}_k01"
-    variant_dir = plan.dataset_dir / "forecasts" / "feature_sweeps" / variant_name
+    variant_dir = _forecast_sweeps_dir(plan.dataset_dir) / variant_name
     src_csv = variant_dir / "evaluation_summary.csv"
 
     if not src_csv.exists():
