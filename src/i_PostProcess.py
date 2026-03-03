@@ -83,6 +83,9 @@ def _build_perf_entry(
     dataset_name: str,
     row: "pd.Series",
     rolling_cv_r2: float = float('nan'),
+    rolling_cv_r2_median: float = float('nan'),
+    rolling_cv_r2_last50: float = float('nan'),
+    rolling_cv_r2_pooled: float = float('nan'),
     rolling_cv_rmse: float = float('nan'),
     rolling_cv_mae: float = float('nan'),
     rolling_cv_n_folds: float = float('nan'),
@@ -101,6 +104,9 @@ def _build_perf_entry(
         'n_test_samples': n_test_samples,
         'n_test_samples_mc': n_test_samples_mc,
         'rolling_cv_r2': rolling_cv_r2,
+        'rolling_cv_r2_median': rolling_cv_r2_median,
+        'rolling_cv_r2_last50': rolling_cv_r2_last50,
+        'rolling_cv_r2_pooled': rolling_cv_r2_pooled,
         'rolling_cv_rmse': rolling_cv_rmse,
         'rolling_cv_mae': rolling_cv_mae,
         'rolling_cv_n_folds': rolling_cv_n_folds,
@@ -211,6 +217,41 @@ def _count_independent_test_samples(plan: DatasetPlan, row: "pd.Series") -> floa
                 return float(len(_map_to_raw_filenames(files)))
 
     return float("nan")
+
+
+def _compute_rolling_cv_r2_stats(df_cv: "pd.DataFrame") -> tuple[float, float, float, float]:
+    """Return CV R2 stats as (mean, median, last50_mean, pooled)."""
+    try:
+        fold_rows = df_cv[df_cv['fold'].astype(str) != 'mean'].copy()
+    except Exception:
+        return float('nan'), float('nan'), float('nan'), float('nan')
+    if fold_rows.empty:
+        return float('nan'), float('nan'), float('nan'), float('nan')
+
+    fold_rows['_fold_num'] = pd.to_numeric(fold_rows['fold'], errors='coerce')
+    fold_rows = fold_rows.sort_values('_fold_num')
+
+    r2_vals = pd.to_numeric(fold_rows['r2'], errors='coerce').to_numpy(dtype=float)
+    finite_r2 = r2_vals[np.isfinite(r2_vals)]
+    r2_mean = float(np.mean(finite_r2)) if finite_r2.size else float('nan')
+    r2_median = float(np.median(finite_r2)) if finite_r2.size else float('nan')
+
+    n_last = max(1, int(np.ceil(len(fold_rows) * 0.5)))
+    last_rows = fold_rows.tail(n_last)
+    last_r2 = pd.to_numeric(last_rows['r2'], errors='coerce').to_numpy(dtype=float)
+    finite_last_r2 = last_r2[np.isfinite(last_r2)]
+    r2_last50 = float(np.mean(finite_last_r2)) if finite_last_r2.size else float('nan')
+
+    r2_pooled = float('nan')
+    if {'ss_res', 'ss_tot'}.issubset(set(fold_rows.columns)):
+        ss_res = pd.to_numeric(fold_rows['ss_res'], errors='coerce').to_numpy(dtype=float)
+        ss_tot = pd.to_numeric(fold_rows['ss_tot'], errors='coerce').to_numpy(dtype=float)
+        ss_res_sum = float(np.nansum(ss_res))
+        ss_tot_sum = float(np.nansum(ss_tot))
+        if np.isfinite(ss_tot_sum) and ss_tot_sum > 0:
+            r2_pooled = float(1.0 - ss_res_sum / ss_tot_sum)
+
+    return r2_mean, r2_median, r2_last50, r2_pooled
 
 
 def _draw_bar_group(ax, x, width: float, data, colors, methods, fmt: str,
@@ -331,14 +372,15 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             if final_metrics_csv.exists():
                 df = pd.read_csv(final_metrics_csv)
                 if not df.empty:
-                    # Select best row across all models/subsets by R²
+                    # Select best row across all models/subsets by R2
                     valid_r2 = _filter_valid_rows(df)
                     if valid_r2.empty:
                         print(f"[WARN] No valid r2 values in metrics for {plan.dataset_dir.name}; skipping rolling CV.")
                     else:
                         best_row = valid_r2.loc[valid_r2['r2'].idxmax()]
 
-                        rolling_cv_r2 = rolling_cv_rmse = rolling_cv_mae = rolling_cv_n_folds = float('nan')
+                        rolling_cv_r2 = rolling_cv_r2_median = rolling_cv_r2_last50 = rolling_cv_r2_pooled = float('nan')
+                        rolling_cv_rmse = rolling_cv_mae = rolling_cv_n_folds = float('nan')
                         n_test_samples_raw = float('nan')
 
                         # Always run rolling origin CV (recomputes on every post-process run)
@@ -379,13 +421,25 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                                 df_cv = pd.read_csv(cv_summary_path)
                                 fold_rows = df_cv[df_cv['fold'].astype(str) != 'mean']
                                 rolling_cv_n_folds = float(len(fold_rows))
+                                (
+                                    rolling_cv_r2,
+                                    rolling_cv_r2_median,
+                                    rolling_cv_r2_last50,
+                                    rolling_cv_r2_pooled,
+                                ) = _compute_rolling_cv_r2_stats(df_cv)
                                 mean_rows = df_cv[df_cv['fold'].astype(str) == 'mean']
                                 if not mean_rows.empty:
                                     agg = mean_rows.iloc[0]
-                                    rolling_cv_r2 = _safe_float(agg.get('r2'))
                                     rolling_cv_rmse = _safe_float(agg.get('rmse'))
                                     rolling_cv_mae = _safe_float(agg.get('mae'))
-                                    print(f"[INFO] Rolling CV: r2={rolling_cv_r2:.4f}, rmse={rolling_cv_rmse:.4f}, mae={rolling_cv_mae:.4f}, n_folds={int(rolling_cv_n_folds)}")
+                                    print(
+                                        f"[INFO] Rolling CV: r2_mean={rolling_cv_r2:.4f}, "
+                                        f"r2_median={rolling_cv_r2_median:.4f}, "
+                                        f"r2_last50={rolling_cv_r2_last50:.4f}, "
+                                        f"r2_pooled={rolling_cv_r2_pooled:.4f}, "
+                                        f"rmse={rolling_cv_rmse:.4f}, mae={rolling_cv_mae:.4f}, "
+                                        f"n_folds={int(rolling_cv_n_folds)}"
+                                    )
                                 else:
                                     print(f"[WARN] rolling_origin_summary.csv has no 'mean' row for {plan.dataset_dir.name}")
                             except Exception as exc:
@@ -397,7 +451,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                         # Write rolling CV metrics into feature_sweep_final_metrics.csv for the best model row
                         try:
                             df_metrics = pd.read_csv(final_metrics_csv)
-                            for col in ['rolling_cv_r2', 'rolling_cv_rmse', 'rolling_cv_mae']:
+                            for col in [
+                                'rolling_cv_r2',
+                                'rolling_cv_r2_median',
+                                'rolling_cv_r2_last50',
+                                'rolling_cv_r2_pooled',
+                                'rolling_cv_rmse',
+                                'rolling_cv_mae',
+                            ]:
                                 if col not in df_metrics.columns:
                                     df_metrics[col] = float('nan')
                             row_mask = (
@@ -407,6 +468,9 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                             )
                             if row_mask.any():
                                 df_metrics.loc[row_mask, 'rolling_cv_r2'] = rolling_cv_r2
+                                df_metrics.loc[row_mask, 'rolling_cv_r2_median'] = rolling_cv_r2_median
+                                df_metrics.loc[row_mask, 'rolling_cv_r2_last50'] = rolling_cv_r2_last50
+                                df_metrics.loc[row_mask, 'rolling_cv_r2_pooled'] = rolling_cv_r2_pooled
                                 df_metrics.loc[row_mask, 'rolling_cv_rmse'] = rolling_cv_rmse
                                 df_metrics.loc[row_mask, 'rolling_cv_mae'] = rolling_cv_mae
                                 print(f"[INFO] Wrote rolling CV results to feature_sweep_final_metrics.csv for {plan.dataset_dir.name}")
@@ -424,6 +488,9 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                                 best_model_performance.append(_build_perf_entry(
                                     plan.dataset_dir.name, best_updated,
                                     rolling_cv_r2=_safe_float(best_updated.get('rolling_cv_r2')),
+                                    rolling_cv_r2_median=_safe_float(best_updated.get('rolling_cv_r2_median')),
+                                    rolling_cv_r2_last50=_safe_float(best_updated.get('rolling_cv_r2_last50')),
+                                    rolling_cv_r2_pooled=_safe_float(best_updated.get('rolling_cv_r2_pooled')),
                                     rolling_cv_rmse=_safe_float(best_updated.get('rolling_cv_rmse')),
                                     rolling_cv_mae=_safe_float(best_updated.get('rolling_cv_mae')),
                                     rolling_cv_n_folds=rolling_cv_n_folds,
@@ -434,6 +501,9 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                                 best_model_performance.append(_build_perf_entry(
                                     plan.dataset_dir.name, best_row,
                                     rolling_cv_r2=rolling_cv_r2,
+                                    rolling_cv_r2_median=rolling_cv_r2_median,
+                                    rolling_cv_r2_last50=rolling_cv_r2_last50,
+                                    rolling_cv_r2_pooled=rolling_cv_r2_pooled,
                                     rolling_cv_rmse=rolling_cv_rmse,
                                     rolling_cv_mae=rolling_cv_mae,
                                     rolling_cv_n_folds=rolling_cv_n_folds,
@@ -444,6 +514,9 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                             best_model_performance.append(_build_perf_entry(
                                 plan.dataset_dir.name, best_row,
                                 rolling_cv_r2=rolling_cv_r2,
+                                rolling_cv_r2_median=rolling_cv_r2_median,
+                                rolling_cv_r2_last50=rolling_cv_r2_last50,
+                                rolling_cv_r2_pooled=rolling_cv_r2_pooled,
                                 rolling_cv_rmse=rolling_cv_rmse,
                                 rolling_cv_mae=rolling_cv_mae,
                                 rolling_cv_n_folds=rolling_cv_n_folds,
@@ -456,7 +529,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
         if wrote_any:
             datasets_with_outputs += 1
 
-    # Generate summary_best_model_performance.png (nRMSE, R², Rolling CV R²)
+    # Generate summary_best_model_performance.png (nRMSE, R2, Rolling CV R2)
     try:
         if best_model_performance:
             # --- Augment with baseline stats ---
@@ -533,7 +606,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             skill_methods = ['vs Naive', 'vs Seasonal']
             skill_colors = ['tab:gray', 'tab:green']
 
-            # --- Combined 3-panel figure (no title): Skill, nRMSE, R² ---
+            # --- Combined 3-panel figure (no title): Skill, nRMSE, R2 ---
             fig, (ax_skill_combo, ax_nrmse_combo, ax_r2_combo) = plt.subplots(
                 3, 1, figsize=(max(12, len(perf_df)*0.8), 13), sharex=True
             )
@@ -552,7 +625,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             r2_bars_combo = _draw_bar_group(
                 ax_r2_combo, x, width, r2_data, colors, methods, '.2f', annotate=False
             )
-            ax_r2_combo.set_ylabel('R²')
+            ax_r2_combo.set_ylabel('R2')
             ax_r2_combo.set_ylim(-0.1, 1.0)
             for bars in r2_bars_combo:
                 _annotate_bars_within_ylim(ax_r2_combo, bars, '.2f')
@@ -580,10 +653,10 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             plt.close(fig_nrmse)
             print(f"[INFO] Wrote nRMSE subplot: {nrmse_path}")
 
-            # --- Standalone R² subplot ---
+            # --- Standalone R2 subplot ---
             fig_r2, ax_r2 = plt.subplots(figsize=(max(10, len(perf_df)*0.7), 5))
             r2_bars = _draw_bar_group(ax_r2, x, width, r2_data, colors, methods, '.2f', annotate=False)
-            ax_r2.set_ylabel('R²')
+            ax_r2.set_ylabel('R2')
             ax_r2.set_ylim(-0.1, 1.0)
             for bars in r2_bars:
                 _annotate_bars_within_ylim(ax_r2, bars, '.2f')
@@ -595,7 +668,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             r2_path = summaries_dir / "summary_best_model_r2.png"
             fig_r2.savefig(r2_path, dpi=300, bbox_inches='tight')
             plt.close(fig_r2)
-            print(f"[INFO] Wrote R² subplot: {r2_path}")
+            print(f"[INFO] Wrote R2 subplot: {r2_path}")
 
             # --- Standalone skill score subplot ---
             fig_skill, ax_skill = plt.subplots(figsize=(max(10, len(perf_df)*0.7), 5))
@@ -612,18 +685,30 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             plt.close(fig_skill)
             print(f"[INFO] Wrote skill score subplot: {skill_path}")
 
-            # --- Cross-validation figure (sorted by descending R², same order as perf_df) ---
-            cv_r2_col = 'rolling_cv_r2' if 'rolling_cv_r2' in perf_df.columns else None
-            cv_data_available = cv_r2_col is not None and perf_df[cv_r2_col].notnull().any()
+            # --- Cross-validation figure (sorted by descending R2, same order as perf_df) ---
+            cv_cols = [
+                c for c in ['rolling_cv_r2', 'rolling_cv_r2_median', 'rolling_cv_r2_last50', 'rolling_cv_r2_pooled']
+                if c in perf_df.columns
+            ]
+            cv_data_available = bool(cv_cols) and perf_df[cv_cols].notnull().any().any()
             if cv_data_available:
-                # Generalization gap: test R² - CV R² (positive = test was optimistic / overfit)
-                gen_gap = perf_df['r2'] - perf_df['rolling_cv_r2']
+                # Generalization gap: test R2 - CV R2 (positive = test was optimistic / overfit)
+                cv_r2_mean_col = perf_df['rolling_cv_r2'] if 'rolling_cv_r2' in perf_df.columns else pd.Series([float('nan')] * len(perf_df))
+                cv_r2_median_col = perf_df['rolling_cv_r2_median'] if 'rolling_cv_r2_median' in perf_df.columns else pd.Series([float('nan')] * len(perf_df))
+                cv_r2_last50_col = perf_df['rolling_cv_r2_last50'] if 'rolling_cv_r2_last50' in perf_df.columns else pd.Series([float('nan')] * len(perf_df))
+                cv_r2_pooled_col = perf_df['rolling_cv_r2_pooled'] if 'rolling_cv_r2_pooled' in perf_df.columns else pd.Series([float('nan')] * len(perf_df))
+                gen_gap_mean = perf_df['r2'] - cv_r2_mean_col
+                gen_gap_last50 = perf_df['r2'] - cv_r2_last50_col
                 n_folds_col = perf_df['rolling_cv_n_folds'] if 'rolling_cv_n_folds' in perf_df.columns else pd.Series([float('nan')] * len(perf_df))
                 n_samples_col = perf_df['n_test_samples'] if 'n_test_samples' in perf_df.columns else pd.Series([float('nan')] * len(perf_df))
 
                 cv_panel_specs = [
-                    (perf_df['rolling_cv_r2'], 'CV R²',            'tab:blue',   '.2f'),
-                    (gen_gap,                  'Generalization Gap\n(test R² − CV R²)', 'tab:red', '.2e'),
+                    (cv_r2_mean_col,           'CV R2 (all folds mean)', 'tab:blue',   '.2f'),
+                    (cv_r2_median_col,         'CV R2 (all folds median)', 'tab:cyan', '.2f'),
+                    (cv_r2_last50_col,         'CV R2 (last 50% folds)', 'tab:green', '.2f'),
+                    (cv_r2_pooled_col,         'CV R2 (pooled SS)', 'tab:olive', '.2f'),
+                    (gen_gap_mean,             'Generalization Gap\n(test R2 - CV R2 mean)', 'tab:red', '.2e'),
+                    (gen_gap_last50,           'Generalization Gap\n(test R2 - CV R2 last50)', 'tab:pink', '.2e'),
                     (n_folds_col,              'CV Folds (n)',      'tab:purple', '.0f'),
                     (n_samples_col,            'Test Samples (n)',  'tab:orange', '.0f'),
                 ]
@@ -706,3 +791,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

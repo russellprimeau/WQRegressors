@@ -1703,6 +1703,8 @@ def _run_rolling_origin_cv(
             "n_train_samples": len(train_samples_fold),
             "n_test_samples": len(test_samples_fold),
             "test_segment": group_labels[test_idx],
+            "ss_res": ss_res,
+            "ss_tot": ss_tot,
             "rmse": rmse,
             "mae": mae,
             "r2": r2,
@@ -1719,6 +1721,16 @@ def _run_rolling_origin_cv(
 
     # --- Compute mean summary row ---
     finite_r2 = [m["r2"] for m in fold_metrics if np.isfinite(m["r2"])]
+    fold_r2 = np.array([m["r2"] for m in fold_metrics], dtype=float)
+    finite_fold_r2 = fold_r2[np.isfinite(fold_r2)]
+    n_last = max(1, int(np.ceil(len(fold_metrics) * 0.5)))
+    last_fold_metrics = fold_metrics[-n_last:]
+    last_r2 = np.array([m["r2"] for m in last_fold_metrics], dtype=float)
+    finite_last_r2 = last_r2[np.isfinite(last_r2)]
+    ss_res_sum = float(np.sum([m["ss_res"] for m in fold_metrics if np.isfinite(m["ss_res"])]))
+    ss_tot_sum = float(np.sum([m["ss_tot"] for m in fold_metrics if np.isfinite(m["ss_tot"])]))
+    r2_pooled = float(1.0 - ss_res_sum / ss_tot_sum) if ss_tot_sum > 0 else float("nan")
+
     summary_row = {
         "fold": "mean",
         "n_train_groups": float("nan"),
@@ -1726,18 +1738,48 @@ def _run_rolling_origin_cv(
         "n_train_samples": float("nan"),
         "n_test_samples": float("nan"),
         "test_segment": "all",
+        "ss_res": ss_res_sum,
+        "ss_tot": ss_tot_sum,
         "rmse": float(np.mean([m["rmse"] for m in fold_metrics])),
         "mae": float(np.mean([m["mae"] for m in fold_metrics])),
         "r2": float(np.mean(finite_r2)) if finite_r2 else float("nan"),
+        "r2_median": float(np.median(finite_fold_r2)) if finite_fold_r2.size else float("nan"),
+        "r2_last50_mean": float(np.mean(finite_last_r2)) if finite_last_r2.size else float("nan"),
+        "r2_pooled": r2_pooled,
     }
 
     df_cv = pd.DataFrame([summary_row] + fold_metrics)
     model_dir.mkdir(parents=True, exist_ok=True)
     cv_summary_path = model_dir / "rolling_origin_summary.csv"
     df_cv.to_csv(cv_summary_path, index=False)
+
+    try:
+        df_plot = pd.DataFrame(fold_metrics).sort_values("n_train_samples")
+        fig_cv_size, axes_cv_size = plt.subplots(3, 1, figsize=(8, 9), sharex=True)
+        axes_cv_size[0].plot(df_plot["n_train_samples"], df_plot["r2"], marker="o", color="tab:blue")
+        axes_cv_size[0].axhline(0, color="black", linewidth=0.8, linestyle="--")
+        axes_cv_size[0].set_ylabel("R²")
+        axes_cv_size[0].grid(alpha=0.3)
+        axes_cv_size[1].plot(df_plot["n_train_samples"], df_plot["rmse"], marker="o", color="tab:red")
+        axes_cv_size[1].set_ylabel("RMSE")
+        axes_cv_size[1].grid(alpha=0.3)
+        axes_cv_size[2].plot(df_plot["n_train_samples"], df_plot["mae"], marker="o", color="tab:green")
+        axes_cv_size[2].set_ylabel("MAE")
+        axes_cv_size[2].set_xlabel("Train Samples (n)")
+        axes_cv_size[2].grid(alpha=0.3)
+        plt.tight_layout()
+        cv_size_plot_path = model_dir / "rolling_origin_vs_train_size.png"
+        fig_cv_size.savefig(cv_size_plot_path, dpi=220, bbox_inches="tight")
+        plt.close(fig_cv_size)
+        print(f"[INFO] Rolling origin CV train-size plot written: {cv_size_plot_path}")
+    except Exception as exc:
+        print(f"[WARN] Could not write rolling_origin_vs_train_size.png: {exc}")
+
     print(
         f"[INFO] Rolling origin CV summary: rmse={summary_row['rmse']:.4f} "
-        f"mae={summary_row['mae']:.4f} r2={summary_row['r2']:.4f}"
+        f"mae={summary_row['mae']:.4f} r2_mean={summary_row['r2']:.4f} "
+        f"r2_median={summary_row['r2_median']:.4f} r2_last50={summary_row['r2_last50_mean']:.4f} "
+        f"r2_pooled={summary_row['r2_pooled']:.4f}"
     )
     print(f"[INFO] Rolling origin CV written: {cv_summary_path}")
     return cv_summary_path
