@@ -605,8 +605,6 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
 
     # Initialize a counter for naming output files
     segment_counter = 1
-    has_segment_col = 'Segment' in df.columns
-
     metadata_cols = [col for col in ["TIMESTAMP", "Segment", "Interpolated"] if col in df.columns]
     predictor_write_cols = [col for col in predictor_cols if col in df.columns]
     target_write_cols = [col for col in target_columns if col in df.columns]
@@ -658,16 +656,6 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
     end_indices = np.arange(length - 1, n_rows)
     target_valid = df[target_columns].notnull().all(axis=1).to_numpy()
     valid_end_mask = target_valid[end_indices]
-
-    if has_segment_col and length > 1:
-        seg_codes = pd.factorize(df['Segment'])[0]
-        run_len = np.ones(n_rows, dtype=np.int32)
-        for idx in range(1, n_rows):
-            if seg_codes[idx] == seg_codes[idx - 1]:
-                run_len[idx] = run_len[idx - 1] + 1
-        preceding_end = end_indices - 1
-        contig_mask = run_len[preceding_end] >= (length - 1)
-        valid_end_mask &= contig_mask
 
     valid_end_indices = end_indices[valid_end_mask]
 

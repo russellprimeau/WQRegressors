@@ -42,6 +42,7 @@ python src/Weather_refill.py combine-weather `
 import argparse
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -275,12 +276,12 @@ def build_thredds_url(base_url: str, filename_prefix: str, ts: pd.Timestamp) -> 
 
 
 def build_thredds_fallback_urls(primary_base_url: str, filename_prefix: str, ts: pd.Timestamp) -> List[str]:
-    """Return ordered OPeNDAP URLs: primary, v4 fallback, v3 fallback."""
+    """Return ordered OPeNDAP URLs: LongTerm, MainArchive, v4, v3."""
     base_candidates = [
+        ("https://thredds.met.no/thredds/dodsC/metppltcarchivev1", "met_analysis_ltc_1_0km_nordic"),
         (primary_base_url.rstrip("/"), filename_prefix),
         ("https://thredds.met.no/thredds/dodsC/metpparchivev4", filename_prefix),
         ("https://thredds.met.no/thredds/dodsC/metpparchivev3", filename_prefix),
-        ("https://thredds.met.no/thredds/dodsC/metppltcarchivev1", "met_analysis_ltc_1_0km_nordic"),
     ]
     urls = [build_thredds_url(base_url=b, filename_prefix=p, ts=ts) for b, p in base_candidates]
     # De-duplicate while preserving order.
@@ -429,6 +430,7 @@ def get_thredds_weather_mappings() -> List[Tuple[str, str]]:
         ("air_pressure_at_sea_level", "pr_trykk_redusert"),
         ("air_temperature_2m", "ta_middel"),
         ("integral_of_surface_downwelling_shortwave_flux_in_air_wrt_time", "qsi_kortbolget"),
+        ("integral_of_surface_downwelling_longwave_flux_in_air_wrt_time", "qli_langbolget"),
         ("precipitation_amount", "rr_1"),
         ("relative_humidity_2m", "uu_luftfuktighet"),
         ("wind_direction_10m", "dx_l"),
@@ -442,6 +444,7 @@ def resolve_weather_columns(weather_columns: List[str]) -> Dict[str, str]:
         "pr_trykk_redusert": ["pr trykk redusert"],
         "ta_middel": ["ta middel"],
         "qsi_kortbolget": ["qsi kort"],
+        "qli_langbolget": ["qli lang", "qli "],
         "rr_1": ["rr_1"],
         "uu_luftfuktighet": ["uu luftfuktighet"],
         "dx_l": ["dx_l"],
@@ -495,6 +498,10 @@ def transform_thredds_series_for_weather_compare(element: str, series: pd.Series
         if median_val > 2000.0:
             return s / 3600.0
         return s
+    if element == "integral_of_surface_downwelling_longwave_flux_in_air_wrt_time":
+        if median_val > 2000.0:
+            return s / 3600.0
+        return s
 
     return s
 
@@ -519,9 +526,49 @@ def apply_thredds_unit_conversions_for_write(
             out[col] = s * 100.0
         elif element == "integral_of_surface_downwelling_shortwave_flux_in_air_wrt_time":
             out[col] = s / 3600.0
+        elif element == "integral_of_surface_downwelling_longwave_flux_in_air_wrt_time":
+            out[col] = s / 3600.0
         else:
             out[col] = s
     return out
+
+
+def infer_decimal_places_by_column(weather_raw_df: pd.DataFrame) -> Dict[str, int]:
+    """
+    Infer decimal places used by each original Weather.csv column from raw string values.
+    """
+    invalid_tokens = {"", " ", "NA", "N/A", "NaN", "nan", "#N/A", "-99,9", "-99.9", "-99", "-999", "-9999"}
+    decimal_map: Dict[str, int] = {}
+    for col in weather_raw_df.columns:
+        if col == "Time":
+            continue
+        counts: Dict[int, int] = {}
+        for v in weather_raw_df[col].dropna():
+            s = str(v).strip()
+            if s in invalid_tokens:
+                continue
+            if "," in s:
+                dec = len(s.split(",")[-1])
+            elif "." in s:
+                dec = len(s.split(".")[-1])
+            else:
+                dec = 0
+            counts[dec] = counts.get(dec, 0) + 1
+        if counts:
+            # Most common decimal precision; break ties toward fewer decimals.
+            decimal_map[col] = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+    return decimal_map
+
+
+def format_numeric_no_scientific(value: object, decimals: int) -> object:
+    if pd.isna(value):
+        return pd.NA
+    try:
+        f = float(value)
+    except Exception:
+        return value
+    txt = f"{round(f, max(0, decimals)):.{max(0, decimals)}f}"
+    return txt.replace(".", ",")
 
 
 def build_series_with_hourly_gap_breaks(
@@ -582,6 +629,7 @@ def generate_thredds_overlay_figure(
     fig, axes = plt.subplots(n, 1, figsize=(16, max(10, n * 2.6)), sharex=True)
     if n == 1:
         axes = [axes]
+    legend_handles = None
 
     thredds_time_min = None
     thredds_time_max = None
@@ -601,7 +649,6 @@ def generate_thredds_overlay_figure(
         th_col = f"thredds_{element}"
         if th_col not in filler_df.columns or weather_col is None:
             ax.text(0.01, 0.5, f"Missing columns for mapping:\n{th_col}\n{weather_key}", transform=ax.transAxes)
-            ax.set_ylabel("value", fontsize=8)
             ax.set_title(f"{element} | Weather: {weather_key}", fontsize=9, loc="left")
             ax.grid(alpha=0.2, linestyle="--")
             continue
@@ -613,13 +660,15 @@ def generate_thredds_overlay_figure(
         th_t, th_v = build_series_with_hourly_gap_breaks(th_t_raw, th_v_raw, max_gap_hours=1)
         w_t, w_v = build_series_with_hourly_gap_breaks(w_t_raw, w_v_raw, max_gap_hours=1)
 
-        ax.plot(w_t, w_v, color="#4C78A8", linewidth=1.0, alpha=0.8, label=f"Weather.csv ({weather_col})")
-        ax.plot(th_t, th_v, color="#F58518", linewidth=0.9, alpha=0.9, label=f"THREDDS ({th_col})")
-        ax.set_ylabel("value", fontsize=8)
+        line_weather, = ax.plot(w_t, w_v, color="#4C78A8", linewidth=1.0, alpha=0.8, label="NTNU weather station")
+        line_thredds, = ax.plot(th_t, th_v, color="#F58518", linewidth=0.9, alpha=0.9, label="MET Analysis")
+        if legend_handles is None:
+            legend_handles = (line_weather, line_thredds)
         ax.set_title(f"{element} | Weather: {weather_col}", fontsize=9, loc="left")
         ax.grid(alpha=0.25, linestyle="--")
 
-    axes[0].legend(loc="upper right")
+    if legend_handles is not None:
+        axes[0].legend(list(legend_handles), ["NTNU weather station", "MET Analysis"], loc="upper right")
     axes[-1].set_xlabel("Time")
     if (thredds_time_min is not None) and (thredds_time_max is not None):
         x_min = thredds_time_min - pd.DateOffset(months=1)
@@ -659,6 +708,7 @@ def combine_weather_with_thredds(
     if not thredds_path.exists():
         raise FileNotFoundError(f"THREDDS file not found: {thredds_path}")
 
+    weather_raw_df = pd.read_csv(weather_path, sep=";", dtype=str, low_memory=False)
     weather_df = pd.read_csv(weather_path, sep=";", decimal=",", low_memory=False)
     thredds_df = pd.read_csv(thredds_path, sep=";", low_memory=False)
     if "Time" not in weather_df.columns or "Time" not in thredds_df.columns:
@@ -675,6 +725,8 @@ def combine_weather_with_thredds(
 
     mappings = get_thredds_weather_mappings()
     resolved_cols = resolve_weather_columns(list(weather_df.columns))
+    decimal_places = infer_decimal_places_by_column(weather_raw_df)
+    invalid_numeric_markers = {-9999.0, -999.0, -99.9, -99.0}
     fill_report = []
     for element, weather_key in mappings:
         th_col = f"thredds_{element}"
@@ -687,10 +739,13 @@ def combine_weather_with_thredds(
             continue
 
         weather_vals = pd.to_numeric(combo_df[weather_col], errors="coerce")
+        weather_vals = weather_vals.mask(weather_vals.isin(list(invalid_numeric_markers)), np.nan)
         th_vals = transform_thredds_series_for_weather_compare(element, thredds_df[th_col]).reindex(all_times)
         before_missing = int(weather_vals.isna().sum())
-        combo_df[weather_col] = weather_vals.fillna(th_vals)
-        after_missing = int(pd.to_numeric(combo_df[weather_col], errors="coerce").isna().sum())
+        filled_series = weather_vals.fillna(th_vals)
+        after_missing = int(pd.to_numeric(filled_series, errors="coerce").isna().sum())
+        decimals = decimal_places.get(weather_col, 2)
+        combo_df[weather_col] = filled_series.map(lambda x: format_numeric_no_scientific(x, decimals))
         fill_report.append((weather_col, th_col, before_missing - after_missing, "ok"))
 
     combo_df = combo_df.reset_index().rename(columns={"index": "Time"})
@@ -727,6 +782,7 @@ def run_query_thredds(
         "air_pressure_at_sea_level",
         "air_temperature_2m",
         "integral_of_surface_downwelling_shortwave_flux_in_air_wrt_time",
+        "integral_of_surface_downwelling_longwave_flux_in_air_wrt_time",
         "precipitation_amount",
         "relative_humidity_2m",
         "wind_direction_10m",
@@ -815,6 +871,8 @@ def run_query_thredds(
         f"  - missing mapped values in existing Weather rows: {missing_value_rows}\n"
         f"  - missing hourly rows in window: {len(missing_times)}"
     )
+    max_retries_per_source = 3
+    retry_backoff_seconds = 1.0
 
     for sample_num, (row_idx, row) in enumerate(query_df.iterrows(), start=1):
         ts = pd.to_datetime(row["_time_tmp_"], errors="coerce")
@@ -833,51 +891,176 @@ def run_query_thredds(
                 f"[progress] sample {sample_num}/{total_rows} | "
                 f"time={ts.strftime('%Y-%m-%dT%H:%M:%S')} | url={url}"
             )
-        opened = False
-        attempt_errors = []
-        for candidate_url in candidate_urls:
+        open_cache: Dict[str, Optional[object]] = {}
+        attempt_errors: Dict[str, str] = {}
+
+        def get_dataset(url_key: str, force_reopen: bool = False):
+            nonlocal files_opened
+            if force_reopen and (url_key in open_cache) and (open_cache[url_key] is not None):
+                try:
+                    open_cache[url_key].close()
+                except Exception:
+                    pass
+                open_cache.pop(url_key, None)
+            if url_key in open_cache:
+                return open_cache[url_key]
             try:
-                with nc.Dataset(candidate_url) as ds:
-                    files_opened += 1
-                    archive_hits[archive_label_from_url(candidate_url)] += 1
-                    if grid_idx is None:
-                        grid_idx = find_nearest_grid_index(
-                            ds=ds,
-                            lat_target=lat,
-                            lon_target=lon,
-                            lat_var_candidates=["latitude", "lat", "y"],
-                            lon_var_candidates=["longitude", "lon", "x"],
-                        )
-                        print(f"Using grid index y={grid_idx[0]}, x={grid_idx[1]} for lat={lat}, lon={lon}")
-
-                    y_idx, x_idx = grid_idx
-                    for el in elements:
-                        out_col = out_cols[el]
-                        if not pd.isna(query_df.at[row_idx, out_col]):
-                            continue
-                        if el not in ds.variables:
-                            errors.append(
-                                {"row": int(row_idx), "time": ts.strftime("%Y-%m-%dT%H:%M:%S"), "url": candidate_url, "element": el, "error": "Missing variable"}
-                            )
-                            continue
-                        val = extract_point_value(ds.variables[el], y_idx=y_idx, x_idx=x_idx)
-                        if val is not None:
-                            query_df.at[row_idx, out_col] = val
-                            values_filled += 1
-                    opened = True
-                break
+                ds_obj = nc.Dataset(url_key)
+                files_opened += 1
+                archive_hits[archive_label_from_url(url_key)] += 1
+                open_cache[url_key] = ds_obj
+                return ds_obj
             except Exception as exc:
-                attempt_errors.append({"url": candidate_url, "error": str(exc)})
+                attempt_errors[url_key] = str(exc)
+                open_cache[url_key] = None
+                return None
 
-        if not opened:
+        # Ensure we have grid coordinates from the first reachable source.
+        if grid_idx is None:
+            for candidate_url in candidate_urls:
+                ds_probe = get_dataset(candidate_url)
+                if ds_probe is None:
+                    continue
+                grid_idx = find_nearest_grid_index(
+                    ds=ds_probe,
+                    lat_target=lat,
+                    lon_target=lon,
+                    lat_var_candidates=["latitude", "lat", "y"],
+                    lon_var_candidates=["longitude", "lon", "x"],
+                )
+                print(f"Using grid index y={grid_idx[0]}, x={grid_idx[1]} for lat={lat}, lon={lon}")
+                break
+
+        if grid_idx is None:
             errors.append(
                 {
                     "row": int(row_idx),
                     "time": ts.strftime("%Y-%m-%dT%H:%M:%S") if not pd.isna(ts) else str(row.get(time_col)),
-                    "attempts": attempt_errors,
-                    "error": "All archive fallbacks failed",
+                    "attempts": [{"url": u, "error": attempt_errors.get(u, "untried")} for u in candidate_urls],
+                    "error": "All archive fallbacks failed (no dataset opened for grid lookup)",
                 }
             )
+            for ds_obj in open_cache.values():
+                if ds_obj is not None:
+                    try:
+                        ds_obj.close()
+                    except Exception:
+                        pass
+            continue
+
+        y_idx, x_idx = grid_idx
+        for el in elements:
+            out_col = out_cols[el]
+            if not pd.isna(query_df.at[row_idx, out_col]):
+                continue
+
+            filled_this_element = False
+            per_element_attempts = []
+            for candidate_url in candidate_urls:
+                # Retry open/read on each source to handle transient OPeNDAP parser/network failures.
+                for attempt_idx in range(1, max_retries_per_source + 1):
+                    ds_use = get_dataset(candidate_url, force_reopen=(attempt_idx > 1))
+                    if ds_use is None:
+                        err_text = attempt_errors.get(candidate_url, "open failed")
+                        per_element_attempts.append(
+                            {
+                                "url": candidate_url,
+                                "attempt": attempt_idx,
+                                "stage": "open",
+                                "error": err_text,
+                            }
+                        )
+                        errors.append(
+                            {
+                                "row": int(row_idx),
+                                "time": ts.strftime("%Y-%m-%dT%H:%M:%S"),
+                                "element": el,
+                                "url": candidate_url,
+                                "attempt": attempt_idx,
+                                "stage": "open",
+                                "error": err_text,
+                            }
+                        )
+                        if attempt_idx < max_retries_per_source:
+                            time.sleep(retry_backoff_seconds * attempt_idx)
+                        continue
+
+                    if el not in ds_use.variables:
+                        per_element_attempts.append(
+                            {
+                                "url": candidate_url,
+                                "attempt": attempt_idx,
+                                "stage": "read",
+                                "error": "Missing variable",
+                            }
+                        )
+                        # No point retrying same source if variable does not exist there.
+                        break
+
+                    try:
+                        val = extract_point_value(ds_use.variables[el], y_idx=y_idx, x_idx=x_idx)
+                        if val is None:
+                            per_element_attempts.append(
+                                {
+                                    "url": candidate_url,
+                                    "attempt": attempt_idx,
+                                    "stage": "read",
+                                    "error": "Variable present but value missing",
+                                }
+                            )
+                            # Missing value is usually not transient; move to next source.
+                            break
+                        query_df.at[row_idx, out_col] = val
+                        values_filled += 1
+                        filled_this_element = True
+                        break
+                    except Exception as exc:
+                        err_text = str(exc)
+                        per_element_attempts.append(
+                            {
+                                "url": candidate_url,
+                                "attempt": attempt_idx,
+                                "stage": "read",
+                                "error": err_text,
+                            }
+                        )
+                        errors.append(
+                            {
+                                "row": int(row_idx),
+                                "time": ts.strftime("%Y-%m-%dT%H:%M:%S"),
+                                "element": el,
+                                "url": candidate_url,
+                                "attempt": attempt_idx,
+                                "stage": "read",
+                                "error": err_text,
+                            }
+                        )
+                        if attempt_idx < max_retries_per_source:
+                            time.sleep(retry_backoff_seconds * attempt_idx)
+                            continue
+                        # Exhausted retries on this source, try next fallback source.
+                        break
+
+                if filled_this_element:
+                    break
+
+            if not filled_this_element:
+                errors.append(
+                    {
+                        "row": int(row_idx),
+                        "time": ts.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "element": el,
+                        "attempts": per_element_attempts,
+                        "error": "All archive fallbacks failed for element",
+                    }
+                )
+
+        for ds_obj in open_cache.values():
+            if ds_obj is not None:
+                try:
+                    ds_obj.close()
+                except Exception:
+                    pass
 
         if sample_num % checkpoint_every == 0:
             checkpoint_df = query_df.drop(columns=["_time_tmp_"], errors="ignore")
@@ -954,7 +1137,7 @@ def parse_args() -> argparse.Namespace:
     p_thredds.add_argument("--checkpoint-every", type=int, default=168)
     p_thredds.add_argument(
         "--elements",
-        default="air_pressure_at_sea_level,air_temperature_2m,integral_of_surface_downwelling_shortwave_flux_in_air_wrt_time,precipitation_amount,relative_humidity_2m,wind_direction_10m,wind_speed_10m",
+        default="air_pressure_at_sea_level,air_temperature_2m,integral_of_surface_downwelling_shortwave_flux_in_air_wrt_time,integral_of_surface_downwelling_longwave_flux_in_air_wrt_time,precipitation_amount,relative_humidity_2m,wind_direction_10m,wind_speed_10m",
         help="Comma-separated list of variable names to extract",
     )
 
@@ -1042,4 +1225,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

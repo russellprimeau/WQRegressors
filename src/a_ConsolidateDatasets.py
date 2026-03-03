@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from utils.preprocessing import (clean_profiler, add_source, decompose_direction, rolling_sum,
-                                 explore_data, forward_fill_columns, add_res, count_segs)
+                                 forward_fill_columns, add_res, count_segs)
 
 ## Configuration Parameters
 # Whether to keep all timesteps (True) or drop rows with missing values (False)

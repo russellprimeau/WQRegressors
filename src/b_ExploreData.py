@@ -262,7 +262,7 @@ def _write_coverage_timeline_raster(repo_root: Path, coverage_entries: list) -> 
     if "TIMESTAMP" in consolidated_df.columns:
         ts = pd.to_datetime(consolidated_df["TIMESTAMP"], errors="coerce")
         if ts.notna().any():
-            start_date = pd.Timestamp("2022-01-01")
+            start_date = pd.Timestamp("2021-12-15")
             end_date = pd.Timestamp("2025-03-01")
 
             valid_idx = np.where(ts.notna())[0]
