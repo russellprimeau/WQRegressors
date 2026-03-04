@@ -1,2 +1,15 @@
-﻿01-Farge;04-Turbiditet;06-E.coli;07-Intestinale enterokokker;08-Kimtall 22°C;09-Koliforme bakterier 37°C;21-Arsen;24-Bly;32-Kadmium;36-Kopper filtrert;37-Krom;41-Nikkel;Sink (Zn)
-20;1;0;0;99.5;0;9.5;9.5;4.95;1.95;49.5;19.5;10.5
+﻿Param_nor,Param_eng,Upper,Lower,Type
+01-Farge,Color,20,,Recommended_grenseverdier
+04-Turbiditet,Turbidity (FNU),1,,Recommended_grenseverdier
+06-E.coli,E.coli (CFU/100mL),0,,Grenseverdier
+07-Intestinale enterokokker,Intestinal enterococci (CFU/100mL),0,,Grenseverdier
+08-Kimtall 22°C,Colony Count 22°C,100,,Action_limit
+09-Koliforme bakterier 37°C,Total coliforms 37°C (CFU/100mL),0,,Action_limit
+21-Arsen,Arsenic (µg/L),10,,Grenseverdier
+24-Bly,Lead (µg/L),10,,Grenseverdier
+32-Kadmium,Cadmium (µg/L),5,,Grenseverdier
+36-Kopper filtrert,Copper filtered (mg/L),2,,Grenseverdier
+37-Krom,Chromium (µg/L),50,,Grenseverdier
+41-Nikkel,Nickel (µg/L),20,,Grenseverdier
+Sink (Zn),Zinc (µg/L),11,,Godt_Klassifering
+"44-pH, surhetsgrad",pH,9.5,6.5,Action_limit

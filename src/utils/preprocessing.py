@@ -5,6 +5,7 @@ from pathlib import Path
 import plotly.graph_objects as go
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
+from utils.limits import load_limits_records, map_limits_to_columns, limit_exceedance_mask
 
 def clean_profiler(full_df, max_gap=6):
     """
@@ -114,8 +115,9 @@ def add_source(df, secondary_df, include_NAs=False, max_gap=6, sparse=False, bin
     merged_df[new_columns] = merged_df[new_columns].apply(pd.to_numeric, errors='coerce')
 
     if binarize:
-        thresholds_df = pd.read_csv(Path('../data/input', "Limits.csv"), sep=';', decimal='.')
-        merged_df = binarize_dataframe(merged_df, output_columns=new_columns, thresholds_df=thresholds_df)
+        limits_records = load_limits_records(Path('../data/input', "Limits.csv"))
+        thresholds_map = map_limits_to_columns(new_columns, limits_records)
+        merged_df = binarize_dataframe(merged_df, output_columns=new_columns, thresholds_df=thresholds_map)
 
     if not sparse:
         # Create a mask where all new columns are NaN
@@ -154,16 +156,31 @@ def add_source(df, secondary_df, include_NAs=False, max_gap=6, sparse=False, bin
 def binarize_dataframe(df, output_columns, thresholds_df):
     """
     Convert values in specified columns of a DataFrame to binary (0 or 1)
-    based on thresholds provided in a single-row thresholds_df.
+    based on thresholds provided either as a per-column mapping or a single-row DataFrame.
     NaN values are preserved.
     """
     binary_df = df.copy()
     for col in output_columns:
-        if col not in thresholds_df.columns:
-            raise ValueError(f"Threshold for column '{col}' not found in thresholds_df.")
-        threshold = thresholds_df.iloc[0][col]
-        # Apply threshold only to non-NaN values
-        binary_df[col] = binary_df[col].where(binary_df[col].isna(), (binary_df[col] > threshold).astype(int))
+        upper = None
+        lower = None
+
+        if isinstance(thresholds_df, dict):
+            spec = thresholds_df.get(col)
+            if spec is None:
+                raise ValueError(f"Threshold for column '{col}' not found in thresholds_df.")
+            upper = spec.get("upper")
+            lower = spec.get("lower")
+        else:
+            if col not in thresholds_df.columns:
+                raise ValueError(f"Threshold for column '{col}' not found in thresholds_df.")
+            upper = thresholds_df.iloc[0][col]
+            lower_col = f"{col}__lower"
+            if lower_col in thresholds_df.columns:
+                lower = thresholds_df.iloc[0][lower_col]
+
+        numeric_col = pd.to_numeric(binary_df[col], errors="coerce")
+        exceed_mask = limit_exceedance_mask(numeric_col, upper=upper if pd.notna(upper) else None, lower=lower if pd.notna(lower) else None)
+        binary_df[col] = binary_df[col].where(binary_df[col].isna(), exceed_mask.astype(int))
     binary_df["anomaly"] = np.where(
         binary_df[output_columns].notna().any(axis=1),  # At least one non-NaN
         np.where(binary_df[output_columns].eq(1).any(axis=1), 1, 0),  # If any 1 → 1 else 0

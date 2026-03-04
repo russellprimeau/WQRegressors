@@ -55,6 +55,7 @@ from utils.config_utils import (
     _build_feature_uncertainty_variance,
 )
 from utils.gp_utils import build_base_kernel, ExactGPRegressor
+from utils.limits import load_limits_records
 
 
 DEFAULT_EVAL_CONFIG = {
@@ -357,7 +358,24 @@ def load_model(model_type, data_cfg, split_cfg, model_name, model_config, device
 
 
 def load_thresholds(eval_cfg):
-    thresholds_df = pd.read_csv(Path(eval_cfg["thresholds_path"]), sep=";", decimal=".")
+    thresholds_path = Path(eval_cfg["thresholds_path"])
+    limits_records = load_limits_records(thresholds_path)
+    if limits_records:
+        row = {}
+        for rec in limits_records:
+            upper = rec.get("upper")
+            lower = rec.get("lower")
+            names = [n for n in [rec.get("translated_name"), rec.get("original_name")] if n]
+            if not names:
+                names = rec.get("names", [])
+            for name in names:
+                if upper is not None and name not in row:
+                    row[name] = upper
+                if lower is not None and f"{name}__lower" not in row:
+                    row[f"{name}__lower"] = lower
+        thresholds_df = pd.DataFrame([row]) if row else pd.DataFrame()
+    else:
+        thresholds_df = pd.read_csv(thresholds_path, sep=";", decimal=".")
     if eval_cfg["use_normalized_thresholds"]:
         thresholds_df = apply_saved_normalize(
             thresholds_df, param_file=Path(eval_cfg["normalization_path"])

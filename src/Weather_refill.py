@@ -2,14 +2,14 @@
 Create a refill template for weather backfilling.
 
 Reads:
-  data/input/sensors/Weather.csv
+  data/input/sensors/Weather_raw.csv
 
 Writes:
   data/input/sensors/Filler.csv
 
 Output contains:
-  - The same columns as Weather.csv
-  - One row per timestamp from Weather.csv within the requested date window
+  - The same columns as Weather_raw.csv
+  - One row per timestamp from Weather_raw.csv within the requested date window
   - Blank values for all non-Time columns
 
 Run:
@@ -20,8 +20,8 @@ python src/Weather_refill.py query-api --endpoint "https://your.api/endpoint" --
 
 python src/Weather_refill.py query-thredds
 python src/Weather_refill.py query-thredds `
-  --weather-filename "Weather.csv" `
-  --output-filename "Filler_thredds.csv" `
+  --weather-filename "Weather_raw.csv" `
+  --output-filename "Weather_alt_source.csv" `
   --start "2022-01-01 00:00:00" `
   --end "2025-03-01 00:00:00" `
   --lat 62.484785020758075 `
@@ -34,9 +34,9 @@ python src/Weather_refill.py plot-thredds-overlay
 python src/Weather_refill.py combine-weather  
 
 python src/Weather_refill.py combine-weather `
-  --weather-filename Weather.csv `
-  --filler-thredds-filename Filler_thredds.csv `
-  --output-filename Weather_combo.csv
+  --weather-filename Weather_raw.csv `
+  --filler-thredds-filename Weather_alt_source.csv `
+  --output-filename Weather.csv
 """
 
 import argparse
@@ -56,17 +56,17 @@ import netCDF4 as nc
 def create_weather_refill_template(
     repo_root: Path,
     start: str = "2020-01-01 00:00:00",
-    end: str = "2025-04-01 00:00:00",
+    end: str = "2025-08-15 00:00:00",
 ) -> None:
-    weather_path = repo_root / "data" / "input" / "sensors" / "Weather.csv"
+    weather_path = repo_root / "data" / "input" / "sensors" / "Weather_raw.csv"
     filler_path = repo_root / "data" / "input" / "sensors" / "Filler.csv"
 
     if not weather_path.exists():
-        raise FileNotFoundError(f"Weather.csv not found: {weather_path}")
+        raise FileNotFoundError(f"Weather_raw.csv not found: {weather_path}")
 
     weather_df = pd.read_csv(weather_path, sep=";", low_memory=False)
     if "Time" not in weather_df.columns:
-        raise ValueError("Expected a 'Time' column in Weather.csv")
+        raise ValueError("Expected a 'Time' column in Weather_raw.csv")
 
     ts = pd.to_datetime(weather_df["Time"], errors="coerce")
     start_ts = pd.Timestamp(start)
@@ -425,7 +425,7 @@ def interpolate_short_gaps_timewise(
 
 
 def get_thredds_weather_mappings() -> List[Tuple[str, str]]:
-    """(THREDDS element, Weather.csv semantic key) mappings confirmed for refill."""
+    """(THREDDS element, Weather_raw.csv semantic key) mappings confirmed for refill."""
     return [
         ("air_pressure_at_sea_level", "pr_trykk_redusert"),
         ("air_temperature_2m", "ta_middel"),
@@ -439,7 +439,7 @@ def get_thredds_weather_mappings() -> List[Tuple[str, str]]:
 
 
 def resolve_weather_columns(weather_columns: List[str]) -> Dict[str, str]:
-    """Resolve target Weather.csv columns by robust token matching."""
+    """Resolve target Weather_raw.csv columns by robust token matching."""
     patterns = {
         "pr_trykk_redusert": ["pr trykk redusert"],
         "ta_middel": ["ta middel"],
@@ -511,7 +511,7 @@ def apply_thredds_unit_conversions_for_write(
     out_cols: Dict[str, str],
 ) -> pd.DataFrame:
     """
-    Deterministically convert raw THREDDS columns before writing to Filler_thredds.csv.
+    Deterministically convert raw THREDDS columns before writing to Weather_alt_source.csv.
     """
     out = df.copy()
     for element, col in out_cols.items():
@@ -535,7 +535,7 @@ def apply_thredds_unit_conversions_for_write(
 
 def infer_decimal_places_by_column(weather_raw_df: pd.DataFrame) -> Dict[str, int]:
     """
-    Infer decimal places used by each original Weather.csv column from raw string values.
+    Infer decimal places used by each original Weather_raw.csv column from raw string values.
     """
     invalid_tokens = {"", " ", "NA", "N/A", "NaN", "nan", "#N/A", "-99,9", "-99.9", "-99", "-999", "-9999"}
     decimal_map: Dict[str, int] = {}
@@ -600,8 +600,8 @@ def build_series_with_hourly_gap_breaks(
 
 def generate_thredds_overlay_figure(
     repo_root: Path,
-    filler_thredds_filename: str = "Filler_thredds.csv",
-    weather_filename: str = "Weather.csv",
+    filler_thredds_filename: str = "Weather_alt_source.csv",
+    weather_filename: str = "Weather_raw.csv",
     output_figure: str = "Weather_thredds_overlay.png",
 ) -> None:
     sensors_dir = repo_root / "data" / "input" / "sensors"
@@ -687,15 +687,15 @@ def generate_thredds_overlay_figure(
 
 def combine_weather_with_thredds(
     repo_root: Path,
-    weather_filename: str = "Weather.csv",
-    filler_thredds_filename: str = "Filler_thredds.csv",
-    output_filename: str = "Weather_combo.csv",
+    weather_filename: str = "Weather_raw.csv",
+    filler_thredds_filename: str = "Weather_alt_source.csv",
+    output_filename: str = "Weather.csv",
 ) -> None:
     """
-    Combine Weather.csv with locally downloaded THREDDS values.
+    Combine Weather_raw.csv with locally downloaded THREDDS values.
 
-    - Keeps Weather.csv schema/columns.
-    - Fills mapped target columns where Weather.csv is missing.
+    - Keeps Weather_raw.csv schema/columns.
+    - Fills mapped target columns where Weather_raw.csv is missing.
     - Allows additional timestamps from THREDDS file (other columns stay blank).
     """
     sensors_dir = repo_root / "data" / "input" / "sensors"
@@ -761,11 +761,11 @@ def combine_weather_with_thredds(
 
 def run_query_thredds(
     repo_root: Path,
-    weather_filename: str = "Weather.csv",
-    output_filename: str = "Filler_thredds.csv",
+    weather_filename: str = "Weather_raw.csv",
+    output_filename: str = "Weather_alt_source.csv",
     time_col: str = "Time",
-    start: str = "2022-01-01 00:00:00",
-    end: str = "2025-03-01 00:00:00",
+    start: str = "2020-01-01 00:00:00",
+    end: str = "2025-08-15 00:00:00",
     lat: float = 62.484785020758075,
     lon: float = 6.479653454212095,
     base_url: str = "https://thredds.met.no/thredds/dodsC/metpparchive",
@@ -821,7 +821,7 @@ def run_query_thredds(
         if (el in selected_elements) and (w_key in resolved_cols)
     ]
     if not mapped_weather_cols:
-        raise ValueError("None of the mapped Weather columns were found in Weather.csv")
+        raise ValueError(f"None of the mapped Weather columns were found in {weather_filename}")
 
     missing_mask = pd.Series(False, index=weather_df.index)
     for w_col in mapped_weather_cols:
@@ -833,7 +833,7 @@ def run_query_thredds(
     query_df = query_df.drop_duplicates(subset=[time_col]).sort_values("_time_tmp_").reset_index(drop=True)
     missing_value_rows = len(query_df)
 
-    # Also include timestamps entirely absent from Weather.csv in the selected window.
+    # Also include timestamps entirely absent from weather file in the selected window.
     existing_times = weather_df.loc[in_window, "_time_tmp_"].dropna().drop_duplicates().sort_values()
     expected_times = pd.date_range(start=start_ts, end=end_ts, freq="h")
     missing_times = expected_times.difference(existing_times)
@@ -1098,7 +1098,7 @@ def run_query_thredds(
     generate_thredds_overlay_figure(
         repo_root=repo_root,
         filler_thredds_filename=output_filename,
-        weather_filename="Weather.csv",
+        weather_filename="Weather_raw.csv",
         output_figure="Weather_thredds_overlay.png",
     )
 
@@ -1107,9 +1107,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Weather refill helper.")
     sub = parser.add_subparsers(dest="command", required=False)
 
-    p_template = sub.add_parser("make-template", help="Create Filler.csv from Weather.csv")
-    p_template.add_argument("--start", default="2022-01-01 00:00:00")
-    p_template.add_argument("--end", default="2025-03-01 00:00:00")
+    p_template = sub.add_parser("make-template", help="Create Filler.csv from Weather_raw.csv")
+    p_template.add_argument("--start", default="2020-01-01 00:00:00")
+    p_template.add_argument("--end", default="2025-08-15 00:00:00")
 
     p_query = sub.add_parser("query-api", help="Run batched API queries and optionally populate filler data")
     p_query.add_argument("--endpoint", required=True, help="API endpoint URL")
@@ -1126,10 +1126,10 @@ def parse_args() -> argparse.Namespace:
     )
 
     p_thredds = sub.add_parser("query-thredds", help="Read point data from THREDDS OPeNDAP files")
-    p_thredds.add_argument("--weather-filename", default="Weather.csv")
-    p_thredds.add_argument("--output-filename", default="Filler_thredds.csv")
-    p_thredds.add_argument("--start", default="2022-01-01 00:00:00")
-    p_thredds.add_argument("--end", default="2025-03-01 00:00:00")
+    p_thredds.add_argument("--weather-filename", default="Weather_raw.csv")
+    p_thredds.add_argument("--output-filename", default="Weather_alt_source.csv")
+    p_thredds.add_argument("--start", default="2020-01-01 00:00:00")
+    p_thredds.add_argument("--end", default="2025-08-15 00:00:00")
     p_thredds.add_argument("--lat", type=float, default=62.484785020758075)
     p_thredds.add_argument("--lon", type=float, default=6.479653454212095)
     p_thredds.add_argument("--base-url", default="https://thredds.met.no/thredds/dodsC/metpparchive")
@@ -1141,15 +1141,15 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated list of variable names to extract",
     )
 
-    p_plot = sub.add_parser("plot-thredds-overlay", help="Plot THREDDS columns over Weather.csv equivalents")
-    p_plot.add_argument("--filler-thredds-filename", default="Filler_thredds.csv")
-    p_plot.add_argument("--weather-filename", default="Weather.csv")
+    p_plot = sub.add_parser("plot-thredds-overlay", help="Plot THREDDS columns over Weather_raw.csv equivalents")
+    p_plot.add_argument("--filler-thredds-filename", default="Weather_alt_source.csv")
+    p_plot.add_argument("--weather-filename", default="Weather_raw.csv")
     p_plot.add_argument("--output-figure", default="Weather_thredds_overlay.png")
 
-    p_combo = sub.add_parser("combine-weather", help="Combine Weather.csv with local THREDDS values")
-    p_combo.add_argument("--weather-filename", default="Weather.csv")
-    p_combo.add_argument("--filler-thredds-filename", default="Filler_thredds.csv")
-    p_combo.add_argument("--output-filename", default="Weather_combo.csv")
+    p_combo = sub.add_parser("combine-weather", help="Combine Weather_raw.csv with local THREDDS values")
+    p_combo.add_argument("--weather-filename", default="Weather_raw.csv")
+    p_combo.add_argument("--filler-thredds-filename", default="Weather_alt_source.csv")
+    p_combo.add_argument("--output-filename", default="Weather.csv")
 
     return parser.parse_args()
 

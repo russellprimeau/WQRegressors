@@ -13,6 +13,7 @@ import copy
 import glob
 import hashlib
 import io
+import math
 import re
 import sys
 import time
@@ -32,6 +33,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from utils.training import load_samples, group_samples_by_segment
 from h_RunMCFeatureSelectionSweep import build_parser, discover_mc_dataset_plans, _derive_target_name, _select_surrogate_config, _parse_row_counts, _available_row_counts_for_postprocess, _regenerate_saved_outputs_for_row, _load_feature_stats_artifacts, _compile_multi_target_comparison, _resolve_dataset_inclusion, _run_rolling_origin_cv, _ensure_k01_baselines, _write_dataset_evaluation_summary, _forecast_sweeps_dir
+
+try:
+    from scipy import stats as scipy_stats
+except Exception:
+    scipy_stats = None
 
 
 SUPPORTED_CONFIG_SUFFIXES = {".yml", ".yaml", ".json"}
@@ -90,11 +96,12 @@ def _build_perf_entry(
     rolling_cv_mae: float = float('nan'),
     rolling_cv_n_folds: float = float('nan'),
     n_test_samples_raw: float = float('nan'),
+    extra_metrics: "dict | None" = None,
 ) -> dict:
     """Build a best-model-performance dict from a metrics row and rolling CV stats."""
     n_test_samples_mc = _safe_float(row.get('n_samples', float('nan')))
     n_test_samples = n_test_samples_raw if np.isfinite(n_test_samples_raw) else n_test_samples_mc
-    return {
+    out = {
         'dataset': dataset_name,
         'model': str(row.get('model', '')),
         'nrmse': _safe_float(row.get('nrmse', float('nan'))),
@@ -111,6 +118,9 @@ def _build_perf_entry(
         'rolling_cv_mae': rolling_cv_mae,
         'rolling_cv_n_folds': rolling_cv_n_folds,
     }
+    if extra_metrics:
+        out.update(extra_metrics)
+    return out
 
 
 def _filter_valid_rows(df: "pd.DataFrame") -> "pd.DataFrame":
@@ -268,9 +278,670 @@ def _draw_bar_group(ax, x, width: float, data, colors, methods, fmt: str,
     return bar_groups
 
 
+def _normalize_model_key(value: str) -> str:
+    return str(value).strip().lower().replace("_", "").replace(" ", "")
+
+
+def _base_sample_id(name: str) -> str:
+    return re.sub(r"_mc_\d+(?=\.csv$)", "", Path(str(name)).name)
+
+
+def _find_best_variant_eval_config(plan: DatasetPlan, row: "pd.Series") -> "tuple[Path | None, Path | None]":
+    try:
+        row_count = int(row.get("row_count"))
+        feature_tag = str(row.get("feature_tag", ""))
+    except Exception:
+        return None, None
+
+    model_key = _normalize_model_key(str(row.get("model", "")))
+    output_dir = _forecast_sweeps_dir(plan.dataset_dir)
+    variant_dirs = [
+        p for p in sorted(output_dir.glob(f"*_r{row_count:03d}_{feature_tag}_k*"))
+        if p.is_dir()
+    ]
+    if not variant_dirs:
+        return None, None
+
+    best_fallback = None
+    for variant_dir in variant_dirs:
+        eval_cfg = variant_dir / f"config_evaluate_{variant_dir.name}.yml"
+        if not eval_cfg.exists():
+            continue
+        if best_fallback is None:
+            best_fallback = (variant_dir, eval_cfg)
+        try:
+            cfg = train_module.load_config(str(eval_cfg))
+        except Exception:
+            continue
+        cfg_keys = [
+            _normalize_model_key(str(cfg.get("model_type", ""))),
+            _normalize_model_key(str(cfg.get("model_name", ""))),
+            _normalize_model_key(str(cfg.get("data", {}).get("forecast_name", ""))),
+        ]
+        if model_key and any(model_key == k or model_key in k or k in model_key for k in cfg_keys if k):
+            return variant_dir, eval_cfg
+
+    return best_fallback if best_fallback is not None else (None, None)
+
+
+def _safe_as_2d(arr) -> np.ndarray:
+    out = np.asarray(arr, dtype=float)
+    if out.ndim == 1:
+        out = out.reshape(-1, 1)
+    return out
+
+
+def _aligned_pred_target(preds, targets, row_limit=None) -> "tuple[np.ndarray, np.ndarray]":
+    pred_arr, tgt_arr, _, _ = eval_module._aligned_arrays(preds, targets, row_limit=row_limit)
+    return _safe_as_2d(pred_arr), _safe_as_2d(tgt_arr)
+
+
+def _compute_point_metrics(preds, targets) -> dict:
+    pred_arr, tgt_arr = _aligned_pred_target(preds, targets)
+    if pred_arr.size == 0 or tgt_arr.size == 0:
+        return {"rmse": float("nan"), "mae": float("nan"), "r2": float("nan"), "n_finite": 0}
+
+    pf = pred_arr.reshape(-1)
+    tf = tgt_arr.reshape(-1)
+    mask = np.isfinite(pf) & np.isfinite(tf)
+    n = int(np.sum(mask))
+    if n == 0:
+        return {"rmse": float("nan"), "mae": float("nan"), "r2": float("nan"), "n_finite": 0}
+
+    err = pf[mask] - tf[mask]
+    mae = float(np.mean(np.abs(err)))
+    rmse = float(np.sqrt(np.mean(np.square(err))))
+    if n > 1:
+        ss_res = float(np.sum(np.square(err)))
+        tvals = tf[mask]
+        ss_tot = float(np.sum(np.square(tvals - np.mean(tvals))))
+        r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
+    else:
+        r2 = float("nan")
+    return {"rmse": rmse, "mae": mae, "r2": r2, "n_finite": n}
+
+
+def _compute_per_sample_losses(preds, targets) -> "tuple[np.ndarray, np.ndarray]":
+    pred_arr, tgt_arr = _aligned_pred_target(preds, targets)
+    n_rows = min(len(pred_arr), len(tgt_arr))
+    if n_rows <= 0:
+        return np.array([], dtype=float), np.array([], dtype=float)
+    pred_arr = pred_arr[:n_rows, :]
+    tgt_arr = tgt_arr[:n_rows, :]
+
+    mae = np.full(n_rows, np.nan, dtype=float)
+    mse = np.full(n_rows, np.nan, dtype=float)
+    for i in range(n_rows):
+        row_pred = pred_arr[i, :]
+        row_tgt = tgt_arr[i, :]
+        mask = np.isfinite(row_pred) & np.isfinite(row_tgt)
+        if not np.any(mask):
+            continue
+        diff = row_pred[mask] - row_tgt[mask]
+        mae[i] = float(np.mean(np.abs(diff)))
+        mse[i] = float(np.mean(np.square(diff)))
+    return mae, mse
+
+
+def _aggregate_by_group(values: np.ndarray, group_ids: list[str]) -> np.ndarray:
+    if values.size == 0 or not group_ids:
+        return np.array([], dtype=float)
+    n = min(len(values), len(group_ids))
+    values = np.asarray(values[:n], dtype=float)
+    group_ids = list(group_ids[:n])
+    grouped: dict[str, list[float]] = {}
+    order: list[str] = []
+    for gid, val in zip(group_ids, values):
+        if not np.isfinite(val):
+            continue
+        if gid not in grouped:
+            grouped[gid] = []
+            order.append(gid)
+        grouped[gid].append(float(val))
+    return np.array([np.mean(grouped[gid]) for gid in order if grouped[gid]], dtype=float)
+
+
+def _normal_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(float(x) / math.sqrt(2.0)))
+
+
+def _dm_test_from_diff(diff: np.ndarray, max_lag: int = 1) -> "tuple[float, float]":
+    d = np.asarray(diff, dtype=float)
+    d = d[np.isfinite(d)]
+    n = int(d.size)
+    if n < 5:
+        return float("nan"), float("nan")
+    mean_d = float(np.mean(d))
+    centered = d - mean_d
+    gamma0 = float(np.dot(centered, centered) / n)
+    max_lag = int(max(0, min(max_lag, n - 1)))
+    var_hac = gamma0
+    for lag in range(1, max_lag + 1):
+        cov = float(np.dot(centered[lag:], centered[:-lag]) / n)
+        weight = 1.0 - lag / (max_lag + 1.0)
+        var_hac += 2.0 * weight * cov
+    if not np.isfinite(var_hac) or var_hac <= 0:
+        return float("nan"), float("nan")
+    stat = float(mean_d / math.sqrt(var_hac / n))
+    p = float(2.0 * (1.0 - _normal_cdf(abs(stat))))
+    return stat, p
+
+
+def _wilcoxon_from_diff(diff: np.ndarray) -> "tuple[float, float]":
+    d = np.asarray(diff, dtype=float)
+    d = d[np.isfinite(d)]
+    d = d[d != 0]
+    if d.size < 5 or scipy_stats is None:
+        return float("nan"), float("nan")
+    try:
+        res = scipy_stats.wilcoxon(d, alternative="two-sided", zero_method="wilcox")
+        return float(res.statistic), float(res.pvalue)
+    except Exception:
+        return float("nan"), float("nan")
+
+
+def _sign_test_from_diff(diff: np.ndarray) -> "tuple[float, float, float]":
+    d = np.asarray(diff, dtype=float)
+    d = d[np.isfinite(d)]
+    if d.size < 5:
+        return float("nan"), float("nan"), float("nan")
+    wins = int(np.sum(d < 0))
+    losses = int(np.sum(d > 0))
+    n = wins + losses
+    if n < 5:
+        return float("nan"), float("nan"), float("nan")
+    win_rate = float(wins / n)
+    p = float("nan")
+    if scipy_stats is not None and hasattr(scipy_stats, "binomtest"):
+        try:
+            p = float(scipy_stats.binomtest(wins, n=n, p=0.5, alternative="two-sided").pvalue)
+        except Exception:
+            p = float("nan")
+    return float(wins), win_rate, p
+
+
+def _bh_adjust(pvals: list[float]) -> list[float]:
+    n = len(pvals)
+    out = [float("nan")] * n
+    finite_idx = [i for i, p in enumerate(pvals) if np.isfinite(p)]
+    if not finite_idx:
+        return out
+    m = len(finite_idx)
+    ordered = sorted(finite_idx, key=lambda i: pvals[i])
+    prev = float("inf")
+    for rank, idx in enumerate(reversed(ordered), start=1):
+        i_rank = m - rank + 1
+        raw = float(pvals[idx]) * m / i_rank
+        val = min(prev, raw, 1.0)
+        prev = val
+        out[idx] = float(val)
+    return out
+
+
+def _cohen_d_from_diff(diff: np.ndarray) -> float:
+    d = np.asarray(diff, dtype=float)
+    d = d[np.isfinite(d)]
+    if d.size < 3:
+        return float("nan")
+    mu = float(np.mean(d))
+    sd = float(np.std(d, ddof=1)) if d.size > 1 else float("nan")
+    if not np.isfinite(sd) or sd <= 0:
+        return float("nan")
+    return float(mu / sd)
+
+
+def _interval_proxy_metrics(preds, targets, alpha: float = 0.1) -> dict:
+    pred_arr, tgt_arr = _aligned_pred_target(preds, targets)
+    pf = pred_arr.reshape(-1)
+    tf = tgt_arr.reshape(-1)
+    mask = np.isfinite(pf) & np.isfinite(tf)
+    if not np.any(mask):
+        return {
+            "picp": float("nan"),
+            "nominal_coverage": float("nan"),
+            "coverage_gap": float("nan"),
+            "coverage_deficit": float("nan"),
+            "mpiw": float("nan"),
+            "nmpiw": float("nan"),
+            "interval_score": float("nan"),
+            "q_abs_resid": float("nan"),
+            "n_points": 0,
+        }
+    err = tf[mask] - pf[mask]
+    abs_err = np.abs(err)
+    alpha = float(min(max(alpha, 1e-6), 0.999999))
+    q = float(np.quantile(abs_err, 1.0 - alpha))
+    lower = pf[mask] - q
+    upper = pf[mask] + q
+    covered = (tf[mask] >= lower) & (tf[mask] <= upper)
+    picp = float(np.mean(covered)) if covered.size else float("nan")
+    nominal = float(1.0 - alpha)
+    gap = float(picp - nominal) if np.isfinite(picp) else float("nan")
+    deficit = float(max(0.0, nominal - picp)) if np.isfinite(picp) else float("nan")
+    mpiw = float(2.0 * q) if np.isfinite(q) else float("nan")
+    std_t = float(np.std(tf[mask], ddof=1)) if np.sum(mask) > 1 else float("nan")
+    nmpiw = float(mpiw / std_t) if np.isfinite(mpiw) and np.isfinite(std_t) and std_t > 0 else float("nan")
+    penalties = (2.0 / alpha) * ((lower - tf[mask]) * (tf[mask] < lower) + (tf[mask] - upper) * (tf[mask] > upper))
+    interval_score = float(np.mean((upper - lower) + penalties)) if penalties.size else float("nan")
+    return {
+        "picp": picp,
+        "nominal_coverage": nominal,
+        "coverage_gap": gap,
+        "coverage_deficit": deficit,
+        "mpiw": mpiw,
+        "nmpiw": nmpiw,
+        "interval_score": interval_score,
+        "q_abs_resid": q,
+        "n_points": int(np.sum(mask)),
+    }
+
+
+def _bootstrap_grouped_skill(
+    y_true,
+    y_model,
+    y_base,
+    group_ids: list[str],
+    n_boot: int,
+    seed: int,
+    mode: str = "iid",
+    block_len: int = 3,
+) -> dict:
+    y_t = _safe_as_2d(y_true)
+    y_m = _safe_as_2d(y_model)
+    y_b = _safe_as_2d(y_base)
+    n_rows = min(len(y_t), len(y_m), len(y_b), len(group_ids))
+    if n_rows < 3:
+        return {}
+    y_t = y_t[:n_rows, :]
+    y_m = y_m[:n_rows, :]
+    y_b = y_b[:n_rows, :]
+    gids = list(group_ids[:n_rows])
+
+    group_to_idx: dict[str, list[int]] = {}
+    order: list[str] = []
+    for idx, gid in enumerate(gids):
+        if gid not in group_to_idx:
+            group_to_idx[gid] = []
+            order.append(gid)
+        group_to_idx[gid].append(idx)
+    n_groups = len(order)
+    if n_groups < 3:
+        return {}
+
+    rng = np.random.default_rng(seed)
+    rmse_diff = []
+    mae_diff = []
+    r2_diff = []
+    skill_vals = []
+    beats = []
+    block_len = int(max(1, block_len))
+    for _ in range(int(max(1, n_boot))):
+        if str(mode).lower() == "moving_block" and n_groups > 1:
+            chosen = []
+            while len(chosen) < n_groups:
+                start = int(rng.integers(0, n_groups))
+                for j in range(block_len):
+                    chosen.append(order[(start + j) % n_groups])
+                    if len(chosen) >= n_groups:
+                        break
+        else:
+            chosen = rng.choice(order, size=n_groups, replace=True)
+        sel_idx = []
+        for gid in chosen:
+            sel_idx.extend(group_to_idx[gid])
+        if not sel_idx:
+            continue
+        yt = y_t[sel_idx, :]
+        ym = y_m[sel_idx, :]
+        yb = y_b[sel_idx, :]
+        m_model = _compute_point_metrics(ym, yt)
+        m_base = _compute_point_metrics(yb, yt)
+        if not (np.isfinite(m_model["rmse"]) and np.isfinite(m_base["rmse"]) and m_base["rmse"] > 0):
+            continue
+        rmse_diff.append(m_model["rmse"] - m_base["rmse"])
+        if np.isfinite(m_model["mae"]) and np.isfinite(m_base["mae"]):
+            mae_diff.append(m_model["mae"] - m_base["mae"])
+        if np.isfinite(m_model["r2"]) and np.isfinite(m_base["r2"]):
+            r2_diff.append(m_model["r2"] - m_base["r2"])
+        skill = float(1.0 - m_model["rmse"] / m_base["rmse"])
+        skill_vals.append(skill)
+        beats.append(1.0 if skill > 0 else 0.0)
+
+    def _q(arr, q):
+        arr = np.asarray(arr, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return float("nan")
+        return float(np.quantile(arr, q))
+
+    skill_arr = np.asarray(skill_vals, dtype=float)
+    rmse_arr = np.asarray(rmse_diff, dtype=float)
+    mae_arr = np.asarray(mae_diff, dtype=float)
+    r2_arr = np.asarray(r2_diff, dtype=float)
+    beats_arr = np.asarray(beats, dtype=float)
+
+    return {
+        "n_boot_ok": int(np.sum(np.isfinite(skill_arr))),
+        "skill_mean": float(np.nanmean(skill_arr)) if skill_arr.size else float("nan"),
+        "skill_ci05": _q(skill_arr, 0.05),
+        "skill_ci95": _q(skill_arr, 0.95),
+        "rmse_diff_mean": float(np.nanmean(rmse_arr)) if rmse_arr.size else float("nan"),
+        "rmse_diff_ci05": _q(rmse_arr, 0.05),
+        "rmse_diff_ci95": _q(rmse_arr, 0.95),
+        "mae_diff_mean": float(np.nanmean(mae_arr)) if mae_arr.size else float("nan"),
+        "r2_diff_mean": float(np.nanmean(r2_arr)) if r2_arr.size else float("nan"),
+        "prob_skill_gt0": float(np.nanmean(beats_arr)) if beats_arr.size else float("nan"),
+    }
+
+
+def _collect_prediction_payload(eval_cfg_path: Path) -> dict:
+    cfg = eval_module.load_config(str(eval_cfg_path))
+    config_dir = cfg["__config_dir"]
+    model_type = cfg["model_type"]
+    model_name = cfg.get("model_name", "")
+    data_cfg = cfg["data"]
+    eval_cfg = eval_module.merge_eval_config(cfg)
+
+    data_cfg["data_dir"], data_cfg["sample_subdir"] = eval_module._resolve_data_paths(data_cfg, config_dir)
+    for key in ["historic_path", "thresholds_path", "normalization_path"]:
+        if eval_cfg.get(key):
+            eval_cfg[key] = str(eval_module._resolve_path_from_config(eval_cfg[key], config_dir))
+
+    model_config = eval_module.load_model_config(
+        data_cfg["data_dir"],
+        data_cfg["forecast_name"],
+        model_name,
+        fallback_data=data_cfg,
+    )
+    input_columns = model_config["input_columns"]
+    output_columns = model_config["output_columns"]
+    input_rows = slice(model_config["input_row_1"], model_config["input_row_2"])
+    output_rows = model_config["output_rows"]
+    input_aggregation = str(model_config.get("input_aggregation", data_cfg.get("input_aggregation", "none"))).lower()
+
+    split_base_dir = Path(data_cfg.get("forecast_dir", eval_cfg_path.parent))
+    test_samples = eval_module.load_split_samples(
+        data_cfg["data_dir"],
+        data_cfg["sample_subdir"],
+        data_cfg["forecast_name"],
+        input_columns,
+        output_columns,
+        input_rows,
+        output_rows,
+        "test_files.txt",
+        split_source_dir=split_base_dir,
+        input_aggregation=input_aggregation,
+    )
+    split_files = eval_module._read_split_files(split_base_dir, "test_files.txt")
+
+    train_samples = None
+    if model_type == "gp_regressor":
+        train_samples = eval_module.load_split_samples(
+            data_cfg["data_dir"],
+            data_cfg["sample_subdir"],
+            data_cfg["forecast_name"],
+            input_columns,
+            output_columns,
+            input_rows,
+            output_rows,
+            "train_files.txt",
+            split_source_dir=split_base_dir,
+            input_aggregation=input_aggregation,
+        )
+
+    if model_type == "transformer":
+        X_test = np.array([s[0] for s in test_samples], dtype=float)
+        y_test = np.array([s[1] for s in test_samples], dtype=float)
+    else:
+        X_test = np.array([s[0].flatten() for s in test_samples], dtype=float)
+        y_test = np.array([s[1].flatten() for s in test_samples], dtype=float)
+
+    split_cfg = cfg.get("data_split", {"random_state": 42})
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = eval_module.load_model(model_type, data_cfg, split_cfg, model_name, model_config, device, train_samples, config_dir)
+
+    if model_type == "gp_regressor":
+        pred_model = eval_module._predict_gp_bundle(model, X_test, device)
+    elif model_type == "transformer":
+        pred_model = model(torch.tensor(X_test, dtype=torch.float32, device=device)).detach().cpu().numpy()
+    elif model_type == "xgb_regressor":
+        out_dim = y_test.shape[1] if y_test.ndim > 1 else 1
+        pred_model = model.predict(X_test).reshape(-1, out_dim)
+    else:
+        raise ValueError(f"Unsupported model_type for inference: {model_type}")
+
+    historic = eval_cfg["historic_path"]
+    sample_subdir = data_cfg.get("sample_subdir", "samples")
+    baseline_preds = {}
+    for label, fn in {
+        "naive": eval_module.evaluate_naive,
+        "seasonal": eval_module.evaluate_seasonal,
+        "linear": eval_module.evaluate_linear,
+    }.items():
+        try:
+            if label == "linear":
+                pred_b, _ = fn(
+                    data_cfg["data_dir"],
+                    data_cfg["forecast_name"],
+                    test_samples,
+                    historic,
+                    output_columns,
+                    sample_subdir=sample_subdir,
+                )
+            else:
+                pred_b, _ = fn(
+                    test_samples,
+                    historic,
+                    output_columns,
+                    data_cfg["data_dir"],
+                    sample_subdir=sample_subdir,
+                )
+            baseline_preds[label] = _safe_as_2d(pred_b)
+        except Exception as exc:
+            print(f"[WARN] Could not compute {label} baseline for {eval_cfg_path.parent.name}: {exc}")
+            baseline_preds[label] = np.full_like(_safe_as_2d(y_test), np.nan, dtype=float)
+
+    return {
+        "y_test": _safe_as_2d(y_test),
+        "pred_model": _safe_as_2d(pred_model),
+        "baseline_preds": baseline_preds,
+        "split_files": split_files,
+    }
+
+
+def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args: argparse.Namespace) -> dict:
+    evidence: dict[str, float | str | int | bool] = {}
+    variant_dir, eval_cfg_path = _find_best_variant_eval_config(plan, best_row)
+    if eval_cfg_path is None or not eval_cfg_path.exists():
+        evidence["evidence_status"] = "missing_eval_config"
+        return evidence
+
+    try:
+        payload = _collect_prediction_payload(eval_cfg_path)
+    except Exception as exc:
+        evidence["evidence_status"] = f"prediction_failed: {type(exc).__name__}"
+        print(f"[WARN] Could not collect prediction payload for {plan.dataset_dir.name}: {exc}")
+        traceback.print_exc()
+        return evidence
+
+    y_test = payload["y_test"]
+    pred_model = payload["pred_model"]
+    split_files = payload["split_files"]
+    n_rows = min(len(y_test), len(pred_model), len(split_files))
+    if n_rows <= 0:
+        evidence["evidence_status"] = "empty_test_payload"
+        return evidence
+
+    y_test = y_test[:n_rows, :]
+    pred_model = pred_model[:n_rows, :]
+    split_files = list(split_files[:n_rows])
+    group_ids = [_base_sample_id(s) for s in split_files]
+    n_raw = len(list(dict.fromkeys(group_ids)))
+
+    model_metrics = _compute_point_metrics(pred_model, y_test)
+    evidence["n_eval_rows_test"] = int(n_rows)
+    evidence["n_eval_raw_segments"] = int(n_raw)
+    evidence["n_eval_points_finite_model"] = int(model_metrics["n_finite"])
+    evidence["sample_reliability_weight"] = float(min(1.0, math.sqrt(max(0.0, n_raw) / max(1.0, float(args.evidence_ref_raw_samples)))))
+
+    baseline_preds = payload["baseline_preds"]
+    pval_records: list[tuple[str, str, float]] = []
+    baseline_tiers: list[str] = []
+    baseline_scores: list[int] = []
+    tier_rank = {"very_low": 0, "low": 1, "moderate": 2, "high": 3}
+    inv_tier_rank = {v: k for k, v in tier_rank.items()}
+    interval_alpha = float(getattr(args, "interval_alpha", 0.1))
+    coverage_tol = float(getattr(args, "coverage_tolerance", 0.03))
+    model_int = _interval_proxy_metrics(pred_model, y_test, alpha=interval_alpha)
+    evidence["model_picp"] = _safe_float(model_int["picp"])
+    evidence["model_nominal_coverage"] = _safe_float(model_int["nominal_coverage"])
+    evidence["model_coverage_gap"] = _safe_float(model_int["coverage_gap"])
+    evidence["model_coverage_deficit"] = _safe_float(model_int["coverage_deficit"])
+    evidence["model_nmpiw"] = _safe_float(model_int["nmpiw"])
+    evidence["model_interval_score"] = _safe_float(model_int["interval_score"])
+
+    for bname in ("naive", "seasonal"):
+        pred_b = _safe_as_2d(baseline_preds.get(bname, np.full_like(y_test, np.nan, dtype=float)))[:n_rows, :]
+        mae_m, mse_m = _compute_per_sample_losses(pred_model, y_test)
+        mae_b, mse_b = _compute_per_sample_losses(pred_b, y_test)
+        mse_diff = mse_m - mse_b
+        ae_diff = mae_m - mae_b
+        mse_diff_group = _aggregate_by_group(mse_diff, group_ids)
+        ae_diff_group = _aggregate_by_group(ae_diff, group_ids)
+        n_groups_eff = int(np.sum(np.isfinite(mse_diff_group)))
+        evidence[f"n_groups_{bname}"] = n_groups_eff
+
+        dm_stat, dm_p = _dm_test_from_diff(mse_diff_group, max_lag=int(args.dm_max_lag))
+        w_stat, w_p = _wilcoxon_from_diff(ae_diff_group)
+        sign_wins, sign_win_rate, sign_p = _sign_test_from_diff(ae_diff_group)
+        boot = _bootstrap_grouped_skill(
+            y_test,
+            pred_model,
+            pred_b,
+            group_ids=group_ids,
+            n_boot=int(args.bootstrap_iterations),
+            seed=int(args.bootstrap_seed),
+            mode=str(getattr(args, "bootstrap_mode", "iid")),
+            block_len=int(getattr(args, "bootstrap_block_len", 3)),
+        )
+
+        model_rmse = model_metrics["rmse"]
+        base_metrics = _compute_point_metrics(pred_b, y_test)
+        baseline_rmse = base_metrics["rmse"]
+        skill = float(1.0 - model_rmse / baseline_rmse) if np.isfinite(model_rmse) and np.isfinite(baseline_rmse) and baseline_rmse > 0 else float("nan")
+        int_base = _interval_proxy_metrics(pred_b, y_test, alpha=interval_alpha)
+
+        prefix = f"vs_{bname}"
+        evidence[f"dm_stat_{prefix}"] = dm_stat
+        evidence[f"dm_p_{prefix}"] = dm_p
+        evidence[f"wilcoxon_stat_{prefix}"] = w_stat
+        evidence[f"wilcoxon_p_{prefix}"] = w_p
+        evidence[f"sign_wins_{prefix}"] = sign_wins
+        evidence[f"sign_win_rate_{prefix}"] = sign_win_rate
+        evidence[f"sign_p_{prefix}"] = sign_p
+        evidence[f"skill_{prefix}"] = skill
+        evidence[f"effect_median_ae_diff_{prefix}"] = float(np.nanmedian(ae_diff_group)) if ae_diff_group.size else float("nan")
+        evidence[f"effect_mean_ae_diff_{prefix}"] = float(np.nanmean(ae_diff_group)) if ae_diff_group.size else float("nan")
+        evidence[f"effect_cohen_d_ae_diff_{prefix}"] = _cohen_d_from_diff(ae_diff_group)
+        evidence[f"bootstrap_n_{prefix}"] = int(boot.get("n_boot_ok", 0))
+        evidence[f"bootstrap_skill_mean_{prefix}"] = _safe_float(boot.get("skill_mean"))
+        evidence[f"bootstrap_skill_ci05_{prefix}"] = _safe_float(boot.get("skill_ci05"))
+        evidence[f"bootstrap_skill_ci95_{prefix}"] = _safe_float(boot.get("skill_ci95"))
+        evidence[f"bootstrap_prob_skill_gt0_{prefix}"] = _safe_float(boot.get("prob_skill_gt0"))
+        evidence[f"bootstrap_rmse_diff_mean_{prefix}"] = _safe_float(boot.get("rmse_diff_mean"))
+        evidence[f"bootstrap_rmse_diff_ci05_{prefix}"] = _safe_float(boot.get("rmse_diff_ci05"))
+        evidence[f"bootstrap_rmse_diff_ci95_{prefix}"] = _safe_float(boot.get("rmse_diff_ci95"))
+        evidence[f"bootstrap_r2_diff_mean_{prefix}"] = _safe_float(boot.get("r2_diff_mean"))
+        evidence[f"lcb95_skill_{prefix}"] = _safe_float(boot.get("skill_ci05"))
+        evidence[f"{bname}_picp"] = _safe_float(int_base["picp"])
+        evidence[f"{bname}_nominal_coverage"] = _safe_float(int_base["nominal_coverage"])
+        evidence[f"{bname}_coverage_gap"] = _safe_float(int_base["coverage_gap"])
+        evidence[f"{bname}_coverage_deficit"] = _safe_float(int_base["coverage_deficit"])
+        evidence[f"{bname}_nmpiw"] = _safe_float(int_base["nmpiw"])
+        evidence[f"{bname}_interval_score"] = _safe_float(int_base["interval_score"])
+        evidence[f"picp_delta_{prefix}"] = _safe_float(model_int["picp"]) - _safe_float(int_base["picp"])
+        evidence[f"nmpiw_delta_{prefix}"] = _safe_float(model_int["nmpiw"]) - _safe_float(int_base["nmpiw"])
+        evidence[f"interval_score_delta_{prefix}"] = _safe_float(model_int["interval_score"]) - _safe_float(int_base["interval_score"])
+
+        pval_records.extend([
+            (prefix, "dm", dm_p),
+            (prefix, "wilcoxon", w_p),
+            (prefix, "sign", sign_p),
+        ])
+
+        gate_min_n = bool(n_raw >= int(args.evidence_min_raw_samples))
+        gate_prob = bool(np.isfinite(evidence[f"bootstrap_prob_skill_gt0_{prefix}"]) and evidence[f"bootstrap_prob_skill_gt0_{prefix}"] >= float(args.evidence_min_prob))
+        gate_lcb = bool(np.isfinite(evidence[f"lcb95_skill_{prefix}"]) and evidence[f"lcb95_skill_{prefix}"] > 0)
+        gate_dm = bool(np.isfinite(dm_p) and dm_p < float(args.evidence_alpha) and np.isfinite(dm_stat) and dm_stat < 0)
+        gate_wilc = bool(np.isfinite(w_p) and w_p < float(args.evidence_alpha))
+        gate_sign = bool(np.isfinite(sign_p) and sign_p < float(args.evidence_alpha) and np.isfinite(sign_win_rate) and sign_win_rate > 0.5)
+        gate_cov = bool(
+            np.isfinite(_safe_float(model_int["coverage_deficit"]))
+            and np.isfinite(_safe_float(int_base["coverage_deficit"]))
+            and _safe_float(model_int["coverage_deficit"]) <= coverage_tol
+            and _safe_float(model_int["coverage_deficit"]) <= _safe_float(int_base["coverage_deficit"]) + coverage_tol
+        )
+        evidence[f"gate_min_raw_{prefix}"] = gate_min_n
+        evidence[f"gate_prob_{prefix}"] = gate_prob
+        evidence[f"gate_lcb_{prefix}"] = gate_lcb
+        evidence[f"gate_dm_{prefix}"] = gate_dm
+        evidence[f"gate_wilcoxon_{prefix}"] = gate_wilc
+        evidence[f"gate_sign_{prefix}"] = gate_sign
+        evidence[f"gate_coverage_{prefix}"] = gate_cov
+        score = int(gate_min_n) + int(gate_prob) + int(gate_lcb) + int(gate_dm) + int(gate_wilc) + int(gate_sign) + int(gate_cov)
+        evidence[f"evidence_score_{prefix}"] = score
+        if score >= 6:
+            tier = "high"
+        elif score >= 4:
+            tier = "moderate"
+        elif score >= 2:
+            tier = "low"
+        else:
+            tier = "very_low"
+        evidence[f"evidence_tier_{prefix}"] = tier
+        baseline_tiers.append(tier)
+        baseline_scores.append(score)
+
+    if pval_records:
+        adj = _bh_adjust([p for _, _, p in pval_records])
+        for (prefix, test_name, _), q in zip(pval_records, adj):
+            evidence[f"{test_name}_q_{prefix}"] = float(q)
+
+        for prefix in ("vs_naive", "vs_seasonal"):
+            dm_q = _safe_float(evidence.get(f"dm_q_{prefix}", float("nan")))
+            wilc_q = _safe_float(evidence.get(f"wilcoxon_q_{prefix}", float("nan")))
+            sign_q = _safe_float(evidence.get(f"sign_q_{prefix}", float("nan")))
+            dm_stat = _safe_float(evidence.get(f"dm_stat_{prefix}", float("nan")))
+            sign_wr = _safe_float(evidence.get(f"sign_win_rate_{prefix}", float("nan")))
+            evidence[f"gate_dm_q_{prefix}"] = bool(np.isfinite(dm_q) and dm_q < float(args.evidence_alpha) and np.isfinite(dm_stat) and dm_stat < 0)
+            evidence[f"gate_wilcoxon_q_{prefix}"] = bool(np.isfinite(wilc_q) and wilc_q < float(args.evidence_alpha))
+            evidence[f"gate_sign_q_{prefix}"] = bool(np.isfinite(sign_q) and sign_q < float(args.evidence_alpha) and np.isfinite(sign_wr) and sign_wr > 0.5)
+
+    if baseline_tiers:
+        min_rank = min(tier_rank.get(t, 0) for t in baseline_tiers)
+        evidence["evidence_tier_overall"] = inv_tier_rank.get(min_rank, "very_low")
+    else:
+        evidence["evidence_tier_overall"] = "very_low"
+    if baseline_scores:
+        evidence["evidence_score_overall_min"] = int(min(baseline_scores))
+        evidence["evidence_score_overall_mean"] = float(np.mean(baseline_scores))
+    else:
+        evidence["evidence_score_overall_min"] = 0
+        evidence["evidence_score_overall_mean"] = 0.0
+    evidence["interval_alpha"] = interval_alpha
+    evidence["evidence_alpha"] = float(args.evidence_alpha)
+    evidence["bootstrap_mode"] = str(getattr(args, "bootstrap_mode", "iid"))
+    evidence["bootstrap_block_len"] = int(getattr(args, "bootstrap_block_len", 3))
+
+    evidence["evidence_status"] = "ok"
+    evidence["evidence_variant_dir"] = str(variant_dir) if variant_dir is not None else ""
+    return evidence
+
+
 def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
     workspace_root = Path(__file__).resolve().parent.parent
     data_root = Path(args.data_root)
+    run_rolling_cv = bool(getattr(args, "run_rolling_cv", False))
     if not data_root.is_absolute():
         data_root = (workspace_root / data_root).resolve()
 
@@ -382,15 +1053,19 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                         rolling_cv_r2 = rolling_cv_r2_median = rolling_cv_r2_last50 = rolling_cv_r2_pooled = float('nan')
                         rolling_cv_rmse = rolling_cv_mae = rolling_cv_n_folds = float('nan')
                         n_test_samples_raw = float('nan')
+                        stat_evidence: dict = {}
 
-                        # Always run rolling origin CV (recomputes on every post-process run)
-                        print(f"[INFO] Running rolling origin CV for {plan.dataset_dir.name}")
                         cv_summary_path = None
-                        try:
-                            cv_summary_path = _run_rolling_origin_cv(plan=plan, final_metrics_csv=final_metrics_csv)
-                        except Exception as exc:
-                            print(f"[WARN] Rolling origin CV failed for {plan.dataset_dir.name}: {exc}")
-                            traceback.print_exc()
+                        if run_rolling_cv:
+                            # Optional execution path, disabled by default due runtime cost.
+                            print(f"[INFO] Running rolling origin CV for {plan.dataset_dir.name}")
+                            try:
+                                cv_summary_path = _run_rolling_origin_cv(plan=plan, final_metrics_csv=final_metrics_csv)
+                            except Exception as exc:
+                                print(f"[WARN] Rolling origin CV failed for {plan.dataset_dir.name}: {exc}")
+                                traceback.print_exc()
+                        else:
+                            print(f"[INFO] Rolling origin CV execution skipped for {plan.dataset_dir.name} (disabled).")
 
                         # Ensure the variant's evaluation_summary.csv has baseline rows.
                         try:
@@ -415,86 +1090,105 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                         except Exception as exc:
                             print(f"[WARN] Failed to count independent raw test samples for {plan.dataset_dir.name}: {exc}")
 
-                        # Read rolling CV results
-                        if cv_summary_path is not None and cv_summary_path.exists():
-                            try:
-                                df_cv = pd.read_csv(cv_summary_path)
-                                fold_rows = df_cv[df_cv['fold'].astype(str) != 'mean']
-                                rolling_cv_n_folds = float(len(fold_rows))
-                                (
-                                    rolling_cv_r2,
-                                    rolling_cv_r2_median,
-                                    rolling_cv_r2_last50,
-                                    rolling_cv_r2_pooled,
-                                ) = _compute_rolling_cv_r2_stats(df_cv)
-                                mean_rows = df_cv[df_cv['fold'].astype(str) == 'mean']
-                                if not mean_rows.empty:
-                                    agg = mean_rows.iloc[0]
-                                    rolling_cv_rmse = _safe_float(agg.get('rmse'))
-                                    rolling_cv_mae = _safe_float(agg.get('mae'))
-                                    print(
-                                        f"[INFO] Rolling CV: r2_mean={rolling_cv_r2:.4f}, "
-                                        f"r2_median={rolling_cv_r2_median:.4f}, "
-                                        f"r2_last50={rolling_cv_r2_last50:.4f}, "
-                                        f"r2_pooled={rolling_cv_r2_pooled:.4f}, "
-                                        f"rmse={rolling_cv_rmse:.4f}, mae={rolling_cv_mae:.4f}, "
-                                        f"n_folds={int(rolling_cv_n_folds)}"
-                                    )
-                                else:
-                                    print(f"[WARN] rolling_origin_summary.csv has no 'mean' row for {plan.dataset_dir.name}")
-                            except Exception as exc:
-                                print(f"[WARN] Could not read rolling CV results for {plan.dataset_dir.name}: {exc}")
-                                traceback.print_exc()
-                        else:
-                            print(f"[WARN] Rolling origin CV summary not available for {plan.dataset_dir.name}")
-
-                        # Write rolling CV metrics into feature_sweep_final_metrics.csv for the best model row
+                        # Re-run best model evaluation context and compute statistical evidence
                         try:
-                            df_metrics = pd.read_csv(final_metrics_csv)
-                            for col in [
-                                'rolling_cv_r2',
-                                'rolling_cv_r2_median',
-                                'rolling_cv_r2_last50',
-                                'rolling_cv_r2_pooled',
-                                'rolling_cv_rmse',
-                                'rolling_cv_mae',
-                            ]:
-                                if col not in df_metrics.columns:
-                                    df_metrics[col] = float('nan')
-                            row_mask = (
-                                (df_metrics['feature_tag'] == best_row['feature_tag'])
-                                & (df_metrics['row_count'] == int(best_row['row_count']))
-                                & (df_metrics['model'] == best_row['model'])
-                            )
-                            if row_mask.any():
-                                df_metrics.loc[row_mask, 'rolling_cv_r2'] = rolling_cv_r2
-                                df_metrics.loc[row_mask, 'rolling_cv_r2_median'] = rolling_cv_r2_median
-                                df_metrics.loc[row_mask, 'rolling_cv_r2_last50'] = rolling_cv_r2_last50
-                                df_metrics.loc[row_mask, 'rolling_cv_r2_pooled'] = rolling_cv_r2_pooled
-                                df_metrics.loc[row_mask, 'rolling_cv_rmse'] = rolling_cv_rmse
-                                df_metrics.loc[row_mask, 'rolling_cv_mae'] = rolling_cv_mae
-                                print(f"[INFO] Wrote rolling CV results to feature_sweep_final_metrics.csv for {plan.dataset_dir.name}")
+                            stat_evidence = _compute_statistical_evidence(plan, best_row, args)
+                            status = str(stat_evidence.get("evidence_status", ""))
+                            if status == "ok":
+                                print(f"[INFO] Statistical evidence computed for {plan.dataset_dir.name}")
                             else:
-                                print(f"[WARN] Could not find matching row for rolling CV update in feature_sweep_final_metrics.csv for {plan.dataset_dir.name}")
-                            df_metrics.to_csv(final_metrics_csv, index=False)
+                                print(f"[WARN] Statistical evidence incomplete for {plan.dataset_dir.name}: {status}")
                         except Exception as exc:
-                            print(f"[WARN] Could not write rolling CV results to feature_sweep_final_metrics.csv for {plan.dataset_dir.name}: {exc}")
+                            print(f"[WARN] Statistical evidence failed for {plan.dataset_dir.name}: {exc}")
+                            traceback.print_exc()
+
+                        # Read/write rolling CV metrics only when explicitly requested.
+                        if run_rolling_cv:
+                            if cv_summary_path is not None and cv_summary_path.exists():
+                                try:
+                                    df_cv = pd.read_csv(cv_summary_path)
+                                    fold_rows = df_cv[df_cv['fold'].astype(str) != 'mean']
+                                    rolling_cv_n_folds = float(len(fold_rows))
+                                    (
+                                        rolling_cv_r2,
+                                        rolling_cv_r2_median,
+                                        rolling_cv_r2_last50,
+                                        rolling_cv_r2_pooled,
+                                    ) = _compute_rolling_cv_r2_stats(df_cv)
+                                    mean_rows = df_cv[df_cv['fold'].astype(str) == 'mean']
+                                    if not mean_rows.empty:
+                                        agg = mean_rows.iloc[0]
+                                        rolling_cv_rmse = _safe_float(agg.get('rmse'))
+                                        rolling_cv_mae = _safe_float(agg.get('mae'))
+                                        print(
+                                            f"[INFO] Rolling CV: r2_mean={rolling_cv_r2:.4f}, "
+                                            f"r2_median={rolling_cv_r2_median:.4f}, "
+                                            f"r2_last50={rolling_cv_r2_last50:.4f}, "
+                                            f"r2_pooled={rolling_cv_r2_pooled:.4f}, "
+                                            f"rmse={rolling_cv_rmse:.4f}, mae={rolling_cv_mae:.4f}, "
+                                            f"n_folds={int(rolling_cv_n_folds)}"
+                                        )
+                                    else:
+                                        print(f"[WARN] rolling_origin_summary.csv has no 'mean' row for {plan.dataset_dir.name}")
+                                except Exception as exc:
+                                    print(f"[WARN] Could not read rolling CV results for {plan.dataset_dir.name}: {exc}")
+                                    traceback.print_exc()
+                            else:
+                                print(f"[WARN] Rolling origin CV summary not available for {plan.dataset_dir.name}")
+
+                            try:
+                                df_metrics = pd.read_csv(final_metrics_csv)
+                                for col in [
+                                    'rolling_cv_r2',
+                                    'rolling_cv_r2_median',
+                                    'rolling_cv_r2_last50',
+                                    'rolling_cv_r2_pooled',
+                                    'rolling_cv_rmse',
+                                    'rolling_cv_mae',
+                                ]:
+                                    if col not in df_metrics.columns:
+                                        df_metrics[col] = float('nan')
+                                row_mask = (
+                                    (df_metrics['feature_tag'] == best_row['feature_tag'])
+                                    & (df_metrics['row_count'] == int(best_row['row_count']))
+                                    & (df_metrics['model'] == best_row['model'])
+                                )
+                                if row_mask.any():
+                                    df_metrics.loc[row_mask, 'rolling_cv_r2'] = rolling_cv_r2
+                                    df_metrics.loc[row_mask, 'rolling_cv_r2_median'] = rolling_cv_r2_median
+                                    df_metrics.loc[row_mask, 'rolling_cv_r2_last50'] = rolling_cv_r2_last50
+                                    df_metrics.loc[row_mask, 'rolling_cv_r2_pooled'] = rolling_cv_r2_pooled
+                                    df_metrics.loc[row_mask, 'rolling_cv_rmse'] = rolling_cv_rmse
+                                    df_metrics.loc[row_mask, 'rolling_cv_mae'] = rolling_cv_mae
+                                    print(f"[INFO] Wrote rolling CV results to feature_sweep_final_metrics.csv for {plan.dataset_dir.name}")
+                                else:
+                                    print(f"[WARN] Could not find matching row for rolling CV update in feature_sweep_final_metrics.csv for {plan.dataset_dir.name}")
+                                df_metrics.to_csv(final_metrics_csv, index=False)
+                            except Exception as exc:
+                                print(f"[WARN] Could not write rolling CV results to feature_sweep_final_metrics.csv for {plan.dataset_dir.name}: {exc}")
 
                         # Re-read updated metrics and append best model performance entry
                         try:
                             valid_r2_2 = _filter_valid_rows(pd.read_csv(final_metrics_csv))
                             if not valid_r2_2.empty:
                                 best_updated = valid_r2_2.loc[valid_r2_2['r2'].idxmax()]
+                                cv_r2_to_write = _safe_float(best_updated.get('rolling_cv_r2')) if run_rolling_cv else rolling_cv_r2
+                                cv_r2_median_to_write = _safe_float(best_updated.get('rolling_cv_r2_median')) if run_rolling_cv else rolling_cv_r2_median
+                                cv_r2_last50_to_write = _safe_float(best_updated.get('rolling_cv_r2_last50')) if run_rolling_cv else rolling_cv_r2_last50
+                                cv_r2_pooled_to_write = _safe_float(best_updated.get('rolling_cv_r2_pooled')) if run_rolling_cv else rolling_cv_r2_pooled
+                                cv_rmse_to_write = _safe_float(best_updated.get('rolling_cv_rmse')) if run_rolling_cv else rolling_cv_rmse
+                                cv_mae_to_write = _safe_float(best_updated.get('rolling_cv_mae')) if run_rolling_cv else rolling_cv_mae
                                 best_model_performance.append(_build_perf_entry(
                                     plan.dataset_dir.name, best_updated,
-                                    rolling_cv_r2=_safe_float(best_updated.get('rolling_cv_r2')),
-                                    rolling_cv_r2_median=_safe_float(best_updated.get('rolling_cv_r2_median')),
-                                    rolling_cv_r2_last50=_safe_float(best_updated.get('rolling_cv_r2_last50')),
-                                    rolling_cv_r2_pooled=_safe_float(best_updated.get('rolling_cv_r2_pooled')),
-                                    rolling_cv_rmse=_safe_float(best_updated.get('rolling_cv_rmse')),
-                                    rolling_cv_mae=_safe_float(best_updated.get('rolling_cv_mae')),
+                                    rolling_cv_r2=cv_r2_to_write,
+                                    rolling_cv_r2_median=cv_r2_median_to_write,
+                                    rolling_cv_r2_last50=cv_r2_last50_to_write,
+                                    rolling_cv_r2_pooled=cv_r2_pooled_to_write,
+                                    rolling_cv_rmse=cv_rmse_to_write,
+                                    rolling_cv_mae=cv_mae_to_write,
                                     rolling_cv_n_folds=rolling_cv_n_folds,
                                     n_test_samples_raw=n_test_samples_raw,
+                                    extra_metrics=stat_evidence,
                                 ))
                             else:
                                 # Fallback: use pre-update values
@@ -508,6 +1202,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                                     rolling_cv_mae=rolling_cv_mae,
                                     rolling_cv_n_folds=rolling_cv_n_folds,
                                     n_test_samples_raw=n_test_samples_raw,
+                                    extra_metrics=stat_evidence,
                                 ))
                         except Exception as exc:
                             print(f"[WARN] Could not re-read updated metrics for {plan.dataset_dir.name}: {exc}")
@@ -521,6 +1216,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                                 rolling_cv_mae=rolling_cv_mae,
                                 rolling_cv_n_folds=rolling_cv_n_folds,
                                 n_test_samples_raw=n_test_samples_raw,
+                                extra_metrics=stat_evidence,
                             ))
         except Exception as e:
             print(f"[WARN] Could not process best model performance for {plan.dataset_dir.name}: {e}")
@@ -685,12 +1381,219 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             plt.close(fig_skill)
             print(f"[INFO] Wrote skill score subplot: {skill_path}")
 
+            # --- Confidence / uncertainty subplot ---
+            tier_map = {"very_low": 0, "low": 1, "moderate": 2, "high": 3}
+            tier_labels = ["very_low", "low", "moderate", "high"]
+            n_perf = len(perf_df)
+
+            def _perf_col(name: str) -> pd.Series:
+                if name in perf_df.columns:
+                    return pd.to_numeric(perf_df[name], errors="coerce")
+                return pd.Series([float("nan")] * n_perf)
+
+            naive_prob = _perf_col("bootstrap_prob_skill_gt0_vs_naive")
+            seasonal_prob = _perf_col("bootstrap_prob_skill_gt0_vs_seasonal")
+            naive_lcb = _perf_col("lcb95_skill_vs_naive")
+            seasonal_lcb = _perf_col("lcb95_skill_vs_seasonal")
+            overall_score = _perf_col("evidence_score_overall_min")
+            model_picp = _perf_col("model_picp")
+            naive_picp = _perf_col("naive_picp")
+            seasonal_picp = _perf_col("seasonal_picp")
+            nominal_cov = _perf_col("model_nominal_coverage")
+            overall_tier_vals = pd.Series(
+                [tier_map.get(str(v), np.nan) for v in perf_df.get("evidence_tier_overall", pd.Series(["very_low"] * n_perf))],
+                dtype=float,
+            )
+
+            fig_conf, conf_axes = plt.subplots(
+                5, 1, figsize=(max(12, len(perf_df) * 0.8), 18), sharex=True
+            )
+            _draw_bar_group(
+                conf_axes[0], x, width,
+                [naive_prob, seasonal_prob],
+                ['tab:gray', 'tab:green'],
+                ['Prob(skill>0) vs Naive', 'Prob(skill>0) vs Seasonal'],
+                '.2f',
+                center_offset=0.5,
+            )
+            conf_axes[0].axhline(float(args.evidence_min_prob), color='black', linewidth=0.8, linestyle='--')
+            conf_axes[0].set_ylabel('Bootstrap Probability')
+            conf_axes[0].set_ylim(0.0, 1.05)
+            conf_axes[0].grid(axis='y', alpha=0.3)
+            conf_axes[0].legend()
+
+            _draw_bar_group(
+                conf_axes[1], x, width,
+                [naive_lcb, seasonal_lcb],
+                ['tab:gray', 'tab:green'],
+                ['LCB95 skill vs Naive', 'LCB95 skill vs Seasonal'],
+                '.2f',
+                center_offset=0.5,
+            )
+            conf_axes[1].axhline(0.0, color='black', linewidth=0.8, linestyle='--')
+            conf_axes[1].set_ylabel('Skill Lower Bound')
+            conf_axes[1].grid(axis='y', alpha=0.3)
+            conf_axes[1].legend()
+
+            bars_score = conf_axes[2].bar(x, overall_score, width=0.5, color='tab:blue')
+            _annotate_bars_within_ylim(conf_axes[2], bars_score, '.0f')
+            conf_axes[2].set_ylabel('Overall Evidence Score (min)')
+            conf_axes[2].grid(axis='y', alpha=0.3)
+
+            bars_tier = conf_axes[3].bar(x, overall_tier_vals, width=0.5, color='tab:purple')
+            _annotate_bars_within_ylim(conf_axes[3], bars_tier, '.0f')
+            conf_axes[3].set_yticks([0, 1, 2, 3])
+            conf_axes[3].set_yticklabels(tier_labels)
+            conf_axes[3].set_ylabel('Overall Evidence Tier')
+            conf_axes[3].grid(axis='y', alpha=0.3)
+
+            _draw_bar_group(
+                conf_axes[4], x, width,
+                [model_picp, naive_picp, seasonal_picp],
+                ['tab:blue', 'tab:gray', 'tab:green'],
+                [model_series_label, 'Naive', 'Seasonal'],
+                '.2f',
+            )
+            nom_arr = nominal_cov.to_numpy(dtype=float) if hasattr(nominal_cov, "to_numpy") else np.array(nominal_cov, dtype=float)
+            if np.isfinite(nom_arr).any():
+                conf_axes[4].axhline(float(np.nanmean(nom_arr)), color='black', linewidth=0.8, linestyle='--', label='Nominal')
+            conf_axes[4].set_ylabel('PICP (interval proxy)')
+            conf_axes[4].set_ylim(0.0, 1.05)
+            conf_axes[4].grid(axis='y', alpha=0.3)
+            conf_axes[4].legend()
+            conf_axes[4].set_xticks(x)
+            conf_axes[4].set_xticklabels(labels, rotation=45, ha='right')
+            plt.tight_layout()
+            conf_path = summaries_dir / "summary_best_model_confidence.png"
+            fig_conf.savefig(conf_path, dpi=300, bbox_inches='tight')
+            plt.close(fig_conf)
+            print(f"[INFO] Wrote confidence subplot: {conf_path}")
+
+            # --- Single model quality matrix (accuracy, precision, reliability, support) ---
+            def _first_finite(row_vals) -> float:
+                arr = np.asarray(row_vals, dtype=float)
+                finite = arr[np.isfinite(arr)]
+                return float(finite[0]) if finite.size else float("nan")
+
+            q_cols = [
+                "dm_q_vs_naive", "dm_q_vs_seasonal",
+                "wilcoxon_q_vs_naive", "wilcoxon_q_vs_seasonal",
+                "sign_q_vs_naive", "sign_q_vs_seasonal",
+            ]
+            p_cols = [
+                "dm_p_vs_naive", "dm_p_vs_seasonal",
+                "wilcoxon_p_vs_naive", "wilcoxon_p_vs_seasonal",
+                "sign_p_vs_naive", "sign_p_vs_seasonal",
+            ]
+            present_q_cols = [c for c in q_cols if c in perf_df.columns]
+            present_p_cols = [c for c in p_cols if c in perf_df.columns]
+
+            q_min = perf_df[present_q_cols].min(axis=1, skipna=True) if present_q_cols else pd.Series([float("nan")] * len(perf_df))
+            p_min = perf_df[present_p_cols].min(axis=1, skipna=True) if present_p_cols else pd.Series([float("nan")] * len(perf_df))
+
+            quality_df = pd.DataFrame({
+                "R2": pd.to_numeric(perf_df.get("r2"), errors="coerce"),
+                "nRMSE": pd.to_numeric(perf_df.get("nrmse"), errors="coerce"),
+                "PICP": pd.to_numeric(perf_df.get("model_picp"), errors="coerce"),
+                "NMPIW": pd.to_numeric(perf_df.get("model_nmpiw"), errors="coerce"),
+                "ProbSkillMin": pd.concat([
+                    pd.to_numeric(perf_df.get("bootstrap_prob_skill_gt0_vs_naive"), errors="coerce"),
+                    pd.to_numeric(perf_df.get("bootstrap_prob_skill_gt0_vs_seasonal"), errors="coerce"),
+                ], axis=1).min(axis=1, skipna=True),
+                "LCB95SkillMin": pd.concat([
+                    pd.to_numeric(perf_df.get("lcb95_skill_vs_naive"), errors="coerce"),
+                    pd.to_numeric(perf_df.get("lcb95_skill_vs_seasonal"), errors="coerce"),
+                ], axis=1).min(axis=1, skipna=True),
+                "BestQ": pd.to_numeric(q_min, errors="coerce"),
+                "BestP": pd.to_numeric(p_min, errors="coerce"),
+                "Tier": pd.Series(
+                    [tier_map.get(str(v), np.nan) for v in perf_df.get("evidence_tier_overall", pd.Series(["very_low"] * len(perf_df)))],
+                    dtype=float,
+                ),
+                "RawN": pd.to_numeric(perf_df.get("n_eval_raw_segments"), errors="coerce"),
+            }, index=labels)
+
+            # Fallback to p-values if q-values are unavailable.
+            if not np.isfinite(quality_df["BestQ"].to_numpy(dtype=float)).any():
+                quality_df["BestQ"] = quality_df["BestP"]
+
+            # Column-wise directional scaling for heatmap coloring only.
+            higher_better = {
+                "R2": True,
+                "nRMSE": False,
+                "PICP": True,
+                "NMPIW": False,
+                "ProbSkillMin": True,
+                "LCB95SkillMin": True,
+                "BestQ": False,
+                "Tier": True,
+                "RawN": True,
+            }
+            if "BestP" in quality_df.columns:
+                higher_better["BestP"] = False
+
+            heat_cols = ["R2", "nRMSE", "PICP", "NMPIW", "ProbSkillMin", "LCB95SkillMin", "BestQ", "Tier", "RawN"]
+            if np.isfinite(quality_df["BestP"].to_numpy(dtype=float)).any():
+                heat_cols.insert(7, "BestP")
+            display_df = quality_df[heat_cols].copy()
+
+            norm = display_df.copy()
+            for c in norm.columns:
+                vals = pd.to_numeric(norm[c], errors="coerce")
+                finite = vals[np.isfinite(vals)]
+                if finite.empty:
+                    norm[c] = np.nan
+                    continue
+                vmin = float(finite.min())
+                vmax = float(finite.max())
+                if np.isclose(vmin, vmax):
+                    scaled = pd.Series([0.5] * len(vals), index=vals.index, dtype=float)
+                else:
+                    scaled = (vals - vmin) / (vmax - vmin)
+                if not higher_better.get(c, True):
+                    scaled = 1.0 - scaled
+                norm[c] = scaled
+
+            annot = display_df.copy()
+            for c in annot.columns:
+                if c in {"Tier", "RawN"}:
+                    annot[c] = annot[c].map(lambda v: "" if not np.isfinite(v) else f"{int(round(v))}")
+                elif c in {"BestQ", "BestP"}:
+                    annot[c] = annot[c].map(lambda v: "" if not np.isfinite(v) else f"{v:.3f}")
+                else:
+                    annot[c] = annot[c].map(lambda v: "" if not np.isfinite(v) else f"{v:.2f}")
+
+            fig_mat, ax_mat = plt.subplots(figsize=(max(12, 1.2 * len(heat_cols)), max(6, 0.5 * len(display_df))))
+            sns.heatmap(
+                norm,
+                ax=ax_mat,
+                cmap="RdYlGn",
+                vmin=0.0,
+                vmax=1.0,
+                cbar=True,
+                linewidths=0.5,
+                linecolor="white",
+                annot=annot.values,
+                fmt="",
+                annot_kws={"fontsize": 8},
+            )
+            ax_mat.set_title("Model Quality Matrix (higher color = better within each metric)")
+            ax_mat.set_xlabel("Metrics")
+            ax_mat.set_ylabel("Dataset")
+            ax_mat.set_yticklabels(ax_mat.get_yticklabels(), rotation=0)
+            ax_mat.set_xticklabels(ax_mat.get_xticklabels(), rotation=35, ha="right")
+            plt.tight_layout()
+            matrix_path = summaries_dir / "summary_model_quality_matrix.png"
+            fig_mat.savefig(matrix_path, dpi=300, bbox_inches='tight')
+            plt.close(fig_mat)
+            print(f"[INFO] Wrote model quality matrix: {matrix_path}")
+
             # --- Cross-validation figure (sorted by descending R2, same order as perf_df) ---
             cv_cols = [
                 c for c in ['rolling_cv_r2', 'rolling_cv_r2_median', 'rolling_cv_r2_last50', 'rolling_cv_r2_pooled']
                 if c in perf_df.columns
             ]
-            cv_data_available = bool(cv_cols) and perf_df[cv_cols].notnull().any().any()
+            cv_data_available = run_rolling_cv and bool(cv_cols) and perf_df[cv_cols].notnull().any().any()
             if cv_data_available:
                 # Generalization gap: test R2 - CV R2 (positive = test was optimistic / overfit)
                 cv_r2_mean_col = perf_df['rolling_cv_r2'] if 'rolling_cv_r2' in perf_df.columns else pd.Series([float('nan')] * len(perf_df))
@@ -734,7 +1637,10 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 plt.close(fig_cv)
                 print(f"[INFO] Wrote cross-validation figure: {cv_path}")
             else:
-                print("[WARN] No cross-validation data available; cross-validation.png not generated.")
+                if run_rolling_cv:
+                    print("[WARN] No cross-validation data available; cross-validation.png not generated.")
+                else:
+                    print("[INFO] Cross-validation figure skipped (enable with --run-rolling-cv).")
         else:
             print("[WARN] No best model performance data found; summary plot not generated.")
     except Exception as e:
@@ -762,6 +1668,28 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = build_parser()
+    parser.add_argument("--dm-max-lag", type=int, default=1, help="Max HAC lag for Diebold-Mariano test.")
+    parser.add_argument("--bootstrap-iterations", type=int, default=2000, help="Bootstrap iterations for grouped skill confidence.")
+    parser.add_argument("--bootstrap-seed", type=int, default=42, help="Random seed for bootstrap evidence.")
+    parser.add_argument(
+        "--bootstrap-mode",
+        type=str,
+        default="iid",
+        choices=["iid", "moving_block"],
+        help="Grouped bootstrap mode: iid resampling of groups or moving-block resampling.",
+    )
+    parser.add_argument("--bootstrap-block-len", type=int, default=3, help="Block length for moving-block bootstrap mode.")
+    parser.add_argument("--evidence-alpha", type=float, default=0.05, help="Alpha threshold for statistical tests and FDR-adjusted tests.")
+    parser.add_argument("--evidence-min-raw-samples", type=int, default=12, help="Minimum independent raw samples required for high confidence.")
+    parser.add_argument("--evidence-min-prob", type=float, default=0.8, help="Minimum bootstrap probability of skill > 0.")
+    parser.add_argument("--evidence-ref-raw-samples", type=int, default=40, help="Reference raw-sample count for reliability weighting.")
+    parser.add_argument("--interval-alpha", type=float, default=0.1, help="Alpha for post-hoc residual interval proxy metrics (PICP/NMPIW).")
+    parser.add_argument("--coverage-tolerance", type=float, default=0.03, help="Allowable shortfall tolerance for coverage gate.")
+    parser.add_argument(
+        "--run-rolling-cv",
+        action="store_true",
+        help="Run and include rolling-origin cross-validation outputs (disabled unless this keyword is provided).",
+    )
     parser.add_argument(
         "--sweep-namespace",
         type=str,

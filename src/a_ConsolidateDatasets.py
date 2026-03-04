@@ -92,7 +92,6 @@ if __name__ == '__main__':
     weather_roll_df = rolling_sum(decomp_df, "Time", 'Precipitation (mm/hr)', 24)
     simplified_weather_set = ['Time', 'Hourly average wind direction (°)_x',
         'Hourly average wind direction (°)_y',
-        "Maximum sustained wind speed, 3-second span (m/s)",
         'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)',
         'Longwave (IR) radiation (W/m2)',
         'Shortwave (solar) radiation (W/m2)',

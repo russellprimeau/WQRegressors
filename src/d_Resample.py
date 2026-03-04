@@ -720,6 +720,27 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
     }
 
 
+def _resolve_state_predictor_column(target_name, available_columns):
+    """
+    Resolve the target-linked state predictor column.
+
+    Rules:
+    - "<target>_res"  -> "<target>_state" (strip "_res" first)
+    - "<target>"      -> "<target>_state"
+    - If target is already a "_state" column, keep it as-is
+    - Return None if no candidate exists in available_columns
+    """
+    base = str(target_name)
+    if base.endswith("_res"):
+        base = base[:-4]
+
+    candidates = [base] if base.endswith("_state") else [f"{base}_state"]
+    for candidate in candidates:
+        if candidate in available_columns:
+            return candidate
+    return None
+
+
 if __name__ == '__main__':
     matplotlib.use('Agg')  # Non-interactive backend for file output to handle remote machine installation errors
     ## Load sensor data
@@ -738,11 +759,11 @@ if __name__ == '__main__':
                         'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
                         '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
         'SCADA - pH', 'SCADA - Temperature (°C)']
-    target_columns = ['Color',
-        'Turbidity (FNU)', 'pH', 'E.coli (CFU/100mL)', 'Intestinal enterococci (CFU/100mL)', 
-        'Colony Count 22°C (CFU/mL)', 'Total coliforms 37°C (CFU/100mL)', 'Arsenic (µg/L)',
-        'Lead (µg/L)', 'Cadmium (µg/L)', 'Copper filtered (mg/L)', 'Chromium (µg/L)', 'Nickel (µg/L)', 
-        'Zinc (µg/L)']  # alternative 1: name-based selection
+    target_columns = ['Color_res',
+        'Turbidity (FNU)_res', 'pH', 'E.coli (CFU/100mL)_res', 'Intestinal enterococci (CFU/100mL)_res', 
+        'Colony Count 22°C (CFU/mL)_res', 'Total coliforms 37°C (CFU/100mL)_res', 'Arsenic (µg/L)_res',
+        'Lead (µg/L)_res', 'Cadmium (µg/L)_res', 'Copper filtered (mg/L)_res', 'Chromium (µg/L)_res', 'Nickel (µg/L)_res', 
+        'Zinc (µg/L)_res']  # alternative 1: name-based selection
     # target_columns = df.columns[-9:]  # alternative: index-based selection
 
     ## Alternative with better coverage
@@ -823,9 +844,53 @@ if __name__ == '__main__':
         verbose=False,
     )
 
+    for target in target_columns:
+        target_slug = target.replace(" ", "_").replace("/", "_")
+        output_dir = os.path.join("../data/output/regression", f"MC_ex{target_slug}")
+        available_cols = set(df_norm.columns)
+        target_state_col = _resolve_state_predictor_column(target, available_cols)
+        per_target_predictors = list(predictor_cols)
+        if target_state_col is not None and target_state_col not in per_target_predictors:
+            per_target_predictors.append(target_state_col)
+
+        missing_predictors = [col for col in per_target_predictors if col not in available_cols]
+        if missing_predictors:
+            print(
+                f"[WARN] Dropping missing predictors for target '{target}': "
+                + ", ".join(missing_predictors)
+            )
+            per_target_predictors = [col for col in per_target_predictors if col in available_cols]
+
+        if target_state_col is None:
+            print(f"[WARN] No matching state predictor column found for target '{target}'.")
+        result = split(
+            df_norm,
+            output_dir,
+            [target],
+            length,
+            0.8,
+            to_normalize,
+            True,
+            predictor_cols=per_target_predictors,
+            use_uncertainty_perturbation=True,
+            n_mc_replicates=10,
+            random_seed=1,
+            pre_normalized=True,
+            normalization_params=normalization_params,
+            sensor_uncertainties=shared_sensor_uncertainties,
+            verbose=False,
+        )
+
+        print(f"Sample set: {result['sample_set_name']}")
+        print(f"Target columns: {result['target_columns']}")
+        print(f"Predictor columns: {result['predictor_columns']}")
+        print(f"Number of samples included: {result['n_samples']}")
+        for cfg in result['config_paths']:
+            print(f"Config file generated: {cfg}")
+
     # for target in target_columns:
     #     target_slug = target.replace(" ", "_").replace("/", "_")
-    #     output_dir = os.path.join("../data/output/regression", f"MC_{target_slug}")
+    #     output_dir = os.path.join("../data/output/regression", f"MC_ex{target_slug}")
     #     target_state_col = target.replace('', '_state') if target.endswith('') else f"{target}_state"
     #     per_target_predictors = predictor_cols + [target_state_col] if target_state_col not in predictor_cols else predictor_cols
     #     result = split(
@@ -852,33 +917,3 @@ if __name__ == '__main__':
     #     print(f"Number of samples included: {result['n_samples']}")
     #     for cfg in result['config_paths']:
     #         print(f"Config file generated: {cfg}")
-
-    for target in target_columns:
-        target_slug = target.replace(" ", "_").replace("/", "_")
-        output_dir = os.path.join("../data/output/regression", f"MC_{target_slug}")
-        # target_state_col = target.replace('', '_state') if target.endswith('') else f"{target}_state"
-        # per_target_predictors = predictor_cols + [target_state_col] if target_state_col not in predictor_cols else predictor_cols
-        result = split(
-            df_norm,
-            output_dir,
-            [target],
-            length,
-            0.8,
-            to_normalize,
-            True,
-            predictor_cols=predictor_cols,
-            use_uncertainty_perturbation=True,
-            n_mc_replicates=10,
-            random_seed=1,
-            pre_normalized=True,
-            normalization_params=normalization_params,
-            sensor_uncertainties=shared_sensor_uncertainties,
-            verbose=False,
-        )
-
-        print(f"Sample set: {result['sample_set_name']}")
-        print(f"Target columns: {result['target_columns']}")
-        print(f"Predictor columns: {result['predictor_columns']}")
-        print(f"Number of samples included: {result['n_samples']}")
-        for cfg in result['config_paths']:
-            print(f"Config file generated: {cfg}")

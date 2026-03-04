@@ -406,8 +406,22 @@ def binarize_predictions(preds, output_columns, thresholds_df):
     for i, col in enumerate(output_columns):
         if col not in thresholds_df.columns:
             raise ValueError(f"Threshold for column '{col}' not found in thresholds_df.")
-        threshold = thresholds_df[col].iloc[0]
-        binarized[:, i] = (preds[:, i] > threshold).astype(int)
+        upper = thresholds_df[col].iloc[0]
+        lower = thresholds_df[f"{col}__lower"].iloc[0] if f"{col}__lower" in thresholds_df.columns else np.nan
+        exceed = np.zeros(preds.shape[0], dtype=bool)
+        if pd.notna(upper):
+            upper_val = float(upper)
+            if np.isclose(upper_val, 0.0):
+                exceed |= preds[:, i] > upper_val
+            else:
+                exceed |= preds[:, i] >= upper_val
+        if pd.notna(lower):
+            lower_val = float(lower)
+            if np.isclose(lower_val, 0.0):
+                exceed |= preds[:, i] < lower_val
+            else:
+                exceed |= preds[:, i] <= lower_val
+        binarized[:, i] = exceed.astype(int)
     return binarized
 
 def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=None, num_samples=200, sample_labels=None):
