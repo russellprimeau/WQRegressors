@@ -17,6 +17,7 @@ import math
 import re
 import sys
 import time
+import textwrap
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
@@ -73,7 +74,6 @@ class CandidateResult:
     n_valid_raw: float
     n_total_raw: float
     n_valid_loaded: float
-    n_test_samples: float
     input_dim: float
     target_dim: float
 
@@ -95,12 +95,9 @@ def _build_perf_entry(
     rolling_cv_rmse: float = float('nan'),
     rolling_cv_mae: float = float('nan'),
     rolling_cv_n_folds: float = float('nan'),
-    n_test_samples_raw: float = float('nan'),
     extra_metrics: "dict | None" = None,
 ) -> dict:
     """Build a best-model-performance dict from a metrics row and rolling CV stats."""
-    n_test_samples_mc = _safe_float(row.get('n_samples', float('nan')))
-    n_test_samples = n_test_samples_raw if np.isfinite(n_test_samples_raw) else n_test_samples_mc
     out = {
         'dataset': dataset_name,
         'model': str(row.get('model', '')),
@@ -108,8 +105,6 @@ def _build_perf_entry(
         'rmse': _safe_float(row.get('rmse', float('nan'))),
         'r2': _safe_float(row.get('r2', float('nan'))),
         'std_target': _safe_float(row.get('std_target', float('nan'))),
-        'n_test_samples': n_test_samples,
-        'n_test_samples_mc': n_test_samples_mc,
         'rolling_cv_r2': rolling_cv_r2,
         'rolling_cv_r2_median': rolling_cv_r2_median,
         'rolling_cv_r2_last50': rolling_cv_r2_last50,
@@ -166,69 +161,6 @@ def _annotate_bars_within_ylim(ax, bars, fmt: str, fontsize: int = 8) -> None:
         )
 
 
-def _map_to_raw_filenames(file_names: list[str]) -> list[str]:
-    mapped = []
-    seen = set()
-    for file_name in file_names:
-        mapped_name = re.sub(r"_mc_\d+(?=\.csv$)", "", str(file_name))
-        if mapped_name not in seen:
-            seen.add(mapped_name)
-            mapped.append(mapped_name)
-    return mapped
-
-
-def _count_independent_test_samples(plan: DatasetPlan, row: "pd.Series") -> float:
-    """Count unique raw test samples for the selected best-model variant."""
-    try:
-        row_count = int(row.get("row_count"))
-        feature_tag = str(row.get("feature_tag", ""))
-    except Exception:
-        return float("nan")
-
-    model_key = str(row.get("model", "")).strip().lower()
-    output_dir = _forecast_sweeps_dir(plan.dataset_dir)
-    variant_dirs = [
-        p for p in sorted(output_dir.glob(f"*_r{row_count:03d}_{feature_tag}_k*"))
-        if p.is_dir()
-    ]
-
-    def _read_test_files(split_path: Path) -> "list[str] | None":
-        try:
-            with open(split_path, "r", encoding="utf-8") as sf:
-                return [line.strip() for line in sf if line.strip()]
-        except Exception:
-            return None
-
-    for variant_dir in variant_dirs:
-        eval_cfg = variant_dir / f"config_evaluate_{variant_dir.name}.yml"
-        local_train_cfg = variant_dir / f"config_train_{variant_dir.name}.yml"
-        cfg_candidates = [p for p in (eval_cfg, local_train_cfg) if p.exists()]
-        for cfg_path in cfg_candidates:
-            try:
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    cfg = yaml.safe_load(f) or {}
-            except Exception:
-                continue
-            cfg_model = str(cfg.get("model_name") or cfg.get("model_type") or "").strip().lower()
-            if model_key and cfg_model and model_key not in cfg_model and cfg_model not in model_key:
-                continue
-            split_path = variant_dir / "test_files.txt"
-            if not split_path.exists():
-                continue
-            files = _read_test_files(split_path)
-            if files:
-                return float(len(_map_to_raw_filenames(files)))
-
-    for variant_dir in variant_dirs:
-        split_path = variant_dir / "test_files.txt"
-        if split_path.exists():
-            files = _read_test_files(split_path)
-            if files:
-                return float(len(_map_to_raw_filenames(files)))
-
-    return float("nan")
-
-
 def _compute_rolling_cv_r2_stats(df_cv: "pd.DataFrame") -> tuple[float, float, float, float]:
     """Return CV R2 stats as (mean, median, last50_mean, pooled)."""
     try:
@@ -276,6 +208,30 @@ def _draw_bar_group(ax, x, width: float, data, colors, methods, fmt: str,
         for bars in bar_groups:
             _annotate_bars_within_ylim(ax, bars, fmt, fontsize=fontsize)
     return bar_groups
+
+
+def _wrap_label(text: str, width: int = 34) -> str:
+    parts = str(text).split("\n")
+    wrapped = [textwrap.fill(p, width=width, break_long_words=False) if p else "" for p in parts]
+    return "\n".join(wrapped)
+
+
+def _style_stacked_axes(axes, y_fontsize: int = 8, tick_fontsize: int = 8, legend_fontsize: int = 7) -> None:
+    arr = np.atleast_1d(axes)
+    for ax in arr:
+        ax.set_ylabel(_wrap_label(ax.get_ylabel(), width=34), fontsize=y_fontsize)
+        ax.tick_params(axis='y', labelsize=tick_fontsize)
+        ax.tick_params(axis='x', labelsize=tick_fontsize)
+        leg = ax.get_legend()
+        if leg is not None:
+            for t in leg.get_texts():
+                t.set_fontsize(legend_fontsize)
+
+
+def _finalize_stacked_figure(fig, axes, left: float = 0.30, right: float = 0.98, top: float = 0.97,
+                             bottom: float = 0.12, hspace: float = 0.50) -> None:
+    _style_stacked_axes(axes)
+    fig.subplots_adjust(left=left, right=right, top=top, bottom=bottom, hspace=hspace)
 
 
 def _normalize_model_key(value: str) -> str:
@@ -366,14 +322,20 @@ def _compute_per_sample_losses(preds, targets) -> "tuple[np.ndarray, np.ndarray]
     n_rows = min(len(pred_arr), len(tgt_arr))
     if n_rows <= 0:
         return np.array([], dtype=float), np.array([], dtype=float)
-    pred_arr = pred_arr[:n_rows, :]
-    tgt_arr = tgt_arr[:n_rows, :]
+    pred_arr = np.asarray(pred_arr[:n_rows], dtype=float)
+    tgt_arr = np.asarray(tgt_arr[:n_rows], dtype=float)
 
     mae = np.full(n_rows, np.nan, dtype=float)
     mse = np.full(n_rows, np.nan, dtype=float)
     for i in range(n_rows):
-        row_pred = pred_arr[i, :]
-        row_tgt = tgt_arr[i, :]
+        # Flatten per-row values so mixed 2D/3D model outputs remain comparable.
+        row_pred = np.asarray(pred_arr[i], dtype=float).reshape(-1)
+        row_tgt = np.asarray(tgt_arr[i], dtype=float).reshape(-1)
+        n = min(row_pred.size, row_tgt.size)
+        if n <= 0:
+            continue
+        row_pred = row_pred[:n]
+        row_tgt = row_tgt[:n]
         mask = np.isfinite(row_pred) & np.isfinite(row_tgt)
         if not np.any(mask):
             continue
@@ -399,6 +361,84 @@ def _aggregate_by_group(values: np.ndarray, group_ids: list[str]) -> np.ndarray:
             order.append(gid)
         grouped[gid].append(float(val))
     return np.array([np.mean(grouped[gid]) for gid in order if grouped[gid]], dtype=float)
+
+
+def _rowwise_mean(arr) -> np.ndarray:
+    vals = np.asarray(arr, dtype=float)
+    n = len(vals)
+    out = np.full(n, np.nan, dtype=float)
+    for i in range(n):
+        row = np.asarray(vals[i], dtype=float).reshape(-1)
+        row = row[np.isfinite(row)]
+        if row.size:
+            out[i] = float(np.mean(row))
+    return out
+
+
+def _group_summary(values: np.ndarray, group_ids: list[str]) -> dict[str, tuple[float, float, int]]:
+    n = min(len(values), len(group_ids))
+    vals = np.asarray(values[:n], dtype=float)
+    gids = list(group_ids[:n])
+    out: dict[str, tuple[float, float, int]] = {}
+    for gid in dict.fromkeys(gids):
+        idx = [i for i, g in enumerate(gids) if g == gid]
+        grp = vals[idx]
+        grp = grp[np.isfinite(grp)]
+        if grp.size == 0:
+            continue
+        mu = float(np.mean(grp))
+        sd = float(np.std(grp, ddof=1)) if grp.size > 1 else 0.0
+        out[gid] = (mu, sd, int(grp.size))
+    return out
+
+
+def _anova_variance_components(values: np.ndarray, group_ids: list[str]) -> dict:
+    n = min(len(values), len(group_ids))
+    vals = np.asarray(values[:n], dtype=float)
+    gids = list(group_ids[:n])
+    mask = np.isfinite(vals)
+    vals = vals[mask]
+    gids = [g for g, m in zip(gids, mask) if m]
+    n_tot = int(vals.size)
+    if n_tot < 3:
+        return {}
+
+    grouped: dict[str, list[float]] = {}
+    for g, v in zip(gids, vals):
+        grouped.setdefault(g, []).append(float(v))
+    groups = list(grouped.keys())
+    g = len(groups)
+    if g < 2:
+        return {}
+
+    grand = float(np.mean(vals))
+    ss_within = 0.0
+    ss_between = 0.0
+    for gid in groups:
+        arr = np.asarray(grouped[gid], dtype=float)
+        mu = float(np.mean(arr))
+        ss_within += float(np.sum((arr - mu) ** 2))
+        ss_between += float(arr.size * (mu - grand) ** 2)
+
+    df_within = n_tot - g
+    df_between = g - 1
+    ms_within = float(ss_within / df_within) if df_within > 0 else float("nan")
+    ms_between = float(ss_between / df_between) if df_between > 0 else float("nan")
+    ratio = float(ms_within / ms_between) if np.isfinite(ms_within) and np.isfinite(ms_between) and ms_between > 0 else float("nan")
+    total = ms_within + ms_between if np.isfinite(ms_within) and np.isfinite(ms_between) else float("nan")
+    noise_fraction = float(ms_within / total) if np.isfinite(total) and total > 0 else float("nan")
+    icc = float(ms_between / total) if np.isfinite(total) and total > 0 else float("nan")
+    return {
+        "n_total": n_tot,
+        "n_groups": g,
+        "ss_within": float(ss_within),
+        "ss_between": float(ss_between),
+        "ms_within": ms_within,
+        "ms_between": ms_between,
+        "within_between_ratio": ratio,
+        "noise_fraction": noise_fraction,
+        "icc": icc,
+    }
 
 
 def _normal_cdf(x: float) -> float:
@@ -779,10 +819,49 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
     n_raw = len(list(dict.fromkeys(group_ids)))
 
     model_metrics = _compute_point_metrics(pred_model, y_test)
+    mae_model_rows, mse_model_rows = _compute_per_sample_losses(pred_model, y_test)
+    y_row_mean = _rowwise_mean(y_test)
+    target_vc = _anova_variance_components(y_row_mean, group_ids)
+    err_vc = _anova_variance_components(mae_model_rows, group_ids)
+    grp_y = _group_summary(y_row_mean, group_ids)
+    grp_mae = _group_summary(mae_model_rows, group_ids)
     evidence["n_eval_rows_test"] = int(n_rows)
     evidence["n_eval_raw_segments"] = int(n_raw)
     evidence["n_eval_points_finite_model"] = int(model_metrics["n_finite"])
     evidence["sample_reliability_weight"] = float(min(1.0, math.sqrt(max(0.0, n_raw) / max(1.0, float(args.evidence_ref_raw_samples)))))
+    evidence["mc_target_within_ms"] = _safe_float(target_vc.get("ms_within", float("nan")))
+    evidence["mc_target_between_ms"] = _safe_float(target_vc.get("ms_between", float("nan")))
+    evidence["mc_target_wb_ratio"] = _safe_float(target_vc.get("within_between_ratio", float("nan")))
+    evidence["mc_target_noise_fraction"] = _safe_float(target_vc.get("noise_fraction", float("nan")))
+    evidence["mc_target_icc"] = _safe_float(target_vc.get("icc", float("nan")))
+    evidence["mc_model_mae_within_ms"] = _safe_float(err_vc.get("ms_within", float("nan")))
+    evidence["mc_model_mae_between_ms"] = _safe_float(err_vc.get("ms_between", float("nan")))
+    evidence["mc_model_mae_wb_ratio"] = _safe_float(err_vc.get("within_between_ratio", float("nan")))
+    evidence["mc_model_mae_noise_fraction"] = _safe_float(err_vc.get("noise_fraction", float("nan")))
+    evidence["mc_model_mae_icc"] = _safe_float(err_vc.get("icc", float("nan")))
+    within_sd_t = math.sqrt(evidence["mc_target_within_ms"]) if np.isfinite(evidence["mc_target_within_ms"]) and evidence["mc_target_within_ms"] >= 0 else float("nan")
+    between_sd_t = math.sqrt(evidence["mc_target_between_ms"]) if np.isfinite(evidence["mc_target_between_ms"]) and evidence["mc_target_between_ms"] >= 0 else float("nan")
+    evidence["mc_target_within_sd"] = _safe_float(within_sd_t)
+    evidence["mc_target_between_sd"] = _safe_float(between_sd_t)
+    evidence["rmse_to_mc_within_sd"] = float(model_metrics["rmse"] / within_sd_t) if np.isfinite(model_metrics["rmse"]) and np.isfinite(within_sd_t) and within_sd_t > 0 else float("nan")
+    evidence["rmse_to_mc_between_sd"] = float(model_metrics["rmse"] / between_sd_t) if np.isfinite(model_metrics["rmse"]) and np.isfinite(between_sd_t) and between_sd_t > 0 else float("nan")
+
+    # Correlation: do higher MC replicate spread segments also have higher model error?
+    corr_pairs = []
+    for gid in sorted(set(grp_y.keys()) & set(grp_mae.keys())):
+        _, y_sd, _ = grp_y[gid]
+        mae_mu, _, _ = grp_mae[gid]
+        if np.isfinite(y_sd) and np.isfinite(mae_mu):
+            corr_pairs.append((y_sd, mae_mu))
+    if len(corr_pairs) >= 3:
+        a = np.asarray([p[0] for p in corr_pairs], dtype=float)
+        b = np.asarray([p[1] for p in corr_pairs], dtype=float)
+        if np.isfinite(a).all() and np.isfinite(b).all() and np.std(a) > 0 and np.std(b) > 0:
+            evidence["mc_uncertainty_vs_error_corr"] = float(np.corrcoef(a, b)[0, 1])
+        else:
+            evidence["mc_uncertainty_vs_error_corr"] = float("nan")
+    else:
+        evidence["mc_uncertainty_vs_error_corr"] = float("nan")
 
     baseline_preds = payload["baseline_preds"]
     pval_records: list[tuple[str, str, float]] = []
@@ -802,7 +881,7 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
 
     for bname in ("naive", "seasonal"):
         pred_b = _safe_as_2d(baseline_preds.get(bname, np.full_like(y_test, np.nan, dtype=float)))[:n_rows, :]
-        mae_m, mse_m = _compute_per_sample_losses(pred_model, y_test)
+        mae_m, mse_m = mae_model_rows, mse_model_rows
         mae_b, mse_b = _compute_per_sample_losses(pred_b, y_test)
         mse_diff = mse_m - mse_b
         ae_diff = mae_m - mae_b
@@ -1052,7 +1131,6 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
                         rolling_cv_r2 = rolling_cv_r2_median = rolling_cv_r2_last50 = rolling_cv_r2_pooled = float('nan')
                         rolling_cv_rmse = rolling_cv_mae = rolling_cv_n_folds = float('nan')
-                        n_test_samples_raw = float('nan')
                         stat_evidence: dict = {}
 
                         cv_summary_path = None
@@ -1080,15 +1158,6 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                         except Exception as exc:
                             print(f"[WARN] Failed to write dataset evaluation summary for {plan.dataset_dir.name}: {exc}")
                             traceback.print_exc()
-
-                        try:
-                            n_test_samples_raw = _count_independent_test_samples(plan, best_row)
-                            if np.isfinite(n_test_samples_raw):
-                                print(f"[INFO] Independent raw test samples: n={int(n_test_samples_raw)}")
-                            else:
-                                print(f"[WARN] Could not determine independent raw test sample count for {plan.dataset_dir.name}")
-                        except Exception as exc:
-                            print(f"[WARN] Failed to count independent raw test samples for {plan.dataset_dir.name}: {exc}")
 
                         # Re-run best model evaluation context and compute statistical evidence
                         try:
@@ -1187,7 +1256,6 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                                     rolling_cv_rmse=cv_rmse_to_write,
                                     rolling_cv_mae=cv_mae_to_write,
                                     rolling_cv_n_folds=rolling_cv_n_folds,
-                                    n_test_samples_raw=n_test_samples_raw,
                                     extra_metrics=stat_evidence,
                                 ))
                             else:
@@ -1201,7 +1269,6 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                                     rolling_cv_rmse=rolling_cv_rmse,
                                     rolling_cv_mae=rolling_cv_mae,
                                     rolling_cv_n_folds=rolling_cv_n_folds,
-                                    n_test_samples_raw=n_test_samples_raw,
                                     extra_metrics=stat_evidence,
                                 ))
                         except Exception as exc:
@@ -1215,7 +1282,6 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                                 rolling_cv_rmse=rolling_cv_rmse,
                                 rolling_cv_mae=rolling_cv_mae,
                                 rolling_cv_n_folds=rolling_cv_n_folds,
-                                n_test_samples_raw=n_test_samples_raw,
                                 extra_metrics=stat_evidence,
                             ))
         except Exception as e:
@@ -1299,7 +1365,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             skill_naive = 1.0 - perf_df['rmse'] / perf_df['naive_rmse'].replace(0, np.nan)
             skill_seasonal = 1.0 - perf_df['rmse'] / perf_df['seasonal_rmse'].replace(0, np.nan)
             skill_data = [skill_naive, skill_seasonal]
-            skill_methods = ['vs Naive', 'vs Seasonal']
+            skill_methods = ['Compared with Naive Baseline', 'Compared with Seasonal Baseline']
             skill_colors = ['tab:gray', 'tab:green']
 
             # --- Combined 3-panel figure (no title): Skill, nRMSE, R2 ---
@@ -1321,7 +1387,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             r2_bars_combo = _draw_bar_group(
                 ax_r2_combo, x, width, r2_data, colors, methods, '.2f', annotate=False
             )
-            ax_r2_combo.set_ylabel('R2')
+            ax_r2_combo.set_ylabel('Coefficient of Determination')
             ax_r2_combo.set_ylim(-0.1, 1.0)
             for bars in r2_bars_combo:
                 _annotate_bars_within_ylim(ax_r2_combo, bars, '.2f')
@@ -1352,7 +1418,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             # --- Standalone R2 subplot ---
             fig_r2, ax_r2 = plt.subplots(figsize=(max(10, len(perf_df)*0.7), 5))
             r2_bars = _draw_bar_group(ax_r2, x, width, r2_data, colors, methods, '.2f', annotate=False)
-            ax_r2.set_ylabel('R2')
+            ax_r2.set_ylabel('Coefficient of Determination')
             ax_r2.set_ylim(-0.1, 1.0)
             for bars in r2_bars:
                 _annotate_bars_within_ylim(ax_r2, bars, '.2f')
@@ -1408,6 +1474,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             fig_conf, conf_axes = plt.subplots(
                 5, 1, figsize=(max(12, len(perf_df) * 0.8), 18), sharex=True
             )
+            # Order: component diagnostics first, overall summaries last.
             _draw_bar_group(
                 conf_axes[0], x, width,
                 [naive_prob, seasonal_prob],
@@ -1417,7 +1484,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 center_offset=0.5,
             )
             conf_axes[0].axhline(float(args.evidence_min_prob), color='black', linewidth=0.8, linestyle='--')
-            conf_axes[0].set_ylabel('Bootstrap Probability')
+            conf_axes[0].set_ylabel('Bootstrap Probability\n(Model Skill > 0)')
             conf_axes[0].set_ylim(0.0, 1.05)
             conf_axes[0].grid(axis='y', alpha=0.3)
             conf_axes[0].legend()
@@ -1426,29 +1493,17 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 conf_axes[1], x, width,
                 [naive_lcb, seasonal_lcb],
                 ['tab:gray', 'tab:green'],
-                ['LCB95 skill vs Naive', 'LCB95 skill vs Seasonal'],
+                ['95% Lower Confidence Bound of Skill\nCompared with Naive Baseline', '95% Lower Confidence Bound of Skill\nCompared with Seasonal Baseline'],
                 '.2f',
                 center_offset=0.5,
             )
             conf_axes[1].axhline(0.0, color='black', linewidth=0.8, linestyle='--')
-            conf_axes[1].set_ylabel('Skill Lower Bound')
+            conf_axes[1].set_ylabel('Skill Lower Confidence Bound')
             conf_axes[1].grid(axis='y', alpha=0.3)
             conf_axes[1].legend()
 
-            bars_score = conf_axes[2].bar(x, overall_score, width=0.5, color='tab:blue')
-            _annotate_bars_within_ylim(conf_axes[2], bars_score, '.0f')
-            conf_axes[2].set_ylabel('Overall Evidence Score (min)')
-            conf_axes[2].grid(axis='y', alpha=0.3)
-
-            bars_tier = conf_axes[3].bar(x, overall_tier_vals, width=0.5, color='tab:purple')
-            _annotate_bars_within_ylim(conf_axes[3], bars_tier, '.0f')
-            conf_axes[3].set_yticks([0, 1, 2, 3])
-            conf_axes[3].set_yticklabels(tier_labels)
-            conf_axes[3].set_ylabel('Overall Evidence Tier')
-            conf_axes[3].grid(axis='y', alpha=0.3)
-
             _draw_bar_group(
-                conf_axes[4], x, width,
+                conf_axes[2], x, width,
                 [model_picp, naive_picp, seasonal_picp],
                 ['tab:blue', 'tab:gray', 'tab:green'],
                 [model_series_label, 'Naive', 'Seasonal'],
@@ -1456,24 +1511,245 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             )
             nom_arr = nominal_cov.to_numpy(dtype=float) if hasattr(nominal_cov, "to_numpy") else np.array(nominal_cov, dtype=float)
             if np.isfinite(nom_arr).any():
-                conf_axes[4].axhline(float(np.nanmean(nom_arr)), color='black', linewidth=0.8, linestyle='--', label='Nominal')
-            conf_axes[4].set_ylabel('PICP (interval proxy)')
-            conf_axes[4].set_ylim(0.0, 1.05)
+                conf_axes[2].axhline(float(np.nanmean(nom_arr)), color='black', linewidth=0.8, linestyle='--', label='Nominal Coverage')
+            conf_axes[2].set_ylabel('Prediction Interval Coverage\nProbability (Proxy)')
+            conf_axes[2].set_ylim(0.0, 1.05)
+            conf_axes[2].grid(axis='y', alpha=0.3)
+            conf_axes[2].legend()
+
+            bars_score = conf_axes[3].bar(x, overall_score, width=0.5, color='tab:blue')
+            _annotate_bars_within_ylim(conf_axes[3], bars_score, '.0f')
+            conf_axes[3].set_ylabel('Overall Evidence Score\n(Minimum Across Baselines)')
+            conf_axes[3].grid(axis='y', alpha=0.3)
+
+            bars_tier = conf_axes[4].bar(x, overall_tier_vals, width=0.5, color='tab:purple')
+            _annotate_bars_within_ylim(conf_axes[4], bars_tier, '.0f')
+            conf_axes[4].set_yticks([0, 1, 2, 3])
+            conf_axes[4].set_yticklabels(tier_labels)
+            conf_axes[4].set_ylabel('Overall Evidence Tier')
             conf_axes[4].grid(axis='y', alpha=0.3)
-            conf_axes[4].legend()
             conf_axes[4].set_xticks(x)
             conf_axes[4].set_xticklabels(labels, rotation=45, ha='right')
-            plt.tight_layout()
+            _finalize_stacked_figure(fig_conf, conf_axes, left=0.30, hspace=0.48)
             conf_path = summaries_dir / "summary_best_model_confidence.png"
             fig_conf.savefig(conf_path, dpi=300, bbox_inches='tight')
             plt.close(fig_conf)
             print(f"[INFO] Wrote confidence subplot: {conf_path}")
 
+            # --- Evidence diagnostics figures (tests, effects, intervals, gates) ---
+            def _col(name: str) -> pd.Series:
+                if name in perf_df.columns:
+                    return pd.to_numeric(perf_df[name], errors='coerce')
+                return pd.Series([float('nan')] * len(perf_df))
+
+            pair_colors = ['tab:gray', 'tab:green']
+            pair_methods = ['Naive Baseline', 'Seasonal Baseline']
+            trio_colors = ['tab:blue', 'tab:gray', 'tab:green']
+            trio_methods = [model_series_label, 'Naive', 'Seasonal']
+
+            def _pair_panel(ax, c_naive: str, c_seasonal: str, ylabel: str, fmt: str = '.2f',
+                            hline: float | None = None, ylim: tuple[float, float] | None = None) -> None:
+                _draw_bar_group(
+                    ax, x, width,
+                    [_col(c_naive), _col(c_seasonal)],
+                    pair_colors,
+                    pair_methods,
+                    fmt,
+                    center_offset=0.5,
+                )
+                if hline is not None and np.isfinite(hline):
+                    ax.axhline(float(hline), color='black', linewidth=0.8, linestyle='--')
+                if ylim is not None:
+                    ax.set_ylim(float(ylim[0]), float(ylim[1]))
+                ax.set_ylabel(ylabel)
+                ax.grid(axis='y', alpha=0.3)
+                ax.legend()
+
+            # Statistical tests and adjusted significance (decision-first ordering).
+            fig_tests, axes_tests = plt.subplots(9, 1, figsize=(max(12, len(perf_df) * 0.8), 28), sharex=True)
+            _pair_panel(axes_tests[0], 'dm_p_vs_naive', 'dm_p_vs_seasonal', 'Diebold-Mariano Test p-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _pair_panel(axes_tests[1], 'dm_q_vs_naive', 'dm_q_vs_seasonal', 'Diebold-Mariano Test\nFalse Discovery Rate Adjusted q-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _pair_panel(axes_tests[2], 'wilcoxon_p_vs_naive', 'wilcoxon_p_vs_seasonal', 'Wilcoxon Signed-Rank Test p-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _pair_panel(axes_tests[3], 'wilcoxon_q_vs_naive', 'wilcoxon_q_vs_seasonal', 'Wilcoxon Signed-Rank Test\nFalse Discovery Rate Adjusted q-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _pair_panel(axes_tests[4], 'sign_p_vs_naive', 'sign_p_vs_seasonal', 'Sign Test p-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _pair_panel(axes_tests[5], 'sign_q_vs_naive', 'sign_q_vs_seasonal', 'Sign Test\nFalse Discovery Rate Adjusted q-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _pair_panel(axes_tests[6], 'dm_stat_vs_naive', 'dm_stat_vs_seasonal', 'Diebold-Mariano Test Statistic', '.2f', hline=0.0)
+            _pair_panel(axes_tests[7], 'wilcoxon_stat_vs_naive', 'wilcoxon_stat_vs_seasonal', 'Wilcoxon Statistic', '.2f')
+            _pair_panel(axes_tests[8], 'sign_win_rate_vs_naive', 'sign_win_rate_vs_seasonal', 'Sign Test Win Rate', '.2f', hline=0.5, ylim=(0.0, 1.05))
+            axes_tests[0].set_title("Evidence Tests (p/q thresholds first, diagnostics after)")
+            axes_tests[-1].set_xticks(x)
+            axes_tests[-1].set_xticklabels(labels, rotation=45, ha='right')
+            _finalize_stacked_figure(fig_tests, axes_tests, left=0.34, hspace=0.55)
+            tests_path = summaries_dir / "summary_evidence_tests.png"
+            fig_tests.savefig(tests_path, dpi=300, bbox_inches='tight')
+            plt.close(fig_tests)
+            print(f"[INFO] Wrote evidence tests figure: {tests_path}")
+
+            # Effect size and bootstrap summaries (interpretation flow).
+            fig_eff, axes_eff = plt.subplots(10, 1, figsize=(max(12, len(perf_df) * 0.8), 31), sharex=True)
+            _pair_panel(axes_eff[0], 'skill_vs_naive', 'skill_vs_seasonal', 'Skill (RMSE-Based)', '.2f', hline=0.0)
+            _pair_panel(axes_eff[1], 'bootstrap_skill_mean_vs_naive', 'bootstrap_skill_mean_vs_seasonal', 'Bootstrap Skill Mean', '.2f', hline=0.0)
+            _pair_panel(axes_eff[2], 'lcb95_skill_vs_naive', 'lcb95_skill_vs_seasonal', '95% Lower Confidence Bound of Skill', '.2f', hline=0.0)
+            _pair_panel(axes_eff[3], 'effect_median_ae_diff_vs_naive', 'effect_median_ae_diff_vs_seasonal', 'Median MAE Difference', '.2e', hline=0.0)
+            _pair_panel(axes_eff[4], 'effect_mean_ae_diff_vs_naive', 'effect_mean_ae_diff_vs_seasonal', 'Mean MAE Difference', '.2e', hline=0.0)
+            _pair_panel(axes_eff[5], 'effect_cohen_d_ae_diff_vs_naive', 'effect_cohen_d_ae_diff_vs_seasonal', "Cohen's d for MAE Difference", '.2f', hline=0.0)
+            _pair_panel(axes_eff[6], 'bootstrap_rmse_diff_mean_vs_naive', 'bootstrap_rmse_diff_mean_vs_seasonal', 'Bootstrap RMSE Difference Mean', '.2e', hline=0.0)
+            _pair_panel(axes_eff[7], 'bootstrap_rmse_diff_ci05_vs_naive', 'bootstrap_rmse_diff_ci05_vs_seasonal', 'Bootstrap RMSE Difference\n5th Percentile', '.2e', hline=0.0)
+            _pair_panel(axes_eff[8], 'bootstrap_rmse_diff_ci95_vs_naive', 'bootstrap_rmse_diff_ci95_vs_seasonal', 'Bootstrap RMSE Difference\n95th Percentile', '.2e', hline=0.0)
+            _pair_panel(axes_eff[9], 'bootstrap_r2_diff_mean_vs_naive', 'bootstrap_r2_diff_mean_vs_seasonal', 'Bootstrap Coefficient of Determination Difference Mean', '.2f', hline=0.0)
+            axes_eff[0].set_title("Evidence Effects (skill, effect sizes, then bootstrap deltas)")
+            axes_eff[-1].set_xticks(x)
+            axes_eff[-1].set_xticklabels(labels, rotation=45, ha='right')
+            _finalize_stacked_figure(fig_eff, axes_eff, left=0.36, hspace=0.56)
+            eff_path = summaries_dir / "summary_evidence_effects.png"
+            fig_eff.savefig(eff_path, dpi=300, bbox_inches='tight')
+            plt.close(fig_eff)
+            print(f"[INFO] Wrote evidence effects figure: {eff_path}")
+
+            # Interval diagnostics and sample support
+            fig_int, axes_int = plt.subplots(9, 1, figsize=(max(12, len(perf_df) * 0.8), 28), sharex=True)
+            _draw_bar_group(
+                axes_int[0], x, width,
+                [_col('model_picp'), _col('naive_picp'), _col('seasonal_picp')],
+                trio_colors,
+                trio_methods,
+                '.2f',
+            )
+            axes_int[0].axhline(1.0 - float(args.interval_alpha), color='black', linewidth=0.8, linestyle='--')
+            axes_int[0].set_ylabel('Prediction Interval Coverage\nProbability')
+            axes_int[0].set_ylim(0.0, 1.05)
+            axes_int[0].grid(axis='y', alpha=0.3)
+            axes_int[0].legend()
+            _draw_bar_group(
+                axes_int[1], x, width,
+                [_col('model_coverage_deficit'), _col('naive_coverage_deficit'), _col('seasonal_coverage_deficit')],
+                trio_colors,
+                trio_methods,
+                '.3f',
+            )
+            axes_int[1].axhline(float(args.coverage_tolerance), color='black', linewidth=0.8, linestyle='--')
+            axes_int[1].set_ylabel('Coverage Deficit')
+            axes_int[1].grid(axis='y', alpha=0.3)
+            axes_int[1].legend()
+            _draw_bar_group(
+                axes_int[2], x, width,
+                [_col('model_nmpiw'), _col('naive_nmpiw'), _col('seasonal_nmpiw')],
+                trio_colors,
+                trio_methods,
+                '.2f',
+            )
+            axes_int[2].set_ylabel('Normalized Mean Prediction\nInterval Width')
+            axes_int[2].grid(axis='y', alpha=0.3)
+            axes_int[2].legend()
+            _draw_bar_group(
+                axes_int[3], x, width,
+                [_col('model_interval_score'), _col('naive_interval_score'), _col('seasonal_interval_score')],
+                trio_colors,
+                trio_methods,
+                '.2e',
+            )
+            axes_int[3].set_ylabel('Interval Score')
+            axes_int[3].grid(axis='y', alpha=0.3)
+            axes_int[3].legend()
+            _pair_panel(axes_int[4], 'picp_delta_vs_naive', 'picp_delta_vs_seasonal', 'Prediction Interval Coverage Probability Difference\n(Model minus Baseline)', '.2f', hline=0.0)
+            _pair_panel(axes_int[5], 'nmpiw_delta_vs_naive', 'nmpiw_delta_vs_seasonal', 'Normalized Mean Prediction Interval Width Difference\n(Model minus Baseline)', '.2f', hline=0.0)
+            _pair_panel(axes_int[6], 'interval_score_delta_vs_naive', 'interval_score_delta_vs_seasonal', 'Interval Score Delta', '.2e', hline=0.0)
+            b_raw = axes_int[7].bar(x, _col('n_eval_raw_segments'), width=0.5, color='tab:orange')
+            _annotate_bars_within_ylim(axes_int[7], b_raw, '.0f')
+            axes_int[7].set_ylabel('Evaluated Independent Raw Segments (Count)')
+            axes_int[7].grid(axis='y', alpha=0.3)
+            b_w = axes_int[8].bar(x, _col('sample_reliability_weight'), width=0.5, color='tab:purple')
+            _annotate_bars_within_ylim(axes_int[8], b_w, '.2f')
+            axes_int[8].set_ylim(0.0, 1.05)
+            axes_int[8].set_ylabel('Sample Reliability Weight')
+            axes_int[8].grid(axis='y', alpha=0.3)
+            axes_int[0].set_title("Interval and Support Diagnostics")
+            axes_int[-1].set_xticks(x)
+            axes_int[-1].set_xticklabels(labels, rotation=45, ha='right')
+            _finalize_stacked_figure(fig_int, axes_int, left=0.36, hspace=0.56)
+            int_path = summaries_dir / "summary_evidence_intervals_support.png"
+            fig_int.savefig(int_path, dpi=300, bbox_inches='tight')
+            plt.close(fig_int)
+            print(f"[INFO] Wrote evidence interval/support figure: {int_path}")
+
+            # Gate-by-gate outcomes used in evidence scoring
+            fig_gate, axes_gate = plt.subplots(10, 1, figsize=(max(12, len(perf_df) * 0.8), 30), sharex=True)
+            gate_specs = [
+                ('gate_min_raw_vs_naive', 'gate_min_raw_vs_seasonal', 'Gate: Minimum Independent Raw Sample Count'),
+                ('gate_prob_vs_naive', 'gate_prob_vs_seasonal', 'Gate: Bootstrap Probability of Positive Skill'),
+                ('gate_lcb_vs_naive', 'gate_lcb_vs_seasonal', 'Gate: 95% Lower Confidence Bound of Skill > 0'),
+                ('gate_dm_vs_naive', 'gate_dm_vs_seasonal', 'Gate: Diebold-Mariano p-value < alpha and statistic < 0'),
+                ('gate_wilcoxon_vs_naive', 'gate_wilcoxon_vs_seasonal', 'Gate: Wilcoxon p-value < alpha'),
+                ('gate_sign_vs_naive', 'gate_sign_vs_seasonal', 'Gate: Sign Test p-value < alpha and win rate > 0.5'),
+                ('gate_coverage_vs_naive', 'gate_coverage_vs_seasonal', 'Gate: Coverage Quality'),
+                ('gate_dm_q_vs_naive', 'gate_dm_q_vs_seasonal', 'Gate: Diebold-Mariano q-value < alpha and statistic < 0'),
+                ('gate_wilcoxon_q_vs_naive', 'gate_wilcoxon_q_vs_seasonal', 'Gate: Wilcoxon q-value < alpha'),
+                ('gate_sign_q_vs_naive', 'gate_sign_q_vs_seasonal', 'Gate: Sign Test q-value < alpha and win rate > 0.5'),
+            ]
+            for ax_g, (g_n, g_s, ylab) in zip(axes_gate, gate_specs):
+                _pair_panel(ax_g, g_n, g_s, ylab, '.0f', ylim=(0.0, 1.05))
+            axes_gate[0].set_title("Evidence Gates (top-to-bottom follows score construction)")
+            axes_gate[-1].set_xticks(x)
+            axes_gate[-1].set_xticklabels(labels, rotation=45, ha='right')
+            _finalize_stacked_figure(fig_gate, axes_gate, left=0.40, hspace=0.60)
+            gate_path = summaries_dir / "summary_evidence_gates.png"
+            fig_gate.savefig(gate_path, dpi=300, bbox_inches='tight')
+            plt.close(fig_gate)
+            print(f"[INFO] Wrote evidence gates figure: {gate_path}")
+
+            # MC replicate uncertainty impact on final accuracy/evidence
+            def _is_informative_series(s: pd.Series, atol: float = 1e-12) -> bool:
+                vals = pd.to_numeric(s, errors='coerce').to_numpy(dtype=float)
+                vals = vals[np.isfinite(vals)]
+                if vals.size <= 1:
+                    return False
+                return bool((np.nanmax(vals) - np.nanmin(vals)) > float(atol))
+
+            mc_specs = [
+                ("mc_target_wb_ratio", 'Target Within-Segment to Between-Segment\nMean Square Ratio', 'tab:orange', '.2f', 1.0, None),
+                ("mc_target_icc", 'Target Intraclass Correlation Coefficient\n(Between-Segment Variance Share)', 'tab:olive', '.2f', None, (0.0, 1.05)),
+                ("mc_target_noise_fraction", 'Target Noise Fraction\n(Within-Segment Variance Share)', 'tab:red', '.2f', None, (0.0, 1.05)),
+                ("rmse_to_mc_within_sd", 'RMSE /\nMonte Carlo Within-Segment SD', 'tab:blue', '.2f', 1.0, None),
+                ("rmse_to_mc_between_sd", 'RMSE /\nBetween-Segment SD', 'tab:cyan', '.2f', 1.0, None),
+                ("mc_uncertainty_vs_error_corr", 'Correlation: Replicate SD vs\nSegment MAE', 'tab:brown', '.2f', 0.0, (-1.05, 1.05)),
+            ]
+            mc_specs_informative = [spec for spec in mc_specs if _is_informative_series(_col(spec[0]))]
+            if mc_specs_informative:
+                fig_mc, axes_mc = plt.subplots(
+                    len(mc_specs_informative), 1,
+                    figsize=(max(12, len(perf_df) * 0.8), max(8, 3.0 * len(mc_specs_informative))),
+                    sharex=True,
+                )
+                if not isinstance(axes_mc, np.ndarray):
+                    axes_mc = np.array([axes_mc])
+                for ax_mc, (col_name, ylab, color, fmt, hline, ylim) in zip(axes_mc, mc_specs_informative):
+                    bars = ax_mc.bar(x, _col(col_name), width=0.5, color=color)
+                    _annotate_bars_within_ylim(ax_mc, bars, fmt)
+                    if hline is not None and np.isfinite(hline):
+                        ax_mc.axhline(float(hline), color='black', linewidth=0.8, linestyle='--')
+                    if ylim is not None:
+                        ax_mc.set_ylim(float(ylim[0]), float(ylim[1]))
+                    ax_mc.set_ylabel(ylab)
+                    ax_mc.grid(axis='y', alpha=0.3)
+                axes_mc[0].set_title("Monte Carlo Replicate Uncertainty Impact")
+                axes_mc[-1].set_xticks(x)
+                axes_mc[-1].set_xticklabels(labels, rotation=45, ha='right')
+                _finalize_stacked_figure(fig_mc, axes_mc, left=0.38, hspace=0.58)
+                mc_path = summaries_dir / "summary_mc_uncertainty_impact.png"
+                fig_mc.savefig(mc_path, dpi=300, bbox_inches='tight')
+                plt.close(fig_mc)
+                print(f"[INFO] Wrote MC uncertainty impact figure: {mc_path}")
+            else:
+                print("[INFO] Skipped MC uncertainty impact figure: all panels were constant or non-finite.")
+
             # --- Single model quality matrix (accuracy, precision, reliability, support) ---
-            def _first_finite(row_vals) -> float:
-                arr = np.asarray(row_vals, dtype=float)
-                finite = arr[np.isfinite(arr)]
-                return float(finite[0]) if finite.size else float("nan")
+            matrix_index = labels.astype(str).tolist()
+            n_rows_mat = len(perf_df)
+
+            def _col_values(name: str) -> np.ndarray:
+                if name in perf_df.columns:
+                    return pd.to_numeric(perf_df[name], errors="coerce").to_numpy(dtype=float)
+                return np.full(n_rows_mat, np.nan, dtype=float)
 
             q_cols = [
                 "dm_q_vs_naive", "dm_q_vs_seasonal",
@@ -1488,53 +1764,64 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             present_q_cols = [c for c in q_cols if c in perf_df.columns]
             present_p_cols = [c for c in p_cols if c in perf_df.columns]
 
-            q_min = perf_df[present_q_cols].min(axis=1, skipna=True) if present_q_cols else pd.Series([float("nan")] * len(perf_df))
-            p_min = perf_df[present_p_cols].min(axis=1, skipna=True) if present_p_cols else pd.Series([float("nan")] * len(perf_df))
+            q_min = pd.to_numeric(perf_df[present_q_cols].min(axis=1, skipna=True), errors="coerce").to_numpy(dtype=float) if present_q_cols else np.full(n_rows_mat, np.nan, dtype=float)
+            p_min = pd.to_numeric(perf_df[present_p_cols].min(axis=1, skipna=True), errors="coerce").to_numpy(dtype=float) if present_p_cols else np.full(n_rows_mat, np.nan, dtype=float)
+            tier_vals = np.array(
+                [tier_map.get(str(v), np.nan) for v in perf_df.get("evidence_tier_overall", pd.Series(["very_low"] * n_rows_mat))],
+                dtype=float,
+            )
 
             quality_df = pd.DataFrame({
-                "R2": pd.to_numeric(perf_df.get("r2"), errors="coerce"),
-                "nRMSE": pd.to_numeric(perf_df.get("nrmse"), errors="coerce"),
-                "PICP": pd.to_numeric(perf_df.get("model_picp"), errors="coerce"),
-                "NMPIW": pd.to_numeric(perf_df.get("model_nmpiw"), errors="coerce"),
-                "ProbSkillMin": pd.concat([
-                    pd.to_numeric(perf_df.get("bootstrap_prob_skill_gt0_vs_naive"), errors="coerce"),
-                    pd.to_numeric(perf_df.get("bootstrap_prob_skill_gt0_vs_seasonal"), errors="coerce"),
-                ], axis=1).min(axis=1, skipna=True),
-                "LCB95SkillMin": pd.concat([
-                    pd.to_numeric(perf_df.get("lcb95_skill_vs_naive"), errors="coerce"),
-                    pd.to_numeric(perf_df.get("lcb95_skill_vs_seasonal"), errors="coerce"),
-                ], axis=1).min(axis=1, skipna=True),
-                "BestQ": pd.to_numeric(q_min, errors="coerce"),
-                "BestP": pd.to_numeric(p_min, errors="coerce"),
-                "Tier": pd.Series(
-                    [tier_map.get(str(v), np.nan) for v in perf_df.get("evidence_tier_overall", pd.Series(["very_low"] * len(perf_df)))],
-                    dtype=float,
-                ),
-                "RawN": pd.to_numeric(perf_df.get("n_eval_raw_segments"), errors="coerce"),
-            }, index=labels)
+                "Coefficient of Determination": _col_values("r2"),
+                "nRMSE": _col_values("nrmse"),
+                "Prediction Interval Coverage Probability": _col_values("model_picp"),
+                "Normalized Mean Prediction Interval Width": _col_values("model_nmpiw"),
+                "Minimum Probability of Positive Skill": pd.concat([
+                    pd.Series(_col_values("bootstrap_prob_skill_gt0_vs_naive")),
+                    pd.Series(_col_values("bootstrap_prob_skill_gt0_vs_seasonal")),
+                ], axis=1).min(axis=1, skipna=True).to_numpy(dtype=float),
+                "Minimum 95% Lower Confidence Bound of Skill": pd.concat([
+                    pd.Series(_col_values("lcb95_skill_vs_naive")),
+                    pd.Series(_col_values("lcb95_skill_vs_seasonal")),
+                ], axis=1).min(axis=1, skipna=True).to_numpy(dtype=float),
+                "Best False Discovery Rate Adjusted q-value": q_min,
+                "Best p-value": p_min,
+                "Overall Evidence Tier": tier_vals,
+                "Independent Raw Segment Count": _col_values("n_eval_raw_segments"),
+            }, index=matrix_index)
 
             # Fallback to p-values if q-values are unavailable.
-            if not np.isfinite(quality_df["BestQ"].to_numpy(dtype=float)).any():
-                quality_df["BestQ"] = quality_df["BestP"]
+            if not np.isfinite(quality_df["Best False Discovery Rate Adjusted q-value"].to_numpy(dtype=float)).any():
+                quality_df["Best False Discovery Rate Adjusted q-value"] = quality_df["Best p-value"]
 
             # Column-wise directional scaling for heatmap coloring only.
             higher_better = {
-                "R2": True,
+                "Coefficient of Determination": True,
                 "nRMSE": False,
-                "PICP": True,
-                "NMPIW": False,
-                "ProbSkillMin": True,
-                "LCB95SkillMin": True,
-                "BestQ": False,
-                "Tier": True,
-                "RawN": True,
+                "Prediction Interval Coverage Probability": True,
+                "Normalized Mean Prediction Interval Width": False,
+                "Minimum Probability of Positive Skill": True,
+                "Minimum 95% Lower Confidence Bound of Skill": True,
+                "Best False Discovery Rate Adjusted q-value": False,
+                "Overall Evidence Tier": True,
+                "Independent Raw Segment Count": True,
             }
-            if "BestP" in quality_df.columns:
-                higher_better["BestP"] = False
+            if "Best p-value" in quality_df.columns:
+                higher_better["Best p-value"] = False
 
-            heat_cols = ["R2", "nRMSE", "PICP", "NMPIW", "ProbSkillMin", "LCB95SkillMin", "BestQ", "Tier", "RawN"]
-            if np.isfinite(quality_df["BestP"].to_numpy(dtype=float)).any():
-                heat_cols.insert(7, "BestP")
+            heat_cols = [
+                "Coefficient of Determination",
+                "nRMSE",
+                "Prediction Interval Coverage Probability",
+                "Normalized Mean Prediction Interval Width",
+                "Minimum Probability of Positive Skill",
+                "Minimum 95% Lower Confidence Bound of Skill",
+                "Best False Discovery Rate Adjusted q-value",
+                "Overall Evidence Tier",
+                "Independent Raw Segment Count",
+            ]
+            if np.isfinite(quality_df["Best p-value"].to_numpy(dtype=float)).any():
+                heat_cols.insert(7, "Best p-value")
             display_df = quality_df[heat_cols].copy()
 
             norm = display_df.copy()
@@ -1558,7 +1845,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             for c in annot.columns:
                 if c in {"Tier", "RawN"}:
                     annot[c] = annot[c].map(lambda v: "" if not np.isfinite(v) else f"{int(round(v))}")
-                elif c in {"BestQ", "BestP"}:
+                elif c in {"Best False Discovery Rate Adjusted q-value", "Best p-value"}:
                     annot[c] = annot[c].map(lambda v: "" if not np.isfinite(v) else f"{v:.3f}")
                 else:
                     annot[c] = annot[c].map(lambda v: "" if not np.isfinite(v) else f"{v:.2f}")
@@ -1603,17 +1890,19 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 gen_gap_mean = perf_df['r2'] - cv_r2_mean_col
                 gen_gap_last50 = perf_df['r2'] - cv_r2_last50_col
                 n_folds_col = perf_df['rolling_cv_n_folds'] if 'rolling_cv_n_folds' in perf_df.columns else pd.Series([float('nan')] * len(perf_df))
-                n_samples_col = perf_df['n_test_samples'] if 'n_test_samples' in perf_df.columns else pd.Series([float('nan')] * len(perf_df))
+                n_samples_col = perf_df['n_eval_raw_segments'] if 'n_eval_raw_segments' in perf_df.columns else (
+                    perf_df['n_eval_rows_test'] if 'n_eval_rows_test' in perf_df.columns else pd.Series([float('nan')] * len(perf_df))
+                )
 
                 cv_panel_specs = [
-                    (cv_r2_mean_col,           'CV R2 (all folds mean)', 'tab:blue',   '.2f'),
-                    (cv_r2_median_col,         'CV R2 (all folds median)', 'tab:cyan', '.2f'),
-                    (cv_r2_last50_col,         'CV R2 (last 50% folds)', 'tab:green', '.2f'),
-                    (cv_r2_pooled_col,         'CV R2 (pooled SS)', 'tab:olive', '.2f'),
-                    (gen_gap_mean,             'Generalization Gap\n(test R2 - CV R2 mean)', 'tab:red', '.2e'),
-                    (gen_gap_last50,           'Generalization Gap\n(test R2 - CV R2 last50)', 'tab:pink', '.2e'),
-                    (n_folds_col,              'CV Folds (n)',      'tab:purple', '.0f'),
-                    (n_samples_col,            'Test Samples (n)',  'tab:orange', '.0f'),
+                    (cv_r2_mean_col,           'Cross-Validation Coefficient of Determination\n(All Folds Mean)', 'tab:blue',   '.2f'),
+                    (cv_r2_median_col,         'Cross-Validation Coefficient of Determination\n(All Folds Median)', 'tab:cyan', '.2f'),
+                    (cv_r2_last50_col,         'Cross-Validation Coefficient of Determination\n(Last 50% of Folds)', 'tab:green', '.2f'),
+                    (cv_r2_pooled_col,         'Cross-Validation Coefficient of Determination\n(Pooled Sum of Squares)', 'tab:olive', '.2f'),
+                    (gen_gap_mean,             'Generalization Gap\n(Test Coefficient of Determination - Cross-Validation Mean)', 'tab:red', '.2e'),
+                    (gen_gap_last50,           'Generalization Gap\n(Test Coefficient of Determination - Cross-Validation Last 50%)', 'tab:pink', '.2e'),
+                    (n_folds_col,              'Cross-Validation Fold Count',      'tab:purple', '.0f'),
+                    (n_samples_col,            'Evaluation Support (Count)',  'tab:orange', '.0f'),
                 ]
                 fig_cv, cv_axes = plt.subplots(
                     len(cv_panel_specs), 1,
@@ -1622,7 +1911,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 )
                 for ax_cv, (vals, ylabel, color, fmt) in zip(cv_axes, cv_panel_specs):
                     bars = ax_cv.bar(x, vals, width=0.5, color=color)
-                    if ylabel.startswith('CV R'):
+                    if ylabel.startswith('Cross-Validation Coefficient of Determination'):
                         ax_cv.set_ylim(-0.1, 1.0)
                     _annotate_bars_within_ylim(ax_cv, bars, fmt)
                     if ylabel.startswith('Generalization'):

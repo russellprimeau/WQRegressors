@@ -1,4 +1,6 @@
 import os
+import re
+import unicodedata
 from functools import lru_cache
 from pathlib import Path
 import json
@@ -11,6 +13,13 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score, accuracy_score, precision_score,
                              recall_score, f1_score, confusion_matrix, roc_curve, precision_recall_curve, auc)
 from .preprocessing import normalize_columns
+
+
+def _safe_plot_filename(name: str) -> str:
+    text = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode("ascii")
+    text = text.replace(os.sep, "_").replace("/", "_").replace("\\", "_")
+    text = re.sub(r"[^A-Za-z0-9._()-]+", "_", text).strip("._")
+    return text or "output"
 
 
 def evaluate_transformer(model, dataset, device):
@@ -385,7 +394,10 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, output_rows=-
             plt.title(f"Seasonality-based Model for {col}")
             plt.legend(loc="best", fontsize=9)
             plt.tight_layout()
-            plt.savefig(os.path.join(plot_dir, f"seasonal_{col}.png"))
+            safe_col = _safe_plot_filename(col)
+            plot_path = os.path.join(plot_dir, f"seasonal_{safe_col}.png")
+            os.makedirs(os.path.dirname(plot_path), exist_ok=True)
+            plt.savefig(plot_path)
             plt.close()
     except Exception as e:
         print(f"[Warning] Could not generate plot of seasonality model: {e}")

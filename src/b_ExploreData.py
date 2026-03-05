@@ -844,6 +844,7 @@ def _load_surface_offset_uncertainty_specs(repo_root: Path) -> dict:
             }
         except Exception:
             continue
+    print(f"[UNCERTAINTY] Loaded {len(specs)} surface uncertainty specs from calibration summaries.")
     return specs
 
 
@@ -1312,12 +1313,20 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                             mu = float(spec["mu"])
                             sigma = float(spec["sigma"])
                             center = broken + mu
+                            finite_center = pd.to_numeric(center, errors="coerce").to_numpy(dtype=float)
+                            finite_center = finite_center[np.isfinite(finite_center)]
+                            center_span = float(np.nanmax(finite_center) - np.nanmin(finite_center)) if finite_center.size > 0 else np.nan
+                            rel_2sigma = (2.0 * sigma / center_span) if np.isfinite(center_span) and center_span > 0 else np.nan
+                            print(
+                                f"[UNCERTAINTY] Surface '{base_surface_name}': mu={mu:.6g}, sigma={sigma:.6g}, "
+                                f"2sigma={2.0 * sigma:.6g}, center_span={center_span:.6g}, rel_2sigma={rel_2sigma:.6g}"
+                            )
                             ax.fill_between(
                                 broken.index,
                                 center - (2.0 * sigma),
                                 center + (2.0 * sigma),
                                 color=series_color,
-                                alpha=0.10,
+                                alpha=0.24,
                                 linewidth=0.0,
                                 zorder=0.6,
                             )
@@ -1326,16 +1335,19 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                                 center - sigma,
                                 center + sigma,
                                 color=series_color,
-                                alpha=0.18,
+                                alpha=0.34,
                                 linewidth=0.0,
                                 zorder=0.7,
                             )
+                        else:
+                            print(f"[UNCERTAINTY] Surface '{base_surface_name}': no matching uncertainty spec found.")
                     ax.plot(
                         broken.index,
                         broken.values,
                         linestyle="-",
-                        linewidth=0.6,
+                        linewidth=0.45,
                         color=series_color,
+                        alpha=0.85,
                         zorder=1.4,
                     )
 
@@ -1873,7 +1885,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 

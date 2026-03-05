@@ -1,8 +1,10 @@
 """
 Build a single 2x6 uncertainty summary figure for Monte Carlo documentation.
 
-Top row: offset-error histogram per sensor with fitted normal overlay.
-Bottom row: per-sensor goodness-of-fit/statistics table.
+Row 1: raw correction errors by calibration point (box + jitter).
+Row 2: offset-error histogram per sensor with fitted normal overlay.
+Row 3: per-sensor goodness-of-fit/statistics table.
+Row 4: Q-Q plot for recommended best-fit distribution.
 """
 
 from __future__ import annotations
@@ -54,9 +56,45 @@ def _default_output_png(aggregate_csv: Path) -> Path:
 
 def normalize_sensor_name(name: str) -> str:
     text = str(name).strip()
+    text = text.replace("Âµ", "µ")
     if "Sp Cond" in text:
         return "Sp Cond (microS_cm)"
     return text
+
+
+def _calibration_output_dir() -> Path:
+    return _repo_root() / "data" / "output" / "calibration"
+
+
+def _load_raw_point_errors(sensor_name: str) -> dict[int, np.ndarray]:
+    """
+    Load raw calibration correction errors per point from data/output/calibration/<sensor>.csv.
+    Returns {point_number: np.ndarray(errors)}.
+    """
+    base_dir = _calibration_output_dir()
+    if not base_dir.exists():
+        return {}
+
+    sensor_csv = None
+    for path in sorted(base_dir.glob("*.csv")):
+        if normalize_sensor_name(path.stem) == sensor_name:
+            sensor_csv = path
+            break
+    if sensor_csv is None:
+        return {}
+
+    try:
+        raw_df = pd.read_csv(sensor_csv)
+    except Exception:
+        return {}
+
+    out: dict[int, np.ndarray] = {}
+    for idx, col in enumerate(["Correction1", "Correction2", "Correction3"], start=1):
+        if col in raw_df.columns:
+            vals = pd.to_numeric(raw_df[col], errors="coerce").dropna().to_numpy(dtype=float)
+            if vals.size > 0:
+                out[idx] = vals
+    return out
 
 
 def fmt(value: float | str | None, digits: int = 4, scientific: bool = False) -> str:
@@ -82,17 +120,20 @@ def _most_common_points(points: np.ndarray) -> str:
     return str(values[np.argmax(counts)])
 
 
-def build_sensor_table_rows(errors: np.ndarray, points_per_event: np.ndarray) -> list[list[str]]:
-    fit = test_distribution_fit(errors, "Offset")
+def _preferred_fit_label(fit: dict) -> str:
     preferred = fit.get("preferred", "NA")
     if preferred == "t":
-        preferred = "Student t"
+        return "Student t"
     elif preferred == "norm":
-        preferred = "Normal"
+        return "Normal"
+    return str(preferred)
+
+
+def build_sensor_table_rows(fit: dict, errors: np.ndarray, points_per_event: np.ndarray) -> list[list[str]]:
+    preferred = _preferred_fit_label(fit)
 
     rows = [
-        ["Points per calibration", _most_common_points(points_per_event)],
-        ["n", str(int(fit.get("n_clean", len(errors))))],
+        ["n calibrations", str(int(fit.get("n_clean", len(errors))))],
         ["mean", fmt(np.mean(errors))],
         ["std", fmt(np.std(errors))],
         ["Shapiro p", fmt(fit.get("shapiro_p"), scientific=True)],
@@ -109,7 +150,41 @@ def build_sensor_table_rows(errors: np.ndarray, points_per_event: np.ndarray) ->
     return rows
 
 
-def plot_histogram(ax: plt.Axes, errors: np.ndarray, title: str) -> None:
+def build_quantile_rows(fit: dict, errors: np.ndarray) -> list[list[str]]:
+    probs = np.array([0.05, 0.25, 0.50, 0.75, 0.95])
+    preferred = fit.get("preferred", "equivalent")
+    dist_used = "Normal"
+
+    q_values = None
+    if preferred == "t":
+        t_df = fit.get("t_df")
+        t_loc = fit.get("t_loc")
+        t_scale = fit.get("t_scale")
+        if all(v is not None and np.isfinite(v) for v in [t_df, t_loc, t_scale]) and t_scale > 0:
+            q_values = stats.t.ppf(probs, df=t_df, loc=t_loc, scale=t_scale)
+            dist_used = "Student t"
+
+    if q_values is None:
+        mu = fit.get("norm_loc", float(np.mean(errors)))
+        sigma = fit.get("norm_scale", float(np.std(errors, ddof=0)))
+        if sigma <= 0 or not np.isfinite(sigma):
+            q_values = np.full_like(probs, np.nan, dtype=float)
+        else:
+            q_values = stats.norm.ppf(probs, loc=mu, scale=sigma)
+        if preferred == "equivalent":
+            dist_used = "Equivalent->Normal"
+
+    return [
+        ["Best fit used", dist_used],
+        ["q05", fmt(q_values[0])],
+        ["q25", fmt(q_values[1])],
+        ["q50", fmt(q_values[2])],
+        ["q75", fmt(q_values[3])],
+        ["q95", fmt(q_values[4])],
+    ]
+
+
+def plot_histogram(ax: plt.Axes, errors: np.ndarray, title: str, fit: dict) -> None:
     bins = max(6, min(14, len(errors) // 2))
     counts, bin_edges, _ = ax.hist(
         errors,
@@ -122,28 +197,108 @@ def plot_histogram(ax: plt.Axes, errors: np.ndarray, title: str) -> None:
 
     mu = float(np.mean(errors))
     sigma = float(np.std(errors, ddof=0))
+    preferred = fit.get("preferred", "equivalent")
+    normal_lw = 3.0 if preferred == "norm" else 1.8
+    t_lw = 3.0 if preferred == "t" else 1.8
+
     if sigma > 0 and len(bin_edges) > 1:
         x = np.linspace(bin_edges[0], bin_edges[-1], 300)
         bin_width = bin_edges[1] - bin_edges[0]
         y = stats.norm.pdf(x, loc=mu, scale=sigma) * len(errors) * bin_width
-        ax.plot(x, y, color="#E45756", linewidth=2.0, label="Normal fit")
+        ax.plot(x, y, color="#E45756", linewidth=normal_lw, label="Normal fit")
 
         try:
             t_df, t_loc, t_scale = stats.t.fit(errors)
             if np.isfinite(t_df) and np.isfinite(t_loc) and np.isfinite(t_scale) and t_scale > 0:
                 y_t = stats.t.pdf(x, df=t_df, loc=t_loc, scale=t_scale) * len(errors) * bin_width
-                ax.plot(x, y_t, color="#54A24B", linewidth=2.0, label="Student t fit")
+                ax.plot(x, y_t, color="#54A24B", linewidth=t_lw, label="Student t fit")
         except Exception:
             pass
 
         ax.legend(loc="upper right", frameon=True, fontsize=FONT_SIZE)
 
     ax.axvline(mu, color="#F58518", linestyle="--", linewidth=1.5)
-    ax.set_title(title, fontsize=FONT_SIZE, fontweight="bold")
-    ax.set_xlabel("")
+    ax.set_title("")
+    ax.set_xlabel("Offset", fontsize=FONT_SIZE)
     ax.set_ylabel("Count", fontsize=FONT_SIZE)
     ax.tick_params(axis="both", labelsize=FONT_SIZE)
     ax.grid(True, alpha=0.25, axis="y")
+
+
+def plot_point_box_jitter(ax: plt.Axes, sensor_name: str, point_errors: dict[int, np.ndarray]) -> None:
+    if not point_errors:
+        ax.text(0.5, 0.5, "No point errors", ha="center", va="center", fontsize=FONT_SIZE, transform=ax.transAxes)
+        ax.set_title(sensor_name, fontsize=FONT_SIZE, fontweight="bold")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        return
+
+    points = sorted(point_errors.keys())
+    data = [point_errors[p] for p in points]
+
+    ax.boxplot(
+        data,
+        positions=points,
+        widths=0.55,
+        showfliers=False,
+        patch_artist=True,
+        boxprops=dict(facecolor="#BFD7EA", alpha=0.75, edgecolor="black"),
+        medianprops=dict(color="#E45756", linewidth=2.0),
+        whiskerprops=dict(color="black"),
+        capprops=dict(color="black"),
+    )
+
+    rng = np.random.default_rng(42)
+    for p, vals in zip(points, data):
+        x_jitter = p + rng.uniform(-0.12, 0.12, size=len(vals))
+        ax.scatter(x_jitter, vals, s=20, alpha=0.65, color="#2E5D8A", edgecolors="none")
+
+    ax.set_title(sensor_name, fontsize=FONT_SIZE, fontweight="bold")
+    ax.set_xlabel("Calibration point", fontsize=FONT_SIZE)
+    ax.set_ylabel("Raw error", fontsize=FONT_SIZE)
+    ax.set_xticks(points)
+    ax.tick_params(axis="both", labelsize=FONT_SIZE)
+    ax.grid(True, alpha=0.25, axis="y")
+
+
+def plot_best_fit_qq(ax: plt.Axes, errors: np.ndarray, fit: dict) -> None:
+    if errors.size < 3:
+        ax.text(0.5, 0.5, "n < 3", ha="center", va="center", fontsize=FONT_SIZE, transform=ax.transAxes)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        return
+
+    probs = (np.arange(1, errors.size + 1) - 0.5) / errors.size
+    sample_q = np.sort(errors)
+    preferred = fit.get("preferred", "equivalent")
+
+    if preferred == "t":
+        t_df = fit.get("t_df")
+        t_loc = fit.get("t_loc")
+        t_scale = fit.get("t_scale")
+        if all(v is not None and np.isfinite(v) for v in [t_df, t_loc, t_scale]) and t_scale > 0:
+            theoretical_q = stats.t.ppf(probs, df=t_df, loc=t_loc, scale=t_scale)
+            dist_label = "Student t"
+        else:
+            mu = fit.get("norm_loc", float(np.mean(errors)))
+            sigma = fit.get("norm_scale", float(np.std(errors, ddof=0)))
+            theoretical_q = stats.norm.ppf(probs, loc=mu, scale=sigma)
+            dist_label = "Normal"
+    else:
+        mu = fit.get("norm_loc", float(np.mean(errors)))
+        sigma = fit.get("norm_scale", float(np.std(errors, ddof=0)))
+        theoretical_q = stats.norm.ppf(probs, loc=mu, scale=sigma)
+        dist_label = "Normal"
+
+    ax.scatter(theoretical_q, sample_q, color="#4C78A8", s=36, alpha=0.85, edgecolors="none")
+    lo = min(np.nanmin(theoretical_q), np.nanmin(sample_q))
+    hi = max(np.nanmax(theoretical_q), np.nanmax(sample_q))
+    ax.plot([lo, hi], [lo, hi], linestyle="--", color="#E45756", linewidth=2.0)
+    ax.set_title(f"Q-Q ({dist_label})", fontsize=FONT_SIZE, fontweight="bold")
+    ax.set_xlabel("Theoretical quantiles", fontsize=FONT_SIZE)
+    ax.set_ylabel("Sample quantiles", fontsize=FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=FONT_SIZE)
+    ax.grid(True, alpha=0.25)
 
 
 def create_figure(df: pd.DataFrame, output_png: Path, dpi: int = 300) -> None:
@@ -152,13 +307,14 @@ def create_figure(df: pd.DataFrame, output_png: Path, dpi: int = 300) -> None:
     df["Offset"] = pd.to_numeric(df["Offset"], errors="coerce")
 
     plt.rcParams.update({"font.size": FONT_SIZE})
-    fig, axes = plt.subplots(2, 6, figsize=(30, 10), dpi=dpi)
+    fig, axes = plt.subplots(4, 6, figsize=(30, 17), dpi=dpi)
     for col, sensor in enumerate(SENSOR_ORDER):
         sensor_errors = (
             df.loc[df["Sensor_Normalized"] == sensor, "Offset"]
             .dropna()
             .to_numpy(dtype=float)
         )
+        sensor_point_errors = _load_raw_point_errors(sensor)
         sensor_points = (
             pd.to_numeric(df.loc[df["Sensor_Normalized"] == sensor, "N_Points"], errors="coerce")
             .dropna()
@@ -167,41 +323,52 @@ def create_figure(df: pd.DataFrame, output_png: Path, dpi: int = 300) -> None:
             else np.array([])
         )
 
-        top_ax = axes[0, col]
-        bottom_ax = axes[1, col]
+        fit = test_distribution_fit(sensor_errors, "Offset")
+        box_ax = axes[0, col]
+        hist_ax = axes[1, col]
+        table_ax = axes[2, col]
+        quant_ax = axes[3, col]
 
         if sensor_errors.size < 3:
-            top_ax.text(
+            plot_point_box_jitter(box_ax, sensor, sensor_point_errors)
+            hist_ax.text(
                 0.5, 0.5, "Insufficient data", ha="center", va="center",
-                fontsize=FONT_SIZE, transform=top_ax.transAxes
+                fontsize=FONT_SIZE, transform=hist_ax.transAxes
             )
-            top_ax.set_title(sensor, fontsize=FONT_SIZE, fontweight="bold")
-            top_ax.set_xticks([])
-            top_ax.set_yticks([])
+            hist_ax.set_title("")
+            hist_ax.set_xlabel("Offset", fontsize=FONT_SIZE)
+            hist_ax.set_xticks([])
+            hist_ax.set_yticks([])
 
-            bottom_ax.axis("off")
-            bottom_ax.text(
+            table_ax.axis("off")
+            table_ax.text(
                 0.5, 0.5, "n < 3", ha="center", va="center",
-                fontsize=FONT_SIZE, transform=bottom_ax.transAxes
+                fontsize=FONT_SIZE, transform=table_ax.transAxes
+            )
+            quant_ax.axis("off")
+            quant_ax.text(
+                0.5, 0.5, "n < 3", ha="center", va="center",
+                fontsize=FONT_SIZE, transform=quant_ax.transAxes
             )
             continue
 
-        plot_histogram(top_ax, sensor_errors, sensor)
+        plot_point_box_jitter(box_ax, sensor, sensor_point_errors)
+        plot_histogram(hist_ax, sensor_errors, "", fit)
 
-        bottom_ax.axis("off")
-        table_rows = build_sensor_table_rows(sensor_errors, sensor_points)
-        table = bottom_ax.table(
+        table_ax.axis("off")
+        table_rows = build_sensor_table_rows(fit, sensor_errors, sensor_points)
+        table = table_ax.table(
             cellText=table_rows,
-            colLabels=["Metric", "Value"],
             loc="center",
             cellLoc="left",
-            colLoc="left",
         )
         table.auto_set_font_size(False)
         table.set_fontsize(FONT_SIZE)
         table.scale(1.0, 1.25)
 
-    fig.subplots_adjust(top=0.97, bottom=0.05, left=0.03, right=0.995, hspace=0.03, wspace=0.20)
+        plot_best_fit_qq(quant_ax, sensor_errors, fit)
+
+    fig.subplots_adjust(top=0.985, bottom=0.03, left=0.03, right=0.995, hspace=0.15, wspace=0.24)
     output_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_png, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
