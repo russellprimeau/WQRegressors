@@ -952,6 +952,7 @@ def save_sensor_uncertainty_summary(og_df, sensor_name, n_calibration_points, ou
     Outputs a CSV with:
     - Number of calibration points available
     - Offset distribution (mean, std, preferred distribution type)
+    - Offset Student's t fit parameters (df, loc, scale)
     - Gain distribution (if >=2 calibration points)
     - Noise distribution (if >=3 calibration points)
     """
@@ -969,10 +970,16 @@ def save_sensor_uncertainty_summary(og_df, sensor_name, n_calibration_points, ou
         offset_fit = test_distribution_fit(offsets, 'Offset')
         preferred = offset_fit.get('preferred', 'normal')
         summary['Offset_Distribution'] = preferred if preferred != 'equivalent' else 'normal'
+        summary['Offset_t_df'] = offset_fit.get('t_df', np.nan)
+        summary['Offset_t_loc'] = offset_fit.get('t_loc', np.nan)
+        summary['Offset_t_scale'] = offset_fit.get('t_scale', np.nan)
     else:
         summary['Offset_Mean'] = np.nan
         summary['Offset_Std'] = np.nan
         summary['Offset_Distribution'] = 'normal'
+        summary['Offset_t_df'] = np.nan
+        summary['Offset_t_loc'] = np.nan
+        summary['Offset_t_scale'] = np.nan
     
     # Gain (if >=2 calibration points)
     if n_calibration_points >= 2:

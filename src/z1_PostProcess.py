@@ -5,6 +5,8 @@ Examples:
 python src/i_PostProcess.py --keep-search-plots
 python src/i_PostProcess.py --sweep-namespace feature_sweeps
 python src/i_PostProcess.py --sweep-namespace Shapley_sweeps
+python src/i_PostProcess.py --path data/output/regression_alt
+python src/i_PostProcess.py --path C:\\full\\path\\tos
 """
 from __future__ import annotations
 import contextlib
@@ -232,6 +234,80 @@ def _finalize_stacked_figure(fig, axes, left: float = 0.30, right: float = 0.98,
                              bottom: float = 0.12, hspace: float = 0.50) -> None:
     _style_stacked_axes(axes)
     fig.subplots_adjust(left=left, right=right, top=top, bottom=bottom, hspace=hspace)
+
+
+def _resolve_summary_plot_dirs(summaries_dir: Path) -> tuple[Path, Path, Path]:
+    combined_dir = (summaries_dir / "combined").resolve()
+    individual_dir = (summaries_dir / "individual").resolve()
+    evaluation_dir = (summaries_dir / "evaluation").resolve()
+    for out_dir in (combined_dir, individual_dir, evaluation_dir):
+        out_dir.mkdir(parents=True, exist_ok=True)
+    return combined_dir, individual_dir, evaluation_dir
+
+
+def _save_subplot_panels(
+    fig,
+    axes,
+    out_dir: Path,
+    base_name: str,
+    dpi: int = 300,
+) -> list[Path]:
+    """Save each axis from a combined figure as its own image without axis titles."""
+    saved: list[Path] = []
+    ax_list = list(np.atleast_1d(axes).ravel())
+    if not ax_list:
+        return saved
+
+    # Shared-x figures usually render category tick labels on the bottom subplot only.
+    # Copy that tick context to all axes so each exported panel is self-contained.
+    ref_ticks = None
+    ref_labels = None
+    ref_style = None
+    ref_xlabel = ""
+    for ref_ax in reversed(ax_list):
+        labels = [t.get_text() for t in ref_ax.get_xticklabels()]
+        if any(str(lbl).strip() for lbl in labels):
+            ref_ticks = ref_ax.get_xticks()
+            ref_labels = labels
+            for t in ref_ax.get_xticklabels():
+                if str(t.get_text()).strip():
+                    ref_style = {
+                        "rotation": t.get_rotation(),
+                        "ha": t.get_ha(),
+                        "va": t.get_va(),
+                        "fontsize": t.get_fontsize(),
+                    }
+                    break
+            ref_xlabel = str(ref_ax.get_xlabel() or "")
+            break
+
+    for ax in ax_list:
+        ax.set_title("")
+        ax.tick_params(axis='x', labelbottom=True)
+        if ref_ticks is not None:
+            ax.set_xticks(ref_ticks)
+        if ref_labels is not None and ref_ticks is not None and len(ref_labels) == len(ref_ticks):
+            ax.set_xticklabels(ref_labels)
+        if ref_style:
+            for tick in ax.get_xticklabels():
+                tick.set_rotation(ref_style["rotation"])
+                tick.set_ha(ref_style["ha"])
+                tick.set_va(ref_style["va"])
+                tick.set_fontsize(ref_style["fontsize"])
+        if ref_xlabel and not str(ax.get_xlabel() or "").strip():
+            ax.set_xlabel(ref_xlabel)
+
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    for idx, ax in enumerate(ax_list, start=1):
+        bbox = ax.get_tightbbox(renderer)
+        if bbox is None:
+            bbox = ax.get_window_extent(renderer)
+        bbox_inches = bbox.expanded(1.03, 1.08).transformed(fig.dpi_scale_trans.inverted())
+        panel_path = out_dir / f"{base_name}__panel_{idx:02d}.png"
+        fig.savefig(panel_path, dpi=dpi, bbox_inches=bbox_inches)
+        saved.append(panel_path)
+    return saved
 
 
 def _normalize_model_key(value: str) -> str:
@@ -1019,7 +1095,8 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
 
 def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
     workspace_root = Path(__file__).resolve().parent.parent
-    data_root = Path(args.data_root)
+    data_root_arg = args.path if getattr(args, "path", None) else args.data_root
+    data_root = Path(data_root_arg)
     run_rolling_cv = bool(getattr(args, "run_rolling_cv", False))
     if not data_root.is_absolute():
         data_root = (workspace_root / data_root).resolve()
@@ -1300,6 +1377,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 sweep_namespace=str(getattr(args, "sweep_namespace", "feature_sweeps")),
             )
             summaries_dir.mkdir(parents=True, exist_ok=True)
+            combined_dir, individual_dir, evaluation_dir = _resolve_summary_plot_dirs(summaries_dir)
             for entry in best_model_performance:
                 dataset = entry['dataset']
                 # Standard location for a full-dataset evaluation summary with baselines
@@ -1396,7 +1474,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             ax_r2_combo.set_xticks(x)
             ax_r2_combo.set_xticklabels(labels, rotation=45, ha='right')
             plt.tight_layout()
-            plot_path = summaries_dir / "summary_best_model_performance.png"
+            plot_path = combined_dir / "summary_best_model_performance.png"
             fig.savefig(plot_path, dpi=180, bbox_inches='tight')
             plt.close(fig)
             print(f"[INFO] Wrote summary_best_model_performance.png to {plot_path}")
@@ -1410,7 +1488,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             ax_nrmse.grid(axis='y', alpha=0.3)
             ax_nrmse.legend()
             plt.tight_layout()
-            nrmse_path = summaries_dir / "summary_best_model_nrmse.png"
+            nrmse_path = individual_dir / "summary_best_model_nrmse.png"
             fig_nrmse.savefig(nrmse_path, dpi=300, bbox_inches='tight')
             plt.close(fig_nrmse)
             print(f"[INFO] Wrote nRMSE subplot: {nrmse_path}")
@@ -1427,7 +1505,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             ax_r2.grid(axis='y', alpha=0.3)
             ax_r2.legend()
             plt.tight_layout()
-            r2_path = summaries_dir / "summary_best_model_r2.png"
+            r2_path = individual_dir / "summary_best_model_r2.png"
             fig_r2.savefig(r2_path, dpi=300, bbox_inches='tight')
             plt.close(fig_r2)
             print(f"[INFO] Wrote R2 subplot: {r2_path}")
@@ -1442,7 +1520,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             ax_skill.grid(axis='y', alpha=0.3)
             ax_skill.legend()
             plt.tight_layout()
-            skill_path = summaries_dir / "summary_best_model_skill.png"
+            skill_path = individual_dir / "summary_best_model_skill.png"
             fig_skill.savefig(skill_path, dpi=300, bbox_inches='tight')
             plt.close(fig_skill)
             print(f"[INFO] Wrote skill score subplot: {skill_path}")
@@ -1531,10 +1609,12 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             conf_axes[4].set_xticks(x)
             conf_axes[4].set_xticklabels(labels, rotation=45, ha='right')
             _finalize_stacked_figure(fig_conf, conf_axes, left=0.30, hspace=0.48)
-            conf_path = summaries_dir / "summary_best_model_confidence.png"
+            conf_path = combined_dir / "summary_best_model_confidence.png"
             fig_conf.savefig(conf_path, dpi=300, bbox_inches='tight')
+            conf_panels = _save_subplot_panels(fig_conf, conf_axes, individual_dir, "summary_best_model_confidence")
             plt.close(fig_conf)
             print(f"[INFO] Wrote confidence subplot: {conf_path}")
+            print(f"[INFO] Wrote {len(conf_panels)} confidence panel(s) to {individual_dir}")
 
             # --- Evidence diagnostics figures (tests, effects, intervals, gates) ---
             def _col(name: str) -> pd.Series:
@@ -1580,10 +1660,12 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             axes_tests[-1].set_xticks(x)
             axes_tests[-1].set_xticklabels(labels, rotation=45, ha='right')
             _finalize_stacked_figure(fig_tests, axes_tests, left=0.34, hspace=0.55)
-            tests_path = summaries_dir / "summary_evidence_tests.png"
+            tests_path = combined_dir / "summary_evidence_tests.png"
             fig_tests.savefig(tests_path, dpi=300, bbox_inches='tight')
+            tests_panels = _save_subplot_panels(fig_tests, axes_tests, individual_dir, "summary_evidence_tests")
             plt.close(fig_tests)
             print(f"[INFO] Wrote evidence tests figure: {tests_path}")
+            print(f"[INFO] Wrote {len(tests_panels)} evidence test panel(s) to {individual_dir}")
 
             # Effect size and bootstrap summaries (interpretation flow).
             fig_eff, axes_eff = plt.subplots(10, 1, figsize=(max(12, len(perf_df) * 0.8), 31), sharex=True)
@@ -1601,10 +1683,12 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             axes_eff[-1].set_xticks(x)
             axes_eff[-1].set_xticklabels(labels, rotation=45, ha='right')
             _finalize_stacked_figure(fig_eff, axes_eff, left=0.36, hspace=0.56)
-            eff_path = summaries_dir / "summary_evidence_effects.png"
+            eff_path = combined_dir / "summary_evidence_effects.png"
             fig_eff.savefig(eff_path, dpi=300, bbox_inches='tight')
+            eff_panels = _save_subplot_panels(fig_eff, axes_eff, individual_dir, "summary_evidence_effects")
             plt.close(fig_eff)
             print(f"[INFO] Wrote evidence effects figure: {eff_path}")
+            print(f"[INFO] Wrote {len(eff_panels)} evidence effect panel(s) to {individual_dir}")
 
             # Interval diagnostics and sample support
             fig_int, axes_int = plt.subplots(9, 1, figsize=(max(12, len(perf_df) * 0.8), 28), sharex=True)
@@ -1667,10 +1751,12 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             axes_int[-1].set_xticks(x)
             axes_int[-1].set_xticklabels(labels, rotation=45, ha='right')
             _finalize_stacked_figure(fig_int, axes_int, left=0.36, hspace=0.56)
-            int_path = summaries_dir / "summary_evidence_intervals_support.png"
+            int_path = combined_dir / "summary_evidence_intervals_support.png"
             fig_int.savefig(int_path, dpi=300, bbox_inches='tight')
+            int_panels = _save_subplot_panels(fig_int, axes_int, individual_dir, "summary_evidence_intervals_support")
             plt.close(fig_int)
             print(f"[INFO] Wrote evidence interval/support figure: {int_path}")
+            print(f"[INFO] Wrote {len(int_panels)} interval/support panel(s) to {individual_dir}")
 
             # Gate-by-gate outcomes used in evidence scoring
             fig_gate, axes_gate = plt.subplots(10, 1, figsize=(max(12, len(perf_df) * 0.8), 30), sharex=True)
@@ -1692,10 +1778,12 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             axes_gate[-1].set_xticks(x)
             axes_gate[-1].set_xticklabels(labels, rotation=45, ha='right')
             _finalize_stacked_figure(fig_gate, axes_gate, left=0.40, hspace=0.60)
-            gate_path = summaries_dir / "summary_evidence_gates.png"
+            gate_path = combined_dir / "summary_evidence_gates.png"
             fig_gate.savefig(gate_path, dpi=300, bbox_inches='tight')
+            gate_panels = _save_subplot_panels(fig_gate, axes_gate, individual_dir, "summary_evidence_gates")
             plt.close(fig_gate)
             print(f"[INFO] Wrote evidence gates figure: {gate_path}")
+            print(f"[INFO] Wrote {len(gate_panels)} evidence gate panel(s) to {individual_dir}")
 
             # MC replicate uncertainty impact on final accuracy/evidence
             def _is_informative_series(s: pd.Series, atol: float = 1e-12) -> bool:
@@ -1735,10 +1823,12 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 axes_mc[-1].set_xticks(x)
                 axes_mc[-1].set_xticklabels(labels, rotation=45, ha='right')
                 _finalize_stacked_figure(fig_mc, axes_mc, left=0.38, hspace=0.58)
-                mc_path = summaries_dir / "summary_mc_uncertainty_impact.png"
+                mc_path = combined_dir / "summary_mc_uncertainty_impact.png"
                 fig_mc.savefig(mc_path, dpi=300, bbox_inches='tight')
+                mc_panels = _save_subplot_panels(fig_mc, axes_mc, individual_dir, "summary_mc_uncertainty_impact")
                 plt.close(fig_mc)
                 print(f"[INFO] Wrote MC uncertainty impact figure: {mc_path}")
+                print(f"[INFO] Wrote {len(mc_panels)} MC uncertainty panel(s) to {individual_dir}")
             else:
                 print("[INFO] Skipped MC uncertainty impact figure: all panels were constant or non-finite.")
 
@@ -1817,8 +1907,8 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 "Minimum Probability of Positive Skill",
                 "Minimum 95% Lower Confidence Bound of Skill",
                 "Best False Discovery Rate Adjusted q-value",
-                "Overall Evidence Tier",
                 "Independent Raw Segment Count",
+                "Overall Evidence Tier",
             ]
             if np.isfinite(quality_df["Best p-value"].to_numpy(dtype=float)).any():
                 heat_cols.insert(7, "Best p-value")
@@ -1864,13 +1954,13 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 fmt="",
                 annot_kws={"fontsize": 8},
             )
-            ax_mat.set_title("Model Quality Matrix (higher color = better within each metric)")
+            ax_mat.set_title("")
             ax_mat.set_xlabel("Metrics")
             ax_mat.set_ylabel("Dataset")
             ax_mat.set_yticklabels(ax_mat.get_yticklabels(), rotation=0)
             ax_mat.set_xticklabels(ax_mat.get_xticklabels(), rotation=35, ha="right")
             plt.tight_layout()
-            matrix_path = summaries_dir / "summary_model_quality_matrix.png"
+            matrix_path = evaluation_dir / "summary_model_quality_matrix.png"
             fig_mat.savefig(matrix_path, dpi=300, bbox_inches='tight')
             plt.close(fig_mat)
             print(f"[INFO] Wrote model quality matrix: {matrix_path}")
@@ -1921,10 +2011,12 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 cv_axes[-1].set_xticks(x)
                 cv_axes[-1].set_xticklabels(labels, rotation=45, ha='right')
                 plt.tight_layout()
-                cv_path = summaries_dir / "cross-validation.png"
+                cv_path = combined_dir / "cross-validation.png"
                 fig_cv.savefig(cv_path, dpi=300, bbox_inches='tight')
+                cv_panels = _save_subplot_panels(fig_cv, cv_axes, individual_dir, "cross-validation")
                 plt.close(fig_cv)
                 print(f"[INFO] Wrote cross-validation figure: {cv_path}")
+                print(f"[INFO] Wrote {len(cv_panels)} cross-validation panel(s) to {individual_dir}")
             else:
                 if run_rolling_cv:
                     print("[WARN] No cross-validation data available; cross-validation.png not generated.")
@@ -1957,6 +2049,12 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = build_parser()
+    parser.add_argument(
+        "--path",
+        type=str,
+        default=None,
+        help="Optional alias for --data-root; dataset root directory to scan.",
+    )
     parser.add_argument("--dm-max-lag", type=int, default=1, help="Max HAC lag for Diebold-Mariano test.")
     parser.add_argument("--bootstrap-iterations", type=int, default=2000, help="Bootstrap iterations for grouped skill confidence.")
     parser.add_argument("--bootstrap-seed", type=int, default=42, help="Random seed for bootstrap evidence.")
@@ -1991,7 +2089,8 @@ def main() -> int:
     args = parser.parse_args()
     os.environ["WQ_FEATURE_SWEEP_NAMESPACE"] = str(args.sweep_namespace).strip() or "feature_sweeps"
     workspace_root = Path(__file__).resolve().parent.parent
-    data_root = Path(args.data_root)
+    data_root_arg = args.path if args.path else args.data_root
+    data_root = Path(data_root_arg)
     if not data_root.is_absolute():
         data_root = (workspace_root / data_root).resolve()
     include_regular, include_res = _resolve_dataset_inclusion(args)
@@ -2008,4 +2107,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

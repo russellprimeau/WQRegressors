@@ -956,12 +956,15 @@ def evaluate_single_config(config_path, save_plots_override=None):
         # Load historic data for baselines
         historic = eval_cfg["historic_path"]
         sample_subdir = data_cfg.get("sample_subdir", "samples")
+        baseline_output_rows = _baseline_output_rows_start(data_cfg.get("output_rows", -1))
         # Naive baseline
         preds_naive, targets_naive = evaluate_naive(
             eval_samples,
             historic,
             output_columns,
             data_cfg["data_dir"],
+            output_rows=baseline_output_rows,
+            gap_hours=int(eval_cfg.get("gap_hours", 5)),
             sample_subdir=sample_subdir
         )
         # Seasonal baseline
@@ -970,6 +973,8 @@ def evaluate_single_config(config_path, save_plots_override=None):
             historic,
             output_columns,
             data_cfg["data_dir"],
+            output_rows=baseline_output_rows,
+            diurnal_window=int(eval_cfg.get("diurnal_window", 2)),
             sample_subdir=sample_subdir
         )
         # Linear baseline
@@ -979,6 +984,11 @@ def evaluate_single_config(config_path, save_plots_override=None):
             eval_samples,
             historic,
             output_columns,
+            output_rows=baseline_output_rows,
+            window_hours=int(eval_cfg.get("window_hours", 340)),
+            gap_hours=int(eval_cfg.get("gap_hours", 0)),
+            debug_plot=bool(eval_cfg.get("debug_plot", False)),
+            examples=int(eval_cfg.get("debug_examples", 10)),
             sample_subdir=sample_subdir
         )
         baseline_pairs = [

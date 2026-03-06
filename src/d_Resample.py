@@ -12,8 +12,83 @@ import yaml
 import matplotlib
 import matplotlib.pyplot as plt
 import plotly.express as px
+from scipy import stats
 from pathlib import Path
 from utils.preprocessing import normalize_columns
+
+
+def _default_aggregate_offset_csv():
+    root = Path(__file__).resolve().parent.parent
+    candidates = [
+        root / "data" / "output" / "calibration" / "aggregate" / "offset_gain_model_results.csv",
+        root / "data" / "output" / "calibration" / "summaries" / "aggregate" / "offset_gain_model_results.csv",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _fit_offset_t_params_from_aggregate(sensor_names):
+    """Fit per-sensor Student's t parameters from aggregate offset data."""
+    agg_csv = _default_aggregate_offset_csv()
+    if agg_csv is None:
+        raise FileNotFoundError(
+            "Could not find offset_gain_model_results.csv in expected calibration aggregate paths."
+        )
+
+    agg_df = pd.read_csv(agg_csv)
+    if "Sensor" not in agg_df.columns or "Offset" not in agg_df.columns:
+        raise ValueError(f"Aggregate CSV missing required columns Sensor/Offset: {agg_csv}")
+
+    def _normalize_sensor_name(name):
+        text = str(name).strip().replace("Âµ", "µ")
+        if "Sp Cond" in text:
+            return "Sp Cond (microS_cm)"
+        return text
+
+    agg_df = agg_df.copy()
+    agg_df["Sensor_Normalized"] = agg_df["Sensor"].map(_normalize_sensor_name)
+    agg_df["Offset"] = pd.to_numeric(agg_df["Offset"], errors='coerce')
+
+    out = {}
+    for sensor_name in sensor_names:
+        offsets = (
+            agg_df.loc[agg_df["Sensor_Normalized"] == sensor_name, "Offset"]
+            .dropna()
+            .to_numpy(dtype=float)
+        )
+        if offsets.size < 3:
+            raise ValueError(
+                f"Insufficient offset data for Student's t fit: sensor={sensor_name}, n={offsets.size}"
+            )
+
+        try:
+            t_df, t_loc, t_scale = stats.t.fit(offsets)
+        except Exception as exc:
+            raise ValueError(f"Could not fit Student's t for sensor={sensor_name}: {exc}") from exc
+
+        if (
+            (not np.isfinite(t_df))
+            or (not np.isfinite(t_loc))
+            or (not np.isfinite(t_scale))
+            or t_scale <= 0
+        ):
+            raise ValueError(
+                f"Invalid Student's t parameters for sensor={sensor_name}: "
+                f"df={t_df}, loc={t_loc}, scale={t_scale}"
+            )
+
+        out[sensor_name] = {
+            "Offset_Distribution": "t",
+            "Offset_t_df": float(t_df),
+            "Offset_t_loc": float(t_loc),
+            "Offset_t_scale": float(t_scale),
+            "Offset_Mean": float(np.mean(offsets)),
+            "Offset_Std": float(np.std(offsets, ddof=0)),
+        }
+
+    return out
 
 
 def _normalize_once(df, columns, min_val=0.0, max_val=1.0):
@@ -62,6 +137,13 @@ def _load_and_prepare_sensor_uncertainties(output_dir, normalization_params=None
         else:
             if verbose:
                 print(f"  X: No uncertainty summary found for {sensor_name}")
+
+    # Force Student's t offset model from aggregate fits. Fail fast if parameters cannot be fitted.
+    t_fit_map = _fit_offset_t_params_from_aggregate(sensor_names)
+    for sensor_name in sensor_names:
+        if sensor_name not in sensor_uncertainties:
+            sensor_uncertainties[sensor_name] = {}
+        sensor_uncertainties[sensor_name].update(t_fit_map[sensor_name])
 
     if normalization_params is None:
         normalization_file = Path(output_dir) / "normalization.json"
@@ -337,10 +419,17 @@ def load_sensor_uncertainty_summary(sensor_name, corrections_dir):
         return None
 
 
-def sample_from_distribution(mean, std, distribution_type='normal', size=1):
+def sample_from_distribution(
+    mean,
+    std,
+    distribution_type='normal',
+    size=1,
+    t_df=None,
+    t_loc=None,
+    t_scale=None,
+):
     """
-    Sample from a distribution given mean and std.
-    distribution_type: 'normal' or 't' (Student's t approximated as normal for simplicity)
+    Sample from a distribution given mean/std or explicit Student's t parameters.
     """
     if pd.isna(mean) or pd.isna(std) or std == 0:
         return np.zeros(size) if size > 1 else 0
@@ -348,10 +437,21 @@ def sample_from_distribution(mean, std, distribution_type='normal', size=1):
     if distribution_type == 'normal' or distribution_type == 'equivalent':
         return np.random.normal(mean, std, size)
     elif distribution_type == 't':
-        # Approximate t-distribution as normal (could use scipy.stats.t if needed)
-        return np.random.normal(mean, std, size)
+        if (
+            t_df is None
+            or t_loc is None
+            or t_scale is None
+            or (not np.isfinite(t_df))
+            or (not np.isfinite(t_loc))
+            or (not np.isfinite(t_scale))
+            or t_scale <= 0
+        ):
+            raise ValueError(
+                f"Missing/invalid Student's t params: df={t_df}, loc={t_loc}, scale={t_scale}"
+            )
+        return stats.t.rvs(df=t_df, loc=t_loc, scale=t_scale, size=size)
     else:
-        return np.random.normal(mean, std, size)
+        raise ValueError(f"Unsupported distribution_type={distribution_type!r}")
 
 
 def normalize_uncertainty_params(params, col_name, norm_params):
@@ -376,7 +476,7 @@ def normalize_uncertainty_params(params, col_name, norm_params):
     params_normalized = params.copy()
     
     # Scale additive components (offset, noise) by range
-    for key in ['Offset_Mean', 'Offset_Std', 'Noise_Std_Mean', 'Noise_Std_Std']:
+    for key in ['Offset_Mean', 'Offset_Std', 'Noise_Std_Mean', 'Noise_Std_Std', 'Offset_t_loc', 'Offset_t_scale']:
         if key in params_normalized:
             params_normalized[key] = params_normalized.get(key, 0) / v_range
     
@@ -428,7 +528,10 @@ def apply_uncertainty_perturbation(segment_df, sensor_uncertainties, random_seed
             uncertainty_info.get('Offset_Mean', 0),
             uncertainty_info.get('Offset_Std', 0),
             uncertainty_info.get('Offset_Distribution', 'normal'),
-            size=1
+            size=1,
+            t_df=uncertainty_info.get('Offset_t_df'),
+            t_loc=uncertainty_info.get('Offset_t_loc'),
+            t_scale=uncertainty_info.get('Offset_t_scale'),
         )[0]
         
         mask = df_perturbed[column_name].notna()
@@ -755,8 +858,7 @@ if __name__ == '__main__':
     predictor_cols  = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
                         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
                         'Pfl - fDOM (QSU)', "Wind speed x (m/s)", "Wind speed y (m/s)",
-                        'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
-                        'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
+                        "Atmospheric pressure (mBar)", 'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
                         '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
         'SCADA - pH', 'SCADA - Temperature (°C)']
     target_columns = ['Color_res',
@@ -801,11 +903,11 @@ if __name__ == '__main__':
         'Turbidity (FNU)_state', 'pH_state', 'E.coli (CFU/100mL)_state', 'Intestinal enterococci (CFU/100mL)_state', 
         'Colony Count 22°C (CFU/mL)_state', 'Total coliforms 37°C (CFU/100mL)_state', 'Arsenic (µg/L)_state',
         'Lead (µg/L)_state', 'Cadmium (µg/L)_state', 'Copper filtered (mg/L)_state', 'Chromium (µg/L)_state', 'Nickel (µg/L)_state', 
-        'Zinc (µg/L)_state', 'Color',
-        'Turbidity (FNU)', 'pH', 'E.coli (CFU/100mL)', 'Intestinal enterococci (CFU/100mL)', 
-        'Colony Count 22°C (CFU/mL)', 'Total coliforms 37°C (CFU/100mL)', 'Arsenic (µg/L)',
-        'Lead (µg/L)', 'Cadmium (µg/L)', 'Copper filtered (mg/L)', 'Chromium (µg/L)', 'Nickel (µg/L)', 
-        'Zinc (µg/L)']
+        'Zinc (µg/L)_state', 'Color_res',
+        'Turbidity (FNU)_res', 'pH_res', 'E.coli (CFU/100mL)_res', 'Intestinal enterococci (CFU/100mL)_res', 
+        'Colony Count 22°C (CFU/mL)_res', 'Total coliforms 37°C (CFU/100mL)_res', 'Arsenic (µg/L)_res',
+        'Lead (µg/L)_res', 'Cadmium (µg/L)_res', 'Copper filtered (mg/L)_res', 'Chromium (µg/L)_res', 'Nickel (µg/L)_res', 
+        'Zinc (µg/L)_res']
 
     # to_normalize = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
     #                     'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
