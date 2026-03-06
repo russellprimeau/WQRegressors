@@ -1,43 +1,61 @@
 """
 TMC-Shapley feature-selection sweeper for MC datasets.
 
-This mirrors the orchestration in h_RunMCFeatureSelectionSweep.py:
-- Discover MC datasets/configs
-- Search feature subsets with a surrogate model
-- Write search trace + selected subsets under forecasts/Shapley_sweeps
-- Retrain/evaluate all discovered model configs on top-K subsets
-- Write feature_sweep_final_metrics.csv
+Overview:
+- Mirrors the core orchestration in `h_RunMCFeatureSelectionSweep.py`:
+    discovery -> surrogate search -> top-K final retrain/evaluation.
+- Uses TMC-Shapley search instead of beam+swap:
+    permutation marginals, antithetic ordering, truncation near full-subset utility.
+- Writes to `forecasts/Shapley_sweeps` namespace.
 
-Search strategy here differs:
-- One-pass TMC-Shapley (permutation-based) under a strict eval budget cap
-- Antithetic permutations (forward + reverse) to reduce variance
-- Early truncation when subset utility is close to the full-feature utility
+Outputs:
+- `feature_shapley_scores_r###.csv` (Shapley estimates + CI diagnostics).
+- `feature_shapley_rankings_r###.json` (ranked feature payload).
+- `feature_seed_subsets_r###.csv` (optimizer seed subsets from ranked prefixes).
+- `feature_shapley_samples_r###.json` (full marginal sample lists for re-visualization).
+- Plot outputs (when --keep-shapley-plots enabled):
+    - `feature_shapley_ranking_bar_r###.png` (ranked Shapley values with 95% CI error bars).
+    - `feature_shapley_confidence_r###.png` (CI band visualization).
+    - `feature_shapley_distribution_r###.png` (violin plot of marginal distributions).
+    - `feature_shapley_coverage_r###.png` (sample accumulation per feature).
+    - `shapley_search_budget_r###.png` (eval budget utilization stacked bar).
+    - `shapley_search_progress_r###.png` (permutation progression curve).
+    - `feature_shapley_rank_stability_r###.png` (rank vs sample stability scatter).
+- Shared search/final artifacts via base helpers:
+    `feature_search_trace_r###.csv`, `feature_selected_subsets_r###.csv`,
+    optional `feature_search_pareto_r###.png`, `feature_sweep_final_metrics.csv`.
+- Post-final compatibility hooks:
+    baseline enforcement and dataset-level `evaluation_summary.csv` propagation.
 
-To get docs:
-python src/i_RunMCFeatureSelectionShapleySweep.py --help
+Important behavior:
+- Search baseline controls now match `h` semantics:
+    `--run-baselines-in-search` is mutually exclusive with
+    `--disable-baselines-for-search`.
+- Search phase is performance-oriented; final phase restores evaluation outputs.
+- Optional `--run-rolling-origin-cv` runs rolling-origin CV for best k01 model.
+- Visualization generation disabled by default for speed; enable with `--keep-shapley-plots`.
 
-Quick test:
-python src/i_RunMCFeatureSelectionShapleySweep.py --limit-datasets 1 --eval-budget 60 --final-top-k 2 --dry-run
+Key CLI groups:
+- Data selection: `--data-root`, `--dataset-prefix`, `--config-pattern`,
+    `--limit-datasets`, `--row-counts`, include/exclude dataset flags.
+- Shapley controls: `--eval-budget`, `--shapley-samples-per-feature`,
+    `--shapley-min-coalition-size`, `--tmc-max-permutations`,
+    `--tmc-truncation-epsilon`, `--tmc-bootstrap-resamples`, `--seed`.
+- Final/model controls: `--min-features`, `--lambda-drop`, `--final-top-k`.
+- Runtime/logging: baseline search flags, `--keep-{training,eval,search,shapley}-plots`,
+    `--show-training-logs`, `--run-rolling-origin-cv`, `--dry-run`, `--stop-on-error`.
 
-Full run:
-python src/i_RunMCFeatureSelectionShapleySweep.py `
-  --dataset-prefix MC `
-  --limit-datasets 0 `
-  --eval-budget 240 `
-  --final-top-k 4 `
-  --shapley-samples-per-feature 3 `
-  --tmc-truncation-epsilon 0.0025 `
-  --tmc-bootstrap-resamples 300 `
-  --run-baselines-in-final
+Examples:
+        python src/i_RunMCFeatureSelectionShapleySweep.py --dry-run
 
-Additional args:
---row-counts 24,48,72: evaluate multiple input window sizes.
---eval-budget: main runtime/quality knob.
---shapley-samples-per-feature: more samples = stabler Shapley estimates, slower.
---tmc-max-permutations: hard cap on permutation runs (0 = no explicit cap).
---tmc-truncation-epsilon: larger = more truncation/faster, potentially noisier.
---regular-only / --res-only / --include-regular / --include-res: dataset filtering.
---keep-search-plots, --keep-training-plots, --keep-eval-plots: retain more figures/artifacts.
+        python src/i_RunMCFeatureSelectionShapleySweep.py \
+            --dataset-prefix MC --limit-datasets 0 --eval-budget 240 --final-top-k 4 \
+            --shapley-samples-per-feature 3 --tmc-truncation-epsilon 0.0025 \
+            --tmc-bootstrap-resamples 300 --keep-shapley-plots
+
+        python src/i_RunMCFeatureSelectionShapleySweep.py \
+            --dataset-prefix MC --eval-budget 180 --run-baselines-in-search \
+            --run-rolling-origin-cv --keep-shapley-plots
 """
 from __future__ import annotations
 
@@ -48,8 +66,11 @@ import sys
 import time
 from pathlib import Path
 
+import matplotlib.colors
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
 
 import e_Train as train_module
 import h_RunMCFeatureSelectionSweep as base
@@ -130,6 +151,371 @@ def _write_shapley_seed_artifacts(
     return rankings_json, seed_csv
 
 
+def _write_shapley_samples_json(
+    dataset_dir: Path,
+    row_count: int,
+    shapley_samples: dict[str, list[float]],
+    shapley_rows: list[dict],
+) -> Path:
+    """Save full marginal samples per feature for distribution analysis."""
+    out_dir = base._forecast_sweeps_dir(dataset_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build metadata dict for each feature
+    features_data = {}
+    for row in shapley_rows:
+        feature = row.get("feature", "")
+        if feature:
+            samples = shapley_samples.get(feature, [])
+            features_data[feature] = {
+                "values": [float(v) for v in samples],
+                "metadata": {
+                    "mean": float(row.get("shapley_value_est", np.nan)),
+                    "std": float(row.get("shapley_std", np.nan)),
+                    "median": float(row.get("shapley_median", np.nan)),
+                    "ci95_low": float(row.get("ci95_low", np.nan)),
+                    "ci95_high": float(row.get("ci95_high", np.nan)),
+                    "n_samples": int(row.get("n_marginal_samples", 0)),
+                    "rank": int(row.get("shapley_rank", 0)),
+                },
+            }
+
+    payload = {
+        "row_count": int(row_count),
+        "features": features_data,
+    }
+    
+    samples_json = out_dir / f"feature_shapley_samples_r{row_count:03d}.json"
+    with open(samples_json, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    
+    return samples_json
+
+
+def _plot_shapley_ranking_bar(
+    shapley_rows: list[dict],
+    dataset_name: str,
+    row_count: int,
+    output_dir: Path,
+    include_row_count_in_name: bool = False,
+) -> Path:
+    """Plot Shapley value ranking as horizontal bar chart with confidence interval whiskers."""
+    features = [str(r.get("feature", "")) for r in shapley_rows]
+    estimates = [float(r.get("shapley_value_est", np.nan)) for r in shapley_rows]
+    ci_lows = [float(r.get("ci95_low", np.nan)) for r in shapley_rows]
+    ci_highs = [float(r.get("ci95_high", np.nan)) for r in shapley_rows]
+
+    # Errors for plotting (differences from mean)
+    errors = [
+        [est - low for est, low in zip(estimates, ci_lows)],
+        [high - est for high, est in zip(ci_highs, estimates)],
+    ]
+
+    fig, ax = plt.subplots(figsize=(12, max(7, len(features) * 0.35)), constrained_layout=True)
+    
+    if estimates:
+        est_min = float(np.nanmin(estimates))
+        est_max = float(np.nanmax(estimates))
+        if est_max > est_min:
+            norm = matplotlib.colors.Normalize(vmin=est_min, vmax=est_max)
+            colors = [plt.cm.RdYlGn(float(norm(v))) for v in estimates]
+        else:
+            colors = [plt.cm.RdYlGn(0.5) for _ in estimates]
+    else:
+        colors = []
+
+    ax.barh(features, estimates, xerr=errors, color=colors, capsize=4, error_kw={"elinewidth": 1.5})
+    ax.set_xlabel("Shapley Value Estimate (with 95% CI)", fontsize=11)
+    ax.set_ylabel("Feature", fontsize=11)
+    ax.grid(axis='x', alpha=0.3)
+    ax.set_title(f"Shapley Feature Attribution Ranking ({dataset_name})", fontsize=12, fontweight='bold')
+
+    plot_filename = f"feature_shapley_ranking_bar_r{row_count:03d}.png" if include_row_count_in_name else "feature_shapley_ranking_bar.png"
+    plot_path = output_dir / plot_filename
+    fig.savefig(plot_path, dpi=180, bbox_inches='tight')
+    plt.close(fig)
+    return plot_path
+
+
+def _plot_shapley_confidence_heatmap(
+    shapley_rows: list[dict],
+    dataset_name: str,
+    row_count: int,
+    output_dir: Path,
+    include_row_count_in_name: bool = False,
+) -> Path:
+    """Plot Shapley confidence intervals as heatmap-style visualization."""
+    features = [str(r.get("feature", "")) for r in shapley_rows]
+    estimates = [float(r.get("shapley_value_est", np.nan)) for r in shapley_rows]
+    ci_lows = [float(r.get("ci95_low", np.nan)) for r in shapley_rows]
+    ci_highs = [float(r.get("ci95_high", np.nan)) for r in shapley_rows]
+
+    fig, ax = plt.subplots(figsize=(14, max(7, len(features) * 0.4)), constrained_layout=True)
+    
+    # Prepare data for horizontal layout
+    y_pos = np.arange(len(features))
+    
+    if estimates:
+        est_min = float(np.nanmin(estimates))
+        est_max = float(np.nanmax(estimates))
+        if est_max > est_min:
+            norm = matplotlib.colors.Normalize(vmin=est_min, vmax=est_max)
+            colors = [plt.cm.RdYlGn(float(norm(v))) for v in estimates]
+        else:
+            colors = [plt.cm.RdYlGn(0.5) for _ in estimates]
+    else:
+        colors = []
+    
+    # Plot bars with CI bands as background
+    for i, (feat, est, ci_low, ci_high) in enumerate(zip(features, estimates, ci_lows, ci_highs)):
+        ax.barh(i, est, color=colors[i], height=0.6, label=feat if i == 0 else "")
+        ax.plot([ci_low, ci_high], [i, i], 'k-', linewidth=2.5, alpha=0.8)
+        ax.plot([ci_low, ci_low], [i - 0.1, i + 0.1], 'k-', linewidth=2.5, alpha=0.8)
+        ax.plot([ci_high, ci_high], [i - 0.1, i + 0.1], 'k-', linewidth=2.5, alpha=0.8)
+    
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(features, fontsize=9)
+    ax.set_xlabel("Shapley Value (with 95% CI bands)", fontsize=11)
+    ax.grid(axis='x', alpha=0.3)
+    ax.set_title(f"Shapley Confidence Intervals ({dataset_name})", fontsize=12, fontweight='bold')
+
+    plot_filename = f"feature_shapley_confidence_r{row_count:03d}.png" if include_row_count_in_name else "feature_shapley_confidence.png"
+    plot_path = output_dir / plot_filename
+    fig.savefig(plot_path, dpi=180, bbox_inches='tight')
+    plt.close(fig)
+    return plot_path
+
+
+def _plot_shapley_distribution(
+    shapley_samples: dict[str, list[float]],
+    shapley_rows: list[dict],
+    dataset_name: str,
+    row_count: int,
+    output_dir: Path,
+    include_row_count_in_name: bool = False,
+) -> Path:
+    """Plot Shapley sample distribution as violin/KDE plot per feature."""
+    features_ordered = [str(r.get("feature", "")) for r in shapley_rows]
+    features_ordered = [f for f in features_ordered if f in shapley_samples and len(shapley_samples[f]) > 0]
+    
+    if not features_ordered:
+        return Path()
+    
+    # Prepare data for seaborn violin plot
+    plot_data = []
+    for feat in features_ordered:
+        for sample in shapley_samples.get(feat, []):
+            plot_data.append({"Feature": feat, "Shapley Marginal": float(sample)})
+    
+    plot_df = pd.DataFrame(plot_data)
+    
+    fig, ax = plt.subplots(figsize=(12, max(7, len(features_ordered) * 0.35)), constrained_layout=True)
+    
+    # Color by sample count (darker = more samples)
+    sample_counts = [len(shapley_samples.get(f, [])) for f in features_ordered]
+    count_min = float(np.min(sample_counts)) if sample_counts else 0
+    count_max = float(np.max(sample_counts)) if sample_counts else 1
+    
+    if count_max > count_min:
+        norm = matplotlib.colors.Normalize(vmin=count_min, vmax=count_max)
+        palette = {f: plt.cm.Blues(0.3 + 0.65 * float(norm(len(shapley_samples.get(f, []))))) 
+                   for f in features_ordered}
+    else:
+        palette = {f: plt.cm.Blues(0.6) for f in features_ordered}
+    
+    sns.violinplot(data=plot_df, y="Feature", x="Shapley Marginal", ax=ax, palette=palette, inner="box")
+    ax.set_ylabel("Feature", fontsize=11)
+    ax.set_xlabel("Shapley Marginal Value", fontsize=11)
+    ax.grid(axis='x', alpha=0.3)
+    ax.set_title(f"Shapley Sample Distribution ({dataset_name})", fontsize=12, fontweight='bold')
+
+    plot_filename = f"feature_shapley_distribution_r{row_count:03d}.png" if include_row_count_in_name else "feature_shapley_distribution.png"
+    plot_path = output_dir / plot_filename
+    fig.savefig(plot_path, dpi=180, bbox_inches='tight')
+    plt.close(fig)
+    return plot_path
+
+
+def _plot_shapley_coverage(
+    shapley_rows: list[dict],
+    samples_per_feature: int,
+    dataset_name: str,
+    row_count: int,
+    output_dir: Path,
+    include_row_count_in_name: bool = False,
+) -> Path:
+    """Plot Shapley sample accumulation per feature (coverage diagnostic)."""
+    features = [str(r.get("feature", "")) for r in shapley_rows]
+    sample_counts = [int(r.get("n_marginal_samples", 0)) for r in shapley_rows]
+    
+    fig, ax = plt.subplots(figsize=(12, max(7, len(features) * 0.35)), constrained_layout=True)
+    
+    # Color gradient by sample count
+    if sample_counts:
+        count_min = float(np.min(sample_counts))
+        count_max = float(np.max(sample_counts))
+        if count_max > count_min:
+            norm = matplotlib.colors.Normalize(vmin=count_min, vmax=count_max)
+            colors = [plt.cm.Greens(0.25 + 0.7 * float(norm(v))) for v in sample_counts]
+        else:
+            colors = [plt.cm.Greens(0.6) for _ in sample_counts]
+    else:
+        colors = []
+    
+    bars = ax.barh(features, sample_counts, color=colors)
+    
+    # Add horizontal line at target
+    ax.axvline(x=samples_per_feature, color='red', linestyle='--', linewidth=2, alpha=0.7, label=f'Target ({samples_per_feature})')
+    
+    # Add value labels on bars
+    for bar, count in zip(bars, sample_counts):
+        width = bar.get_width()
+        ax.text(width, bar.get_y() + bar.get_height() / 2, f'{int(count)}',
+                ha='left', va='center', fontsize=9)
+    
+    ax.set_xlabel("Number of Marginal Samples", fontsize=11)
+    ax.set_ylabel("Feature", fontsize=11)
+    ax.grid(axis='x', alpha=0.3)
+    ax.legend(loc='lower right')
+    ax.set_title(f"Shapley Sample Coverage ({dataset_name})", fontsize=12, fontweight='bold')
+
+    plot_filename = f"feature_shapley_coverage_r{row_count:03d}.png" if include_row_count_in_name else "feature_shapley_coverage.png"
+    plot_path = output_dir / plot_filename
+    fig.savefig(plot_path, dpi=180, bbox_inches='tight')
+    plt.close(fig)
+    return plot_path
+
+
+def _plot_search_budget(
+    eval_count: int,
+    eval_budget: int,
+    permutation_runs: int,
+    truncation_events: int,
+    dataset_name: str,
+    row_count: int,
+    output_dir: Path,
+    include_row_count_in_name: bool = False,
+) -> Path:
+    """Plot search budget utilization (eval count vs budget)."""
+    remaining = max(0, eval_budget - eval_count)
+    
+    fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+    
+    # Stacked horizontal bar
+    categories = ["Evals Used", "Budget Remaining"]
+    counts = [eval_count, remaining]
+    colors = ["#2ecc71", "#95a5a6"]
+    
+    ax.barh(["Budget Utilization"], counts, color=colors, label=categories)
+    
+    # Add value labels
+    x_offset = 0
+    for i, (cat, count) in enumerate(zip(categories, counts)):
+        ax.text(x_offset + count / 2, 0, f"{cat}\n{int(count)}", 
+                ha='center', va='center', fontsize=11, fontweight='bold', color='white')
+        x_offset += count
+    
+    ax.set_xlim(0, eval_budget * 1.05)
+    ax.set_xlabel(f"Evaluation Count (total budget: {eval_budget})", fontsize=11)
+    ax.set_title(f"Search Budget Utilization ({dataset_name})\nPermutations: {int(permutation_runs)}, Truncations: {int(truncation_events)}", 
+                 fontsize=12, fontweight='bold')
+    ax.set_yticks([])
+
+    plot_filename = f"shapley_search_budget_r{row_count:03d}.png" if include_row_count_in_name else "shapley_search_budget.png"
+    plot_path = output_dir / plot_filename
+    fig.savefig(plot_path, dpi=180, bbox_inches='tight')
+    plt.close(fig)
+    return plot_path
+
+
+def _plot_permutation_progression(
+    trace: list,
+    permutation_runs: int,
+    truncation_events: int,
+    dataset_name: str,
+    row_count: int,
+    output_dir: Path,
+    include_row_count_in_name: bool = False,
+) -> Path:
+    """Plot permutation progression (cumulative evals vs achievements)."""
+    if not trace:
+        return Path()
+    
+    # Extract objectives from trace
+    eval_indices = np.arange(len(trace)) + 1
+    objectives = [float(r.objective) for r in trace]
+    cumulative_best = np.minimum.accumulate(objectives)
+    
+    fig, ax = plt.subplots(figsize=(12, 6), constrained_layout=True)
+    
+    # Plot cumulative best found
+    ax.plot(eval_indices, cumulative_best, 'o-', color='#3498db', linewidth=2, markersize=5, label='Best Found')
+    
+    # Add light background for objective history
+    ax.plot(eval_indices, objectives, 'x', color='#95a5a6', alpha=0.5, markersize=4, label='All Evaluations')
+    
+    ax.set_xlabel("Evaluation Number", fontsize=11)
+    ax.set_ylabel("Objective Value", fontsize=11)
+    ax.grid(alpha=0.3)
+    ax.legend(loc='best')
+    ax.set_title(f"Permutation Progression ({dataset_name})\nTotal Perms: {int(permutation_runs)}, Truncations: {int(truncation_events)}", 
+                 fontsize=12, fontweight='bold')
+
+    plot_filename = f"shapley_search_progress_r{row_count:03d}.png" if include_row_count_in_name else "shapley_search_progress.png"
+    plot_path = output_dir / plot_filename
+    fig.savefig(plot_path, dpi=180, bbox_inches='tight')
+    plt.close(fig)
+    return plot_path
+
+
+def _plot_rank_stability(
+    shapley_rows: list[dict],
+    dataset_name: str,
+    row_count: int,
+    output_dir: Path,
+    include_row_count_in_name: bool = False,
+) -> Path:
+    """Plot feature rank stability (rank vs sample count, colored by Shapley value)."""
+    features = [str(r.get("feature", "")) for r in shapley_rows]
+    ranks = [int(r.get("shapley_rank", 0)) for r in shapley_rows]
+    sample_counts = [int(r.get("n_marginal_samples", 0)) for r in shapley_rows]
+    estimates = [float(r.get("shapley_value_est", np.nan)) for r in shapley_rows]
+
+    fig, ax = plt.subplots(figsize=(12, 7), constrained_layout=True)
+    
+    # Color by Shapley value estimate
+    if estimates:
+        est_min = float(np.nanmin(estimates))
+        est_max = float(np.nanmax(estimates))
+        if est_max > est_min:
+            norm = matplotlib.colors.Normalize(vmin=est_min, vmax=est_max)
+            colors = [plt.cm.RdYlGn(float(norm(v))) for v in estimates]
+        else:
+            colors = [plt.cm.RdYlGn(0.5) for _ in estimates]
+    else:
+        colors = ['gray'] * len(features)
+
+    scatter = ax.scatter(ranks, sample_counts, c=estimates, cmap='RdYlGn', s=200, alpha=0.7, edgecolors='black', linewidth=1.5)
+    
+    # Add feature labels
+    for rank, count, feat in zip(ranks, sample_counts, features):
+        ax.annotate(feat, (rank, count), fontsize=8, ha='center', va='center')
+    
+    ax.set_xlabel("Shapley Rank (1 = Highest)", fontsize=11)
+    ax.set_ylabel("Number of Marginal Samples", fontsize=11)
+    ax.grid(alpha=0.3)
+    cbar = plt.colorbar(scatter, ax=ax)
+    cbar.set_label("Shapley Estimate", fontsize=10)
+    ax.set_title(f"Rank vs Sample Stability ({dataset_name})", fontsize=12, fontweight='bold')
+
+    plot_filename = f"feature_shapley_rank_stability_r{row_count:03d}.png" if include_row_count_in_name else "feature_shapley_rank_stability.png"
+    plot_path = output_dir / plot_filename
+    fig.savefig(plot_path, dpi=180, bbox_inches='tight')
+    plt.close(fig)
+    return plot_path
+
+
+
 def _tmc_shapley_subsets(
     dataset_dir: Path,
     dataset_prefix: str,
@@ -148,6 +534,7 @@ def _tmc_shapley_subsets(
     disable_eval_plots: bool,
     suppress_training_logs: bool,
     seed: int,
+    keep_shapley_plots: bool = True,
     include_row_count_in_plot_names: bool = False,
 ) -> tuple[list[base.CandidateResult], list[base.CandidateResult], Path, Path, Path]:
     target_name = base._derive_target_name(dataset_dir.name, dataset_prefix)
@@ -344,6 +731,90 @@ def _tmc_shapley_subsets(
         full_features=full_features,
         min_features=min_features,
     )
+
+    # Generate visualizations if requested
+    out_dir = base._forecast_sweeps_dir(dataset_dir)
+    dataset_name = dataset_dir.name
+    
+    if keep_shapley_plots:
+        _plot_shapley_ranking_bar(
+            shapley_rows=shapley_rows,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            output_dir=out_dir,
+            include_row_count_in_name=include_row_count_in_plot_names,
+        )
+        print(f"[INFO] Wrote Shapley ranking bar plot")
+        
+        _plot_shapley_confidence_heatmap(
+            shapley_rows=shapley_rows,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            output_dir=out_dir,
+            include_row_count_in_name=include_row_count_in_plot_names,
+        )
+        print(f"[INFO] Wrote Shapley confidence heatmap")
+        
+        _plot_shapley_distribution(
+            shapley_samples=shapley_samples,
+            shapley_rows=shapley_rows,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            output_dir=out_dir,
+            include_row_count_in_name=include_row_count_in_plot_names,
+        )
+        print(f"[INFO] Wrote Shapley distribution plot")
+        
+        _plot_shapley_coverage(
+            shapley_rows=shapley_rows,
+            samples_per_feature=samples_per_feature,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            output_dir=out_dir,
+            include_row_count_in_name=include_row_count_in_plot_names,
+        )
+        print(f"[INFO] Wrote Shapley coverage plot")
+        
+        _plot_search_budget(
+            eval_count=eval_count,
+            eval_budget=eval_budget,
+            permutation_runs=permutation_runs,
+            truncation_events=truncation_events,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            output_dir=out_dir,
+            include_row_count_in_name=include_row_count_in_plot_names,
+        )
+        print(f"[INFO] Wrote search budget plot")
+        
+        _plot_permutation_progression(
+            trace=trace,
+            permutation_runs=permutation_runs,
+            truncation_events=truncation_events,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            output_dir=out_dir,
+            include_row_count_in_name=include_row_count_in_plot_names,
+        )
+        print(f"[INFO] Wrote permutation progression plot")
+        
+        _plot_rank_stability(
+            shapley_rows=shapley_rows,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            output_dir=out_dir,
+            include_row_count_in_name=include_row_count_in_plot_names,
+        )
+        print(f"[INFO] Wrote rank stability plot")
+        
+        _write_shapley_samples_json(
+            dataset_dir=dataset_dir,
+            row_count=row_count,
+            shapley_samples=shapley_samples,
+            shapley_rows=shapley_rows,
+        )
+        print(f"[INFO] Wrote Shapley samples JSON")
+
     return top_sorted, trace, shapley_csv, shapley_rankings_json, seed_csv
 
 
@@ -444,6 +915,7 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     disable_eval_plots=search_disable_eval_plots,
                     suppress_training_logs=not args.show_training_logs,
                     seed=args.seed,
+                    keep_shapley_plots=bool(args.keep_shapley_plots),
                     include_row_count_in_plot_names=include_row_count_in_plot_names,
                 )
                 selected = top_sorted[: args.final_top_k]
@@ -540,7 +1012,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--res-only", action="store_true")
 
     parser.add_argument("--disable-baselines-for-search", action="store_true")
-    parser.add_argument("--run-baselines-in-final", action="store_true")
     parser.add_argument(
         "--run-baselines-in-search",
         action="store_true",
@@ -560,6 +1031,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-search-plots",
         action="store_true",
         help="Keep feature-search Pareto plots (disabled by default for speed).",
+    )
+    parser.add_argument(
+        "--keep-shapley-plots",
+        action="store_true",
+        help="Keep Shapley attribution and search progress plots (disabled by default for speed).",
     )
     parser.add_argument(
         "--show-training-logs",
