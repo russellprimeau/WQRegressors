@@ -11,9 +11,9 @@ Alternative 1 implemented here:
 - Plot RMSE and R² vs predictor rows for each target.
 
 Examples:
-python src/h_RunMCPredictorRowsSweep.py --dry-run
-python src/h_RunMCPredictorRowsSweep.py --limit-datasets 1 --limit-rows 5
-python src/h_RunMCPredictorRowsSweep.py --dataset-prefix MC --max-rows 160
+python src/j_RunMCPredictorRowsSweep.py --dry-run
+python src/j_RunMCPredictorRowsSweep.py --limit-datasets 1 --limit-rows 5
+python src/j_RunMCPredictorRowsSweep.py --dataset-prefix MC --max-rows 160
 """
 
 from __future__ import annotations

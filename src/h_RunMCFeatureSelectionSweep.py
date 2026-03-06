@@ -12,7 +12,7 @@ Then:
 
 Examples:
 python src/h_RunMCFeatureSelectionSweep.py --dry-run
-python src/h_RunMCFeatureSelectionSweep.py --limit-datasets 1 --max-rounds 8 --beam-width 6
+python src/h_RunMCFeatureSelectionSweep.py --limit-datasets 1 --max-rounds 10 --beam-width 6  --eval-budget 300
 python src/h_RunMCFeatureSelectionSweep.py --row-counts 1,2,3,5 --limit-datasets 1
 python src/h_RunMCFeatureSelectionSweep.py --exclude=MC_Trial1,MC_Trial2
 python src/h_RunMCFeatureSelectionSweep.py --postprocess-only --keep-search-plots

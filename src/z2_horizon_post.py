@@ -11,14 +11,14 @@ nRMSE (= RMSE / std_target) is used instead of raw RMSE so that datasets with
 very different target magnitudes can be compared on the same axis.  The
 ``std_target`` value is read from each dataset's
 ``forecasts/feature_sweeps/feature_sweep_final_metrics.csv`` (populated by
-``i2_PostProcess.py`` / ``h_RunMCFeatureSelectionSweep.py``).
+``z1_PostProcess.py`` / ``z1_PostProcess.py``).
 
 Both figures are written to the ``summaries/`` subdirectory of the data root,
-the same location used by ``i2_PostProcess.py``.
+the same location used by ``z1_PostProcess.py``.
 
 Examples:
-    python src/i3_post.py
-    python src/i3_post.py --data-root data/output/regression --dataset-prefix MC
+    python src/z2_horizon_post.py
+    python src/z2_horizon_post.py --data-root data/output/regression --dataset-prefix MC
 """
 from __future__ import annotations
 import argparse

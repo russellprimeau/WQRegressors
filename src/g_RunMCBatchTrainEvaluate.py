@@ -5,10 +5,10 @@ Default behavior runs a limited pilot on the first 3 datasets that start with "M
 under data/output/regression so behavior can be verified quickly.
 
 Examples:
-python src/h_RunMCBatchTrainEvaluate.py
-python src/h_RunMCBatchTrainEvaluate.py --limit 0
-python src/h_RunMCBatchTrainEvaluate.py --dataset-prefix MC_ --data-root data/output/regression
-python src/h_RunMCBatchTrainEvaluate.py --dry-run
+python src/g_RunMCBatchTrainEvaluate.py
+python src/g_RunMCBatchTrainEvaluate.py --dry-run
+python src/g_RunMCBatchTrainEvaluate.py --limit 0
+python src/g_RunMCBatchTrainEvaluate.py --dataset-prefix MC_ --data-root data/output/regression
 """
 
 from __future__ import annotations

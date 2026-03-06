@@ -2,11 +2,10 @@
 Post-processor script for generating outputs of feature-selection sweep for MC datasets without re-running the entire sweep.
 
 Examples:
-python src/i_PostProcess.py --keep-search-plots
-python src/i_PostProcess.py --sweep-namespace feature_sweeps
-python src/i_PostProcess.py --sweep-namespace Shapley_sweeps
-python src/i_PostProcess.py --path data/output/regression_alt
-python src/i_PostProcess.py --path C:\\full\\path\\tos
+python src/z1_PostProcess.py --keep-search-plots
+python src/z1_PostProcess.py --sweep-namespace feature_sweeps
+python src/z1_PostProcess.py --sweep-namespace Shapley_sweeps
+python src/z1_PostProcess.py --path data/output/regression_alt --sweep-namespace Shapley_sweeps
 """
 from __future__ import annotations
 import contextlib
