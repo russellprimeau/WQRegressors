@@ -28,6 +28,14 @@ EUROFINS_SUMMARY_DEFAULT_PATH = (
     / "Eurofins_summary.csv"
 )
 
+NORMALIZATION_OUTPUT_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "data"
+    / "output"
+    / "sensors"
+    / "normalization.json"
+)
+
 
 def _normalize_target_for_eurofins_lookup(name):
     """Normalize target/parameter names for robust Eurofins matching."""
@@ -199,8 +207,8 @@ def _normalize_once(df, columns, min_val=0.0, max_val=1.0):
     return df_norm, normalization_params
 
 
-def _write_normalization_params(output_dir, normalization_params, filename="normalization.json"):
-    out_path = Path(output_dir) / filename
+def _write_normalization_params(normalization_params, output_path=NORMALIZATION_OUTPUT_PATH):
+    out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(normalization_params, f)
@@ -232,7 +240,7 @@ def _load_and_prepare_sensor_uncertainties(output_dir, normalization_params=None
         sensor_uncertainties[sensor_name].update(t_fit_map[sensor_name])
 
     if normalization_params is None:
-        normalization_file = Path(output_dir) / "normalization.json"
+        normalization_file = NORMALIZATION_OUTPUT_PATH
         try:
             with open(normalization_file, 'r') as f:
                 normalization_params = json.load(f)
@@ -761,12 +769,28 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
     if pre_normalized:
         df = df.copy()
         if normalization_params is not None:
-            _write_normalization_params(output_dir, normalization_params)
+            _write_normalization_params(normalization_params)
         else:
             # Fallback: preserve old behavior if caller did not provide params.
-            df = normalize_columns(df, to_normalize, param_file=None, min_val=0, max_val=1, save=True, directory=output_dir)
+            df = normalize_columns(
+                df,
+                to_normalize,
+                param_file=None,
+                min_val=0,
+                max_val=1,
+                save=True,
+                directory=NORMALIZATION_OUTPUT_PATH.parent,
+            )
     else:
-        df = normalize_columns(df, to_normalize, param_file=None, min_val=0, max_val=1, save=True, directory=output_dir)
+        df = normalize_columns(
+            df,
+            to_normalize,
+            param_file=None,
+            min_val=0,
+            max_val=1,
+            save=True,
+            directory=NORMALIZATION_OUTPUT_PATH.parent,
+        )
 
     samples_dir = os.path.join(output_dir, 'samples')
     perturbed_samples_dir = os.path.join(output_dir, 'mc_replicates')

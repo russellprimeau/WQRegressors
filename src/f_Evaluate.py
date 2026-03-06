@@ -71,7 +71,7 @@ DEFAULT_EVAL_CONFIG = {
     "diurnal_window": 1,
     "historic_path": "../data/output/regression/Consolidated_sparse.csv",
     "thresholds_path": "../data/input/Limits.csv",
-    "normalization_path": "../data/input/normalization.json",
+    "normalization_path": "../data/output/sensors/normalization.json",
     "use_normalized_thresholds": False,
     "baseline_sample_subdir": "samples",
     "baseline_split_file": "test_files.txt",

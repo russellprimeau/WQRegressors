@@ -7,70 +7,130 @@ import torch.optim as optim
 from torch.utils.data import Dataset
 
 
-def train_model(directory, model, forecast_name, trainloader, testloader, device, num_epochs=100, learning_rate=1e-3,
-                loss_threshold=1e-3, patience=5, model_subdir='transformer'):
+def _batch_pearson_corr(y_pred, y_true, eps=1e-8, clip=True):
+    """Compute mean Pearson correlation across flattened output dimensions."""
+    pred = y_pred.reshape(y_pred.shape[0], -1)
+    target = y_true.reshape(y_true.shape[0], -1)
 
-    criterion = nn.MSELoss()
+    pred_centered = pred - pred.mean(dim=0, keepdim=True)
+    target_centered = target - target.mean(dim=0, keepdim=True)
+
+    numerator = torch.sum(pred_centered * target_centered, dim=0)
+    pred_norm = torch.sqrt(torch.sum(pred_centered ** 2, dim=0) + eps)
+    target_norm = torch.sqrt(torch.sum(target_centered ** 2, dim=0) + eps)
+    corr = numerator / (pred_norm * target_norm + eps)
+
+    if clip:
+        corr = torch.clamp(corr, -1.0, 1.0)
+
+    return torch.mean(corr)
+
+
+def train_model(directory, model, forecast_name, trainloader, testloader, device, num_epochs=100, learning_rate=1e-3,
+                loss_threshold=1e-3, patience=5, model_subdir='transformer',
+                corr_lambda=0.1, corr_eps=1e-8, corr_clip=True):
+
+    mse_criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     model.train()
-    train_losses = []
-    val_losses = []
-    best_val_loss = float('inf')
+    train_mse_losses = []
+    train_corr_terms = []
+    train_combined_losses = []
+    val_mse_losses = []
+    val_corr_terms = []
+    val_combined_losses = []
+    best_val_combined = float('inf')
     patience_counter = 0
 
     for epoch in range(num_epochs):
         model.train()
-        epoch_loss = 0
+        epoch_train_mse = 0.0
+        epoch_train_corr = 0.0
+        epoch_train_combined = 0.0
         for inputs, targets, _ in trainloader:
             inputs = inputs.to(device)
             targets = targets.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss.backward()
+            mse_loss = mse_criterion(outputs, targets)
+            corr_term = _batch_pearson_corr(outputs, targets, eps=corr_eps, clip=corr_clip)
+            combined_loss = mse_loss - float(corr_lambda) * corr_term
+            combined_loss.backward()
             optimizer.step()
-            epoch_loss += loss.item()
 
-        avg_loss = epoch_loss / len(trainloader)
-        train_losses.append(avg_loss)
+            epoch_train_mse += mse_loss.item()
+            epoch_train_corr += corr_term.item()
+            epoch_train_combined += combined_loss.item()
+
+        avg_train_mse = epoch_train_mse / len(trainloader)
+        avg_train_corr = epoch_train_corr / len(trainloader)
+        avg_train_combined = epoch_train_combined / len(trainloader)
+        train_mse_losses.append(avg_train_mse)
+        train_corr_terms.append(avg_train_corr)
+        train_combined_losses.append(avg_train_combined)
 
         # Validation (for early stopping condition)
         model.eval()
-        val_loss = 0
+        epoch_val_mse = 0.0
+        epoch_val_corr = 0.0
+        epoch_val_combined = 0.0
         with torch.no_grad():
             for inputs, targets, _ in testloader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 outputs = model(inputs)
-                val_loss += criterion(outputs, targets).item()
-        val_loss /= len(testloader)
-        val_losses.append(val_loss)
-        print(f"Epoch {epoch + 1}/{num_epochs}, Training Loss: {epoch_loss / len(trainloader):.6f}, Validation Loss: {val_loss / len(testloader):.6f}")
+                mse_loss = mse_criterion(outputs, targets)
+                corr_term = _batch_pearson_corr(outputs, targets, eps=corr_eps, clip=corr_clip)
+                combined_loss = mse_loss - float(corr_lambda) * corr_term
+
+                epoch_val_mse += mse_loss.item()
+                epoch_val_corr += corr_term.item()
+                epoch_val_combined += combined_loss.item()
+
+        avg_val_mse = epoch_val_mse / len(testloader)
+        avg_val_corr = epoch_val_corr / len(testloader)
+        avg_val_combined = epoch_val_combined / len(testloader)
+        val_mse_losses.append(avg_val_mse)
+        val_corr_terms.append(avg_val_corr)
+        val_combined_losses.append(avg_val_combined)
+
+        print(
+            f"Epoch {epoch + 1}/{num_epochs} | "
+            f"train_mse={avg_train_mse:.6f}, train_corr={avg_train_corr:.6f}, train_combined={avg_train_combined:.6f} | "
+            f"val_mse={avg_val_mse:.6f}, val_corr={avg_val_corr:.6f}, val_combined={avg_val_combined:.6f}"
+        )
 
         # Early stopping condition
-        if loss_threshold is not None and avg_loss <= loss_threshold:
-            print(f"Stopping early at epoch {epoch + 1} because loss reached {avg_loss:.6f}")
+        if loss_threshold is not None and avg_train_combined <= loss_threshold:
+            print(
+                f"Stopping early at epoch {epoch + 1} because combined loss reached "
+                f"{avg_train_combined:.6f}"
+            )
             break
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if avg_val_combined < best_val_combined:
+            best_val_combined = avg_val_combined
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print("Stopping early due to validation loss plateau.")
+                print("Stopping early due to validation combined-loss plateau.")
                 break
 
-    # Plotting loss vs. epochs on log-log scale
+    # Plot all objective terms for train/validation to inspect optimization behavior.
     filepath = Path(directory, "forecasts", forecast_name, model_subdir)
     os.makedirs(filepath, exist_ok=True)
     plt.figure(figsize=(8, 6))
-    x_vals = list(range(1, len(train_losses) + 1))
-    plt.loglog(x_vals, train_losses, marker='o', label='Training Loss')
-    plt.loglog(x_vals, val_losses, marker='s', label='Validation Loss')
+    x_vals = list(range(1, len(train_combined_losses) + 1))
+    plt.plot(x_vals, train_combined_losses, marker='o', label='Train Combined')
+    plt.plot(x_vals, val_combined_losses, marker='s', label='Val Combined')
+    plt.plot(x_vals, train_mse_losses, marker='o', linestyle='--', label='Train MSE')
+    plt.plot(x_vals, val_mse_losses, marker='s', linestyle='--', label='Val MSE')
+    plt.plot(x_vals, train_corr_terms, marker='o', linestyle=':', label='Train Corr')
+    plt.plot(x_vals, val_corr_terms, marker='s', linestyle=':', label='Val Corr')
     plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training and Validation Loss vs. Epochs (Log-Log Scale)")
-    plt.grid(True, which="both", ls="--")
+    plt.ylabel("Value")
+    plt.title("Transformer MSE/Corr/Combined Terms vs. Epoch")
+    plt.grid(True, ls="--")
     plt.legend()
     plt.tight_layout()
     plt.savefig(filepath / "loss_plot.png")

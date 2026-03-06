@@ -10,6 +10,15 @@ import pandas as pd
 import yaml
 
 
+NORMALIZATION_OUTPUT_PATH = (
+    Path(__file__).resolve().parent.parent.parent
+    / "data"
+    / "output"
+    / "sensors"
+    / "normalization.json"
+)
+
+
 def load_config(config_path):
     """Load configuration from YAML or JSON file, storing the config directory."""
     path = Path(config_path)
@@ -140,7 +149,7 @@ def _build_feature_uncertainty_variance(data_cfg, hyper_cfg, config_dir, verbose
     if verbose:
         print(f"[INFO] Uncertainty source directory: {summary_dir}")
 
-    norm_path = Path(data_cfg["data_dir"]) / "normalization.json"
+    norm_path = NORMALIZATION_OUTPUT_PATH
     norm_params = {}
     if norm_path.exists():
         try:

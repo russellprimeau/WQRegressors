@@ -39,6 +39,15 @@ from utils.config_utils import (
 from utils.gp_utils import UncertainInputRBFKernel, build_base_kernel, ExactGPRegressor
 
 
+NORMALIZATION_OUTPUT_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "data"
+    / "output"
+    / "sensors"
+    / "normalization.json"
+)
+
+
 # ===========================================================================================
 # DEFAULT CONFIGURATIONS
 # ===========================================================================================
@@ -59,6 +68,9 @@ DEFAULT_TRANSFORMER_CONFIG = {
     "loss_threshold": 0.000001,
     "learning_rate": 1e-4,
     "patience": 10,
+    "corr_lambda": 0.1,
+    "corr_eps": 1e-8,
+    "corr_clip": True,
 }
 
 DEFAULT_XGB_REGRESSOR_CONFIG = {
@@ -122,7 +134,7 @@ DEFAULT_EVALUATION_CONFIG = {
     "diurnal_window": 1,
     "historic_path": "../data/output/regression/Consolidated_sparse.csv",
     "thresholds_path": "../data/input/Limits.csv",
-    "normalization_path": "../data/input/normalization.json",
+    "normalization_path": "../data/output/sensors/normalization.json",
     "use_normalized_thresholds": False,
     "save_plots": True,
 }
@@ -260,9 +272,7 @@ def write_evaluation_config(config):
         evaluation_cfg["run_regression"] = False
         evaluation_cfg["run_pure_classification"] = True
 
-    normalization_candidate = Path(data_cfg["data_dir"]) / "normalization.json"
-    if normalization_candidate.exists():
-        evaluation_cfg["normalization_path"] = str(normalization_candidate)
+    evaluation_cfg["normalization_path"] = str(NORMALIZATION_OUTPUT_PATH)
 
     save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
     os.makedirs(save_path, exist_ok=True)
@@ -351,7 +361,10 @@ def train_transformer_model(config, train_samples, test_samples):
         hyper_cfg["learning_rate"],
         hyper_cfg["loss_threshold"],
         hyper_cfg["patience"],
-        ""
+        "",
+        hyper_cfg["corr_lambda"],
+        hyper_cfg["corr_eps"],
+        hyper_cfg["corr_clip"],
     )
     
     # Save model
