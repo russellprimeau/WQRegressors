@@ -43,6 +43,17 @@ except Exception:
 
 
 SUPPORTED_CONFIG_SUFFIXES = {".yml", ".yaml", ".json"}
+BASELINE_ORDER = ("naive", "seasonal", "linear")
+BASELINE_PLOT_LABELS = {
+    "naive": "Naive",
+    "seasonal": "Seasonal",
+    "linear": "Linear",
+}
+BASELINE_PLOT_COLORS = {
+    "naive": "tab:gray",
+    "seasonal": "tab:green",
+    "linear": "tab:orange",
+}
 
 
 def _resolve_summaries_dir(data_root: Path, sweep_namespace: str) -> Path:
@@ -954,7 +965,7 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
     evidence["model_nmpiw"] = _safe_float(model_int["nmpiw"])
     evidence["model_interval_score"] = _safe_float(model_int["interval_score"])
 
-    for bname in ("naive", "seasonal"):
+    for bname in BASELINE_ORDER:
         pred_b = _safe_as_2d(baseline_preds.get(bname, np.full_like(y_test, np.nan, dtype=float)))[:n_rows, :]
         mae_m, mse_m = mae_model_rows, mse_model_rows
         mae_b, mse_b = _compute_per_sample_losses(pred_b, y_test)
@@ -1061,7 +1072,8 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
         for (prefix, test_name, _), q in zip(pval_records, adj):
             evidence[f"{test_name}_q_{prefix}"] = float(q)
 
-        for prefix in ("vs_naive", "vs_seasonal"):
+        for bname in BASELINE_ORDER:
+            prefix = f"vs_{bname}"
             dm_q = _safe_float(evidence.get(f"dm_q_{prefix}", float("nan")))
             wilc_q = _safe_float(evidence.get(f"wilcoxon_q_{prefix}", float("nan")))
             sign_q = _safe_float(evidence.get(f"sign_q_{prefix}", float("nan")))
@@ -1381,7 +1393,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 dataset = entry['dataset']
                 # Standard location for a full-dataset evaluation summary with baselines
                 eval_csv = os.path.join(data_root, dataset, 'evaluation_summary.csv')
-                baseline_stats = {'naive': {}, 'seasonal': {}}
+                baseline_stats = {name: {} for name in BASELINE_ORDER}
                 if os.path.exists(eval_csv):
                     try:
                         df_eval = pd.read_csv(eval_csv)
@@ -1413,7 +1425,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             print(f"[INFO] Wrote summary CSV: {summary_csv}")
 
             x = np.arange(len(perf_df))
-            width = 0.25
+            width = 0.20
             labels = perf_df['dataset']
             # Use the actual ML model type(s) as the label; fall back to 'Model' if not recorded.
             if 'model' in perf_df.columns:
@@ -1424,26 +1436,33 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 )
             else:
                 model_series_label = 'Model'
-            methods = [model_series_label, 'Naive', 'Seasonal']
-            colors = ['tab:blue', 'tab:gray', 'tab:green']
+            methods = [model_series_label] + [BASELINE_PLOT_LABELS[name] for name in BASELINE_ORDER]
+            colors = ['tab:blue'] + [BASELINE_PLOT_COLORS[name] for name in BASELINE_ORDER]
 
             std_target_col = perf_df['std_target'].replace(0, np.nan)
             nrmse_data = [
                 perf_df['nrmse'],
                 perf_df['naive_rmse'] / std_target_col,
                 perf_df['seasonal_rmse'] / std_target_col,
+                perf_df['linear_rmse'] / std_target_col,
             ]
             r2_data = [
                 perf_df['r2'],
                 perf_df['naive_r2'],
                 perf_df['seasonal_r2'],
+                perf_df['linear_r2'],
             ]
             # Skill score: 1 - (model_rmse / baseline_rmse); positive = better than baseline
             skill_naive = 1.0 - perf_df['rmse'] / perf_df['naive_rmse'].replace(0, np.nan)
             skill_seasonal = 1.0 - perf_df['rmse'] / perf_df['seasonal_rmse'].replace(0, np.nan)
-            skill_data = [skill_naive, skill_seasonal]
-            skill_methods = ['Compared with Naive Baseline', 'Compared with Seasonal Baseline']
-            skill_colors = ['tab:gray', 'tab:green']
+            skill_linear = 1.0 - perf_df['rmse'] / perf_df['linear_rmse'].replace(0, np.nan)
+            skill_data = [skill_naive, skill_seasonal, skill_linear]
+            skill_methods = [
+                'Compared with Naive Baseline',
+                'Compared with Seasonal Baseline',
+                'Compared with Linear Baseline',
+            ]
+            skill_colors = [BASELINE_PLOT_COLORS['naive'], BASELINE_PLOT_COLORS['seasonal'], BASELINE_PLOT_COLORS['linear']]
 
             # --- Combined 3-panel figure (no title): Skill, nRMSE, R2 ---
             fig, (ax_skill_combo, ax_nrmse_combo, ax_r2_combo) = plt.subplots(
@@ -1534,14 +1553,13 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     return pd.to_numeric(perf_df[name], errors="coerce")
                 return pd.Series([float("nan")] * n_perf)
 
-            naive_prob = _perf_col("bootstrap_prob_skill_gt0_vs_naive")
-            seasonal_prob = _perf_col("bootstrap_prob_skill_gt0_vs_seasonal")
-            naive_lcb = _perf_col("lcb95_skill_vs_naive")
-            seasonal_lcb = _perf_col("lcb95_skill_vs_seasonal")
+            baseline_prob_cols = [_perf_col(f"bootstrap_prob_skill_gt0_vs_{name}") for name in BASELINE_ORDER]
+            baseline_lcb_cols = [_perf_col(f"lcb95_skill_vs_{name}") for name in BASELINE_ORDER]
             overall_score = _perf_col("evidence_score_overall_min")
             model_picp = _perf_col("model_picp")
             naive_picp = _perf_col("naive_picp")
             seasonal_picp = _perf_col("seasonal_picp")
+            linear_picp = _perf_col("linear_picp")
             nominal_cov = _perf_col("model_nominal_coverage")
             overall_tier_vals = pd.Series(
                 [tier_map.get(str(v), np.nan) for v in perf_df.get("evidence_tier_overall", pd.Series(["very_low"] * n_perf))],
@@ -1554,11 +1572,10 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             # Order: component diagnostics first, overall summaries last.
             _draw_bar_group(
                 conf_axes[0], x, width,
-                [naive_prob, seasonal_prob],
-                ['tab:gray', 'tab:green'],
-                ['Prob(skill>0) vs Naive', 'Prob(skill>0) vs Seasonal'],
+                baseline_prob_cols,
+                [BASELINE_PLOT_COLORS[name] for name in BASELINE_ORDER],
+                [f"Prob(skill>0) vs {BASELINE_PLOT_LABELS[name]}" for name in BASELINE_ORDER],
                 '.2f',
-                center_offset=0.5,
             )
             conf_axes[0].axhline(float(args.evidence_min_prob), color='black', linewidth=0.8, linestyle='--')
             conf_axes[0].set_ylabel('Bootstrap Probability\n(Model Skill > 0)')
@@ -1568,11 +1585,10 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             _draw_bar_group(
                 conf_axes[1], x, width,
-                [naive_lcb, seasonal_lcb],
-                ['tab:gray', 'tab:green'],
-                ['95% Lower Confidence Bound of Skill\nCompared with Naive Baseline', '95% Lower Confidence Bound of Skill\nCompared with Seasonal Baseline'],
+                baseline_lcb_cols,
+                [BASELINE_PLOT_COLORS[name] for name in BASELINE_ORDER],
+                [f"95% Lower Confidence Bound of Skill\nCompared with {BASELINE_PLOT_LABELS[name]} Baseline" for name in BASELINE_ORDER],
                 '.2f',
-                center_offset=0.5,
             )
             conf_axes[1].axhline(0.0, color='black', linewidth=0.8, linestyle='--')
             conf_axes[1].set_ylabel('Skill Lower Confidence Bound')
@@ -1581,9 +1597,9 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             _draw_bar_group(
                 conf_axes[2], x, width,
-                [model_picp, naive_picp, seasonal_picp],
-                ['tab:blue', 'tab:gray', 'tab:green'],
-                [model_series_label, 'Naive', 'Seasonal'],
+                [model_picp, naive_picp, seasonal_picp, linear_picp],
+                ['tab:blue', BASELINE_PLOT_COLORS['naive'], BASELINE_PLOT_COLORS['seasonal'], BASELINE_PLOT_COLORS['linear']],
+                [model_series_label, 'Naive', 'Seasonal', 'Linear'],
                 '.2f',
             )
             nom_arr = nominal_cov.to_numpy(dtype=float) if hasattr(nominal_cov, "to_numpy") else np.array(nominal_cov, dtype=float)
@@ -1621,20 +1637,19 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     return pd.to_numeric(perf_df[name], errors='coerce')
                 return pd.Series([float('nan')] * len(perf_df))
 
-            pair_colors = ['tab:gray', 'tab:green']
-            pair_methods = ['Naive Baseline', 'Seasonal Baseline']
-            trio_colors = ['tab:blue', 'tab:gray', 'tab:green']
-            trio_methods = [model_series_label, 'Naive', 'Seasonal']
+            baseline_colors = [BASELINE_PLOT_COLORS[name] for name in BASELINE_ORDER]
+            baseline_methods = [f"{BASELINE_PLOT_LABELS[name]} Baseline" for name in BASELINE_ORDER]
+            trio_colors = ['tab:blue'] + baseline_colors
+            trio_methods = [model_series_label] + [BASELINE_PLOT_LABELS[name] for name in BASELINE_ORDER]
 
-            def _pair_panel(ax, c_naive: str, c_seasonal: str, ylabel: str, fmt: str = '.2f',
+            def _baseline_panel(ax, cols: list[str], ylabel: str, fmt: str = '.2f',
                             hline: float | None = None, ylim: tuple[float, float] | None = None) -> None:
                 _draw_bar_group(
                     ax, x, width,
-                    [_col(c_naive), _col(c_seasonal)],
-                    pair_colors,
-                    pair_methods,
+                    [_col(c) for c in cols],
+                    baseline_colors,
+                    baseline_methods,
                     fmt,
-                    center_offset=0.5,
                 )
                 if hline is not None and np.isfinite(hline):
                     ax.axhline(float(hline), color='black', linewidth=0.8, linestyle='--')
@@ -1646,15 +1661,15 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             # Statistical tests and adjusted significance (decision-first ordering).
             fig_tests, axes_tests = plt.subplots(9, 1, figsize=(max(12, len(perf_df) * 0.8), 28), sharex=True)
-            _pair_panel(axes_tests[0], 'dm_p_vs_naive', 'dm_p_vs_seasonal', 'Diebold-Mariano Test p-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
-            _pair_panel(axes_tests[1], 'dm_q_vs_naive', 'dm_q_vs_seasonal', 'Diebold-Mariano Test\nFalse Discovery Rate Adjusted q-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
-            _pair_panel(axes_tests[2], 'wilcoxon_p_vs_naive', 'wilcoxon_p_vs_seasonal', 'Wilcoxon Signed-Rank Test p-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
-            _pair_panel(axes_tests[3], 'wilcoxon_q_vs_naive', 'wilcoxon_q_vs_seasonal', 'Wilcoxon Signed-Rank Test\nFalse Discovery Rate Adjusted q-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
-            _pair_panel(axes_tests[4], 'sign_p_vs_naive', 'sign_p_vs_seasonal', 'Sign Test p-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
-            _pair_panel(axes_tests[5], 'sign_q_vs_naive', 'sign_q_vs_seasonal', 'Sign Test\nFalse Discovery Rate Adjusted q-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
-            _pair_panel(axes_tests[6], 'dm_stat_vs_naive', 'dm_stat_vs_seasonal', 'Diebold-Mariano Test Statistic', '.2f', hline=0.0)
-            _pair_panel(axes_tests[7], 'wilcoxon_stat_vs_naive', 'wilcoxon_stat_vs_seasonal', 'Wilcoxon Statistic', '.2f')
-            _pair_panel(axes_tests[8], 'sign_win_rate_vs_naive', 'sign_win_rate_vs_seasonal', 'Sign Test Win Rate', '.2f', hline=0.5, ylim=(0.0, 1.05))
+            _baseline_panel(axes_tests[0], ['dm_p_vs_naive', 'dm_p_vs_seasonal', 'dm_p_vs_linear'], 'Diebold-Mariano Test p-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _baseline_panel(axes_tests[1], ['dm_q_vs_naive', 'dm_q_vs_seasonal', 'dm_q_vs_linear'], 'Diebold-Mariano Test\nFalse Discovery Rate Adjusted q-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _baseline_panel(axes_tests[2], ['wilcoxon_p_vs_naive', 'wilcoxon_p_vs_seasonal', 'wilcoxon_p_vs_linear'], 'Wilcoxon Signed-Rank Test p-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _baseline_panel(axes_tests[3], ['wilcoxon_q_vs_naive', 'wilcoxon_q_vs_seasonal', 'wilcoxon_q_vs_linear'], 'Wilcoxon Signed-Rank Test\nFalse Discovery Rate Adjusted q-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _baseline_panel(axes_tests[4], ['sign_p_vs_naive', 'sign_p_vs_seasonal', 'sign_p_vs_linear'], 'Sign Test p-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _baseline_panel(axes_tests[5], ['sign_q_vs_naive', 'sign_q_vs_seasonal', 'sign_q_vs_linear'], 'Sign Test\nFalse Discovery Rate Adjusted q-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _baseline_panel(axes_tests[6], ['dm_stat_vs_naive', 'dm_stat_vs_seasonal', 'dm_stat_vs_linear'], 'Diebold-Mariano Test Statistic', '.2f', hline=0.0)
+            _baseline_panel(axes_tests[7], ['wilcoxon_stat_vs_naive', 'wilcoxon_stat_vs_seasonal', 'wilcoxon_stat_vs_linear'], 'Wilcoxon Statistic', '.2f')
+            _baseline_panel(axes_tests[8], ['sign_win_rate_vs_naive', 'sign_win_rate_vs_seasonal', 'sign_win_rate_vs_linear'], 'Sign Test Win Rate', '.2f', hline=0.5, ylim=(0.0, 1.05))
             axes_tests[0].set_title("Evidence Tests (p/q thresholds first, diagnostics after)")
             axes_tests[-1].set_xticks(x)
             axes_tests[-1].set_xticklabels(labels, rotation=45, ha='right')
@@ -1668,16 +1683,16 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             # Effect size and bootstrap summaries (interpretation flow).
             fig_eff, axes_eff = plt.subplots(10, 1, figsize=(max(12, len(perf_df) * 0.8), 31), sharex=True)
-            _pair_panel(axes_eff[0], 'skill_vs_naive', 'skill_vs_seasonal', 'Skill (RMSE-Based)', '.2f', hline=0.0)
-            _pair_panel(axes_eff[1], 'bootstrap_skill_mean_vs_naive', 'bootstrap_skill_mean_vs_seasonal', 'Bootstrap Skill Mean', '.2f', hline=0.0)
-            _pair_panel(axes_eff[2], 'lcb95_skill_vs_naive', 'lcb95_skill_vs_seasonal', '95% Lower Confidence Bound of Skill', '.2f', hline=0.0)
-            _pair_panel(axes_eff[3], 'effect_median_ae_diff_vs_naive', 'effect_median_ae_diff_vs_seasonal', 'Median MAE Difference', '.2e', hline=0.0)
-            _pair_panel(axes_eff[4], 'effect_mean_ae_diff_vs_naive', 'effect_mean_ae_diff_vs_seasonal', 'Mean MAE Difference', '.2e', hline=0.0)
-            _pair_panel(axes_eff[5], 'effect_cohen_d_ae_diff_vs_naive', 'effect_cohen_d_ae_diff_vs_seasonal', "Cohen's d for MAE Difference", '.2f', hline=0.0)
-            _pair_panel(axes_eff[6], 'bootstrap_rmse_diff_mean_vs_naive', 'bootstrap_rmse_diff_mean_vs_seasonal', 'Bootstrap RMSE Difference Mean', '.2e', hline=0.0)
-            _pair_panel(axes_eff[7], 'bootstrap_rmse_diff_ci05_vs_naive', 'bootstrap_rmse_diff_ci05_vs_seasonal', 'Bootstrap RMSE Difference\n5th Percentile', '.2e', hline=0.0)
-            _pair_panel(axes_eff[8], 'bootstrap_rmse_diff_ci95_vs_naive', 'bootstrap_rmse_diff_ci95_vs_seasonal', 'Bootstrap RMSE Difference\n95th Percentile', '.2e', hline=0.0)
-            _pair_panel(axes_eff[9], 'bootstrap_r2_diff_mean_vs_naive', 'bootstrap_r2_diff_mean_vs_seasonal', 'Bootstrap Coefficient of Determination Difference Mean', '.2f', hline=0.0)
+            _baseline_panel(axes_eff[0], ['skill_vs_naive', 'skill_vs_seasonal', 'skill_vs_linear'], 'Skill (RMSE-Based)', '.2f', hline=0.0)
+            _baseline_panel(axes_eff[1], ['bootstrap_skill_mean_vs_naive', 'bootstrap_skill_mean_vs_seasonal', 'bootstrap_skill_mean_vs_linear'], 'Bootstrap Skill Mean', '.2f', hline=0.0)
+            _baseline_panel(axes_eff[2], ['lcb95_skill_vs_naive', 'lcb95_skill_vs_seasonal', 'lcb95_skill_vs_linear'], '95% Lower Confidence Bound of Skill', '.2f', hline=0.0)
+            _baseline_panel(axes_eff[3], ['effect_median_ae_diff_vs_naive', 'effect_median_ae_diff_vs_seasonal', 'effect_median_ae_diff_vs_linear'], 'Median MAE Difference', '.2e', hline=0.0)
+            _baseline_panel(axes_eff[4], ['effect_mean_ae_diff_vs_naive', 'effect_mean_ae_diff_vs_seasonal', 'effect_mean_ae_diff_vs_linear'], 'Mean MAE Difference', '.2e', hline=0.0)
+            _baseline_panel(axes_eff[5], ['effect_cohen_d_ae_diff_vs_naive', 'effect_cohen_d_ae_diff_vs_seasonal', 'effect_cohen_d_ae_diff_vs_linear'], "Cohen's d for MAE Difference", '.2f', hline=0.0)
+            _baseline_panel(axes_eff[6], ['bootstrap_rmse_diff_mean_vs_naive', 'bootstrap_rmse_diff_mean_vs_seasonal', 'bootstrap_rmse_diff_mean_vs_linear'], 'Bootstrap RMSE Difference Mean', '.2e', hline=0.0)
+            _baseline_panel(axes_eff[7], ['bootstrap_rmse_diff_ci05_vs_naive', 'bootstrap_rmse_diff_ci05_vs_seasonal', 'bootstrap_rmse_diff_ci05_vs_linear'], 'Bootstrap RMSE Difference\n5th Percentile', '.2e', hline=0.0)
+            _baseline_panel(axes_eff[8], ['bootstrap_rmse_diff_ci95_vs_naive', 'bootstrap_rmse_diff_ci95_vs_seasonal', 'bootstrap_rmse_diff_ci95_vs_linear'], 'Bootstrap RMSE Difference\n95th Percentile', '.2e', hline=0.0)
+            _baseline_panel(axes_eff[9], ['bootstrap_r2_diff_mean_vs_naive', 'bootstrap_r2_diff_mean_vs_seasonal', 'bootstrap_r2_diff_mean_vs_linear'], 'Bootstrap Coefficient of Determination Difference Mean', '.2f', hline=0.0)
             axes_eff[0].set_title("Evidence Effects (skill, effect sizes, then bootstrap deltas)")
             axes_eff[-1].set_xticks(x)
             axes_eff[-1].set_xticklabels(labels, rotation=45, ha='right')
@@ -1693,7 +1708,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             fig_int, axes_int = plt.subplots(9, 1, figsize=(max(12, len(perf_df) * 0.8), 28), sharex=True)
             _draw_bar_group(
                 axes_int[0], x, width,
-                [_col('model_picp'), _col('naive_picp'), _col('seasonal_picp')],
+                [_col('model_picp'), _col('naive_picp'), _col('seasonal_picp'), _col('linear_picp')],
                 trio_colors,
                 trio_methods,
                 '.2f',
@@ -1705,7 +1720,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             axes_int[0].legend()
             _draw_bar_group(
                 axes_int[1], x, width,
-                [_col('model_coverage_deficit'), _col('naive_coverage_deficit'), _col('seasonal_coverage_deficit')],
+                [_col('model_coverage_deficit'), _col('naive_coverage_deficit'), _col('seasonal_coverage_deficit'), _col('linear_coverage_deficit')],
                 trio_colors,
                 trio_methods,
                 '.3f',
@@ -1716,7 +1731,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             axes_int[1].legend()
             _draw_bar_group(
                 axes_int[2], x, width,
-                [_col('model_nmpiw'), _col('naive_nmpiw'), _col('seasonal_nmpiw')],
+                [_col('model_nmpiw'), _col('naive_nmpiw'), _col('seasonal_nmpiw'), _col('linear_nmpiw')],
                 trio_colors,
                 trio_methods,
                 '.2f',
@@ -1726,7 +1741,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             axes_int[2].legend()
             _draw_bar_group(
                 axes_int[3], x, width,
-                [_col('model_interval_score'), _col('naive_interval_score'), _col('seasonal_interval_score')],
+                [_col('model_interval_score'), _col('naive_interval_score'), _col('seasonal_interval_score'), _col('linear_interval_score')],
                 trio_colors,
                 trio_methods,
                 '.2e',
@@ -1734,9 +1749,9 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             axes_int[3].set_ylabel('Interval Score')
             axes_int[3].grid(axis='y', alpha=0.3)
             axes_int[3].legend()
-            _pair_panel(axes_int[4], 'picp_delta_vs_naive', 'picp_delta_vs_seasonal', 'Prediction Interval Coverage Probability Difference\n(Model minus Baseline)', '.2f', hline=0.0)
-            _pair_panel(axes_int[5], 'nmpiw_delta_vs_naive', 'nmpiw_delta_vs_seasonal', 'Normalized Mean Prediction Interval Width Difference\n(Model minus Baseline)', '.2f', hline=0.0)
-            _pair_panel(axes_int[6], 'interval_score_delta_vs_naive', 'interval_score_delta_vs_seasonal', 'Interval Score Delta', '.2e', hline=0.0)
+            _baseline_panel(axes_int[4], ['picp_delta_vs_naive', 'picp_delta_vs_seasonal', 'picp_delta_vs_linear'], 'Prediction Interval Coverage Probability Difference\n(Model minus Baseline)', '.2f', hline=0.0)
+            _baseline_panel(axes_int[5], ['nmpiw_delta_vs_naive', 'nmpiw_delta_vs_seasonal', 'nmpiw_delta_vs_linear'], 'Normalized Mean Prediction Interval Width Difference\n(Model minus Baseline)', '.2f', hline=0.0)
+            _baseline_panel(axes_int[6], ['interval_score_delta_vs_naive', 'interval_score_delta_vs_seasonal', 'interval_score_delta_vs_linear'], 'Interval Score Delta', '.2e', hline=0.0)
             b_raw = axes_int[7].bar(x, _col('n_eval_raw_segments'), width=0.5, color='tab:orange')
             _annotate_bars_within_ylim(axes_int[7], b_raw, '.0f')
             axes_int[7].set_ylabel('Evaluated Independent Raw Segments (Count)')
@@ -1760,19 +1775,19 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             # Gate-by-gate outcomes used in evidence scoring
             fig_gate, axes_gate = plt.subplots(10, 1, figsize=(max(12, len(perf_df) * 0.8), 30), sharex=True)
             gate_specs = [
-                ('gate_min_raw_vs_naive', 'gate_min_raw_vs_seasonal', 'Gate: Minimum Independent Raw Sample Count'),
-                ('gate_prob_vs_naive', 'gate_prob_vs_seasonal', 'Gate: Bootstrap Probability of Positive Skill'),
-                ('gate_lcb_vs_naive', 'gate_lcb_vs_seasonal', 'Gate: 95% Lower Confidence Bound of Skill > 0'),
-                ('gate_dm_vs_naive', 'gate_dm_vs_seasonal', 'Gate: Diebold-Mariano p-value < alpha and statistic < 0'),
-                ('gate_wilcoxon_vs_naive', 'gate_wilcoxon_vs_seasonal', 'Gate: Wilcoxon p-value < alpha'),
-                ('gate_sign_vs_naive', 'gate_sign_vs_seasonal', 'Gate: Sign Test p-value < alpha and win rate > 0.5'),
-                ('gate_coverage_vs_naive', 'gate_coverage_vs_seasonal', 'Gate: Coverage Quality'),
-                ('gate_dm_q_vs_naive', 'gate_dm_q_vs_seasonal', 'Gate: Diebold-Mariano q-value < alpha and statistic < 0'),
-                ('gate_wilcoxon_q_vs_naive', 'gate_wilcoxon_q_vs_seasonal', 'Gate: Wilcoxon q-value < alpha'),
-                ('gate_sign_q_vs_naive', 'gate_sign_q_vs_seasonal', 'Gate: Sign Test q-value < alpha and win rate > 0.5'),
+                (['gate_min_raw_vs_naive', 'gate_min_raw_vs_seasonal', 'gate_min_raw_vs_linear'], 'Gate: Minimum Independent Raw Sample Count'),
+                (['gate_prob_vs_naive', 'gate_prob_vs_seasonal', 'gate_prob_vs_linear'], 'Gate: Bootstrap Probability of Positive Skill'),
+                (['gate_lcb_vs_naive', 'gate_lcb_vs_seasonal', 'gate_lcb_vs_linear'], 'Gate: 95% Lower Confidence Bound of Skill > 0'),
+                (['gate_dm_vs_naive', 'gate_dm_vs_seasonal', 'gate_dm_vs_linear'], 'Gate: Diebold-Mariano p-value < alpha and statistic < 0'),
+                (['gate_wilcoxon_vs_naive', 'gate_wilcoxon_vs_seasonal', 'gate_wilcoxon_vs_linear'], 'Gate: Wilcoxon p-value < alpha'),
+                (['gate_sign_vs_naive', 'gate_sign_vs_seasonal', 'gate_sign_vs_linear'], 'Gate: Sign Test p-value < alpha and win rate > 0.5'),
+                (['gate_coverage_vs_naive', 'gate_coverage_vs_seasonal', 'gate_coverage_vs_linear'], 'Gate: Coverage Quality'),
+                (['gate_dm_q_vs_naive', 'gate_dm_q_vs_seasonal', 'gate_dm_q_vs_linear'], 'Gate: Diebold-Mariano q-value < alpha and statistic < 0'),
+                (['gate_wilcoxon_q_vs_naive', 'gate_wilcoxon_q_vs_seasonal', 'gate_wilcoxon_q_vs_linear'], 'Gate: Wilcoxon q-value < alpha'),
+                (['gate_sign_q_vs_naive', 'gate_sign_q_vs_seasonal', 'gate_sign_q_vs_linear'], 'Gate: Sign Test q-value < alpha and win rate > 0.5'),
             ]
-            for ax_g, (g_n, g_s, ylab) in zip(axes_gate, gate_specs):
-                _pair_panel(ax_g, g_n, g_s, ylab, '.0f', ylim=(0.0, 1.05))
+            for ax_g, (g_cols, ylab) in zip(axes_gate, gate_specs):
+                _baseline_panel(ax_g, g_cols, ylab, '.0f', ylim=(0.0, 1.05))
             axes_gate[0].set_title("Evidence Gates (top-to-bottom follows score construction)")
             axes_gate[-1].set_xticks(x)
             axes_gate[-1].set_xticklabels(labels, rotation=45, ha='right')
@@ -1841,14 +1856,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 return np.full(n_rows_mat, np.nan, dtype=float)
 
             q_cols = [
-                "dm_q_vs_naive", "dm_q_vs_seasonal",
-                "wilcoxon_q_vs_naive", "wilcoxon_q_vs_seasonal",
-                "sign_q_vs_naive", "sign_q_vs_seasonal",
+                "dm_q_vs_naive", "dm_q_vs_seasonal", "dm_q_vs_linear",
+                "wilcoxon_q_vs_naive", "wilcoxon_q_vs_seasonal", "wilcoxon_q_vs_linear",
+                "sign_q_vs_naive", "sign_q_vs_seasonal", "sign_q_vs_linear",
             ]
             p_cols = [
-                "dm_p_vs_naive", "dm_p_vs_seasonal",
-                "wilcoxon_p_vs_naive", "wilcoxon_p_vs_seasonal",
-                "sign_p_vs_naive", "sign_p_vs_seasonal",
+                "dm_p_vs_naive", "dm_p_vs_seasonal", "dm_p_vs_linear",
+                "wilcoxon_p_vs_naive", "wilcoxon_p_vs_seasonal", "wilcoxon_p_vs_linear",
+                "sign_p_vs_naive", "sign_p_vs_seasonal", "sign_p_vs_linear",
             ]
             present_q_cols = [c for c in q_cols if c in perf_df.columns]
             present_p_cols = [c for c in p_cols if c in perf_df.columns]
@@ -1868,10 +1883,12 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 "Minimum Probability of Positive Skill": pd.concat([
                     pd.Series(_col_values("bootstrap_prob_skill_gt0_vs_naive")),
                     pd.Series(_col_values("bootstrap_prob_skill_gt0_vs_seasonal")),
+                    pd.Series(_col_values("bootstrap_prob_skill_gt0_vs_linear")),
                 ], axis=1).min(axis=1, skipna=True).to_numpy(dtype=float),
                 "Minimum 95% Lower Confidence Bound of Skill": pd.concat([
                     pd.Series(_col_values("lcb95_skill_vs_naive")),
                     pd.Series(_col_values("lcb95_skill_vs_seasonal")),
+                    pd.Series(_col_values("lcb95_skill_vs_linear")),
                 ], axis=1).min(axis=1, skipna=True).to_numpy(dtype=float),
                 "Best False Discovery Rate Adjusted q-value": q_min,
                 "Best p-value": p_min,

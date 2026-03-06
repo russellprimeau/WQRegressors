@@ -325,6 +325,11 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
     print(f"Keep search plots         : {args.keep_search_plots}")
     print(f"Show train logs           : {args.show_training_logs}")
 
+    search_disable_baselines = bool(args.disable_baselines_for_search)
+    final_run_baselines = True
+    print(f"Search run baselines      : {not search_disable_baselines}")
+    print(f"Final run baselines       : {final_run_baselines}")
+
     if args.dry_run:
         for plan in plans:
             surrogate = base._select_surrogate_config(plan.train_configs)
@@ -361,7 +366,7 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     tmc_max_permutations=args.tmc_max_permutations,
                     tmc_truncation_epsilon=args.tmc_truncation_epsilon,
                     tmc_bootstrap_resamples=args.tmc_bootstrap_resamples,
-                    disable_baselines_for_search=args.disable_baselines_for_search,
+                    disable_baselines_for_search=search_disable_baselines,
                     disable_training_plots=not args.keep_training_plots,
                     disable_eval_plots=not args.keep_eval_plots,
                     suppress_training_logs=not args.show_training_logs,
@@ -384,7 +389,7 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     dataset_plan=plan,
                     dataset_prefix=args.dataset_prefix,
                     selected=selected,
-                    run_baselines_in_final=args.run_baselines_in_final,
+                    run_baselines_in_final=final_run_baselines,
                     disable_training_plots=not args.keep_training_plots,
                     disable_eval_plots=not args.keep_eval_plots,
                     suppress_training_logs=not args.show_training_logs,

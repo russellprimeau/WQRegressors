@@ -10,12 +10,60 @@ Then:
 - Retrain/evaluate all discovered model configs on top-K subsets.
 - Write trace, selected subsets, and final metrics to forecasts/feature_sweeps.
 
-Examples:
-python src/h_RunMCFeatureSelectionSweep.py --dry-run
-python src/h_RunMCFeatureSelectionSweep.py --limit-datasets 1 --max-rounds 10 --beam-width 6  --eval-budget 300
-python src/h_RunMCFeatureSelectionSweep.py --row-counts 1,2,3,5 --limit-datasets 1
-python src/h_RunMCFeatureSelectionSweep.py --exclude=MC_Trial1,MC_Trial2
-python src/h_RunMCFeatureSelectionSweep.py --postprocess-only --keep-search-plots
+CLI Arguments (current):
+- --data-root PATH: Root directory containing regression dataset folders to sweep.
+- --dataset-prefix PREFIX: Dataset name prefix filter (for example, MC).
+- --config-pattern GLOB: Glob pattern used to discover per-dataset train configs.
+- --limit-datasets N: Maximum number of matching datasets to process (0 means all).
+- --row-counts CSV_INTS: Comma-separated input window sizes to evaluate.
+- --min-features N: Minimum feature count allowed during backward elimination.
+- --beam-width N: Number of best candidates retained each search round.
+- --max-rounds N: Maximum backward-elimination rounds before swap refinement.
+- --no-improve-patience N: Stop search after N consecutive non-improving rounds.
+- --eval-budget N: Maximum candidate evaluations per dataset/row-count search.
+- --max-swap-attempts N: Cap on swap-refinement attempts after beam search.
+- --lambda-drop FLOAT: Penalty weight for sample drop rate in objective.
+- --final-top-k N: Number of best discovered subsets retrained in final stage.
+- --seed N: Random seed for candidate ordering and swap sampling.
+- --include-regular: Include non-`_res` datasets only when paired with include flags.
+- --include-res: Include `_res` datasets only when paired with include flags.
+- --regular-only: Include only non-`_res` datasets.
+- --res-only: Include only `_res` datasets.
+- --disable-baselines-for-search: Disable baseline model evaluation during search phase.
+- --run-baselines-in-final: CLI-accepted legacy flag; final baselines are enabled by policy.
+- --run-baselines-in-search: Enable baseline model evaluation during search (slower).
+- --keep-training-plots: Preserve per-model training plots (disabled by default in search).
+- --keep-eval-plots: Preserve per-config evaluation plots during search.
+- --keep-search-plots: Save search Pareto plot (`feature_search_pareto_*.png`).
+- --show-training-logs: Print verbose training/sample split logs.
+- --dry-run: Print discovered execution plan and exit without training/evaluation.
+- --stop-on-error: Raise immediately on first dataset failure instead of continuing.
+
+Examples (valid syntax):
+- Minimal dry run (defaults):
+    python src/h_RunMCFeatureSelectionSweep.py --dry-run
+
+- Explicit values for all value-taking arguments:
+    python src/h_RunMCFeatureSelectionSweep.py --data-root data/output/regression --dataset-prefix MC --config-pattern "config_*.yml" --limit-datasets 2 --row-counts 1,2,3,5 --min-features 4 --beam-width 6 --max-rounds 10 --no-improve-patience 3 --eval-budget 500 --max-swap-attempts 60 --lambda-drop 0.25 --final-top-k 4 --seed 42
+
+- Dataset inclusion controls:
+    python src/h_RunMCFeatureSelectionSweep.py --include-regular
+    python src/h_RunMCFeatureSelectionSweep.py --include-res
+    python src/h_RunMCFeatureSelectionSweep.py --regular-only
+    python src/h_RunMCFeatureSelectionSweep.py --res-only
+
+- Search baseline controls (mutually exclusive pair shown separately):
+    python src/h_RunMCFeatureSelectionSweep.py --disable-baselines-for-search
+    python src/h_RunMCFeatureSelectionSweep.py --run-baselines-in-search
+
+- Final-phase baseline flag (accepted by CLI):
+    python src/h_RunMCFeatureSelectionSweep.py --run-baselines-in-final
+
+- Plot/log toggles:
+    python src/h_RunMCFeatureSelectionSweep.py --keep-training-plots --keep-eval-plots --keep-search-plots --show-training-logs
+
+- Error handling:
+    python src/h_RunMCFeatureSelectionSweep.py --stop-on-error
 """
 from __future__ import annotations
 import contextlib
@@ -293,6 +341,7 @@ def _prepare_variant_config(
     features: tuple[str, ...],
     feature_tag: str,
     tmp_dir: Path,
+    forced_data_dir: Path | None = None,
 ) -> Path:
     cfg = train_module.load_config(str(base_config_path))
     cfg_copy = copy.deepcopy(cfg)
@@ -319,9 +368,12 @@ def _prepare_variant_config(
     data_cfg["input_row_1"] = int(base_stop - row_count)
     data_cfg["input_row_2"] = int(base_stop)
 
-    # Always resolve forecast_name as a relative path under the correct data_dir
-    # and ensure data_dir is absolute and correct
-    resolved_data_dir = train_module._resolve_path_from_config(data_cfg["data_dir"], source_config_dir)
+    # Resolve data_dir from the discovered dataset path when provided.
+    # This keeps read/write locations consistent with --data-root.
+    if forced_data_dir is not None:
+        resolved_data_dir = Path(forced_data_dir).resolve()
+    else:
+        resolved_data_dir = train_module._resolve_path_from_config(data_cfg["data_dir"], source_config_dir)
     data_cfg["data_dir"] = str(resolved_data_dir)
     # Ensure forecast_name is always relative to the correct data_dir
     data_cfg["forecast_name"] = _variant_forecast_name(str(data_cfg["forecast_name"]), row_count, feature_tag)
@@ -410,13 +462,13 @@ def _train_single_config(
 
 
 def _set_eval_overrides(eval_config_path: Path, run_baselines: bool) -> None:
-    # Always force run_baselines True for evaluation summary output
+    # Apply explicit per-phase baseline policy (search vs final).
     with open(eval_config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     if "evaluation" not in cfg:
         cfg["evaluation"] = {}
-    cfg["evaluation"]["run_baselines"] = True
+    cfg["evaluation"]["run_baselines"] = bool(run_baselines)
 
     with open(eval_config_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
@@ -494,7 +546,8 @@ def _evaluate_candidate(
         base_stop = int(base_data["input_row_2"])
         input_rows = slice(base_stop - row_count, base_stop)
 
-        data_dir_resolved = Path(train_module._resolve_path_from_config(base_data["data_dir"], Path(base_cfg["__config_dir"])))
+        # Use discovered dataset_dir as the authoritative data root for this run.
+        data_dir_resolved = Path(dataset_dir).resolve()
         sample_subdir = str(base_data.get("sample_subdir", "samples"))
         output_columns = list(base_data["output_columns"])
         output_rows = list(base_data["output_rows"])
@@ -515,6 +568,7 @@ def _evaluate_candidate(
             features=features,
             feature_tag=feature_tag,
             tmp_dir=tmp_cfg_dir,
+            forced_data_dir=dataset_dir,
         )
         eval_cfg = _train_single_config(
             variant_cfg,
@@ -598,7 +652,6 @@ def _plot_feature_importance_bar(
     colors = plt.cm.RdYlGn(np.linspace(0.3, 0.9, len(features)))
     ax.barh(features, scores, color=colors)
     ax.set_xlabel("Removal Sensitivity (avg delta)")
-    ax.set_title(f"Feature Removal Sensitivity: {target_name} (rows={row_count})\n(Positive = valuable)")
     ax.grid(axis='x', alpha=0.3)
     
     plot_path = output_dir / f"feature_importance_bar_r{row_count:03d}.png"
@@ -646,7 +699,6 @@ def _plot_removal_sensitivity(
     ax.axvline(x=0, color='black', linestyle='--', linewidth=0.8, alpha=0.5)
     ax.set_xlabel("Objective Delta (removing feature)")
     ax.set_ylabel("Feature")
-    ax.set_title(f"Removal Sensitivity Distribution: {target_name} (rows={row_count})\n(green=valuable, yellow=neutral, red=detrimental)")
     ax.grid(axis='x', alpha=0.3)
 
     plot_path = output_dir / f"removal_sensitivity_box_r{row_count:03d}.png"
@@ -678,7 +730,6 @@ def _plot_feature_frequency(
                 ha='left', va='center', fontsize=9)
     
     ax.set_xlabel("Frequency in Improving Solutions")
-    ax.set_title(f"Feature Inclusion Frequency: {target_name} (rows={row_count})")
     ax.grid(axis='x', alpha=0.3)
     
     plot_path = output_dir / f"feature_frequency_r{row_count:03d}.png"
@@ -817,7 +868,6 @@ def _regenerate_saved_outputs_for_row(
                 ax.scatter(selected_df["drop_rate"], selected_df["rmse"], s=60, marker="*", color="red")
             ax.set_xlabel("Drop rate (raw sample loss)")
             ax.set_ylabel("RMSE (surrogate)")
-            ax.set_title(f"Feature search Pareto-like view (rows={row_count})")
             ax.grid(alpha=0.25)
             fig.savefig(plot_path, dpi=180)
             plt.close(fig)
@@ -1233,7 +1283,6 @@ def _compile_multi_target_comparison(
             )
     ax.set_xticklabels(all_features, rotation=45, ha='right', fontsize=8)
     ax.set_yticklabels(targets, fontsize=9)
-    ax.set_title("Feature Removal Sensitivity Heatmap Across Targets\n(Positive = valuable)")
     ax.set_xlabel("Feature")
     ax.set_ylabel("Target")
 
@@ -1258,7 +1307,6 @@ def _compile_multi_target_comparison(
     bars = ax.bar(x, summed_scores, color=plt.cm.RdYlGn((np.array(summed_scores) - np.min(summed_scores)) / (np.ptp(summed_scores) if np.ptp(summed_scores) > 0 else 1)))
     ax.set_xlabel("Feature (grouped: common across targets first, then single-target)")
     ax.set_ylabel("Total Removal Sensitivity (sum across targets)")
-    ax.set_title(f"Total Feature Removal Sensitivity Across All Targets\n(Positive = valuable feature)")
     ax.set_xticks(x)
     ax.set_xticklabels(top_features, rotation=45, ha='right')
     ax.grid(axis='y', alpha=0.3)
@@ -1342,7 +1390,6 @@ def _write_search_outputs(
             ax.scatter(selected_df["drop_rate"], selected_df["rmse"], s=60, marker="*", color="red")
         ax.set_xlabel("Drop rate (raw sample loss)")
         ax.set_ylabel("RMSE (surrogate)")
-        ax.set_title(f"Feature search Pareto-like view (rows={row_count})")
         ax.grid(alpha=0.25)
         fig.savefig(plot_path, dpi=180)
         plt.close(fig)
@@ -1374,6 +1421,7 @@ def _evaluate_selected_subsets_all_models(
                 features=cand.features,
                 feature_tag=f"{cand.feature_tag}_k{rank:02d}",
                 tmp_dir=cfg_dir,
+                forced_data_dir=dataset_plan.dataset_dir,
             )
 
             try:
@@ -1825,13 +1873,16 @@ def _ensure_k01_baselines(plan: DatasetPlan, final_metrics_csv: Path) -> None:
     eval_csv = variant_dir / "evaluation_summary.csv"
     eval_cfg_path = variant_dir / f"config_evaluate_{variant_name}.yml"
 
-    # Check if baseline rows already present
+    # Check if all baseline rows are already present
     if eval_csv.exists():
         try:
             df_eval = pd.read_csv(eval_csv)
-            if "label" in df_eval.columns and df_eval["label"].str.lower().str.contains("naive").any():
-                print(f"[DEBUG] _ensure_k01_baselines: {variant_name} already has baseline rows; skipping re-evaluation.")
-                return
+            if "label" in df_eval.columns:
+                labels = df_eval["label"].astype(str).str.lower()
+                has_all = all(labels.str.contains(name).any() for name in ("naive", "seasonal", "linear"))
+                if has_all:
+                    print(f"[DEBUG] _ensure_k01_baselines: {variant_name} already has Naive/Seasonal/Linear rows; skipping re-evaluation.")
+                    return
         except Exception:
             pass
 
@@ -1933,6 +1984,17 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
         include_res=include_res,
     )
 
+    if args.run_baselines_in_search and args.disable_baselines_for_search:
+        raise ValueError("Cannot use both --run-baselines-in-search and --disable-baselines-for-search.")
+
+    # Search is performance-oriented by default; final phase restores outputs.
+    search_run_baselines = bool(args.run_baselines_in_search) and (not args.disable_baselines_for_search)
+    search_disable_training_plots = not bool(args.keep_training_plots)
+    search_disable_eval_plots = not bool(args.keep_eval_plots)
+    final_run_baselines = True
+    final_disable_training_plots = False
+    final_disable_eval_plots = False
+
     # --exclude logic removed
     if not plans:
         print("No matching datasets/configs found.")
@@ -1956,6 +2018,10 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
     print(f"Keep eval plots           : {args.keep_eval_plots}")
     print(f"Keep search plots         : {args.keep_search_plots}")
     print(f"Show train logs           : {args.show_training_logs}")
+    print(f"Search run baselines      : {search_run_baselines}")
+    print(f"Search eval plots enabled : {not search_disable_eval_plots}")
+    print(f"Final run baselines       : {final_run_baselines}")
+    print(f"Final eval plots enabled  : {not final_disable_eval_plots}")
 
     if args.dry_run:
         for plan in plans:
@@ -1992,9 +2058,9 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     min_features=args.min_features,
                     eval_budget=args.eval_budget,
                     max_swap_attempts=args.max_swap_attempts,
-                    disable_baselines_for_search=args.disable_baselines_for_search,
-                    disable_training_plots=not args.keep_training_plots,
-                    disable_eval_plots=not args.keep_eval_plots,
+                    disable_baselines_for_search=not search_run_baselines,
+                    disable_training_plots=search_disable_training_plots,
+                    disable_eval_plots=search_disable_eval_plots,
                     suppress_training_logs=not args.show_training_logs,
                     seed=args.seed,
                 )
@@ -2014,9 +2080,9 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     dataset_plan=plan,
                     dataset_prefix=args.dataset_prefix,
                     selected=selected,
-                    run_baselines_in_final=args.run_baselines_in_final,
-                    disable_training_plots=not args.keep_training_plots,
-                    disable_eval_plots=not args.keep_eval_plots,
+                    run_baselines_in_final=final_run_baselines,
+                    disable_training_plots=final_disable_training_plots,
+                    disable_eval_plots=final_disable_eval_plots,
                     suppress_training_logs=not args.show_training_logs,
                 )
                 print(f"[INFO] Wrote final model metrics: {final_metrics_csv}")
@@ -2063,6 +2129,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--disable-baselines-for-search", action="store_true")
     parser.add_argument("--run-baselines-in-final", action="store_true")
+    parser.add_argument(
+        "--run-baselines-in-search",
+        action="store_true",
+        help="Enable baselines during search evaluations (disabled by default for speed).",
+    )
     parser.add_argument(
         "--keep-training-plots",
         action="store_true",

@@ -22,8 +22,8 @@ DEFAULT_SAMPLE_LENGTH_ROWS = 168
 EUROFINS_SUMMARY_DEFAULT_PATH = (
     Path(__file__).resolve().parent.parent
     / "data"
+    / "output"
     / "sensors"
-    / "summaries"
     / "tables"
     / "Eurofins_summary.csv"
 )

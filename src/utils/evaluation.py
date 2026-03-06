@@ -15,11 +15,63 @@ from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score, 
 from .preprocessing import normalize_columns
 
 
+EUROFINS_SUMMARY_DEFAULT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "data"
+    / "output"
+    / "sensors"
+    / "tables"
+    / "Eurofins_summary.csv"
+)
+
+
 def _safe_plot_filename(name: str) -> str:
     text = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode("ascii")
     text = text.replace(os.sep, "_").replace("/", "_").replace("\\", "_")
     text = re.sub(r"[^A-Za-z0-9._()-]+", "_", text).strip("._")
     return text or "output"
+
+
+def _normalize_target_for_eurofins_lookup(name):
+    text = str(name).strip()
+    if text.endswith("_res"):
+        text = text[:-4]
+    text = re.sub(r"\s*\([^)]*\)\s*$", "", text).strip()
+    return text.casefold()
+
+
+@lru_cache(maxsize=1)
+def _load_eurofins_sample_length_map(summary_csv_path=str(EUROFINS_SUMMARY_DEFAULT_PATH)):
+    path = Path(summary_csv_path)
+    if not path.exists():
+        return {}
+
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return {}
+
+    required = {"parameter", "median_hours_between_measurements"}
+    if not required.issubset(set(df.columns)):
+        return {}
+
+    out = {}
+    for _, row in df.iterrows():
+        key = _normalize_target_for_eurofins_lookup(row.get("parameter", ""))
+        if not key:
+            continue
+        value = pd.to_numeric(row.get("median_hours_between_measurements"), errors="coerce")
+        if pd.isna(value) or float(value) <= 0:
+            continue
+        out[key] = max(1.0, float(value))
+    return out
+
+
+def _target_sample_length_hours(target_name, default_hours):
+    default_value = max(1.0, float(default_hours))
+    lookup_key = _normalize_target_for_eurofins_lookup(target_name)
+    sample_len_map = _load_eurofins_sample_length_map()
+    return float(sample_len_map.get(lookup_key, default_value))
 
 
 def evaluate_transformer(model, dataset, device):
@@ -158,6 +210,8 @@ def evaluate_linear(data_dir, forecast_name, dataset, historic, output_columns, 
 
     predictions, targets = [], []
 
+    fit_scale = 3.1
+
     for i in range(len(dataset)):
         _, y, filename = dataset[i]
 
@@ -167,51 +221,73 @@ def evaluate_linear(data_dir, forecast_name, dataset, historic, output_columns, 
 
         forecast_start = output_times[0]
         window_end = forecast_start - pd.Timedelta(hours=gap_hours)
-        window_start = window_end - pd.Timedelta(hours=window_hours)
+        pred_matrix = np.full((len(output_times), len(output_columns)), np.nan, dtype=float)
 
-        window_df = historical_df.loc[window_start:window_end - pd.Timedelta(nanoseconds=1), output_columns]
-        window_df = window_df.dropna(subset=output_columns)
+        for j, col in enumerate(output_columns):
+            # Per-target handling prevents one sparse output from blanking all outputs.
+            series = historical_df[col].dropna()
+            if series.empty:
+                continue
 
-        if window_df.empty:
-            pred_matrix = np.full((len(output_times), len(output_columns)), np.nan)
-        else:
-            times = (window_df.index - window_start).total_seconds().to_numpy().reshape(-1, 1)
-            forecast_secs = (output_times - window_start).total_seconds().to_numpy().reshape(-1, 1)
-            pred_matrix = np.zeros((len(output_times), len(output_columns)))
+            history = series.loc[: window_end - pd.Timedelta(nanoseconds=1)]
+            if history.empty:
+                continue
 
-            for j, col in enumerate(output_columns):
-                values = window_df[col].values
-                if len(values) == 0 or np.isnan(values).all():
-                    pred_matrix[:, j] = np.nan
-                else:
-                    model = LinearRegression()
-                    model.fit(times, values)
+            sample_length_hours = _target_sample_length_hours(col, default_hours=window_hours)
+            fit_span_hours = max(1.0, float(fit_scale * sample_length_hours))
+            fit_start = window_end - pd.Timedelta(hours=fit_span_hours)
+            fit_series = history.loc[fit_start: window_end - pd.Timedelta(nanoseconds=1)]
 
-                    pred_matrix[:, j] = model.predict(forecast_secs)
+            method = "persistence"
+            if len(fit_series) >= 2:
+                times = (fit_series.index - fit_start).total_seconds().to_numpy().reshape(-1, 1)
+                forecast_secs = (output_times - fit_start).total_seconds().to_numpy().reshape(-1, 1)
+                values = fit_series.to_numpy(dtype=float)
 
-                    # === Debug plot for this variable ===
-                    if debug_plot and i < examples:
-                        plt.figure(figsize=(8, 5))
-                        plt.scatter(window_df.index, values, label="Training data", color="blue", alpha=0.6)
-                        fit_times = np.linspace(times.min(), times.max(), 100).reshape(-1, 1)
-                        fit_dates = [window_start + pd.Timedelta(seconds=s) for s in fit_times.flatten()]
-                        plt.plot(fit_dates, model.predict(fit_times), "k--", label="Fitted line")
-                        plt.scatter(output_times, pred_matrix[:, j], color="orange", label="Predictions", zorder=5)
-                        plt.plot(output_times, y.numpy().reshape(-1)[j::len(output_columns)],
-                                 color="green", marker="o", linestyle="", label="Ground truth", zorder=6)
+                model = LinearRegression()
+                model.fit(times, values)
+                pred_matrix[:, j] = model.predict(forecast_secs)
+                method = "linear"
+            else:
+                # Fallback when span is too sparse: hold the last valid value.
+                pred_matrix[:, j] = float(history.iloc[-1])
 
-                        # Reference verticals
-                        plt.axvline(window_end, color="red", linestyle="--", label=f"Gap start (-{gap_hours}h)")
-                        plt.axvline(forecast_start, color="red", linestyle=":", label="Forecast start")
+            if debug_plot and i < examples:
+                plt.figure(figsize=(8, 5))
+                plt.scatter(fit_series.index, fit_series.to_numpy(dtype=float), label="Training data", color="blue", alpha=0.6)
 
-                        plt.title(f"Linear Regression Forecast — {col}\nSample: {filename}")
-                        plt.xlabel("Timestamp")
-                        plt.ylabel(col)
-                        plt.legend()
-                        plt.tight_layout()
-                        plt.savefig(os.path.join(os.path.join(data_dir, "forecasts", forecast_name, "linear"),
-                                                 f"{filename}_{col}_debug.png"))
-                        plt.close()
+                if method == "linear":
+                    fit_times = np.linspace(times.min(), times.max(), 100).reshape(-1, 1)
+                    fit_dates = [fit_start + pd.Timedelta(seconds=s) for s in fit_times.flatten()]
+                    plt.plot(fit_dates, model.predict(fit_times), "k--", label="Fitted line")
+
+                plt.scatter(output_times, pred_matrix[:, j], color="orange", label="Predictions", zorder=5)
+                y_arr = np.asarray(y).reshape(-1)
+                plt.plot(
+                    output_times,
+                    y_arr[j::len(output_columns)],
+                    color="green",
+                    marker="o",
+                    linestyle="",
+                    label="Ground truth",
+                    zorder=6,
+                )
+
+                plt.axvline(window_end, color="red", linestyle="--", label=f"Gap start (-{gap_hours}h)")
+                plt.axvline(forecast_start, color="red", linestyle=":", label="Forecast start")
+                plt.title(f"{col} ({method})")
+                plt.xlabel("Timestamp")
+                plt.ylabel(col)
+                plt.legend()
+                plt.tight_layout()
+                safe_col = _safe_plot_filename(col)
+                plt.savefig(
+                    os.path.join(
+                        os.path.join(data_dir, "forecasts", forecast_name, "linear"),
+                        f"{filename}_{safe_col}_debug.png",
+                    )
+                )
+                plt.close()
 
         predictions.append(pred_matrix.reshape(-1))
         targets.append(y.reshape(-1))
@@ -391,7 +467,6 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, output_rows=-
             plt.xlim(0, 366)
             plt.xlabel("Month")
             plt.ylabel(col)
-            plt.title(f"Seasonality-based Model for {col}")
             plt.legend(loc="best", fontsize=9)
             plt.tight_layout()
             safe_col = _safe_plot_filename(col)
@@ -503,7 +578,6 @@ def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=No
     ax.plot([min_val, max_val], [min_val, max_val], color="red", linestyle="--")
     ax.set_xlabel("Ground truth")
     ax.set_ylabel("Predicted Value")
-    ax.set_title("ML & Baseline Models")
     ax.set_xlim(min_val, max_val)
     ax.set_ylim(min_val, max_val)
     ax.set_aspect("equal", adjustable="box")
@@ -521,21 +595,17 @@ def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=No
         fig, ax = plt.subplots(1, 3, figsize=(14, 5))
         bar_kwargs = dict(alpha=0.7)
         ax[0].bar(labels_m, mae_vals, color=colors, **bar_kwargs)
-        ax[0].set_title("Mean Absolute Error")
         ax[0].set_ylabel("MAE")
         ax[1].bar(labels_m, rmse_vals, color=colors, **bar_kwargs)
-        ax[1].set_title("Root Mean Squared Error")
         ax[1].set_ylabel("RMSE")
         ax[2].bar(labels_m, r2_vals, color=colors, **bar_kwargs)
-        ax[2].set_title("R² Score")
         ax[2].set_ylabel("R²")
         ax[2].set_ylim(bottom=-0.1)
         for a in ax:
             a.set_xticks(range(len(labels_m)))
             a.set_xticklabels(labels_m, rotation=30, ha="right")
             a.grid(True, axis="y", linestyle="--", alpha=0.6)
-        plt.suptitle("Model Performance Metrics", fontsize=14)
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        plt.tight_layout()
         plt.savefig(Path(directory, "forecasts", forecast_name, "metrics_summary.png"))
         plt.close(fig)
 
@@ -568,7 +638,6 @@ def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=No
             rmse_per_step.append(rmse)
         ax.plot(range(1, horizon + 1), rmse_per_step, marker='o', label=label, color=colors[i])
 
-    ax.set_title("RMSE vs Forecast Horizon")
     ax.set_xlabel("Forecast Step (T+)")
     ax.set_ylabel("RMSE")
     ax.legend()
@@ -615,7 +684,6 @@ def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=No
             artist.set_facecolor('red')
             artist.set_edgecolor('red')
 
-        ax.set_title("Prediction Error Distribution")
         ax.set_ylabel("Error (Absolute)")
         ax.set_xlabel("Model")
         plt.tight_layout()
@@ -662,7 +730,6 @@ def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=No
         sns.stripplot(x="Column", y="Error", data=df_long_pair,
                       jitter=True, size=6, color='black', alpha=0.8, ax=ax)
 
-        ax.set_title(f"Error by Column for {label}")
         ax.set_ylabel("Error")
         ax.set_xlabel("Column")
         plt.tight_layout()
@@ -724,11 +791,9 @@ def classification_visualizer(*pred_target_pairs, labels=None, directory='.', fo
         axes = [axes]
     for ax, (label, cm) in zip(axes, all_conf_matrices):
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax)
-        ax.set_title(f"{label}")
         ax.set_xlabel("Predicted")
         ax.set_ylabel("Actual")
-    plt.suptitle("Confusion Matrices")
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.tight_layout()
     plt.savefig(Path(directory, "forecasts", forecast_name, "classification", f"confusion.png"))
     plt.close()
 
@@ -738,7 +803,6 @@ def classification_visualizer(*pred_target_pairs, labels=None, directory='.', fo
         for label, fpr, tpr, roc_auc in roc_data:
             plt.plot(fpr, tpr, label=f"{label} (AUC = {roc_auc:.2f})")
         plt.plot([0, 1], [0, 1], 'k--')
-        plt.title("ROC Curves")
         plt.xlabel("False Positive Rate")
         plt.ylabel("True Positive Rate")
         plt.legend()
@@ -751,7 +815,6 @@ def classification_visualizer(*pred_target_pairs, labels=None, directory='.', fo
         plt.figure(figsize=(6, 5))
         for label, recall, precision, pr_auc in pr_data:
             plt.plot(recall, precision, label=f"{label} (AUC = {pr_auc:.2f})")
-        plt.title("Precision-Recall Curves")
         plt.xlabel("Recall")
         plt.ylabel("Precision")
         plt.legend()
@@ -765,7 +828,6 @@ def classification_visualizer(*pred_target_pairs, labels=None, directory='.', fo
     if auc_scores:
         plt.figure(figsize=(8, 5))
         sns.barplot(x=labels_auc, y=auc_vals, hue=auc_scores, legend=False)
-        plt.title("AUC Scores")
         plt.ylabel("AUC")
         plt.xticks(rotation=30, ha="right")
         plt.grid(True, axis="y", linestyle="--", alpha=0.6)

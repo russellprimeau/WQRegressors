@@ -26,8 +26,8 @@ from utils.limits import (
 
 
 def _summary_theme_dirs(repo_root: Path) -> dict:
-    """Return themed output directories under data/sensors/summaries."""
-    base = repo_root / "data" / "sensors" / "summaries"
+    """Return themed output directories under data/output/sensors."""
+    base = repo_root / "data" / "output" / "sensors"
     dirs = {
         "root": base,
         "tables": base / "tables",

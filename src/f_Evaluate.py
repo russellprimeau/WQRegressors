@@ -549,11 +549,6 @@ def _plot_uncertainty_boxplots(regression_pairs, regression_labels, split_files_
             ax.set_ylabel("Prediction")
             ax.set_xlabel("Ground truth")
             ax.grid(alpha=0.25)
-            if out_idx == 0:
-                ax.set_title(
-                    f"Prediction uncertainty (x=ground truth, y=prediction replicate distribution) — {label}\n"
-                    f"n_groups={len(group_order)}"
-                )
             ax.text(0.01, 0.98, f"Output {out_idx + 1}", transform=ax.transAxes, ha="left", va="top", fontsize=9)
 
         if valid_axes == 0:
@@ -957,6 +952,10 @@ def evaluate_single_config(config_path, save_plots_override=None):
         historic = eval_cfg["historic_path"]
         sample_subdir = data_cfg.get("sample_subdir", "samples")
         baseline_output_rows = _baseline_output_rows_start(data_cfg.get("output_rows", -1))
+        secondary, baseline_window_hours = load_secondary(
+            output_columns,
+            int(eval_cfg.get("window_hours", 340)),
+        )
         # Naive baseline
         preds_naive, targets_naive = evaluate_naive(
             eval_samples,
@@ -975,6 +974,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
             data_cfg["data_dir"],
             output_rows=baseline_output_rows,
             diurnal_window=int(eval_cfg.get("diurnal_window", 2)),
+            secondary=secondary,
             sample_subdir=sample_subdir
         )
         # Linear baseline
@@ -985,7 +985,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
             historic,
             output_columns,
             output_rows=baseline_output_rows,
-            window_hours=int(eval_cfg.get("window_hours", 340)),
+            window_hours=int(baseline_window_hours),
             gap_hours=int(eval_cfg.get("gap_hours", 0)),
             debug_plot=bool(eval_cfg.get("debug_plot", False)),
             examples=int(eval_cfg.get("debug_examples", 10)),
@@ -1027,8 +1027,8 @@ def evaluate_single_config(config_path, save_plots_override=None):
     plot_labels.extend(baseline_labels)
     plot_split_files.extend(baseline_split_files)
 
-    # Call visualizer and _plot_uncertainty_boxplots
-    if plot_pairs:
+    # Call visualizer and uncertainty plots only when plot output is enabled.
+    if plot_pairs and save_plots:
         visualizer(
             *plot_pairs,
             labels=plot_labels,
