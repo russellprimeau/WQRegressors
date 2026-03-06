@@ -397,15 +397,19 @@ def generate_transformer_config_template(output_dir, forecast_name, input_column
         },
         'hyperparameters': {
             # Transformer hyperparameters
-            'd_model': 64,
-            'nhead': 4,
+            'model_dim': 64,
+            'num_heads': 4,
             'num_layers': 2,
-            'dim_feedforward': 256,
             'dropout': 0.1,
             'learning_rate': 0.001,
             'batch_size': 32,
-            'epochs': 100,
+            'num_epochs': 100,
+            'loss_threshold': 0.000001,
             'patience': 10,
+            # Composite objective: combined_loss = mse_loss - corr_lambda * pearson_corr
+            'corr_lambda': 0.1,
+            'corr_eps': 1e-8,
+            'corr_clip': True,
         },
         '_comments': {
             'model_type': "This is a Transformer model configuration",

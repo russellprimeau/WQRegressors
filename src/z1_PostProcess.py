@@ -1177,12 +1177,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
         print(f"\n[INFO] Rebuilding saved outputs for {plan.dataset_dir.name}: rows={row_counts}")
         wrote_any = False
+        include_row_count_in_plot_names = len(row_counts) > 1
         for row_count in row_counts:
             written = _regenerate_saved_outputs_for_row(
                 dataset_dir=plan.dataset_dir,
                 target_name=target_name,
                 row_count=row_count,
                 keep_search_plots=bool(args.keep_search_plots),
+                include_row_count_in_plot_names=include_row_count_in_plot_names,
             )
 
             feature_sensitivities, _, _ = _load_feature_stats_artifacts(

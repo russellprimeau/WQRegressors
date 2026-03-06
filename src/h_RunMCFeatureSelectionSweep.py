@@ -636,25 +636,46 @@ def _candidate_key(row_count: int, features: tuple[str, ...]) -> tuple[int, tupl
     return int(row_count), tuple(features)
 
 
+def _feature_plot_filename(stem: str, row_count: int, include_row_count_in_name: bool) -> str:
+    """Return standard feature-plot filename with optional row-count disambiguation."""
+    if include_row_count_in_name:
+        return f"{stem}_r{row_count:03d}.png"
+    return f"{stem}.png"
+
+
 def _plot_feature_importance_bar(
     feature_sensitivities: dict[str, tuple[float, int]],
     dataset_name: str,
     target_name: str,
     row_count: int,
     output_dir: Path,
+    include_row_count_in_name: bool = False,
 ) -> Path:
     """Plot feature importance (removal sensitivity) as horizontal bar chart."""
     ranked = sorted(feature_sensitivities.items(), key=lambda x: -x[1][0])
     features = [f for f, _ in ranked]
     scores = [s[0] for _, s in ranked]
-    
+
     fig, ax = plt.subplots(figsize=(10, max(6, len(features) * 0.3)), constrained_layout=True)
-    colors = plt.cm.RdYlGn(np.linspace(0.3, 0.9, len(features)))
+    if scores:
+        score_min = float(np.min(scores))
+        score_max = float(np.max(scores))
+        if score_max > score_min:
+            norm = matplotlib.colors.Normalize(vmin=score_min, vmax=score_max)
+            colors = [plt.cm.RdYlGn(float(norm(s))) for s in scores]
+        else:
+            colors = [plt.cm.RdYlGn(0.5) for _ in scores]
+    else:
+        colors = []
     ax.barh(features, scores, color=colors)
     ax.set_xlabel("Removal Sensitivity (avg delta)")
     ax.grid(axis='x', alpha=0.3)
-    
-    plot_path = output_dir / f"feature_importance_bar_r{row_count:03d}.png"
+
+    plot_path = output_dir / _feature_plot_filename(
+        "feature_importance_bar",
+        row_count,
+        include_row_count_in_name,
+    )
     fig.savefig(plot_path, dpi=180, bbox_inches='tight')
     plt.close(fig)
     return plot_path
@@ -666,6 +687,7 @@ def _plot_removal_sensitivity(
     target_name: str,
     row_count: int,
     output_dir: Path,
+    include_row_count_in_name: bool = False,
 ) -> Path:
     """Plot removal sensitivity as box plot showing distribution of objective deltas."""
     features = sorted(feature_removal_deltas.keys())
@@ -680,19 +702,27 @@ def _plot_removal_sensitivity(
     if not tested_features:
         return Path()  # No data to plot
 
+    median_deltas = [float(np.median(deltas)) for deltas in tested_deltas]
+    med_min = float(np.min(median_deltas))
+    med_max = float(np.max(median_deltas))
+    if med_max > med_min:
+        if med_min < 0.0 < med_max:
+            color_norm = matplotlib.colors.TwoSlopeNorm(vmin=med_min, vcenter=0.0, vmax=med_max)
+        else:
+            color_norm = matplotlib.colors.Normalize(vmin=med_min, vmax=med_max)
+    else:
+        color_norm = None
+
     fig_h = max(7, len(tested_features) * 0.45)
     fig, ax = plt.subplots(figsize=(14, fig_h), constrained_layout=True)
     bp = ax.boxplot(tested_deltas, vert=False, patch_artist=True)
 
-    # Color boxes by median delta (positive = valuable feature; bad to remove)
-    for patch, deltas in zip(bp['boxes'], tested_deltas):
-        median_delta = np.median(deltas)
-        if median_delta > 0.01:
-            patch.set_facecolor('lightgreen')
-        elif median_delta > 0.001:
-            patch.set_facecolor('lightyellow')
+    # Continuous shading by median removal delta (red=low, green=high).
+    for patch, median_delta in zip(bp['boxes'], median_deltas):
+        if color_norm is None:
+            patch.set_facecolor(plt.cm.RdYlGn(0.5))
         else:
-            patch.set_facecolor('lightcoral')
+            patch.set_facecolor(plt.cm.RdYlGn(float(color_norm(median_delta))))
 
     ax.set_yticks(np.arange(1, len(tested_features) + 1))
     ax.set_yticklabels(tested_features, fontsize=8)
@@ -701,7 +731,11 @@ def _plot_removal_sensitivity(
     ax.set_ylabel("Feature")
     ax.grid(axis='x', alpha=0.3)
 
-    plot_path = output_dir / f"removal_sensitivity_box_r{row_count:03d}.png"
+    plot_path = output_dir / _feature_plot_filename(
+        "removal_sensitivity_box",
+        row_count,
+        include_row_count_in_name,
+    )
     fig.savefig(plot_path, dpi=180, bbox_inches='tight')
     plt.close(fig)
     return plot_path
@@ -713,26 +747,40 @@ def _plot_feature_frequency(
     target_name: str,
     row_count: int,
     output_dir: Path,
+    include_row_count_in_name: bool = False,
 ) -> Path:
     """Plot feature frequency in improving solutions."""
     ranked = sorted(feature_sensitivities.items(), key=lambda x: -x[1][0])
     features = [f for f, _ in ranked]
     frequencies = [feature_improvement_counts[f] for f in features]
-    
+
     fig, ax = plt.subplots(figsize=(10, max(6, len(features) * 0.3)), constrained_layout=True)
-    colors = plt.cm.Blues(np.linspace(0.4, 0.9, len(features)))
+    if frequencies:
+        freq_min = float(np.min(frequencies))
+        freq_max = float(np.max(frequencies))
+        if freq_max > freq_min:
+            norm = matplotlib.colors.Normalize(vmin=freq_min, vmax=freq_max)
+            colors = [plt.cm.Greens(0.25 + (0.7 * float(norm(v)))) for v in frequencies]
+        else:
+            colors = [plt.cm.Greens(0.6) for _ in frequencies]
+    else:
+        colors = []
     bars = ax.barh(features, frequencies, color=colors)
-    
+
     # Add value labels on bars
     for bar, freq in zip(bars, frequencies):
         width = bar.get_width()
         ax.text(width, bar.get_y() + bar.get_height()/2, f'{int(freq)}', 
                 ha='left', va='center', fontsize=9)
-    
+
     ax.set_xlabel("Frequency in Improving Solutions")
     ax.grid(axis='x', alpha=0.3)
-    
-    plot_path = output_dir / f"feature_frequency_r{row_count:03d}.png"
+
+    plot_path = output_dir / _feature_plot_filename(
+        "feature_frequency",
+        row_count,
+        include_row_count_in_name,
+    )
     fig.savefig(plot_path, dpi=180, bbox_inches='tight')
     plt.close(fig)
     return plot_path
@@ -849,6 +897,7 @@ def _regenerate_saved_outputs_for_row(
     target_name: str,
     row_count: int,
     keep_search_plots: bool,
+    include_row_count_in_plot_names: bool = False,
 ) -> dict[str, Path]:
     out_dir = _forecast_sweeps_dir(dataset_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -880,10 +929,24 @@ def _regenerate_saved_outputs_for_row(
     if not feature_sensitivities:
         return written
 
-    bar_plot = _plot_feature_importance_bar(feature_sensitivities, dataset_dir.name, target_name, row_count, out_dir)
+    bar_plot = _plot_feature_importance_bar(
+        feature_sensitivities,
+        dataset_dir.name,
+        target_name,
+        row_count,
+        out_dir,
+        include_row_count_in_name=include_row_count_in_plot_names,
+    )
     written["bar_plot"] = bar_plot
 
-    sensitivity_plot = _plot_removal_sensitivity(feature_removal_deltas, dataset_dir.name, target_name, row_count, out_dir)
+    sensitivity_plot = _plot_removal_sensitivity(
+        feature_removal_deltas,
+        dataset_dir.name,
+        target_name,
+        row_count,
+        out_dir,
+        include_row_count_in_name=include_row_count_in_plot_names,
+    )
     if sensitivity_plot.exists():
         written["sensitivity_plot"] = sensitivity_plot
 
@@ -894,6 +957,7 @@ def _regenerate_saved_outputs_for_row(
         target_name,
         row_count,
         out_dir,
+        include_row_count_in_name=include_row_count_in_plot_names,
     )
     written["frequency_plot"] = frequency_plot
     return written
@@ -916,6 +980,7 @@ def _beam_search_subsets(
     disable_eval_plots: bool,
     suppress_training_logs: bool,
     seed: int,
+    include_row_count_in_plot_names: bool = False,
 ) -> tuple[list[CandidateResult], list[CandidateResult], dict[str, tuple[float, int]]]:
     target_name = _derive_target_name(dataset_dir.name, dataset_prefix)
     tmp_cfg_dir = _forecast_sweeps_dir(dataset_dir) / "configs"
@@ -1111,14 +1176,36 @@ def _beam_search_subsets(
         print(f"[INFO] Wrote feature stats table: {stats_csv}")
         print(f"[INFO] Wrote feature deltas table: {deltas_csv}")
 
-        bar_plot = _plot_feature_importance_bar(feature_sensitivities, dataset_dir.name, target_name, row_count, out_dir)
+        bar_plot = _plot_feature_importance_bar(
+            feature_sensitivities,
+            dataset_dir.name,
+            target_name,
+            row_count,
+            out_dir,
+            include_row_count_in_name=include_row_count_in_plot_names,
+        )
         print(f"[INFO] Wrote feature importance bar chart: {bar_plot}")
-        
-        sensitivity_plot = _plot_removal_sensitivity(feature_removal_deltas, dataset_dir.name, target_name, row_count, out_dir)
+
+        sensitivity_plot = _plot_removal_sensitivity(
+            feature_removal_deltas,
+            dataset_dir.name,
+            target_name,
+            row_count,
+            out_dir,
+            include_row_count_in_name=include_row_count_in_plot_names,
+        )
         if sensitivity_plot.exists():
             print(f"[INFO] Wrote removal sensitivity plot: {sensitivity_plot}")
-        
-        frequency_plot = _plot_feature_frequency(feature_improvement_counts, feature_sensitivities, dataset_dir.name, target_name, row_count, out_dir)
+
+        frequency_plot = _plot_feature_frequency(
+            feature_improvement_counts,
+            feature_sensitivities,
+            dataset_dir.name,
+            target_name,
+            row_count,
+            out_dir,
+            include_row_count_in_name=include_row_count_in_plot_names,
+        )
         print(f"[INFO] Wrote feature frequency plot: {frequency_plot}")
     except Exception as e:
         print(f"[WARN] Failed to generate feature importance plots: {e}")
@@ -2042,6 +2129,7 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
         surrogate_data = train_module.load_config(str(surrogate_cfg))["data"]
         base_span = int(surrogate_data["input_row_2"]) - int(surrogate_data["input_row_1"])
         row_counts = _parse_row_counts(args.row_counts, default_span=base_span)
+        include_row_count_in_plot_names = len(row_counts) > 1
 
         for row_count in row_counts:
             try:
@@ -2063,6 +2151,7 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     disable_eval_plots=search_disable_eval_plots,
                     suppress_training_logs=not args.show_training_logs,
                     seed=args.seed,
+                    include_row_count_in_plot_names=include_row_count_in_plot_names,
                 )
                 selected = top_sorted[: args.final_top_k]
                 trace_csv, selected_csv, plot_path = _write_search_outputs(
