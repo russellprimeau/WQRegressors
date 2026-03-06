@@ -257,6 +257,68 @@ def _parse_row_counts(value: str | None, default_span: int) -> list[int]:
     return rows
 
 
+def _parse_seed_features(raw: str) -> tuple[str, ...]:
+    parts = [p.strip() for p in str(raw).split("|") if p.strip()]
+    return tuple(parts)
+
+
+def _resolve_seed_subsets_csv_path(
+    dataset_dir: Path,
+    row_count: int,
+    explicit_path: Path | None,
+    from_shapley: bool,
+) -> Path | None:
+    if from_shapley:
+        return dataset_dir / "forecasts" / "Shapley_sweeps" / f"feature_seed_subsets_r{row_count:03d}.csv"
+    if explicit_path is None:
+        return None
+    if explicit_path.is_dir():
+        return explicit_path / f"feature_seed_subsets_r{row_count:03d}.csv"
+    return explicit_path
+
+
+def _load_seed_subsets(
+    dataset_dir: Path,
+    row_count: int,
+    explicit_path: Path | None,
+    from_shapley: bool,
+    max_seed_subsets: int,
+) -> list[tuple[str, ...]]:
+    seed_csv = _resolve_seed_subsets_csv_path(
+        dataset_dir=dataset_dir,
+        row_count=row_count,
+        explicit_path=explicit_path,
+        from_shapley=from_shapley,
+    )
+    if seed_csv is None or (not seed_csv.exists()):
+        return []
+
+    try:
+        df = pd.read_csv(seed_csv)
+    except Exception as exc:
+        print(f"[WARN] Failed to load seed subsets from {seed_csv}: {exc}")
+        return []
+
+    if "features" not in df.columns:
+        print(f"[WARN] Seed subsets CSV missing 'features' column: {seed_csv}")
+        return []
+
+    seen: set[tuple[str, ...]] = set()
+    out: list[tuple[str, ...]] = []
+    for raw in df["features"].tolist():
+        feats = _parse_seed_features(str(raw))
+        if not feats or feats in seen:
+            continue
+        seen.add(feats)
+        out.append(feats)
+        if max_seed_subsets > 0 and len(out) >= max_seed_subsets:
+            break
+
+    if out:
+        print(f"[INFO] Loaded {len(out)} seed subset(s) from: {seed_csv}")
+    return out
+
+
 def discover_mc_dataset_plans(
     data_root: Path,
     dataset_prefix: str,
@@ -981,6 +1043,7 @@ def _beam_search_subsets(
     suppress_training_logs: bool,
     seed: int,
     include_row_count_in_plot_names: bool = False,
+    seeded_subsets: list[tuple[str, ...]] | None = None,
 ) -> tuple[list[CandidateResult], list[CandidateResult], dict[str, tuple[float, int]]]:
     target_name = _derive_target_name(dataset_dir.name, dataset_prefix)
     tmp_cfg_dir = _forecast_sweeps_dir(dataset_dir) / "configs"
@@ -1034,6 +1097,23 @@ def _beam_search_subsets(
 
     beam: list[CandidateResult] = [first]
     best = first
+    if seeded_subsets:
+        seeded_scored: list[CandidateResult] = []
+        for raw_feats in seeded_subsets:
+            filtered = [f for f in raw_feats if f in full_features]
+            deduped = list(dict.fromkeys(filtered))
+            if len(deduped) < min_features:
+                continue
+            ordered = tuple(sorted(deduped, key=lambda s: full_features.index(s)))
+            out = _eval(ordered)
+            if out is not None:
+                seeded_scored.append(out)
+        if seeded_scored:
+            seeded_scored.sort(key=lambda x: (x.objective, x.rmse, -x.n_features))
+            beam = sorted([first] + seeded_scored, key=lambda x: (x.objective, x.rmse, -x.n_features))[:beam_width]
+            best = beam[0]
+            print(f"[SEARCH] Seeded initialization: {len(seeded_scored)} subset(s) evaluated; best objective={best.objective:.4f} rmse={best.rmse:.6f} n_features={best.n_features}")
+
     no_improve = 0
     print(f"[SEARCH] Initial (all {len(full_features)} features): objective={best.objective:.4f} rmse={best.rmse:.6f} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
 
@@ -2059,6 +2139,12 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
     if not data_root.is_absolute():
         data_root = (workspace_root / data_root).resolve()
 
+    explicit_seed_csv: Path | None = None
+    if args.seed_subsets_csv:
+        explicit_seed_csv = Path(args.seed_subsets_csv)
+        if not explicit_seed_csv.is_absolute():
+            explicit_seed_csv = (workspace_root / explicit_seed_csv).resolve()
+
 
     include_regular, include_res = _resolve_dataset_inclusion(args)
 
@@ -2073,6 +2159,8 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
 
     if args.run_baselines_in_search and args.disable_baselines_for_search:
         raise ValueError("Cannot use both --run-baselines-in-search and --disable-baselines-for-search.")
+    if args.seed_subsets_from_shapley and explicit_seed_csv is not None:
+        raise ValueError("Cannot use both --seed-subsets-from-shapley and --seed-subsets-csv.")
 
     # Search is performance-oriented by default; final phase restores outputs.
     search_run_baselines = bool(args.run_baselines_in_search) and (not args.disable_baselines_for_search)
@@ -2109,6 +2197,9 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
     print(f"Search eval plots enabled : {not search_disable_eval_plots}")
     print(f"Final run baselines       : {final_run_baselines}")
     print(f"Final eval plots enabled  : {not final_disable_eval_plots}")
+    print(f"Seed subsets from Shapley : {args.seed_subsets_from_shapley}")
+    print(f"Seed subsets CSV          : {explicit_seed_csv}")
+    print(f"Max seed subsets          : {args.max_seed_subsets}")
 
     if args.dry_run:
         for plan in plans:
@@ -2134,6 +2225,13 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
         for row_count in row_counts:
             try:
                 print(f"\n[SEARCH] rows={row_count} surrogate={surrogate_cfg.name}")
+                seeded_subsets = _load_seed_subsets(
+                    dataset_dir=plan.dataset_dir,
+                    row_count=row_count,
+                    explicit_path=explicit_seed_csv,
+                    from_shapley=bool(args.seed_subsets_from_shapley),
+                    max_seed_subsets=int(args.max_seed_subsets),
+                )
                 top_sorted, trace, _ = _beam_search_subsets(
                     dataset_dir=plan.dataset_dir,
                     dataset_prefix=args.dataset_prefix,
@@ -2152,6 +2250,7 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     suppress_training_logs=not args.show_training_logs,
                     seed=args.seed,
                     include_row_count_in_plot_names=include_row_count_in_plot_names,
+                    seeded_subsets=seeded_subsets,
                 )
                 selected = top_sorted[: args.final_top_k]
                 trace_csv, selected_csv, plot_path = _write_search_outputs(
@@ -2210,6 +2309,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-drop", type=float, default=0.25)
     parser.add_argument("--final-top-k", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed-subsets-csv",
+        type=str,
+        default=None,
+        help="Path to seed subset CSV (or directory containing feature_seed_subsets_r###.csv).",
+    )
+    parser.add_argument(
+        "--seed-subsets-from-shapley",
+        action="store_true",
+        help="Load seed subsets from forecasts/Shapley_sweeps/feature_seed_subsets_r###.csv per dataset/row_count.",
+    )
+    parser.add_argument(
+        "--max-seed-subsets",
+        type=int,
+        default=0,
+        help="Optional cap on loaded seed subsets (0 means no explicit cap).",
+    )
 
     parser.add_argument("--include-regular", action="store_true")
     parser.add_argument("--include-res", action="store_true")

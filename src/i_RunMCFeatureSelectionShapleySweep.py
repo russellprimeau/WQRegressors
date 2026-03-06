@@ -42,6 +42,7 @@ Additional args:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -77,6 +78,58 @@ def _write_shapley_round_artifact(
     return csv_path
 
 
+def _write_shapley_seed_artifacts(
+    dataset_dir: Path,
+    row_count: int,
+    shapley_rows: list[dict],
+    full_features: tuple[str, ...],
+    min_features: int,
+) -> tuple[Path, Path]:
+    out_dir = base._forecast_sweeps_dir(dataset_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ranked_features = [str(r.get("feature", "")) for r in shapley_rows if str(r.get("feature", "")).strip()]
+    ranked_features = [f for f in ranked_features if f in set(full_features)]
+    if not ranked_features:
+        ranked_features = list(full_features)
+
+    n_features = len(ranked_features)
+    min_k = max(1, int(min_features))
+    prefix_max = min(n_features, max(min_k, min_k + 5))
+    candidate_sizes = list(range(min_k, prefix_max + 1))
+    if n_features not in candidate_sizes:
+        candidate_sizes.append(n_features)
+
+    seed_rows: list[dict] = []
+    for subset_id, k in enumerate(candidate_sizes, start=1):
+        prefix = ranked_features[:k]
+        ordered = _ordered_tuple(prefix, full_features)
+        seed_rows.append(
+            {
+                "row_count": int(row_count),
+                "subset_id": int(subset_id),
+                "source": "shapley_top_prefix",
+                "n_features": int(len(ordered)),
+                "max_shapley_rank": int(k),
+                "features": "|".join(ordered),
+            }
+        )
+
+    seed_csv = out_dir / f"feature_seed_subsets_r{row_count:03d}.csv"
+    pd.DataFrame(seed_rows).to_csv(seed_csv, index=False)
+
+    rankings_json = out_dir / f"feature_shapley_rankings_r{row_count:03d}.json"
+    payload = {
+        "row_count": int(row_count),
+        "n_features": int(len(full_features)),
+        "features": shapley_rows,
+    }
+    with open(rankings_json, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    return rankings_json, seed_csv
+
+
 def _tmc_shapley_subsets(
     dataset_dir: Path,
     dataset_prefix: str,
@@ -95,9 +148,11 @@ def _tmc_shapley_subsets(
     disable_eval_plots: bool,
     suppress_training_logs: bool,
     seed: int,
-) -> tuple[list[base.CandidateResult], list[base.CandidateResult], Path]:
+    include_row_count_in_plot_names: bool = False,
+) -> tuple[list[base.CandidateResult], list[base.CandidateResult], Path, Path, Path]:
     target_name = base._derive_target_name(dataset_dir.name, dataset_prefix)
     tmp_cfg_dir = base._forecast_sweeps_dir(dataset_dir) / "configs"
+    _ = include_row_count_in_plot_names  # Reserved for parity with h_* plot-disambiguation flow.
 
     cfg = train_module.load_config(str(surrogate_config_path))
     full_features = tuple(cfg["data"]["input_columns"])
@@ -282,7 +337,14 @@ def _tmc_shapley_subsets(
     )
 
     shapley_csv = _write_shapley_round_artifact(dataset_dir, row_count, shapley_rows)
-    return top_sorted, trace, shapley_csv
+    shapley_rankings_json, seed_csv = _write_shapley_seed_artifacts(
+        dataset_dir=dataset_dir,
+        row_count=row_count,
+        shapley_rows=shapley_rows,
+        full_features=full_features,
+        min_features=min_features,
+    )
+    return top_sorted, trace, shapley_csv, shapley_rankings_json, seed_csv
 
 
 def run_feature_selection_sweep(args: argparse.Namespace) -> int:
@@ -306,6 +368,17 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
         print("No matching datasets/configs found.")
         return 1
 
+    if args.run_baselines_in_search and args.disable_baselines_for_search:
+        raise ValueError("Cannot use both --run-baselines-in-search and --disable-baselines-for-search.")
+
+    # Match h_* phase policy: search is performance-oriented; final phase restores outputs.
+    search_run_baselines = bool(args.run_baselines_in_search) and (not args.disable_baselines_for_search)
+    search_disable_training_plots = not bool(args.keep_training_plots)
+    search_disable_eval_plots = not bool(args.keep_eval_plots)
+    final_run_baselines = True
+    final_disable_training_plots = False
+    final_disable_eval_plots = False
+
     print("\nExecution plan")
     print("-" * 100)
     print(f"Data root                 : {data_root}")
@@ -324,11 +397,10 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
     print(f"Keep eval plots           : {args.keep_eval_plots}")
     print(f"Keep search plots         : {args.keep_search_plots}")
     print(f"Show train logs           : {args.show_training_logs}")
-
-    search_disable_baselines = bool(args.disable_baselines_for_search)
-    final_run_baselines = True
-    print(f"Search run baselines      : {not search_disable_baselines}")
+    print(f"Search run baselines      : {search_run_baselines}")
+    print(f"Search eval plots enabled : {not search_disable_eval_plots}")
     print(f"Final run baselines       : {final_run_baselines}")
+    print(f"Final eval plots enabled  : {not final_disable_eval_plots}")
 
     if args.dry_run:
         for plan in plans:
@@ -349,11 +421,12 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
         surrogate_data = train_module.load_config(str(surrogate_cfg))["data"]
         base_span = int(surrogate_data["input_row_2"]) - int(surrogate_data["input_row_1"])
         row_counts = base._parse_row_counts(args.row_counts, default_span=base_span)
+        include_row_count_in_plot_names = len(row_counts) > 1
 
         for row_count in row_counts:
             try:
                 print(f"\n[SHAPLEY-TMC] rows={row_count} surrogate={surrogate_cfg.name}")
-                top_sorted, trace, shapley_csv = _tmc_shapley_subsets(
+                top_sorted, trace, shapley_csv, shapley_rankings_json, seed_csv = _tmc_shapley_subsets(
                     dataset_dir=plan.dataset_dir,
                     dataset_prefix=args.dataset_prefix,
                     surrogate_config_path=surrogate_cfg,
@@ -366,11 +439,12 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     tmc_max_permutations=args.tmc_max_permutations,
                     tmc_truncation_epsilon=args.tmc_truncation_epsilon,
                     tmc_bootstrap_resamples=args.tmc_bootstrap_resamples,
-                    disable_baselines_for_search=search_disable_baselines,
-                    disable_training_plots=not args.keep_training_plots,
-                    disable_eval_plots=not args.keep_eval_plots,
+                    disable_baselines_for_search=not search_run_baselines,
+                    disable_training_plots=search_disable_training_plots,
+                    disable_eval_plots=search_disable_eval_plots,
                     suppress_training_logs=not args.show_training_logs,
                     seed=args.seed,
+                    include_row_count_in_plot_names=include_row_count_in_plot_names,
                 )
                 selected = top_sorted[: args.final_top_k]
                 trace_csv, selected_csv, plot_path = base._write_search_outputs(
@@ -381,6 +455,8 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     save_plots=bool(args.keep_search_plots),
                 )
                 print(f"[INFO] Wrote Shapley scores: {shapley_csv}")
+                print(f"[INFO] Wrote Shapley rankings: {shapley_rankings_json}")
+                print(f"[INFO] Wrote seed subsets: {seed_csv}")
                 print(f"[INFO] Wrote search trace: {trace_csv}")
                 print(f"[INFO] Wrote selected subsets: {selected_csv}")
                 print(f"[INFO] Wrote search plot: {plot_path}")
@@ -390,11 +466,22 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     dataset_prefix=args.dataset_prefix,
                     selected=selected,
                     run_baselines_in_final=final_run_baselines,
-                    disable_training_plots=not args.keep_training_plots,
-                    disable_eval_plots=not args.keep_eval_plots,
+                    disable_training_plots=final_disable_training_plots,
+                    disable_eval_plots=final_disable_eval_plots,
                     suppress_training_logs=not args.show_training_logs,
                 )
                 print(f"[INFO] Wrote final model metrics: {final_metrics_csv}")
+
+                # Keep post-process baseline artifacts aligned with h_* behavior.
+                base._ensure_k01_baselines(plan, final_metrics_csv)
+                dataset_eval_summary = base._write_dataset_evaluation_summary(plan, final_metrics_csv)
+                if dataset_eval_summary is not None:
+                    print(f"[INFO] Wrote dataset evaluation summary: {dataset_eval_summary}")
+
+                if args.run_rolling_origin_cv:
+                    cv_summary = base._run_rolling_origin_cv(plan, final_metrics_csv)
+                    if cv_summary is not None:
+                        print(f"[INFO] Wrote rolling-origin summary: {cv_summary}")
 
             except Exception as exc:
                 failed += 1
@@ -444,7 +531,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--tmc-bootstrap-resamples",
         type=int,
         default=300,
-        help="Bootstrap resamples for 95% CI around each feature's TMC-Shapley estimate.",
+        help="Bootstrap resamples for 95%% CI around each feature's TMC-Shapley estimate.",
     )
 
     parser.add_argument("--include-regular", action="store_true")
@@ -454,6 +541,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--disable-baselines-for-search", action="store_true")
     parser.add_argument("--run-baselines-in-final", action="store_true")
+    parser.add_argument(
+        "--run-baselines-in-search",
+        action="store_true",
+        help="Enable baselines during search evaluations (disabled by default for speed).",
+    )
     parser.add_argument(
         "--keep-training-plots",
         action="store_true",
@@ -473,6 +565,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-training-logs",
         action="store_true",
         help="Show verbose model training logs (epoch metrics, sample-loading details).",
+    )
+    parser.add_argument(
+        "--run-rolling-origin-cv",
+        action="store_true",
+        help="Run rolling-origin CV for the best k01 model after final metrics are written.",
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--stop-on-error", action="store_true")
