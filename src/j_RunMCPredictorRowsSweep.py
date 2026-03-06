@@ -321,13 +321,19 @@ def _model_sort_key(config_path: Path) -> tuple[int, str]:
     return 3, name
 
 
-def _row_count_schedule(max_rows: int) -> list[int]:
+def _row_count_schedule(
+    max_rows: int,
+    preferred: list[int] | None = None,
+    include_max: bool = True,
+) -> list[int]:
     if max_rows < 1:
         return []
 
-    default_milestones = [1, 12, 24, 48, 96, 144, 168]
-    rows = [row for row in default_milestones if row <= int(max_rows)]
-    return rows
+    milestones = preferred if preferred is not None else [1, 12, 24, 48, 96, 144, 168]
+    rows = [int(row) for row in milestones if 1 <= int(row) <= int(max_rows)]
+    if include_max:
+        rows.append(int(max_rows))
+    return sorted(set(rows))
 
 
 def _build_sweep_options(row_counts: list[int], avg_label: str = "AVG") -> list[SweepOption]:

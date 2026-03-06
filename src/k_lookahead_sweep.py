@@ -6,7 +6,6 @@ retrain and evaluate the model, and save metrics/plots to forecasts/lookahead_sw
 
 import os
 import sys
-import shutil
 import argparse
 from pathlib import Path
 import yaml
@@ -14,7 +13,35 @@ import pandas as pd
 import numpy as np
 import subprocess
 
-LOOKAHEADS = [0,1,2,6,12,24,48,96,120,167]
+PREFERRED_LOOKAHEADS = [0, 1, 2, 6, 12, 24, 48, 96, 120, 167]
+
+
+def _base_window_rows_from_config(config_path: Path) -> int:
+    """Return base predictor window length from a training/eval config."""
+    with open(config_path, 'r', encoding='utf-8') as f:
+        cfg = yaml.safe_load(f)
+    data_cfg = cfg.get('data', {})
+    base_start = int(data_cfg['input_row_1'])
+    base_stop = int(data_cfg['input_row_2'])
+    return int(base_stop - base_start)
+
+
+def _build_lookahead_schedule(base_rows: int, preferred: list[int] | None = None) -> list[int]:
+    """Build a valid lookahead schedule bounded by the available base window.
+
+    For a base window of N rows, max valid lookahead is N-1 (must leave >=1 row).
+    The schedule keeps preferred milestones that fit and also includes the max
+    endpoint to ensure full-range coverage for long-window targets.
+    """
+    if base_rows <= 0:
+        return []
+
+    max_lookahead = int(base_rows - 1)
+    candidates = preferred if preferred is not None else PREFERRED_LOOKAHEADS
+    schedule = [int(v) for v in candidates if 0 <= int(v) <= max_lookahead]
+    if max_lookahead not in schedule:
+        schedule.append(max_lookahead)
+    return sorted(set(schedule))
 
 # Helper: Find best config for each dataset from feature_sweeps
 def find_best_configs(data_root, dataset_prefix):
@@ -97,12 +124,17 @@ def run_lookahead_sweep(data_root, dataset_prefix):
         print(f"\n[DATASET] {dataset_dir.name}")
         sweep_dir = dataset_dir / 'forecasts' / 'lookahead_sweeps'
         sweep_dir.mkdir(parents=True, exist_ok=True)
+        base_rows = _base_window_rows_from_config(base_config)
+        lookaheads = _build_lookahead_schedule(base_rows=base_rows)
+        if not lookaheads:
+            print(f"  [WARN] No valid lookahead schedule for base_rows={base_rows}. Skipping dataset.")
+            continue
+        print(f"  [INFO] Base rows={base_rows}; lookahead schedule={lookaheads}")
         # No longer copy files to sweep_dir; handled per-lookahead below
         if not forecast_dir.exists():
             print(f"  [WARN] Forecast directory not found: {forecast_dir}")
         metrics = []
-        for lookahead in LOOKAHEADS:
-            lookahead_dir = sweep_dir / f"{lookahead}_hr"
+        for lookahead in lookaheads:
             mod_cfg = modify_config_for_lookahead(base_config, lookahead, sweep_dir)
             if mod_cfg is None:
                 print(f"  [SKIP] Lookahead {lookahead}: not enough rows.")
