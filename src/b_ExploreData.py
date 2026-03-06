@@ -166,6 +166,119 @@ def _write_clustered_bar_chart(
     print(f"Wrote chart to: {fig_path}")
 
 
+def _write_eurofins_interval_clustered_bar(summary_df: pd.DataFrame, out_dir: Path) -> None:
+    """
+    Write Eurofins interval chart with:
+      - left axis: mean/median hours between valid measurements
+      - right axis: count of intervals greater than median
+    """
+    required = {
+        "parameter",
+        "valid_count_consolidated",
+        "mean_hours_between_measurements",
+        "median_hours_between_measurements",
+        "count_gt_median_hours",
+    }
+    if summary_df.empty or not required.issubset(set(summary_df.columns)):
+        return
+
+    plot_df = summary_df[
+        [
+            "parameter",
+            "valid_count_consolidated",
+            "mean_hours_between_measurements",
+            "median_hours_between_measurements",
+            "count_gt_median_hours",
+        ]
+    ].copy()
+    plot_df["valid_count_consolidated"] = pd.to_numeric(plot_df["valid_count_consolidated"], errors="coerce")
+    plot_df["mean_hours_between_measurements"] = pd.to_numeric(plot_df["mean_hours_between_measurements"], errors="coerce")
+    plot_df["median_hours_between_measurements"] = pd.to_numeric(plot_df["median_hours_between_measurements"], errors="coerce")
+    plot_df["count_gt_median_hours"] = pd.to_numeric(plot_df["count_gt_median_hours"], errors="coerce")
+
+    plot_df["_label_sort"] = plot_df["parameter"].astype(str).str.lower()
+    plot_df = plot_df.sort_values(
+        ["median_hours_between_measurements", "_label_sort"],
+        ascending=[True, True],
+    ).reset_index(drop=True)
+    plot_df = plot_df.drop(columns=["_label_sort"])
+    if plot_df.empty:
+        return
+
+    x = np.arange(len(plot_df))
+    width = 0.26
+    font_size = 14  # ~40% larger than Matplotlib default (10)
+
+    def _format_label(value, decimals=1):
+        """Format label: if rounds to 0, show '0', else show with decimals."""
+        rounded = round(value, decimals)
+        if rounded == 0:
+            return "0"
+        return f"{value:.{decimals}f}"
+
+    fig, ax_left = plt.subplots(figsize=(max(13, len(plot_df) * 0.65), 6))
+    bars_median = ax_left.bar(
+        x,
+        plot_df["median_hours_between_measurements"].fillna(0),
+        width=width,
+        color="#54A24B",
+        label="Median hours",
+    )
+    bars_mean = ax_left.bar(
+        x - width,
+        plot_df["mean_hours_between_measurements"].fillna(0),
+        width=width,
+        color="#4C78A8",
+        label="Mean hours",
+    )
+    
+    labels_mean = [_format_label(v, 1) for v in plot_df["mean_hours_between_measurements"].fillna(0)]
+    ax_left.bar_label(bars_mean, labels=labels_mean, rotation=90, padding=3, fontsize=font_size)
+    labels_median = [_format_label(v, 1) for v in plot_df["median_hours_between_measurements"].fillna(0)]
+    ax_left.bar_label(bars_median, labels=labels_median, rotation=90, padding=3, fontsize=font_size)
+
+    ax_right = ax_left.twinx()
+    bars_gt = ax_right.bar(
+        x + width,
+        plot_df["count_gt_median_hours"].fillna(0),
+        width=width,
+        color="#F58518",
+        label="Count > median",
+    )
+
+    labels_gt = [_format_label(v, 0) for v in plot_df["count_gt_median_hours"].fillna(0)]
+    ax_right.bar_label(bars_gt, labels=labels_gt, rotation=90, padding=3, fontsize=font_size)
+
+    # Add headroom so vertical bar labels do not clip at the top edge.
+    left_max = float(
+        max(
+            pd.to_numeric(plot_df["mean_hours_between_measurements"], errors="coerce").fillna(0).max(),
+            pd.to_numeric(plot_df["median_hours_between_measurements"], errors="coerce").fillna(0).max(),
+        )
+    )
+    right_max = float(pd.to_numeric(plot_df["count_gt_median_hours"], errors="coerce").fillna(0).max())
+    ax_left.set_ylim(0, (left_max * 1.18) if left_max > 0 else 1)
+    ax_right.set_ylim(0, (right_max * 1.23) if right_max > 0 else 1)
+
+    ax_left.set_ylabel("Hours between measurements", fontsize=font_size)
+    ax_right.set_ylabel("Count > median", fontsize=font_size)
+    ax_left.set_xticks(x)
+    ax_left.set_xticklabels(plot_df["parameter"].astype(str), rotation=45, ha="right", fontsize=font_size)
+    ax_left.tick_params(axis="y", labelsize=font_size)
+    ax_right.tick_params(axis="y", labelsize=font_size)
+    ax_left.grid(axis="y", linestyle="--", alpha=0.35)
+
+    handles = [bars_median, bars_mean, bars_gt]
+    labels = ["Median hours", "Mean hours", "Count > median"]
+    ax_left.legend(handles, labels, loc="upper left", fontsize=font_size)
+
+    fig.tight_layout()
+    out_path = out_dir / "Eurofins_interval_clustered_bar.png"
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+    print(f"Wrote chart to: {out_path}")
+
+
 def _ks_statistic(a: np.ndarray, b: np.ndarray) -> float:
     """Two-sample KS statistic without SciPy dependency."""
     a = np.asarray(a, dtype=float)
@@ -1753,6 +1866,7 @@ def generate_eurofins_summary(repo_root: Path) -> list:
 
     eurofins_df = pd.read_csv(eurofins_csv, sep=";", decimal=".", low_memory=False)
     consolidated_df = pd.read_csv(consolidated_csv, low_memory=False)
+    consolidated_timestamps = pd.to_datetime(consolidated_df.get("TIMESTAMP"), errors="coerce")
     limits_records = load_limits_records(limits_csv)
 
     eurofins_cols = [c for c in eurofins_df.columns if c not in {"Time", "TIMESTAMP"}]
@@ -1763,10 +1877,23 @@ def generate_eurofins_summary(repo_root: Path) -> list:
     eurofins_limits = map_limits_to_columns(eurofins_cols, limits_records)
     consolidated_limits = map_limits_to_columns(consolidated_cols, limits_records)
 
+    def _name_variants_like_limits(name: str) -> set:
+        raw = "" if name is None else str(name).strip()
+        if not raw:
+            return set()
+        variants = {normalize_limit_name(raw)}
+        no_paren = re.sub(r"\s*\([^)]*\)", "", raw).strip()
+        if no_paren:
+            variants.add(normalize_limit_name(no_paren))
+        return {v for v in variants if v}
+
     def _pick_col_by_names(columns: list, names: list):
-        name_keys = {normalize_limit_name(n) for n in names if n}
+        name_keys = set()
+        for n in names:
+            name_keys.update(_name_variants_like_limits(n))
         for col in columns:
-            if normalize_limit_name(col) in name_keys:
+            col_keys = _name_variants_like_limits(col)
+            if name_keys.intersection(col_keys):
                 return col
         return None
 
@@ -1816,6 +1943,17 @@ def generate_eurofins_summary(repo_root: Path) -> list:
             pct_consolidated = (valid_count_consolidated / total_consolidated * 100) if total_consolidated > 0 else 0.0
             mean_cons, std_cons = _mean_std_valid_numeric(consolidated_df[cons_col], valid_mask_cons)
             mean_cons_norm01, std_cons_norm01 = _mean_std_valid_numeric_normalized_01(consolidated_df[cons_col], valid_mask_cons)
+            mean_hours_between = None
+            median_hours_between = None
+            count_gt_median_hours = None
+            valid_ts = consolidated_timestamps[valid_mask_cons & consolidated_timestamps.notna()]
+            if not valid_ts.empty:
+                valid_ts = valid_ts.sort_values()
+                deltas_hours = valid_ts.diff().dt.total_seconds().div(3600.0).dropna()
+                if not deltas_hours.empty:
+                    mean_hours_between = float(deltas_hours.mean())
+                    median_hours_between = float(deltas_hours.median())
+                    count_gt_median_hours = int((deltas_hours > median_hours_between).sum())
             split_idx = int(total_consolidated * 0.8)
             train_valid_count = int(valid_mask_cons.iloc[:split_idx].sum())
             test_valid_count = int(valid_mask_cons.iloc[split_idx:].sum())
@@ -1842,6 +1980,9 @@ def generate_eurofins_summary(repo_root: Path) -> list:
             test_valid_count = 0
             exceed_count = 0
             test_exceed_count = 0
+            mean_hours_between = None
+            median_hours_between = None
+            count_gt_median_hours = None
 
         rows.append({
             "parameter": param_name,
@@ -1863,6 +2004,9 @@ def generate_eurofins_summary(repo_root: Path) -> list:
             "count_test_valid_consolidated": int(test_valid_count),
             "count_exceed_limit": exceed_count,
             "count_test_exceed_limit": int(test_exceed_count),
+            "mean_hours_between_measurements": round(mean_hours_between, 4) if mean_hours_between is not None else None,
+            "median_hours_between_measurements": round(median_hours_between, 4) if median_hours_between is not None else None,
+            "count_gt_median_hours": int(count_gt_median_hours) if count_gt_median_hours is not None else None,
         })
 
     out_path = out_tables / "Eurofins_summary.csv"
@@ -1870,7 +2014,10 @@ def generate_eurofins_summary(repo_root: Path) -> list:
     summary_df.to_csv(out_path, index=False)
     print(f"Wrote summary to: {out_path}")
     _write_clustered_bar_chart(summary_df, out_charts, "Eurofins", include_exceed_bar=True)
+    _write_eurofins_interval_clustered_bar(summary_df, out_charts)
     return coverage_entries
+
+
 def main():
     repo_root = Path(__file__).resolve().parents[1]
     coverage_entries = []

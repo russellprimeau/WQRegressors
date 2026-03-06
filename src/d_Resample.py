@@ -6,6 +6,7 @@ Then, split the dataset into files for each equivalent sample.
 
 import os
 import json
+import re
 import pandas as pd
 import numpy as np
 import yaml
@@ -15,6 +16,91 @@ import plotly.express as px
 from scipy import stats
 from pathlib import Path
 from utils.preprocessing import normalize_columns
+
+
+DEFAULT_SAMPLE_LENGTH_ROWS = 168
+EUROFINS_SUMMARY_DEFAULT_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "data"
+    / "sensors"
+    / "summaries"
+    / "tables"
+    / "Eurofins_summary.csv"
+)
+
+
+def _normalize_target_for_eurofins_lookup(name):
+    """Normalize target/parameter names for robust Eurofins matching."""
+    text = str(name).strip()
+    if text.endswith("_res"):
+        text = text[:-4]
+    text = re.sub(r"\s*\([^)]*\)\s*$", "", text).strip()
+    return text.casefold()
+
+
+def _load_eurofins_summary_df(summary_csv_path=EUROFINS_SUMMARY_DEFAULT_PATH):
+    """Load Eurofins summary table and add normalized lookup keys."""
+    summary_path = Path(summary_csv_path)
+    if not summary_path.exists():
+        raise FileNotFoundError(f"Eurofins summary CSV not found: {summary_path}")
+
+    summary_df = pd.read_csv(summary_path)
+    required_columns = {"parameter", "median_hours_between_measurements"}
+    missing = required_columns.difference(summary_df.columns)
+    if missing:
+        raise ValueError(
+            f"Eurofins summary CSV missing required columns {sorted(missing)}: {summary_path}"
+        )
+
+    summary_df = summary_df.copy()
+    summary_df["_parameter_normalized"] = summary_df["parameter"].map(
+        _normalize_target_for_eurofins_lookup
+    )
+    return summary_df
+
+
+def _get_target_sample_length_rows(
+    target_name,
+    eurofins_summary_df,
+    default_rows=DEFAULT_SAMPLE_LENGTH_ROWS,
+    verbose=True,
+):
+    """
+    Resolve sample length (rows) from Eurofins median measurement interval.
+
+    Falls back to default_rows when target lookup fails or median is invalid.
+    """
+    target_key = _normalize_target_for_eurofins_lookup(target_name)
+    matches = eurofins_summary_df.loc[
+        eurofins_summary_df["_parameter_normalized"] == target_key
+    ]
+
+    if matches.empty:
+        if verbose:
+            print(
+                f"[WARN] No Eurofins summary match for target '{target_name}'. "
+                f"Using fallback sample length={default_rows}."
+            )
+        return int(default_rows)
+
+    if len(matches) > 1 and verbose:
+        print(
+            f"[WARN] Multiple Eurofins matches for target '{target_name}'. "
+            "Using the first match."
+        )
+
+    median_value = pd.to_numeric(
+        matches.iloc[0]["median_hours_between_measurements"], errors="coerce"
+    )
+    if pd.isna(median_value) or median_value <= 0:
+        if verbose:
+            print(
+                f"[WARN] Invalid median_hours_between_measurements for target '{target_name}': "
+                f"{median_value}. Using fallback sample length={default_rows}."
+            )
+        return int(default_rows)
+
+    return max(1, int(round(float(median_value))))
 
 
 def _default_aggregate_offset_csv():
@@ -650,7 +736,7 @@ def gapped(df, target_columns, seg_length, name="length_v_count_analysis"):
 def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.coli',
                         '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
                         '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)'],
-          length=1, nan_tol=0.0, to_normalize=[],fault_tolerant=False, offset=0,
+          length=DEFAULT_SAMPLE_LENGTH_ROWS, nan_tol=0.0, to_normalize=[],fault_tolerant=False, offset=0,
           predictor_cols=['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
                         'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
                         'Pfl - fDOM (QSU)', "Wind speed x (m/s)", "Wind speed y (m/s)",
@@ -887,7 +973,7 @@ if __name__ == '__main__':
 
     ## Name the dataset and select the size of each sample (# of timesteps/rows)
     set_name  = "MC_all"  # Name of subdirectory where samples will be organized
-    length = 169  # Hours of contiguous data per sample
+    fallback_length = DEFAULT_SAMPLE_LENGTH_ROWS  # Fallback rows if target lookup fails
 
     ## Select columns where values in samples will be normalized, which helps with calculating loss accurately
     # to_normalize = df.columns[3:]
@@ -945,10 +1031,27 @@ if __name__ == '__main__':
         normalization_params=normalization_params,
         verbose=False,
     )
+    try:
+        eurofins_summary_df = _load_eurofins_summary_df()
+    except Exception as exc:
+        eurofins_summary_df = None
+        print(
+            "[WARN] Could not load Eurofins summary table for per-target lengths: "
+            f"{exc}. Using fallback sample length={fallback_length} for all targets."
+        )
 
     for target in target_columns:
         target_slug = target.replace(" ", "_").replace("/", "_")
         output_dir = os.path.join("../data/output/regression", f"MC_ex{target_slug}")
+        if eurofins_summary_df is None:
+            target_length = fallback_length
+        else:
+            target_length = _get_target_sample_length_rows(
+                target,
+                eurofins_summary_df,
+                default_rows=fallback_length,
+                verbose=True,
+            )
         available_cols = set(df_norm.columns)
         target_state_col = _resolve_state_predictor_column(target, available_cols)
         per_target_predictors = list(predictor_cols)
@@ -965,11 +1068,12 @@ if __name__ == '__main__':
 
         if target_state_col is None:
             print(f"[WARN] No matching state predictor column found for target '{target}'.")
+        print(f"[INFO] Target '{target}' sample length (rows): {target_length}")
         result = split(
             df_norm,
             output_dir,
             [target],
-            length,
+            target_length,
             0.8,
             to_normalize,
             True,

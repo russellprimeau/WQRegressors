@@ -3,7 +3,7 @@
 04-Turbiditet,Turbidity (FNU),1,,Recommended_grenseverdier
 06-E.coli,E.coli (CFU/100mL),0,,Grenseverdier
 07-Intestinale enterokokker,Intestinal enterococci (CFU/100mL),0,,Grenseverdier
-08-Kimtall 22°C,Colony Count 22°C,100,,Action_limit
+08-Kimtall 22°C,Colony Count 22°C (CFU/mL),100,,Action_limit
 09-Koliforme bakterier 37°C,Total coliforms 37°C (CFU/100mL),0,,Action_limit
 21-Arsen,Arsenic (µg/L),10,,Grenseverdier
 24-Bly,Lead (µg/L),10,,Grenseverdier
