@@ -85,6 +85,9 @@ DEFAULT_EVAL_CONFIG = {
     "evaluate_all": False,  # If true, combine train and test samples for evaluation
 }
 
+EVAL_METRIC_SEMANTICS = "independent_sample_primary"
+EVAL_METRIC_CONTRACT_VERSION = 1
+
 
 
 def merge_eval_config(cfg):
@@ -768,6 +771,9 @@ def _compute_regression_summary(label, preds, targets, num_samples, metadata=Non
         "n_test_independent": int(n_test_independent),
         "n_test_valid": int(n_test_valid),
         "n_test_evals": int(n_rows),
+        # Explicit contract marker for downstream strict consumers.
+        "metric_semantics": EVAL_METRIC_SEMANTICS,
+        "metric_contract_version": int(EVAL_METRIC_CONTRACT_VERSION),
     }
     row.update(metadata)
     return row
@@ -814,6 +820,8 @@ def _compute_classification_summary(label, preds, targets, num_samples, metadata
         "rmse": np.nan,
         "r2": np.nan,
         "pearson_r": np.nan,
+        "metric_semantics": EVAL_METRIC_SEMANTICS,
+        "metric_contract_version": int(EVAL_METRIC_CONTRACT_VERSION),
     }
     row.update(metadata)
     return row
@@ -844,6 +852,8 @@ def _write_summary_csv(rows, output_path):
         "n_eval_outputs",
         "n_eval_points_finite",
         "n_eval_points_finite_replicate",
+        "metric_semantics",
+        "metric_contract_version",
         "input_dim",
         "target_dim",
         "data_dir",
@@ -1089,9 +1099,10 @@ def evaluate_single_config(config_path, save_plots_override=None):
     baseline_split_files = []
     per_set_metrics = []
 
-    # --- Regression metrics for train, test, and combined sets ---
-    # Only for regression tasks
+    # --- Regression metrics for train/test and optional combined set ---
+    # Combined metrics are emitted only when evaluate_all truly evaluates train+test.
     if eval_cfg.get("run_regression", True):
+        include_combined_metrics = bool(eval_cfg.get("evaluate_all", False) and train_samples is not None)
         preds_train = None
         preds_test = None
         preds_all = None
@@ -1099,17 +1110,20 @@ def evaluate_single_config(config_path, save_plots_override=None):
             if X_train is not None:
                 preds_train = _predict_gp_bundle(model, X_train, device)
             preds_test = _predict_gp_bundle(model, X_test, device)
-            preds_all = _predict_gp_bundle(model, X_all, device)
+            if include_combined_metrics:
+                preds_all = _predict_gp_bundle(model, X_all, device)
         elif model_type == "transformer":
             if X_train is not None:
                 preds_train = model(torch.tensor(X_train, dtype=torch.float32, device=device)).detach().cpu().numpy()
             preds_test = model(torch.tensor(X_test, dtype=torch.float32, device=device)).detach().cpu().numpy()
-            preds_all = model(torch.tensor(X_all, dtype=torch.float32, device=device)).detach().cpu().numpy()
+            if include_combined_metrics:
+                preds_all = model(torch.tensor(X_all, dtype=torch.float32, device=device)).detach().cpu().numpy()
         elif model_type == "xgb_regressor":
             if X_train is not None:
                 preds_train = model.predict(X_train).reshape(-1, y_train.shape[1] if y_train.ndim > 1 else 1)
             preds_test = model.predict(X_test).reshape(-1, y_test.shape[1] if y_test.ndim > 1 else 1)
-            preds_all = model.predict(X_all).reshape(-1, y_all.shape[1] if y_all.ndim > 1 else 1)
+            if include_combined_metrics:
+                preds_all = model.predict(X_all).reshape(-1, y_all.shape[1] if y_all.ndim > 1 else 1)
         # Compute metrics for each set
         if preds_train is not None:
             row_train = _compute_regression_summary(
@@ -1141,7 +1155,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 split_files=eval_split_files,
             )
             per_set_metrics.append(row_all)
-    # Add per-set metrics to summary_rows for CSV output
+    # Add per-set metrics to summary_rows for CSV output.
     summary_rows.extend(per_set_metrics)
 
     # --- Baseline metrics and plotting ---
@@ -1231,7 +1245,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
             plot_pairs.append((preds_test, y_test))
             plot_labels.append(_model_label(model_type))
             plot_split_files.append(model_split_files)
-    # Baselines (still plotted on combined set)
+    # Baselines (plotted on eval_samples: combined only when evaluate_all is enabled)
     plot_pairs.extend(baseline_pairs)
     plot_labels.extend(baseline_labels)
     plot_split_files.extend(baseline_split_files)
@@ -1256,7 +1270,8 @@ def evaluate_single_config(config_path, save_plots_override=None):
             sample_labels=None,
         )
 
-    # Write summary CSV for regression/classification results (train/test/combined)
+    # Write summary CSV for regression/classification results.
+    # Model rows include test always, train optionally, and combined only when evaluate_all=true.
     # Output path logic: forecasts/<forecast_name>/evaluation_summary.csv
     summary_dir = Path(data_cfg["data_dir"]) / "forecasts" / data_cfg["forecast_name"]
     summary_dir.mkdir(parents=True, exist_ok=True)

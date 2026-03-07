@@ -548,6 +548,58 @@ def _aggregate_by_group(values: np.ndarray, group_ids: list[str]) -> np.ndarray:
     return np.array([np.mean(grouped[gid]) for gid in order if grouped[gid]], dtype=float)
 
 
+def _aggregate_pred_target_by_group(preds, targets, group_ids: list[str]) -> "tuple[np.ndarray, np.ndarray]":
+    """Aggregate predictions/targets to one mean row per independent sample id."""
+    pred_arr, tgt_arr = _aligned_pred_target(preds, targets)
+    n_rows = min(len(pred_arr), len(tgt_arr), len(group_ids))
+    if n_rows <= 0:
+        return np.empty((0, 0), dtype=float), np.empty((0, 0), dtype=float)
+
+    pred_arr = np.asarray(pred_arr[:n_rows, :], dtype=float)
+    tgt_arr = np.asarray(tgt_arr[:n_rows, :], dtype=float)
+    gids = list(group_ids[:n_rows])
+
+    grouped_pred: dict[str, list[np.ndarray]] = {}
+    grouped_tgt: dict[str, list[np.ndarray]] = {}
+    order: list[str] = []
+    for idx, gid in enumerate(gids):
+        if gid not in grouped_pred:
+            grouped_pred[gid] = []
+            grouped_tgt[gid] = []
+            order.append(gid)
+        grouped_pred[gid].append(pred_arr[idx, :])
+        grouped_tgt[gid].append(tgt_arr[idx, :])
+
+    agg_pred: list[np.ndarray] = []
+    agg_tgt: list[np.ndarray] = []
+    for gid in order:
+        pgrp = np.asarray(grouped_pred[gid], dtype=float)
+        tgrp = np.asarray(grouped_tgt[gid], dtype=float)
+
+        pcount = np.sum(np.isfinite(pgrp), axis=0)
+        psum = np.nansum(pgrp, axis=0)
+        pmean = np.full(pgrp.shape[1], np.nan, dtype=float)
+        np.divide(psum, pcount, out=pmean, where=pcount > 0)
+
+        tcount = np.sum(np.isfinite(tgrp), axis=0)
+        tsum = np.nansum(tgrp, axis=0)
+        tmean = np.full(tgrp.shape[1], np.nan, dtype=float)
+        np.divide(tsum, tcount, out=tmean, where=tcount > 0)
+
+        agg_pred.append(pmean)
+        agg_tgt.append(tmean)
+
+    return np.asarray(agg_pred, dtype=float), np.asarray(agg_tgt, dtype=float)
+
+
+def _compute_point_metrics_grouped(preds, targets, group_ids: list[str]) -> dict:
+    """Compute point metrics after collapsing MC replicates to independent groups."""
+    agg_pred, agg_tgt = _aggregate_pred_target_by_group(preds, targets, group_ids)
+    metrics = _compute_point_metrics(agg_pred, agg_tgt)
+    metrics["n_groups"] = int(len(agg_pred)) if agg_pred.ndim == 2 else 0
+    return metrics
+
+
 def _rowwise_mean(arr) -> np.ndarray:
     vals = np.asarray(arr, dtype=float)
     n = len(vals)
@@ -1003,7 +1055,7 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
     group_ids = [_base_sample_id(s) for s in split_files]
     n_raw = len(list(dict.fromkeys(group_ids)))
 
-    model_metrics = _compute_point_metrics(pred_model, y_test)
+    model_metrics = _compute_point_metrics_grouped(pred_model, y_test, group_ids)
     mae_model_rows, mse_model_rows = _compute_per_sample_losses(pred_model, y_test)
     y_row_mean = _rowwise_mean(y_test)
     target_vc = _anova_variance_components(y_row_mean, group_ids)
@@ -1012,7 +1064,13 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
     grp_mae = _group_summary(mae_model_rows, group_ids)
     evidence["n_eval_rows_test"] = int(n_rows)
     evidence["n_eval_raw_segments"] = int(n_raw)
+    # Semantics markers keep downstream usage explicit.
+    evidence["metric_semantics_point"] = "group_aggregated_independent_samples"
+    evidence["metric_semantics_tests"] = "group_aggregated_differences"
+    evidence["metric_semantics_interval"] = "replicate_pooled_diagnostic"
     evidence["n_eval_points_finite_model"] = int(model_metrics["n_finite"])
+    evidence["n_eval_points_finite_model_grouped"] = int(model_metrics["n_finite"])
+    evidence["n_eval_groups_model"] = int(model_metrics.get("n_groups", 0))
     evidence["sample_reliability_weight"] = float(min(1.0, math.sqrt(max(0.0, n_raw) / max(1.0, float(args.evidence_ref_raw_samples)))))
     evidence["mc_target_within_ms"] = _safe_float(target_vc.get("ms_within", float("nan")))
     evidence["mc_target_between_ms"] = _safe_float(target_vc.get("ms_between", float("nan")))
@@ -1063,6 +1121,7 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
     evidence["model_coverage_deficit"] = _safe_float(model_int["coverage_deficit"])
     evidence["model_nmpiw"] = _safe_float(model_int["nmpiw"])
     evidence["model_interval_score"] = _safe_float(model_int["interval_score"])
+    evidence["model_interval_is_diagnostic"] = True
 
     for bname in BASELINE_ORDER:
         pred_b = _safe_as_2d(baseline_preds.get(bname, np.full_like(y_test, np.nan, dtype=float)))[:n_rows, :]
@@ -1090,8 +1149,9 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
         )
 
         model_rmse = model_metrics["rmse"]
-        base_metrics = _compute_point_metrics(pred_b, y_test)
+        base_metrics = _compute_point_metrics_grouped(pred_b, y_test, group_ids)
         baseline_rmse = base_metrics["rmse"]
+        evidence[f"n_eval_groups_{bname}"] = int(base_metrics.get("n_groups", 0))
         skill = float(1.0 - model_rmse / baseline_rmse) if np.isfinite(model_rmse) and np.isfinite(baseline_rmse) and baseline_rmse > 0 else float("nan")
         int_base = _interval_proxy_metrics(pred_b, y_test, alpha=interval_alpha)
 
@@ -1123,6 +1183,7 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
         evidence[f"{bname}_coverage_deficit"] = _safe_float(int_base["coverage_deficit"])
         evidence[f"{bname}_nmpiw"] = _safe_float(int_base["nmpiw"])
         evidence[f"{bname}_interval_score"] = _safe_float(int_base["interval_score"])
+        evidence[f"{bname}_interval_is_diagnostic"] = True
         evidence[f"picp_delta_{prefix}"] = _safe_float(model_int["picp"]) - _safe_float(int_base["picp"])
         evidence[f"nmpiw_delta_{prefix}"] = _safe_float(model_int["nmpiw"]) - _safe_float(int_base["nmpiw"])
         evidence[f"interval_score_delta_{prefix}"] = _safe_float(model_int["interval_score"]) - _safe_float(int_base["interval_score"])

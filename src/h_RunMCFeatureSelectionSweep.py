@@ -128,6 +128,40 @@ FINAL_METRICS_MODEL_STYLE = {
     "linear": {"label": "Linear", "color": "#bcbd22", "hatch": "//"},
 }
 
+_EXPECTED_EVAL_METRIC_SEMANTICS = "independent_sample_primary"
+
+
+def _extract_required_independent_metric(model_row: dict, key: str, context: str) -> float:
+    """Read a required primary independent-sample metric as a finite float."""
+    val = pd.to_numeric(model_row.get(key, np.nan), errors="coerce")
+    out = float(val) if np.isfinite(val) else float("nan")
+    if not np.isfinite(out):
+        raise ValueError(
+            f"Missing or non-finite independent metric '{key}' in {context}. "
+            "Primary scoring metrics must come from independent-sample aggregation."
+        )
+    return out
+
+
+def _validate_eval_metric_contract(model_row: dict, context: str) -> None:
+    """Enforce metric contract for strict downstream scoring/selection."""
+    semantics = str(model_row.get("metric_semantics", "")).strip()
+    if semantics != _EXPECTED_EVAL_METRIC_SEMANTICS:
+        raise ValueError(
+            f"Unexpected metric semantics '{semantics or '<missing>'}' in {context}; "
+            f"expected '{_EXPECTED_EVAL_METRIC_SEMANTICS}'."
+        )
+
+    contract_version = pd.to_numeric(model_row.get("metric_contract_version", np.nan), errors="coerce")
+    if not np.isfinite(contract_version) or int(contract_version) < 1:
+        raise ValueError(
+            f"Missing/invalid metric_contract_version in {context}; expected integer >= 1."
+        )
+
+    required_keys = ("rmse", "mae", "n_test_independent")
+    for key in required_keys:
+        _extract_required_independent_metric(model_row, key, context=context)
+
 
 def _normalize_baseline_label(value: object) -> "str | None":
     text = str(value).strip().lower()
@@ -714,12 +748,13 @@ def _evaluate_candidate(
             return None
         model_row = eval_result
 
-        rmse = float(model_row.get("rmse", model_row.get("rmse_replicate", np.nan)))
-        r2 = float(model_row.get("r2", model_row.get("r2_replicate", np.nan)))
-        mae = float(model_row.get("mae", model_row.get("mae_replicate", np.nan)))
-        n_test_samples = float(model_row.get("n_test_independent", np.nan))
-        if not np.isfinite(n_test_samples):
-            n_test_samples = float(model_row.get("n_test_samples", model_row.get("n_eval_rows", np.nan)))
+        context = f"{eval_cfg.parent.name} [{dataset_dir.name} r{int(row_count):03d} {feature_tag}]"
+        _validate_eval_metric_contract(model_row, context=context)
+
+        rmse = _extract_required_independent_metric(model_row, "rmse", context=context)
+        mae = _extract_required_independent_metric(model_row, "mae", context=context)
+        n_test_samples = _extract_required_independent_metric(model_row, "n_test_independent", context=context)
+        r2 = float(pd.to_numeric(model_row.get("r2", np.nan), errors="coerce"))
         input_dim = float(model_row.get("input_dim", np.nan))
         target_dim = float(model_row.get("target_dim", np.nan))
         objective = _objective_from_metrics(rmse=rmse, drop_rate=drop_rate, lambda_drop=lambda_drop)
@@ -2109,10 +2144,18 @@ def _evaluate_selected_subsets_all_models(
                 model_name = baseline_id if baseline_id is not None else model_name_default
                 gp_uncertainty_mode = str(srow.get("gp_uncertainty_mode", ""))
 
+                row_context = (
+                    f"final_summary:{eval_cfg.parent.name} "
+                    f"dataset={dataset_plan.dataset_dir.name} subset_rank={rank} model={model_name}"
+                )
+                _validate_eval_metric_contract(srow, context=row_context)
+                mae_val = _extract_required_independent_metric(srow, "mae", context=row_context)
+                rmse_val = _extract_required_independent_metric(srow, "rmse", context=row_context)
+                n_samples = _extract_required_independent_metric(srow, "n_test_independent", context=row_context)
+                r2_val = float(pd.to_numeric(srow.get("r2", np.nan), errors="coerce"))
+                pearson_val = float(pd.to_numeric(srow.get("pearson_r", np.nan), errors="coerce"))
+
                 # Prefer explicit independent-sample semantics for the primary count.
-                n_samples = float(srow.get("n_test_independent", np.nan))
-                if not np.isfinite(n_samples):
-                    n_samples = float(srow.get("n_eval_rows", np.nan))
                 n_test_independent = float(srow.get("n_test_independent", n_samples))
                 n_test_valid = float(srow.get("n_test_valid", np.nan))
                 n_test_evals = float(srow.get("n_test_evals", srow.get("n_eval_rows", np.nan)))
@@ -2166,10 +2209,10 @@ def _evaluate_selected_subsets_all_models(
                     "n_test_evals": n_test_evals,
                     "input_dim": input_dim,
                     "target_dim": target_dim,
-                    "mae": float(srow.get("mae", np.nan)),
-                    "rmse": float(srow.get("rmse", np.nan)),
-                    "r2": float(srow.get("r2", np.nan)),
-                    "pearson_r": float(srow.get("pearson_r", np.nan)),
+                    "mae": mae_val,
+                    "rmse": rmse_val,
+                    "r2": r2_val,
+                    "pearson_r": pearson_val,
                     "std_target": std_target,
                 }
 
