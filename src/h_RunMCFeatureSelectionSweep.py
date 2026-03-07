@@ -972,8 +972,9 @@ def _regenerate_saved_outputs_for_row(
     out_dir.mkdir(parents=True, exist_ok=True)
     written: dict[str, Path] = {}
 
+    _ = keep_search_plots  # Legacy compatibility: search Pareto plots are always regenerated when possible.
     trace_csv = out_dir / f"feature_search_trace_r{row_count:03d}.csv"
-    if keep_search_plots and trace_csv.exists():
+    if trace_csv.exists():
         trace_df = pd.read_csv(trace_csv)
         if not trace_df.empty and {"drop_rate", "rmse"}.issubset(set(trace_df.columns)):
             selected_csv = out_dir / f"feature_selected_subsets_r{row_count:03d}.csv"
@@ -1557,7 +1558,7 @@ def _write_search_outputs(
     selected_df.to_csv(selected_csv, index=False)
 
     plot_path = out_dir / f"feature_search_pareto_r{row_count:03d}.png"
-    if save_plots and not trace_df.empty:
+    if not trace_df.empty:
         fig, ax = plt.subplots(1, 1, figsize=(7.5, 5.5), constrained_layout=True)
         ax.scatter(trace_df["drop_rate"], trace_df["rmse"], s=20, alpha=0.6)
         if not selected_df.empty:
@@ -2174,8 +2175,8 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
 
     # Search is performance-oriented by default; final phase restores outputs.
     search_run_baselines = bool(args.run_baselines_in_search) and (not args.disable_baselines_for_search)
-    search_disable_training_plots = not bool(args.keep_training_plots)
-    search_disable_eval_plots = not bool(args.keep_eval_plots)
+    search_disable_training_plots = False
+    search_disable_eval_plots = False
     final_run_baselines = True
     final_disable_training_plots = False
     final_disable_eval_plots = False
@@ -2268,7 +2269,7 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     row_count=row_count,
                     trace=trace,
                     selected=selected,
-                    save_plots=bool(args.keep_search_plots),
+                    save_plots=True,
                 )
                 print(f"[INFO] Wrote search trace: {trace_csv}")
                 print(f"[INFO] Wrote selected subsets: {selected_csv}")
@@ -2351,17 +2352,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--keep-training-plots",
         action="store_true",
-        help="Keep per-model training plots during feature sweeps (disabled by default for speed).",
+        help="Legacy no-op: training plots are always generated.",
     )
     parser.add_argument(
         "--keep-eval-plots",
         action="store_true",
-        help="Keep per-config evaluation plots during feature sweeps (disabled by default for speed).",
+        help="Legacy no-op: evaluation plots are always generated.",
     )
     parser.add_argument(
         "--keep-search-plots",
         action="store_true",
-        help="Keep feature-search Pareto plots (disabled by default for speed).",
+        help="Legacy no-op: feature-search Pareto plots are always generated.",
     )
     parser.add_argument(
         "--show-training-logs",

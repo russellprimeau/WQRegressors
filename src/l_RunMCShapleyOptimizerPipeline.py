@@ -211,10 +211,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-baselines-for-search", action="store_true")
     parser.add_argument("--run-baselines-in-search", action="store_true")
 
-    parser.add_argument("--keep-training-plots", action="store_true")
-    parser.add_argument("--keep-eval-plots", action="store_true")
-    parser.add_argument("--keep-search-plots", action="store_true")
-    parser.add_argument("--keep-shapley-plots", action="store_true")
+    parser.add_argument(
+        "--keep-training-plots",
+        action="store_true",
+        help="Legacy no-op: training plots are always generated.",
+    )
+    parser.add_argument(
+        "--keep-eval-plots",
+        action="store_true",
+        help="Legacy no-op: evaluation plots are always generated.",
+    )
+    parser.add_argument(
+        "--keep-search-plots",
+        action="store_true",
+        help="Legacy no-op: search Pareto plots are always generated.",
+    )
+    parser.add_argument(
+        "--keep-shapley-plots",
+        action="store_true",
+        help="Legacy no-op: Shapley visualizations are always generated.",
+    )
     parser.add_argument("--show-training-logs", action="store_true")
     parser.add_argument("--run-rolling-origin-cv", action="store_true")
 
