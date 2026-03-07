@@ -575,22 +575,24 @@ def _plot_uncertainty_boxplots(regression_pairs, regression_labels, split_files_
             if len(finite_pred) > 0 and len(finite_gt) > 0:
                 diag_min = float(min(np.min(finite_gt), np.min(finite_pred)))
                 diag_max = float(max(np.max(finite_gt), np.max(finite_pred)))
-                if diag_max > diag_min:
-                    global_min = min(global_min, diag_min)
-                    global_max = max(global_max, diag_max)
+                global_min = min(global_min, diag_min)
+                global_max = max(global_max, diag_max)
 
             ax.set_ylabel("Prediction")
             ax.set_xlabel("Ground truth")
             ax.grid(alpha=0.25)
-            ax.text(0.01, 0.98, f"Output {out_idx + 1}", transform=ax.transAxes, ha="left", va="top", fontsize=9)
 
         if valid_axes == 0:
             plt.close(fig)
             print(f"[INFO] Skipping uncertainty boxplot for {label}: no finite grouped values.")
             continue
 
-        if np.isfinite(global_min) and np.isfinite(global_max) and global_max > global_min:
-            pad = 0.03 * (global_max - global_min)
+        if np.isfinite(global_min) and np.isfinite(global_max):
+            span = global_max - global_min
+            if span > 0:
+                pad = 0.03 * span
+            else:
+                pad = 0.03 * max(1.0, abs(global_max))
             axis_min = global_min - pad
             axis_max = global_max + pad
             tick_fmt = FuncFormatter(lambda val, _: f"{val:.3g}")
@@ -608,9 +610,6 @@ def _plot_uncertainty_boxplots(regression_pairs, regression_labels, split_files_
                 ax.yaxis.set_major_formatter(tick_fmt)
                 ax.tick_params(axis="both", labelsize=9)
 
-        if n_cols > max_outputs:
-            fig.text(0.99, 0.01, f"Showing first {max_outputs}/{n_cols} outputs", ha="right", va="bottom", fontsize=8)
-
         out_path = base_dir / f"predictions_uncertainty_boxplot_{_sanitize_label_for_filename(label)}.png"
         fig.savefig(out_path, dpi=180)
         plt.close(fig)
@@ -627,20 +626,26 @@ def _compute_regression_summary(label, preds, targets, num_samples, metadata=Non
     finite_count = int(np.sum(finite_mask))
 
     if finite_count > 0:
-        errors = pred_flat[finite_mask] - target_flat[finite_mask]
+        pred_vals = pred_flat[finite_mask]
+        target_vals = target_flat[finite_mask]
+        errors = pred_vals - target_vals
         mae = float(np.mean(np.abs(errors)))
         rmse = float(np.sqrt(np.mean(np.square(errors))))
         if finite_count > 1:
-            target_vals = target_flat[finite_mask]
             ss_res = float(np.sum(np.square(errors)))
             ss_tot = float(np.sum(np.square(target_vals - np.mean(target_vals))))
             r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
         else:
             r2 = np.nan
+        if finite_count > 1 and np.std(pred_vals) > 0 and np.std(target_vals) > 0:
+            pearson_r = float(np.corrcoef(pred_vals, target_vals)[0, 1])
+        else:
+            pearson_r = np.nan
     else:
         mae = np.nan
         rmse = np.nan
         r2 = np.nan
+        pearson_r = np.nan
 
     row = {
         "label": label,
@@ -650,6 +655,7 @@ def _compute_regression_summary(label, preds, targets, num_samples, metadata=Non
         "mae": mae,
         "rmse": rmse,
         "r2": r2,
+        "pearson_r": pearson_r,
     }
     row.update(metadata)
     return row
@@ -695,6 +701,7 @@ def _compute_classification_summary(label, preds, targets, num_samples, metadata
         "mae": np.nan,
         "rmse": np.nan,
         "r2": np.nan,
+        "pearson_r": np.nan,
     }
     row.update(metadata)
     return row
@@ -708,6 +715,7 @@ def _write_summary_csv(rows, output_path):
         "mae",
         "rmse",
         "r2",
+        "pearson_r",
         "skill_v_naive",
         "kind",
         "n_train_samples",

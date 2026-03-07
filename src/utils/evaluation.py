@@ -536,14 +536,14 @@ def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=No
     fig, ax = plt.subplots(figsize=(8, 8))
     colors = sns.color_palette("husl", len(pred_target_pairs))
     min_val, max_val = float("inf"), float("-inf")
-    metrics = []  # store (label, MAE, RMSE, R2)
+    metrics = []  # store (label, MAE, RMSE, r, R2)
 
 
     for i, (preds, targets) in enumerate(pred_target_pairs):
         preds, targets = _aligned_flat(preds, targets, limit=num_samples)
         label = labels[i] if labels else f"Model {i+1}"
         if len(preds) == 0:
-            metrics.append((label, np.nan, np.nan, np.nan))
+            metrics.append((label, np.nan, np.nan, np.nan, np.nan))
             print(f"{label}: no valid data for metrics")
             continue
 
@@ -562,24 +562,40 @@ def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=No
                 min_val = min(min_val, np.nanmin(targets[mask]), np.nanmin(preds[mask]))
                 max_val = max(max_val, np.nanmax(targets[mask]), np.nanmax(preds[mask]))
         if mask.any():
-            mae = mean_absolute_error(targets[mask], preds[mask])
-            rmse = np.sqrt(mean_squared_error(targets[mask], preds[mask]))
-            r2 = r2_score(targets[mask], preds[mask])
-            metrics.append((label, mae, rmse, r2))
-            print(f"{label}: MAE={mae:.4f}, RMSE={rmse:.4f}, R²={r2:.4f}")
+            target_vals = targets[mask]
+            pred_vals = preds[mask]
+            mae = mean_absolute_error(target_vals, pred_vals)
+            rmse = np.sqrt(mean_squared_error(target_vals, pred_vals))
+            if len(target_vals) > 1:
+                r2 = r2_score(target_vals, pred_vals)
+            else:
+                r2 = np.nan
+            if len(target_vals) > 1 and np.std(target_vals) > 0 and np.std(pred_vals) > 0:
+                r_value = float(np.corrcoef(target_vals, pred_vals)[0, 1])
+            else:
+                r_value = np.nan
+            metrics.append((label, mae, rmse, r_value, r2))
+            print(f"{label}: MAE={mae:.4f}, RMSE={rmse:.4f}, r={r_value:.4f}, R²={r2:.4f}")
             print()
         else:
-            metrics.append((label, np.nan, np.nan, np.nan))
+            metrics.append((label, np.nan, np.nan, np.nan, np.nan))
             print(f"{label}: no valid data for metrics")
 
     if not np.isfinite(min_val) or not np.isfinite(max_val):
         min_val, max_val = 0.0, 1.0
 
-    ax.plot([min_val, max_val], [min_val, max_val], color="red", linestyle="--")
+    if max_val > min_val:
+        pad = 0.03 * (max_val - min_val)
+    else:
+        pad = 0.03 * max(1.0, abs(max_val))
+    axis_min = min_val - pad
+    axis_max = max_val + pad
+
+    ax.plot([axis_min, axis_max], [axis_min, axis_max], color="red", linestyle="--")
     ax.set_xlabel("Ground truth")
     ax.set_ylabel("Predicted Value")
-    ax.set_xlim(min_val, max_val)
-    ax.set_ylim(min_val, max_val)
+    ax.set_xlim(axis_min, axis_max)
+    ax.set_ylim(axis_min, axis_max)
     ax.set_aspect("equal", adjustable="box")
     ax.legend()
     plt.tight_layout()
@@ -591,60 +607,27 @@ def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=No
         labels_m = [m[0] for m in metrics]
         mae_vals = [m[1] for m in metrics]
         rmse_vals = [m[2] for m in metrics]
-        r2_vals = [m[3] for m in metrics]
-        fig, ax = plt.subplots(1, 3, figsize=(14, 5))
+        r_vals = [m[3] for m in metrics]
+        r2_vals = [m[4] for m in metrics]
+        fig, ax = plt.subplots(2, 2, figsize=(14, 10))
         bar_kwargs = dict(alpha=0.7)
-        ax[0].bar(labels_m, mae_vals, color=colors, **bar_kwargs)
-        ax[0].set_ylabel("MAE")
-        ax[1].bar(labels_m, rmse_vals, color=colors, **bar_kwargs)
-        ax[1].set_ylabel("RMSE")
-        ax[2].bar(labels_m, r2_vals, color=colors, **bar_kwargs)
-        ax[2].set_ylabel("R²")
-        ax[2].set_ylim(bottom=-0.1)
-        for a in ax:
+        plot_defs = [
+            (ax[0, 0], mae_vals, "MAE"),
+            (ax[0, 1], rmse_vals, "RMSE"),
+            (ax[1, 0], r_vals, "r"),
+            (ax[1, 1], r2_vals, "R²"),
+        ]
+        for a, values, ylabel in plot_defs:
+            a.bar(labels_m, values, color=colors, **bar_kwargs)
+            a.set_ylabel(ylabel)
+            if ylabel == "R²":
+                a.set_ylim(bottom=-0.1)
             a.set_xticks(range(len(labels_m)))
             a.set_xticklabels(labels_m, rotation=30, ha="right")
             a.grid(True, axis="y", linestyle="--", alpha=0.6)
         plt.tight_layout()
         plt.savefig(Path(directory, "forecasts", forecast_name, "metrics_summary.png"))
         plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for i, (preds, targets) in enumerate(pred_target_pairs):
-        preds = np.array(preds)
-        targets = np.array(targets)
-        label = labels[i] if labels else f"Model {i+1}"
-        if preds.ndim == 1:
-            preds = preds.reshape(-1, 1)
-        if targets.ndim == 1:
-            targets = targets.reshape(-1, 1)
-        if preds.ndim != 2 or targets.ndim != 2:
-            continue
-        if preds.shape[0] == 0 or targets.shape[0] == 0:
-            continue
-        n_rows = min(preds.shape[0], targets.shape[0])
-        horizon = min(preds.shape[1], targets.shape[1])
-        if horizon == 0:
-            continue
-        preds = preds[:n_rows, :horizon]
-        targets = targets[:n_rows, :horizon]
-        rmse_per_step = []
-        for t in range(horizon):
-            mask = np.isfinite(preds[:, t]) & np.isfinite(targets[:, t])
-            if mask.any():
-                rmse = np.sqrt(mean_squared_error(targets[mask, t], preds[mask, t]))
-            else:
-                rmse = np.nan
-            rmse_per_step.append(rmse)
-        ax.plot(range(1, horizon + 1), rmse_per_step, marker='o', label=label, color=colors[i])
-
-    ax.set_xlabel("Forecast Step (T+)")
-    ax.set_ylabel("RMSE")
-    ax.legend()
-    ax.grid(True, linestyle="--", alpha=0.6)
-    plt.tight_layout()
-    plt.savefig(Path(directory, "forecasts", forecast_name, "horizon_rmse.png"))
-    plt.close(fig)
 
     n_sets = len(pred_target_pairs)
     if labels is None:
