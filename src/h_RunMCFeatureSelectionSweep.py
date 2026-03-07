@@ -45,9 +45,13 @@ Key CLI groups (detailed):
     `--run-baselines-in-search`: Enable baseline evals during search (mutually exclusive with disable flag).
     `--show-training-logs`: Show verbose model training/sample logs.
 - Artifacts/runtime:
-    `--keep-training-plots`: Keep per-model training plots during sweeps.
-    `--keep-eval-plots`: Keep per-config evaluation plots during sweeps.
-    `--keep-search-plots`: Save search Pareto plot (`feature_search_pareto_r###.png`).
+        `--keep-training-plots`: Enable per-candidate training plots during search phase.
+            Default is disabled for speed; final top-K evaluation still keeps plots.
+        `--keep-eval-plots`: Enable per-candidate evaluation plots (for example, boxplots)
+            during search phase. Default is disabled for speed; final top-K keeps plots.
+        `--keep-search-plots`: Enable search summary plots
+            (`feature_search_pareto_r###.png`, feature-importance charts).
+            Default is disabled for speed.
     `--dry-run`: Print discovered execution plan and exit.
     `--stop-on-error`: Raise immediately on first dataset failure.
 
@@ -56,6 +60,11 @@ Search/output behavior:
     `WQ_FEATURE_SWEEP_NAMESPACE` overrides the namespace.
 - Writes `feature_search_trace_r###.csv`, `feature_selected_subsets_r###.csv`,
     optional `feature_search_pareto_r###.png`, and `feature_sweep_final_metrics.csv`.
+- Search-phase defaults are intentionally artifact-light:
+    candidate runs write required training/evaluation artifacts
+    (model outputs, split files, `evaluation_summary.csv`) while plot-heavy
+    outputs are opt-in via `--keep-training-plots`, `--keep-eval-plots`, and
+    `--keep-search-plots`.
 - Maintains baseline/report compatibility via post-final hooks
     (`_ensure_k01_baselines`, dataset-level `evaluation_summary.csv`).
 
@@ -67,6 +76,9 @@ Examples:
         python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --eval-budget 180 --seed-subsets-from-shapley
 
         python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --eval-budget 180 --seed-subsets-csv data/output/regression/MC_exColor_res/forecasts/Shapley_sweeps/feature_seed_subsets_r671.csv --max-seed-subsets 6
+
+        # Opt in to search-phase plots when diagnosing candidate behavior:
+        python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --eval-budget 60 --keep-training-plots --keep-eval-plots --keep-search-plots
 """
 from __future__ import annotations
 import contextlib
@@ -112,8 +124,8 @@ FINAL_METRICS_MODEL_STYLE = {
     "transformer": {"label": "Transformer", "color": "#ff7f0e", "hatch": ""},
     "xgb_regressor": {"label": "XGB", "color": "#2ca02c", "hatch": ""},
     "naive": {"label": "Naive", "color": "#7f7f7f", "hatch": "//"},
-    "seasonal": {"label": "Seasonal", "color": "#17becf", "hatch": "\\\\"},
-    "linear": {"label": "Linear", "color": "#bcbd22", "hatch": "xx"},
+    "seasonal": {"label": "Seasonal", "color": "#17becf", "hatch": "//"},
+    "linear": {"label": "Linear", "color": "#bcbd22", "hatch": "//"},
 }
 
 
@@ -752,6 +764,21 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_path = output_dir / "feature_sweep_final_metrics_summary.png"
 
+    def _format_bar_label(value: float) -> str:
+        if not np.isfinite(value):
+            return ""
+        abs_v = abs(float(value))
+        if abs_v >= 100.0:
+            # 2 significant figures in scientific notation.
+            return f"{value:.1e}"
+        if abs_v == 0.0:
+            return "0"
+        decimals = max(0, 2 - 1 - int(np.floor(np.log10(abs_v))))
+        txt = f"{value:.{decimals}f}"
+        if "." in txt:
+            txt = txt.rstrip("0").rstrip(".")
+        return txt
+
     if final_df is None or final_df.empty:
         raise ValueError("Cannot plot final metrics summary: final_df is empty.")
 
@@ -830,18 +857,20 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     cluster_width = 0.86
     bar_w = cluster_width / max(1, n_models)
 
-    fig, axes = plt.subplots(4, 1, figsize=(max(10, 0.85 * len(subset_order) + 6), 14), sharex=True, constrained_layout=True)
+    fig, axes = plt.subplots(4, 1, figsize=(max(10, 0.85 * len(subset_order) + 6), 14), sharex=True, constrained_layout=False)
     metric_specs = [
         ("mae", "MAE"),
         ("rmse", "RMSE"),
         ("pearson_r", "Pearson's r"),
-        ("r2", "R^2"),
+        ("r2", "R\N{SUPERSCRIPT TWO}"),
     ]
 
     legend_handles = []
     legend_labels = []
     for ax, (metric, ylabel) in zip(axes, metric_specs):
         metric_pivot = grouped.pivot(index="subset_rank", columns="model_norm", values=metric)
+        axis_vals: list[float] = []
+        axis_bar_groups = []
 
         for i, model in enumerate(FINAL_METRICS_MODEL_ORDER):
             style = FINAL_METRICS_MODEL_STYLE[model]
@@ -864,6 +893,8 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
                 linewidth=0.8 if style["hatch"] else 0.0,
                 label=style["label"],
             )
+            axis_bar_groups.append((bars, vals))
+            axis_vals.extend([float(v) for v in vals if np.isfinite(v)])
             if len(legend_handles) < n_models:
                 legend_handles.append(bars[0])
                 legend_labels.append(style["label"])
@@ -878,10 +909,49 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
             ymax = float(np.max(finite_vals)) if finite_vals.size > 0 else 1.0
             if ymax <= 0.0:
                 ymax = 1.0
-            ax.set_ylim(0.0, ymax * 1.08)
+            ymin_base, ymax_base = 0.0, ymax * 1.08
         elif metric in ("pearson_r", "r2"):
             # Correlation and R^2 are interpreted on a bounded scale.
-            ax.set_ylim(-1.0, 1.0)
+            ymin_base, ymax_base = -1.0, 1.0
+        else:
+            ymin_base = float(np.min(finite_vals)) if finite_vals.size > 0 else -1.0
+            ymax_base = float(np.max(finite_vals)) if finite_vals.size > 0 else 1.0
+
+        if not axis_vals:
+            ax.set_ylim(ymin_base, ymax_base)
+            continue
+
+        span = float(ymax_base - ymin_base)
+        if not np.isfinite(span) or span <= 0.0:
+            span = 1.0
+        label_offset = 0.02 * span
+        label_pad = 0.04 * span
+        upper_needed = max((v + label_offset) if v >= 0 else v for v in axis_vals)
+        lower_needed = min((v - label_offset) if v < 0 else v for v in axis_vals)
+        ylim_low = min(ymin_base, lower_needed - label_pad)
+        ylim_high = max(ymax_base, upper_needed + label_pad)
+        ax.set_ylim(ylim_low, ylim_high)
+
+        y_low, y_high = ax.get_ylim()
+        y_span = float(y_high - y_low) if np.isfinite(y_high - y_low) and (y_high - y_low) > 0 else 1.0
+        text_pad = 0.02 * y_span
+
+        for bars, vals in axis_bar_groups:
+            for bar, val in zip(bars, vals):
+                if not np.isfinite(val):
+                    continue
+                y = float(val) + text_pad if float(val) >= 0 else float(val) - text_pad
+                y = min(max(y, y_low + text_pad), y_high - text_pad)
+                ax.text(
+                    bar.get_x() + (bar.get_width() / 2.0),
+                    y,
+                    _format_bar_label(float(val)),
+                    ha="center",
+                    va="bottom" if float(val) >= 0 else "top",
+                    fontsize=7,
+                    rotation=90,
+                    clip_on=True,
+                )
 
     axes[-1].set_xticks(x)
     axes[-1].set_xticklabels([rank_to_label[r] for r in subset_order], rotation=0)
@@ -890,8 +960,16 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     for ax in axes[:-1]:
         ax.tick_params(axis="x", labelbottom=False)
 
-    fig.legend(legend_handles, legend_labels, loc="upper center", ncol=6, frameon=True, fontsize=9)
-    fig.suptitle(f"Candidate Subset Comparison (ordered by RMSE of {FINAL_METRICS_MODEL_STYLE.get(best_model, {}).get('label', best_model)})", y=1.02, fontsize=11)
+    fig.subplots_adjust(top=0.90, hspace=0.16)
+    fig.legend(
+        legend_handles,
+        legend_labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.98),
+        ncol=6,
+        frameon=True,
+        fontsize=9,
+    )
     fig.savefig(plot_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
     return plot_path
@@ -1242,9 +1320,44 @@ def _beam_search_subsets(
     disable_eval_plots: bool,
     suppress_training_logs: bool,
     seed: int,
+    save_search_plots: bool,
     include_row_count_in_plot_names: bool = False,
     seeded_subsets: list[tuple[str, ...]] | None = None,
 ) -> tuple[list[CandidateResult], list[CandidateResult], dict[str, tuple[float, int]]]:
+    """Run beam+swap feature-subset search for one dataset and one row-count.
+
+    Args:
+        dataset_dir: Dataset directory containing samples/config-derived forecast outputs.
+        dataset_prefix: Prefix used to derive human-readable target name.
+        surrogate_config_path: Base train config used as the surrogate evaluator.
+        row_count: Input lookback rows to evaluate.
+        lambda_drop: Drop-rate penalty weight in objective.
+        beam_width: Number of best candidates kept each elimination round.
+        max_rounds: Maximum elimination rounds before swap refinement.
+        no_improve_patience: Consecutive non-improving rounds allowed.
+        min_features: Minimum subset size allowed during elimination.
+        eval_budget: Maximum candidate evaluations for this search run.
+        max_swap_attempts: Maximum swap refinements attempted.
+        disable_baselines_for_search: If True, disable baseline evaluation during search.
+        disable_training_plots: If True, suppress training plots during candidate training.
+        disable_eval_plots: If True, suppress evaluation plots during candidate evaluation.
+        suppress_training_logs: If True, hide verbose model training logs.
+        seed: Random seed for candidate ordering and swap sampling.
+        save_search_plots: If True, write search summary plots (Pareto/feature charts).
+            When False, search still writes feature stats CSV artifacts needed downstream.
+        include_row_count_in_plot_names: If True, append `_r###` to saved search-plot names.
+        seeded_subsets: Optional explicit seed feature subsets to evaluate before beam rounds.
+
+    Returns:
+        `(top_sorted, trace, feature_sensitivities)` where:
+        - `top_sorted`: All evaluated candidates sorted by objective.
+        - `trace`: Chronological candidate evaluation trace.
+        - `feature_sensitivities`: Per-feature `(avg_removal_delta, improvement_count)`.
+
+    Example:
+        `top_sorted, trace, sens = _beam_search_subsets(..., save_search_plots=False)`
+        to keep search fast while retaining CSV artifacts for postprocess.
+    """
     target_name = _derive_target_name(dataset_dir.name, dataset_prefix)
     tmp_cfg_dir = _forecast_sweeps_dir(dataset_dir) / "configs"
 
@@ -1440,8 +1553,8 @@ def _beam_search_subsets(
     print(f"  Objective: {best.objective:.6f} (rmse={best.rmse:.6f}, r2={best.r2:.6f}, drop_rate={best.drop_rate:.4f})")
     print(f"  (Full ranked importance written to feature_stats CSV)")
     
-    # Generate feature importance visualizations
-    print(f"\n[SEARCH] Generating feature importance visualizations...")
+    # Generate feature stats always; plots are optional for search-speed defaults.
+    print(f"\n[SEARCH] Writing feature-importance artifacts...")
     out_dir = _forecast_sweeps_dir(dataset_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     
@@ -1456,37 +1569,40 @@ def _beam_search_subsets(
         print(f"[INFO] Wrote feature stats table: {stats_csv}")
         print(f"[INFO] Wrote feature deltas table: {deltas_csv}")
 
-        bar_plot = _plot_feature_importance_bar(
-            feature_sensitivities,
-            dataset_dir.name,
-            target_name,
-            row_count,
-            out_dir,
-            include_row_count_in_name=include_row_count_in_plot_names,
-        )
-        print(f"[INFO] Wrote feature importance bar chart: {bar_plot}")
+        if save_search_plots:
+            bar_plot = _plot_feature_importance_bar(
+                feature_sensitivities,
+                dataset_dir.name,
+                target_name,
+                row_count,
+                out_dir,
+                include_row_count_in_name=include_row_count_in_plot_names,
+            )
+            print(f"[INFO] Wrote feature importance bar chart: {bar_plot}")
 
-        sensitivity_plot = _plot_removal_sensitivity(
-            feature_removal_deltas,
-            dataset_dir.name,
-            target_name,
-            row_count,
-            out_dir,
-            include_row_count_in_name=include_row_count_in_plot_names,
-        )
-        if sensitivity_plot.exists():
-            print(f"[INFO] Wrote removal sensitivity plot: {sensitivity_plot}")
+            sensitivity_plot = _plot_removal_sensitivity(
+                feature_removal_deltas,
+                dataset_dir.name,
+                target_name,
+                row_count,
+                out_dir,
+                include_row_count_in_name=include_row_count_in_plot_names,
+            )
+            if sensitivity_plot.exists():
+                print(f"[INFO] Wrote removal sensitivity plot: {sensitivity_plot}")
 
-        frequency_plot = _plot_feature_frequency(
-            feature_improvement_counts,
-            feature_sensitivities,
-            dataset_dir.name,
-            target_name,
-            row_count,
-            out_dir,
-            include_row_count_in_name=include_row_count_in_plot_names,
-        )
-        print(f"[INFO] Wrote feature frequency plot: {frequency_plot}")
+            frequency_plot = _plot_feature_frequency(
+                feature_improvement_counts,
+                feature_sensitivities,
+                dataset_dir.name,
+                target_name,
+                row_count,
+                out_dir,
+                include_row_count_in_name=include_row_count_in_plot_names,
+            )
+            print(f"[INFO] Wrote feature frequency plot: {frequency_plot}")
+        else:
+            print("[INFO] Search plots disabled by default (use --keep-search-plots to enable).")
     except Exception as e:
         print(f"[WARN] Failed to generate feature importance plots: {e}")
     
@@ -1696,6 +1812,23 @@ def _write_search_outputs(
     selected: list[CandidateResult],
     save_plots: bool,
 ) -> tuple[Path, Path, Path]:
+    """Write search trace/selection CSVs and optional Pareto plot.
+
+    Args:
+        dataset_dir: Dataset directory whose sweep namespace receives outputs.
+        row_count: Evaluated lookback row-count for filename suffixing.
+        trace: Chronological candidate evaluations to persist as trace CSV.
+        selected: Final selected subsets to persist as ranked CSV.
+        save_plots: If True, also write `feature_search_pareto_r###.png`.
+
+    Returns:
+        `(trace_csv, selected_csv, plot_path)` where `plot_path` is returned even
+        when `save_plots=False` (file may not exist in that case).
+
+    Example:
+        `_write_search_outputs(..., save_plots=False)` writes only CSVs for
+        lightweight search runs.
+    """
     out_dir = _forecast_sweeps_dir(dataset_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1750,7 +1883,7 @@ def _write_search_outputs(
     selected_df.to_csv(selected_csv, index=False)
 
     plot_path = out_dir / f"feature_search_pareto_r{row_count:03d}.png"
-    if not trace_df.empty:
+    if save_plots and not trace_df.empty:
         fig, ax = plt.subplots(1, 1, figsize=(7.5, 5.5), constrained_layout=True)
         ax.scatter(trace_df["drop_rate"], trace_df["rmse"], s=20, alpha=0.6)
         if not selected_df.empty:
@@ -2489,8 +2622,9 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
 
     # Search is performance-oriented by default; final phase restores outputs.
     search_run_baselines = bool(args.run_baselines_in_search) and (not args.disable_baselines_for_search)
-    search_disable_training_plots = False
-    search_disable_eval_plots = False
+    search_disable_training_plots = not bool(args.keep_training_plots)
+    search_disable_eval_plots = not bool(args.keep_eval_plots)
+    search_save_plots = bool(args.keep_search_plots)
     final_run_baselines = True
     final_disable_training_plots = False
     final_disable_eval_plots = False
@@ -2514,12 +2648,14 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
     print(f"Lambda drop               : {args.lambda_drop}")
     print(f"Top-K for final models    : {args.final_top_k}")
     print(f"Dry run                   : {args.dry_run}")
-    print(f"Keep train plots          : {args.keep_training_plots}")
-    print(f"Keep eval plots           : {args.keep_eval_plots}")
+    print(f"Keep train plots (search) : {args.keep_training_plots}")
+    print(f"Keep eval plots (search)  : {args.keep_eval_plots}")
     print(f"Keep search plots         : {args.keep_search_plots}")
     print(f"Show train logs           : {args.show_training_logs}")
     print(f"Search run baselines      : {search_run_baselines}")
+    print(f"Search train plots enabled: {not search_disable_training_plots}")
     print(f"Search eval plots enabled : {not search_disable_eval_plots}")
+    print(f"Search summary plots      : {search_save_plots}")
     print(f"Final run baselines       : {final_run_baselines}")
     print(f"Final eval plots enabled  : {not final_disable_eval_plots}")
     print(f"Seed subsets from Shapley : {args.seed_subsets_from_shapley}")
@@ -2574,6 +2710,7 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     disable_eval_plots=search_disable_eval_plots,
                     suppress_training_logs=not args.show_training_logs,
                     seed=args.seed,
+                    save_search_plots=search_save_plots,
                     include_row_count_in_plot_names=include_row_count_in_plot_names,
                     seeded_subsets=seeded_subsets,
                 )
@@ -2583,11 +2720,14 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     row_count=row_count,
                     trace=trace,
                     selected=selected,
-                    save_plots=True,
+                    save_plots=search_save_plots,
                 )
                 print(f"[INFO] Wrote search trace: {trace_csv}")
                 print(f"[INFO] Wrote selected subsets: {selected_csv}")
-                print(f"[INFO] Wrote search plot: {plot_path}")
+                if search_save_plots:
+                    print(f"[INFO] Wrote search plot: {plot_path}")
+                else:
+                    print("[INFO] Search Pareto plot disabled by default (use --keep-search-plots to enable).")
 
                 final_metrics_csv = _evaluate_selected_subsets_all_models(
                     dataset_plan=plan,
@@ -2666,17 +2806,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--keep-training-plots",
         action="store_true",
-        help="Legacy no-op: training plots are always generated.",
+        help="Enable training plots during search-phase candidate evaluation (disabled by default for speed).",
     )
     parser.add_argument(
         "--keep-eval-plots",
         action="store_true",
-        help="Legacy no-op: evaluation plots are always generated.",
+        help="Enable evaluation plots during search-phase candidate evaluation (disabled by default for speed).",
     )
     parser.add_argument(
         "--keep-search-plots",
         action="store_true",
-        help="Legacy no-op: feature-search Pareto plots are always generated.",
+        help="Enable search-phase summary plots (Pareto and feature-importance plots), disabled by default for speed.",
     )
     parser.add_argument(
         "--show-training-logs",

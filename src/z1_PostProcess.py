@@ -1,11 +1,35 @@
 """
 Post-processor script for generating outputs of feature-selection sweep for MC datasets without re-running the entire sweep.
 
+Key CLI groups (detailed):
+- Inherited sweep-discovery arguments (from `h_RunMCFeatureSelectionSweep.build_parser`):
+    `--data-root`, `--config-pattern`, dataset include/exclude selectors, and
+    legacy sweep toggles used to discover dataset/config plans.
+- Path/namespace selection:
+    `--path PATH`: Optional alias for `--data-root`; path scanned for dataset folders.
+    `--sweep-namespace NAME`: Forecast subdirectory namespace to post-process
+      (for example `feature_sweeps` or `Shapley_sweeps`).
+- Rolling CV control:
+    `--run-rolling-cv`: Enable optional rolling-origin CV execution.
+- Statistical evidence controls:
+    `--dm-max-lag`, `--bootstrap-iterations`, `--bootstrap-seed`,
+    `--bootstrap-mode`, `--bootstrap-block-len`, `--evidence-alpha`,
+    `--evidence-min-raw-samples`, `--evidence-min-prob`,
+    `--evidence-ref-raw-samples`, `--interval-alpha`, `--coverage-tolerance`.
+
+Postprocess behavior highlights:
+- Rebuilds saved search artifacts from CSVs where available.
+- Regenerates `feature_sweep_final_metrics_summary.png` from
+  `feature_sweep_final_metrics.csv` so full sweep re-run is not required.
+- Does not retroactively rewrite historical split files.
+
 Examples:
 python src/z1_PostProcess.py --keep-search-plots
 python src/z1_PostProcess.py --sweep-namespace feature_sweeps
 python src/z1_PostProcess.py --sweep-namespace Shapley_sweeps
 python src/z1_PostProcess.py --path data/output/regression_alt --sweep-namespace Shapley_sweeps
+python src/z1_PostProcess.py --sweep-namespace feature_sweeps --run-rolling-cv
+python src/z1_PostProcess.py --path data/output/regression --sweep-namespace feature_sweeps --bootstrap-mode moving_block --bootstrap-block-len 5
 """
 from __future__ import annotations
 import contextlib
@@ -34,7 +58,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from utils.training import load_samples, group_samples_by_segment
-from h_RunMCFeatureSelectionSweep import build_parser, discover_mc_dataset_plans, _derive_target_name, _select_surrogate_config, _parse_row_counts, _available_row_counts_for_postprocess, _regenerate_saved_outputs_for_row, _load_feature_stats_artifacts, _compile_multi_target_comparison, _resolve_dataset_inclusion, _run_rolling_origin_cv, _ensure_k01_baselines, _write_dataset_evaluation_summary, _forecast_sweeps_dir
+from h_RunMCFeatureSelectionSweep import build_parser, discover_mc_dataset_plans, _derive_target_name, _select_surrogate_config, _parse_row_counts, _available_row_counts_for_postprocess, _regenerate_saved_outputs_for_row, _load_feature_stats_artifacts, _compile_multi_target_comparison, _resolve_dataset_inclusion, _run_rolling_origin_cv, _ensure_k01_baselines, _write_dataset_evaluation_summary, _forecast_sweeps_dir, _plot_final_metrics_comparison
 
 try:
     from scipy import stats as scipy_stats
@@ -1254,6 +1278,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 # Only update std_target for rows where it was computed; leave others empty
                 df["std_target"] = std_targets
                 df.to_csv(metrics_csv, index=False)
+
+            try:
+                final_df = pd.read_csv(metrics_csv)
+                if not final_df.empty:
+                    summary_plot = _plot_final_metrics_comparison(final_df, output_dir)
+                    print(f"[INFO] Rebuilt final metrics comparison plot: {summary_plot}")
+            except Exception as exc:
+                print(f"[WARN] Could not rebuild final metrics comparison plot for {plan.dataset_dir.name}: {exc}")
 
         print(f"\n[INFO] Rebuilding saved outputs for {plan.dataset_dir.name}: rows={row_counts}")
         wrote_any = False
