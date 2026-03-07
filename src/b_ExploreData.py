@@ -25,6 +25,9 @@ from utils.limits import (
 )
 
 
+OVERLAY_TRAIN_FRACTION = 0.7
+
+
 def _summary_theme_dirs(repo_root: Path) -> dict:
     """Return themed output directories under data/output/sensors."""
     base = repo_root / "data" / "output" / "sensors"
@@ -295,7 +298,7 @@ def _ks_statistic(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.max(np.abs(cdf_a - cdf_b)))
 
 
-def _split_index_from_cumulative_counts(valid_counts: list, train_fraction: float = 0.8) -> tuple:
+def _split_index_from_cumulative_counts(valid_counts: list, train_fraction: float = OVERLAY_TRAIN_FRACTION) -> tuple:
     """
     Mirror temporal split logic from utils.training._split_index_from_cumulative_valid_counts.
     Returns (split_idx, total_valid, train_valid) where split_idx is count of train samples.
@@ -473,7 +476,7 @@ def write_target_split_comparison(repo_root: Path) -> None:
                 continue
 
             valid_counts = [_predictor_valid_count_for_idx(int(i)) for i in valid_idx]
-            split_cut, _, _ = _split_index_from_cumulative_counts(valid_counts, train_fraction=0.8)
+            split_cut, _, _ = _split_index_from_cumulative_counts(valid_counts, train_fraction=OVERLAY_TRAIN_FRACTION)
             split_cut = max(1, min(split_cut, int(valid_idx.size)))
 
             eligible_vals = series.iloc[valid_idx].dropna()
@@ -1232,7 +1235,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                 n_valid = len(valid_idx)
                 if n_valid > 0:
                     valid_counts = [_predictor_valid_count_for_overlay(int(i)) for i in valid_idx]
-                    split_cut, _, _ = _split_index_from_cumulative_counts(valid_counts, train_fraction=0.8)
+                    split_cut, _, _ = _split_index_from_cumulative_counts(valid_counts, train_fraction=OVERLAY_TRAIN_FRACTION)
                     split_cut = max(1, min(split_cut, n_valid))
                     first_start = series.index[valid_idx[0]] - pd.Timedelta(minutes=30)
                     first_end = series.index[valid_idx[split_cut - 1]]
@@ -1470,7 +1473,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                     n_valid = len(valid_idx)
                     if n_valid > 0:
                         valid_counts = [_predictor_valid_count_for_overlay(int(i)) for i in valid_idx]
-                        split_cut, _, _ = _split_index_from_cumulative_counts(valid_counts, train_fraction=0.8)
+                        split_cut, _, _ = _split_index_from_cumulative_counts(valid_counts, train_fraction=OVERLAY_TRAIN_FRACTION)
                         split_cut = max(1, min(split_cut, n_valid))
                         train_last_pos = split_cut - 1
                         first_start = series.index[valid_idx[0]] - pd.Timedelta(minutes=30)
@@ -1954,7 +1957,7 @@ def generate_eurofins_summary(repo_root: Path) -> list:
                     mean_hours_between = float(deltas_hours.mean())
                     median_hours_between = float(deltas_hours.median())
                     count_gt_median_hours = int((deltas_hours > median_hours_between).sum())
-            split_idx = int(total_consolidated * 0.8)
+            split_idx = int(total_consolidated * 0.7)
             train_valid_count = int(valid_mask_cons.iloc[:split_idx].sum())
             test_valid_count = int(valid_mask_cons.iloc[split_idx:].sum())
             exceed_count = 0
