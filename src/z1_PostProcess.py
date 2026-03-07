@@ -54,6 +54,7 @@ BASELINE_PLOT_COLORS = {
     "seasonal": "tab:green",
     "linear": "tab:orange",
 }
+BASELINE_MODEL_IDS = {"naive", "seasonal", "linear"}
 
 
 def _resolve_summaries_dir(data_root: Path, sweep_namespace: str) -> Path:
@@ -97,6 +98,17 @@ def _safe_float(val) -> float:
         return float('nan')
 
 
+def _is_baseline_model_value(value: object) -> bool:
+    return str(value).strip().lower() in BASELINE_MODEL_IDS
+
+
+def _exclude_baseline_metric_rows(df: "pd.DataFrame") -> "pd.DataFrame":
+    out = df.copy()
+    if 'model' not in out.columns:
+        return out
+    return out[~out['model'].apply(_is_baseline_model_value)].copy()
+
+
 def _build_perf_entry(
     dataset_name: str,
     row: "pd.Series",
@@ -116,6 +128,7 @@ def _build_perf_entry(
         'nrmse': _safe_float(row.get('nrmse', float('nan'))),
         'rmse': _safe_float(row.get('rmse', float('nan'))),
         'r2': _safe_float(row.get('r2', float('nan'))),
+        'pearson_r': _safe_float(row.get('pearson_r', float('nan'))),
         'std_target': _safe_float(row.get('std_target', float('nan'))),
         'rolling_cv_r2': rolling_cv_r2,
         'rolling_cv_r2_median': rolling_cv_r2_median,
@@ -1280,7 +1293,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 df = pd.read_csv(final_metrics_csv)
                 if not df.empty:
                     # Select best row across all models/subsets by R2
-                    valid_r2 = _filter_valid_rows(df)
+                    valid_r2 = _exclude_baseline_metric_rows(_filter_valid_rows(df))
                     if valid_r2.empty:
                         print(f"[WARN] No valid r2 values in metrics for {plan.dataset_dir.name}; skipping rolling CV.")
                     else:
@@ -1395,7 +1408,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
                         # Re-read updated metrics and append best model performance entry
                         try:
-                            valid_r2_2 = _filter_valid_rows(pd.read_csv(final_metrics_csv))
+                            valid_r2_2 = _exclude_baseline_metric_rows(_filter_valid_rows(pd.read_csv(final_metrics_csv)))
                             if not valid_r2_2.empty:
                                 best_updated = valid_r2_2.loc[valid_r2_2['r2'].idxmax()]
                                 cv_r2_to_write = _safe_float(best_updated.get('rolling_cv_r2')) if run_rolling_cv else rolling_cv_r2
@@ -1469,22 +1482,22 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                         for kind in baseline_stats.keys():
                             row = df_eval[df_eval['label'].str.lower().str.contains(kind)].iloc[0] if not df_eval[df_eval['label'].str.lower().str.contains(kind)].empty else None
                             if row is not None:
-                                for stat in ['mae', 'rmse', 'r2']:
+                                for stat in ['mae', 'rmse', 'r2', 'pearson_r']:
                                     baseline_stats[kind][stat] = row.get(stat, np.nan)
                             else:
-                                for stat in ['mae', 'rmse', 'r2']:
+                                for stat in ['mae', 'rmse', 'r2', 'pearson_r']:
                                     baseline_stats[kind][stat] = np.nan
                     except Exception as e:
                         print(f"[WARN] Could not read baseline stats for {dataset}: {e}")
                         for kind in baseline_stats.keys():
-                            for stat in ['mae', 'rmse', 'r2']:
+                            for stat in ['mae', 'rmse', 'r2', 'pearson_r']:
                                 baseline_stats[kind][stat] = np.nan
                 else:
                     for kind in baseline_stats.keys():
-                        for stat in ['mae', 'rmse', 'r2']:
+                        for stat in ['mae', 'rmse', 'r2', 'pearson_r']:
                             baseline_stats[kind][stat] = np.nan
                 for kind in baseline_stats.keys():
-                    for stat in ['mae', 'rmse', 'r2']:
+                    for stat in ['mae', 'rmse', 'r2', 'pearson_r']:
                         entry[f'{kind}_{stat}'] = baseline_stats[kind][stat]
 
             perf_df = pd.DataFrame(best_model_performance)

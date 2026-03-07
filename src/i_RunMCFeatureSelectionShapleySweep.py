@@ -15,7 +15,6 @@ Outputs:
 - `feature_shapley_samples_r###.json` (full marginal sample lists for re-visualization).
 - Plot outputs (when --keep-shapley-plots enabled):
     - `feature_shapley_ranking_bar_r###.png` (ranked Shapley values with 95% CI error bars).
-    - `feature_shapley_confidence_r###.png` (CI band visualization).
     - `feature_shapley_distribution_r###.png` (violin plot of marginal distributions).
     - `feature_shapley_coverage_r###.png` (sample accumulation per feature).
     - `shapley_search_budget_r###.png` (eval budget utilization stacked bar).
@@ -258,58 +257,9 @@ def _plot_shapley_ranking_bar(
     ax.set_xlabel("Shapley Value Estimate (with 95% CI)", fontsize=11)
     ax.set_ylabel("Feature", fontsize=11)
     ax.grid(axis='x', alpha=0.3)
-    ax.set_title(f"Shapley Feature Attribution Ranking ({dataset_name})", fontsize=12, fontweight='bold')
+    # Title intentionally omitted to reduce redundancy with companion diagnostics.
 
     plot_filename = f"feature_shapley_ranking_bar_r{row_count:03d}.png" if include_row_count_in_name else "feature_shapley_ranking_bar.png"
-    plot_path = output_dir / plot_filename
-    fig.savefig(plot_path, dpi=180, bbox_inches='tight')
-    plt.close(fig)
-    return plot_path
-
-
-def _plot_shapley_confidence_heatmap(
-    shapley_rows: list[dict],
-    dataset_name: str,
-    row_count: int,
-    output_dir: Path,
-    include_row_count_in_name: bool = False,
-) -> Path:
-    """Plot Shapley confidence intervals as heatmap-style visualization."""
-    features = [str(r.get("feature", "")) for r in shapley_rows]
-    estimates = [float(r.get("shapley_value_est", np.nan)) for r in shapley_rows]
-    ci_lows = [float(r.get("ci95_low", np.nan)) for r in shapley_rows]
-    ci_highs = [float(r.get("ci95_high", np.nan)) for r in shapley_rows]
-
-    fig, ax = plt.subplots(figsize=(14, max(7, len(features) * 0.4)), constrained_layout=True)
-    
-    # Prepare data for horizontal layout
-    y_pos = np.arange(len(features))
-    
-    if estimates:
-        est_min = float(np.nanmin(estimates))
-        est_max = float(np.nanmax(estimates))
-        if est_max > est_min:
-            norm = matplotlib.colors.Normalize(vmin=est_min, vmax=est_max)
-            colors = [plt.cm.RdYlGn(float(norm(v))) for v in estimates]
-        else:
-            colors = [plt.cm.RdYlGn(0.5) for _ in estimates]
-    else:
-        colors = []
-    
-    # Plot bars with CI bands as background
-    for i, (feat, est, ci_low, ci_high) in enumerate(zip(features, estimates, ci_lows, ci_highs)):
-        ax.barh(i, est, color=colors[i], height=0.6, label=feat if i == 0 else "")
-        ax.plot([ci_low, ci_high], [i, i], 'k-', linewidth=2.5, alpha=0.8)
-        ax.plot([ci_low, ci_low], [i - 0.1, i + 0.1], 'k-', linewidth=2.5, alpha=0.8)
-        ax.plot([ci_high, ci_high], [i - 0.1, i + 0.1], 'k-', linewidth=2.5, alpha=0.8)
-    
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(features, fontsize=9)
-    ax.set_xlabel("Shapley Value (with 95% CI bands)", fontsize=11)
-    ax.grid(axis='x', alpha=0.3)
-    ax.set_title(f"Shapley Confidence Intervals ({dataset_name})", fontsize=12, fontweight='bold')
-
-    plot_filename = f"feature_shapley_confidence_r{row_count:03d}.png" if include_row_count_in_name else "feature_shapley_confidence.png"
     plot_path = output_dir / plot_filename
     fig.savefig(plot_path, dpi=180, bbox_inches='tight')
     plt.close(fig)
@@ -775,15 +725,6 @@ def _tmc_shapley_subsets(
         include_row_count_in_name=include_row_count_in_plot_names,
     )
     print(f"[INFO] Wrote Shapley ranking bar plot")
-
-    _plot_shapley_confidence_heatmap(
-        shapley_rows=shapley_rows,
-        dataset_name=dataset_name,
-        row_count=row_count,
-        output_dir=out_dir,
-        include_row_count_in_name=include_row_count_in_plot_names,
-    )
-    print(f"[INFO] Wrote Shapley confidence heatmap")
 
     _plot_shapley_distribution(
         shapley_samples=shapley_samples,

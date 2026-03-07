@@ -118,7 +118,7 @@ def build_super_summary_from_combined(
 
     super_df = pd.concat(summary_rows, ignore_index=True)
 
-    for metric in ["mae", "rmse", "r2"]:
+    for metric in ["mae", "rmse", "r2", "pearson_r"]:
         if metric in super_df.columns:
             super_df[metric] = pd.to_numeric(super_df[metric], errors="coerce")
         else:
@@ -136,6 +136,7 @@ def build_super_summary_from_combined(
         "mae",
         "rmse",
         "r2",
+        "pearson_r",
         "rank_rmse",
         "rank_r2",
         "is_best_rmse",
@@ -164,6 +165,7 @@ def build_super_summary_from_combined(
                     "mae": row["mae"],
                     "rmse": row["rmse"],
                     "r2": row["r2"],
+                    "pearson_r": row["pearson_r"],
                 }
             )
         for _, row in best_r2.iterrows():
@@ -175,10 +177,11 @@ def build_super_summary_from_combined(
                     "mae": row["mae"],
                     "rmse": row["rmse"],
                     "r2": row["r2"],
+                    "pearson_r": row["pearson_r"],
                 }
             )
 
-    best_df = pd.DataFrame(best_rows, columns=["target", "selection", "model", "mae", "rmse", "r2"])
+    best_df = pd.DataFrame(best_rows, columns=["target", "selection", "model", "mae", "rmse", "r2", "pearson_r"])
 
     super_csv_path, best_csv_path, plot_path = _super_summary_paths(data_root)
     super_csv_path.parent.mkdir(parents=True, exist_ok=True)

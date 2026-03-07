@@ -98,6 +98,39 @@ from utils.training import load_samples, group_samples_by_segment
 
 SUPPORTED_CONFIG_SUFFIXES = {".yml", ".yaml", ".json"}
 FINAL_TOPK_MIN_TEST_SAMPLES = 5
+BASELINE_MODEL_IDS = {"naive", "seasonal", "linear"}
+FINAL_METRICS_MODEL_ORDER = [
+    "gp_regressor",
+    "transformer",
+    "xgb_regressor",
+    "naive",
+    "seasonal",
+    "linear",
+]
+FINAL_METRICS_MODEL_STYLE = {
+    "gp_regressor": {"label": "GP", "color": "#1f77b4", "hatch": ""},
+    "transformer": {"label": "Transformer", "color": "#ff7f0e", "hatch": ""},
+    "xgb_regressor": {"label": "XGB", "color": "#2ca02c", "hatch": ""},
+    "naive": {"label": "Naive", "color": "#7f7f7f", "hatch": "//"},
+    "seasonal": {"label": "Seasonal", "color": "#17becf", "hatch": "\\\\"},
+    "linear": {"label": "Linear", "color": "#bcbd22", "hatch": "xx"},
+}
+
+
+def _normalize_baseline_label(value: object) -> "str | None":
+    text = str(value).strip().lower()
+    if "naive" in text:
+        return "naive"
+    if "seasonal" in text:
+        return "seasonal"
+    if "linear" in text:
+        return "linear"
+    return None
+
+
+def _is_baseline_model_value(value: object) -> bool:
+    text = str(value).strip().lower()
+    return text in BASELINE_MODEL_IDS
 
 
 def _sweep_namespace() -> str:
@@ -708,6 +741,160 @@ def _evaluate_candidate(
 
 def _candidate_key(row_count: int, features: tuple[str, ...]) -> tuple[int, tuple[str, ...]]:
     return int(row_count), tuple(features)
+
+
+def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> Path:
+    """Write a 4-panel clustered-bar comparison figure from final metrics rows.
+
+    Panels: MAE, RMSE, Pearson's r, and R^2. Clusters are candidate subsets
+    ordered by ascending RMSE for the model type with the best (lowest) subset RMSE.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plot_path = output_dir / "feature_sweep_final_metrics_summary.png"
+
+    if final_df is None or final_df.empty:
+        raise ValueError("Cannot plot final metrics summary: final_df is empty.")
+
+    required_cols = ["subset_rank", "model", "mae", "rmse", "pearson_r", "r2"]
+    missing = [c for c in required_cols if c not in final_df.columns]
+    if missing:
+        raise ValueError(f"Cannot plot final metrics summary: missing column(s) {missing}")
+
+    df = final_df.copy()
+    df["subset_rank"] = pd.to_numeric(df["subset_rank"], errors="coerce")
+    df = df[df["subset_rank"].notnull()].copy()
+    df["subset_rank"] = df["subset_rank"].astype(int)
+
+    def _normalize_plot_model(raw: object) -> str:
+        baseline_id = _normalize_baseline_label(raw)
+        if baseline_id is not None:
+            return baseline_id
+        lowered = str(raw).strip().lower()
+        if lowered in FINAL_METRICS_MODEL_STYLE:
+            return lowered
+        if "transformer" in lowered:
+            return "transformer"
+        if "xgb" in lowered:
+            return "xgb_regressor"
+        if "gp" in lowered:
+            return "gp_regressor"
+        return lowered
+
+    df["model_norm"] = df["model"].apply(_normalize_plot_model)
+    df = df[df["model_norm"].isin(FINAL_METRICS_MODEL_ORDER)].copy()
+    if df.empty:
+        raise ValueError("Cannot plot final metrics summary: no recognized model rows found.")
+
+    metric_cols = ["mae", "rmse", "pearson_r", "r2"]
+    for metric in metric_cols:
+        df[metric] = pd.to_numeric(df[metric], errors="coerce")
+
+    # Collapse potential duplicate rows (for example, baseline rows repeated per ML config).
+    grouped = (
+        df.groupby(["subset_rank", "model_norm"], as_index=False)[metric_cols]
+        .mean(numeric_only=True)
+    )
+
+    rank_to_label = {
+        int(rank): f"k{int(rank):02d}"
+        for rank in sorted(grouped["subset_rank"].dropna().unique().tolist())
+    }
+
+    rmse_pivot = grouped.pivot(index="subset_rank", columns="model_norm", values="rmse")
+    finite_min_rmse = {}
+    for model in FINAL_METRICS_MODEL_ORDER:
+        if model not in rmse_pivot.columns:
+            continue
+        vals = pd.to_numeric(rmse_pivot[model], errors="coerce").to_numpy(dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size > 0:
+            finite_min_rmse[model] = float(np.min(vals))
+
+    if not finite_min_rmse:
+        raise ValueError("Cannot plot final metrics summary: RMSE values are all non-finite.")
+
+    best_model = min(finite_min_rmse.items(), key=lambda item: item[1])[0]
+
+    subset_order = sorted(
+        rank_to_label.keys(),
+        key=lambda rank: (
+            float(rmse_pivot.loc[rank, best_model])
+            if (rank in rmse_pivot.index and best_model in rmse_pivot.columns and np.isfinite(rmse_pivot.loc[rank, best_model]))
+            else float("inf"),
+            int(rank),
+        ),
+    )
+
+    x = np.arange(len(subset_order), dtype=float)
+    n_models = len(FINAL_METRICS_MODEL_ORDER)
+    cluster_width = 0.86
+    bar_w = cluster_width / max(1, n_models)
+
+    fig, axes = plt.subplots(4, 1, figsize=(max(10, 0.85 * len(subset_order) + 6), 14), sharex=True, constrained_layout=True)
+    metric_specs = [
+        ("mae", "MAE"),
+        ("rmse", "RMSE"),
+        ("pearson_r", "Pearson's r"),
+        ("r2", "R^2"),
+    ]
+
+    legend_handles = []
+    legend_labels = []
+    for ax, (metric, ylabel) in zip(axes, metric_specs):
+        metric_pivot = grouped.pivot(index="subset_rank", columns="model_norm", values=metric)
+
+        for i, model in enumerate(FINAL_METRICS_MODEL_ORDER):
+            style = FINAL_METRICS_MODEL_STYLE[model]
+            vals = []
+            for rank in subset_order:
+                if rank in metric_pivot.index and model in metric_pivot.columns:
+                    val = metric_pivot.loc[rank, model]
+                    vals.append(float(val) if np.isfinite(val) else np.nan)
+                else:
+                    vals.append(np.nan)
+
+            xpos = x - (cluster_width / 2.0) + (i + 0.5) * bar_w
+            bars = ax.bar(
+                xpos,
+                vals,
+                width=bar_w,
+                color=style["color"],
+                hatch=style["hatch"],
+                edgecolor="black" if style["hatch"] else "none",
+                linewidth=0.8 if style["hatch"] else 0.0,
+                label=style["label"],
+            )
+            if len(legend_handles) < n_models:
+                legend_handles.append(bars[0])
+                legend_labels.append(style["label"])
+
+        ax.set_ylabel(ylabel)
+        ax.grid(axis="y", alpha=0.3)
+
+        metric_vals = pd.to_numeric(grouped[metric], errors="coerce").to_numpy(dtype=float)
+        finite_vals = metric_vals[np.isfinite(metric_vals)]
+        if metric in ("mae", "rmse"):
+            # Error metrics are non-negative; anchor at zero for comparability.
+            ymax = float(np.max(finite_vals)) if finite_vals.size > 0 else 1.0
+            if ymax <= 0.0:
+                ymax = 1.0
+            ax.set_ylim(0.0, ymax * 1.08)
+        elif metric in ("pearson_r", "r2"):
+            # Correlation and R^2 are interpreted on a bounded scale.
+            ax.set_ylim(-1.0, 1.0)
+
+    axes[-1].set_xticks(x)
+    axes[-1].set_xticklabels([rank_to_label[r] for r in subset_order], rotation=0)
+    axes[-1].set_xlabel("Candidate Feature Subset")
+
+    for ax in axes[:-1]:
+        ax.tick_params(axis="x", labelbottom=False)
+
+    fig.legend(legend_handles, legend_labels, loc="upper center", ncol=6, frameon=True, fontsize=9)
+    fig.suptitle(f"Candidate Subset Comparison (ordered by RMSE of {FINAL_METRICS_MODEL_STYLE.get(best_model, {}).get('label', best_model)})", y=1.02, fontsize=11)
+    fig.savefig(plot_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return plot_path
 
 
 def _feature_plot_filename(stem: str, row_count: int, include_row_count_in_name: bool) -> str:
@@ -1688,7 +1875,46 @@ def _evaluate_selected_subsets_all_models(
                         str(eval_cfg),
                         save_plots_override=not disable_eval_plots,
                     )
-                    summary_rows = [eval_result] if eval_result is not None else []
+                    summary_rows = []
+                    eval_summary_csv = Path(eval_cfg).parent / "evaluation_summary.csv"
+                    if eval_summary_csv.exists():
+                        try:
+                            summary_df = pd.read_csv(eval_summary_csv)
+
+                            # Pick one primary model row using the same preference order as evaluate_single_config.
+                            primary_model_row = None
+                            if not summary_df.empty:
+                                if "kind" in summary_df.columns:
+                                    kinds = summary_df["kind"].astype(str).str.lower().str.strip()
+                                    for preferred_kind in ("test", "combined", "train"):
+                                        hit = summary_df[kinds == preferred_kind]
+                                        if not hit.empty:
+                                            primary_model_row = hit.iloc[0].to_dict()
+                                            break
+
+                                if primary_model_row is None:
+                                    for _, _row in summary_df.iterrows():
+                                        if _normalize_baseline_label(_row.get("label", "")) is None:
+                                            primary_model_row = _row.to_dict()
+                                            break
+
+                            if primary_model_row is not None:
+                                summary_rows.append(primary_model_row)
+
+                            # Add one row per baseline model (Naive/Seasonal/Linear).
+                            seen_baselines: set[str] = set()
+                            for _, _row in summary_df.iterrows():
+                                baseline_id = _normalize_baseline_label(_row.get("label", ""))
+                                if baseline_id is None or baseline_id in seen_baselines:
+                                    continue
+                                summary_rows.append(_row.to_dict())
+                                seen_baselines.add(baseline_id)
+
+                        except Exception as read_exc:
+                            print(f"[WARN] Could not read evaluation_summary.csv at {eval_summary_csv}: {read_exc}")
+
+                    if not summary_rows and eval_result is not None:
+                        summary_rows = [eval_result]
             except Exception as e:
                 print(f"[ERROR] Evaluation failed for config {variant_cfg}: {e}")
                 summary_rows = []
@@ -1718,6 +1944,7 @@ def _evaluate_selected_subsets_all_models(
                     "mae": float('nan'),
                     "rmse": float('nan'),
                     "r2": float('nan'),
+                    "pearson_r": float('nan'),
                     "std_target": float('nan'),
                 })
                 continue
@@ -1732,11 +1959,13 @@ def _evaluate_selected_subsets_all_models(
                     pass
 
                 # model: write_evaluation_config always sets model_name=""; fall back to model_type
-                model_name = (
+                model_name_default = (
                     _eval_cfg_data.get("model_name")
                     or _eval_cfg_data.get("model_type")
                     or srow.get("label", "unknown")
                 )
+                baseline_id = _normalize_baseline_label(srow.get("label", ""))
+                model_name = baseline_id if baseline_id is not None else model_name_default
 
                 # n_samples: n_eval_rows is set by _compute_regression_summary to len(eval set)
                 n_samples = float(srow.get("n_eval_rows", np.nan))
@@ -1790,6 +2019,7 @@ def _evaluate_selected_subsets_all_models(
                         "mae": float(srow.get("mae", np.nan)),
                         "rmse": float(srow.get("rmse", np.nan)),
                         "r2": float(srow.get("r2", np.nan)),
+                        "pearson_r": float(srow.get("pearson_r", np.nan)),
                         "std_target": std_target,
                     }
                 )
@@ -1797,6 +2027,11 @@ def _evaluate_selected_subsets_all_models(
     final_df = pd.DataFrame(rows)
     out_csv = output_dir / "feature_sweep_final_metrics.csv"
     final_df.to_csv(out_csv, index=False)
+    try:
+        summary_plot = _plot_final_metrics_comparison(final_df, output_dir)
+        print(f"[INFO] Wrote final metrics comparison plot: {summary_plot}")
+    except Exception as exc:
+        print(f"[WARN] Could not generate final metrics comparison plot for {dataset_plan.dataset_dir.name}: {exc}")
     return out_csv
 
 
@@ -1821,6 +2056,8 @@ def _run_rolling_origin_cv(
         return
 
     k01_rows = df_final[df_final["subset_rank"] == 1].copy()
+    if "model" in k01_rows.columns:
+        k01_rows = k01_rows[~k01_rows["model"].apply(_is_baseline_model_value)]
     if k01_rows.empty or k01_rows["r2"].isna().all():
         print("[WARN] Rolling origin CV: no valid k01 rows in final metrics. Skipping.")
         return
@@ -2096,6 +2333,8 @@ def _ensure_k01_baselines(plan: DatasetPlan, final_metrics_csv: Path) -> None:
         return
 
     k01_rows = df_final[df_final["subset_rank"] == 1].copy()
+    if "model" in k01_rows.columns:
+        k01_rows = k01_rows[~k01_rows["model"].apply(_is_baseline_model_value)]
     valid_k01 = k01_rows[k01_rows["r2"].notnull() & np.isfinite(k01_rows["r2"].astype(float))] if not k01_rows.empty else k01_rows
     if valid_k01.empty:
         print(f"[WARN] _ensure_k01_baselines: no valid k01 rows for {plan.dataset_dir.name}; skipping.")
@@ -2165,6 +2404,8 @@ def _write_dataset_evaluation_summary(plan: DatasetPlan, final_metrics_csv: Path
         return None
 
     k01_rows = df_final[df_final["subset_rank"] == 1].copy()
+    if "model" in k01_rows.columns:
+        k01_rows = k01_rows[~k01_rows["model"].apply(_is_baseline_model_value)]
     if k01_rows.empty or k01_rows["r2"].isna().all():
         print(f"[WARN] _write_dataset_evaluation_summary: no valid k01 rows with r2 in {final_metrics_csv}")
         return None
