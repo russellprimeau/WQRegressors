@@ -320,6 +320,68 @@ def _save_subplot_panels(
     return saved
 
 
+def _save_individual_panel(
+    out_dir: Path,
+    base_name: str,
+    panel_index: int,
+    labels,
+    draw_fn,
+    figsize: tuple[float, float],
+    dpi: int = 300,
+    left: float = 0.34,
+    right: float = 0.98,
+    top: float = 0.96,
+    bottom: float = 0.30,
+) -> Path:
+    """Render and save a standalone panel image using a dedicated figure canvas."""
+    fig, ax = plt.subplots(figsize=figsize)
+    draw_fn(ax)
+
+    label_list = [str(v) for v in list(labels)]
+    x_ticks = np.arange(len(label_list), dtype=float)
+    ax.set_xticks(x_ticks)
+    ax.set_xticklabels(label_list, rotation=45, ha='right')
+    _style_stacked_axes(np.array([ax]), y_fontsize=9, tick_fontsize=8, legend_fontsize=8)
+    fig.subplots_adjust(left=left, right=right, top=top, bottom=bottom)
+
+    panel_path = out_dir / f"{base_name}__panel_{int(panel_index):02d}.png"
+    fig.savefig(panel_path, dpi=dpi, bbox_inches='tight')
+    plt.close(fig)
+    return panel_path
+
+
+def _save_individual_panels_from_builders(
+    out_dir: Path,
+    base_name: str,
+    labels,
+    builders,
+    figsize: tuple[float, float],
+    dpi: int = 300,
+    left: float = 0.34,
+    right: float = 0.98,
+    top: float = 0.96,
+    bottom: float = 0.30,
+) -> list[Path]:
+    """Render a sequence of standalone panels, one figure per builder callback."""
+    saved: list[Path] = []
+    for idx, builder in enumerate(list(builders), start=1):
+        panel_path = _save_individual_panel(
+            out_dir=out_dir,
+            base_name=base_name,
+            panel_index=idx,
+            labels=labels,
+            draw_fn=builder,
+            figsize=figsize,
+            dpi=dpi,
+            left=left,
+            right=right,
+            top=top,
+            bottom=bottom,
+        )
+        saved.append(panel_path)
+    return saved
+
+
 def _normalize_model_key(value: str) -> str:
     return str(value).strip().lower().replace("_", "").replace(" ", "")
 
@@ -1628,7 +1690,74 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             _finalize_stacked_figure(fig_conf, conf_axes, left=0.30, hspace=0.48)
             conf_path = combined_dir / "summary_best_model_confidence.png"
             fig_conf.savefig(conf_path, dpi=300, bbox_inches='tight')
-            conf_panels = _save_subplot_panels(fig_conf, conf_axes, individual_dir, "summary_best_model_confidence")
+
+            def _conf_panel_prob(ax):
+                _draw_bar_group(
+                    ax, x, width,
+                    baseline_prob_cols,
+                    [BASELINE_PLOT_COLORS[name] for name in BASELINE_ORDER],
+                    [f"Prob(skill>0) vs {BASELINE_PLOT_LABELS[name]}" for name in BASELINE_ORDER],
+                    '.2f',
+                )
+                ax.axhline(float(args.evidence_min_prob), color='black', linewidth=0.8, linestyle='--')
+                ax.set_ylabel('Bootstrap Probability\n(Model Skill > 0)')
+                ax.set_ylim(0.0, 1.05)
+                ax.grid(axis='y', alpha=0.3)
+                ax.legend()
+
+            def _conf_panel_lcb(ax):
+                _draw_bar_group(
+                    ax, x, width,
+                    baseline_lcb_cols,
+                    [BASELINE_PLOT_COLORS[name] for name in BASELINE_ORDER],
+                    [f"95% Lower Confidence Bound of Skill\nCompared with {BASELINE_PLOT_LABELS[name]} Baseline" for name in BASELINE_ORDER],
+                    '.2f',
+                )
+                ax.axhline(0.0, color='black', linewidth=0.8, linestyle='--')
+                ax.set_ylabel('Skill Lower Confidence Bound')
+                ax.grid(axis='y', alpha=0.3)
+                ax.legend()
+
+            def _conf_panel_picp(ax):
+                _draw_bar_group(
+                    ax, x, width,
+                    [model_picp, naive_picp, seasonal_picp, linear_picp],
+                    ['tab:blue', BASELINE_PLOT_COLORS['naive'], BASELINE_PLOT_COLORS['seasonal'], BASELINE_PLOT_COLORS['linear']],
+                    [model_series_label, 'Naive', 'Seasonal', 'Linear'],
+                    '.2f',
+                )
+                nom_arr = nominal_cov.to_numpy(dtype=float) if hasattr(nominal_cov, "to_numpy") else np.array(nominal_cov, dtype=float)
+                if np.isfinite(nom_arr).any():
+                    ax.axhline(float(np.nanmean(nom_arr)), color='black', linewidth=0.8, linestyle='--', label='Nominal Coverage')
+                ax.set_ylabel('Prediction Interval Coverage\nProbability (Proxy)')
+                ax.set_ylim(0.0, 1.05)
+                ax.grid(axis='y', alpha=0.3)
+                ax.legend()
+
+            def _conf_panel_score(ax):
+                bars = ax.bar(x, overall_score, width=0.5, color='tab:blue')
+                _annotate_bars_within_ylim(ax, bars, '.0f')
+                ax.set_ylabel('Overall Evidence Score\n(Minimum Across Baselines)')
+                ax.grid(axis='y', alpha=0.3)
+
+            def _conf_panel_tier(ax):
+                bars = ax.bar(x, overall_tier_vals, width=0.5, color='tab:purple')
+                _annotate_bars_within_ylim(ax, bars, '.0f')
+                ax.set_yticks([0, 1, 2, 3])
+                ax.set_yticklabels(tier_labels)
+                ax.set_ylabel('Overall Evidence Tier')
+                ax.grid(axis='y', alpha=0.3)
+
+            conf_panels = _save_individual_panels_from_builders(
+                out_dir=individual_dir,
+                base_name="summary_best_model_confidence",
+                labels=labels,
+                builders=[_conf_panel_prob, _conf_panel_lcb, _conf_panel_picp, _conf_panel_score, _conf_panel_tier],
+                figsize=(max(11, len(perf_df) * 0.85), 6.2),
+                dpi=300,
+                left=0.36,
+                bottom=0.30,
+            )
             plt.close(fig_conf)
             print(f"[INFO] Wrote confidence subplot: {conf_path}")
             print(f"[INFO] Wrote {len(conf_panels)} confidence panel(s) to {individual_dir}")
@@ -1678,7 +1807,32 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             _finalize_stacked_figure(fig_tests, axes_tests, left=0.34, hspace=0.55)
             tests_path = combined_dir / "summary_evidence_tests.png"
             fig_tests.savefig(tests_path, dpi=300, bbox_inches='tight')
-            tests_panels = _save_subplot_panels(fig_tests, axes_tests, individual_dir, "summary_evidence_tests")
+
+            test_specs = [
+                (['dm_p_vs_naive', 'dm_p_vs_seasonal', 'dm_p_vs_linear'], 'Diebold-Mariano Test p-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
+                (['dm_q_vs_naive', 'dm_q_vs_seasonal', 'dm_q_vs_linear'], 'Diebold-Mariano Test\nFalse Discovery Rate Adjusted q-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
+                (['wilcoxon_p_vs_naive', 'wilcoxon_p_vs_seasonal', 'wilcoxon_p_vs_linear'], 'Wilcoxon Signed-Rank Test p-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
+                (['wilcoxon_q_vs_naive', 'wilcoxon_q_vs_seasonal', 'wilcoxon_q_vs_linear'], 'Wilcoxon Signed-Rank Test\nFalse Discovery Rate Adjusted q-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
+                (['sign_p_vs_naive', 'sign_p_vs_seasonal', 'sign_p_vs_linear'], 'Sign Test p-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
+                (['sign_q_vs_naive', 'sign_q_vs_seasonal', 'sign_q_vs_linear'], 'Sign Test\nFalse Discovery Rate Adjusted q-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
+                (['dm_stat_vs_naive', 'dm_stat_vs_seasonal', 'dm_stat_vs_linear'], 'Diebold-Mariano Test Statistic', '.2f', 0.0, None),
+                (['wilcoxon_stat_vs_naive', 'wilcoxon_stat_vs_seasonal', 'wilcoxon_stat_vs_linear'], 'Wilcoxon Statistic', '.2f', None, None),
+                (['sign_win_rate_vs_naive', 'sign_win_rate_vs_seasonal', 'sign_win_rate_vs_linear'], 'Sign Test Win Rate', '.2f', 0.5, (0.0, 1.05)),
+            ]
+            tests_builders = [
+                (lambda cols=cols, ylabel=ylabel, fmt=fmt, hline=hline, ylim=ylim: (lambda ax: _baseline_panel(ax, cols, ylabel, fmt, hline=hline, ylim=ylim)))()
+                for cols, ylabel, fmt, hline, ylim in test_specs
+            ]
+            tests_panels = _save_individual_panels_from_builders(
+                out_dir=individual_dir,
+                base_name="summary_evidence_tests",
+                labels=labels,
+                builders=tests_builders,
+                figsize=(max(11, len(perf_df) * 0.85), 6.4),
+                dpi=300,
+                left=0.40,
+                bottom=0.30,
+            )
             plt.close(fig_tests)
             print(f"[INFO] Wrote evidence tests figure: {tests_path}")
             print(f"[INFO] Wrote {len(tests_panels)} evidence test panel(s) to {individual_dir}")
@@ -1701,7 +1855,33 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             _finalize_stacked_figure(fig_eff, axes_eff, left=0.36, hspace=0.56)
             eff_path = combined_dir / "summary_evidence_effects.png"
             fig_eff.savefig(eff_path, dpi=300, bbox_inches='tight')
-            eff_panels = _save_subplot_panels(fig_eff, axes_eff, individual_dir, "summary_evidence_effects")
+
+            eff_specs = [
+                (['skill_vs_naive', 'skill_vs_seasonal', 'skill_vs_linear'], 'Skill (RMSE-Based)', '.2f', 0.0, None),
+                (['bootstrap_skill_mean_vs_naive', 'bootstrap_skill_mean_vs_seasonal', 'bootstrap_skill_mean_vs_linear'], 'Bootstrap Skill Mean', '.2f', 0.0, None),
+                (['lcb95_skill_vs_naive', 'lcb95_skill_vs_seasonal', 'lcb95_skill_vs_linear'], '95% Lower Confidence Bound of Skill', '.2f', 0.0, None),
+                (['effect_median_ae_diff_vs_naive', 'effect_median_ae_diff_vs_seasonal', 'effect_median_ae_diff_vs_linear'], 'Median MAE Difference', '.2e', 0.0, None),
+                (['effect_mean_ae_diff_vs_naive', 'effect_mean_ae_diff_vs_seasonal', 'effect_mean_ae_diff_vs_linear'], 'Mean MAE Difference', '.2e', 0.0, None),
+                (['effect_cohen_d_ae_diff_vs_naive', 'effect_cohen_d_ae_diff_vs_seasonal', 'effect_cohen_d_ae_diff_vs_linear'], "Cohen's d for MAE Difference", '.2f', 0.0, None),
+                (['bootstrap_rmse_diff_mean_vs_naive', 'bootstrap_rmse_diff_mean_vs_seasonal', 'bootstrap_rmse_diff_mean_vs_linear'], 'Bootstrap RMSE Difference Mean', '.2e', 0.0, None),
+                (['bootstrap_rmse_diff_ci05_vs_naive', 'bootstrap_rmse_diff_ci05_vs_seasonal', 'bootstrap_rmse_diff_ci05_vs_linear'], 'Bootstrap RMSE Difference\n5th Percentile', '.2e', 0.0, None),
+                (['bootstrap_rmse_diff_ci95_vs_naive', 'bootstrap_rmse_diff_ci95_vs_seasonal', 'bootstrap_rmse_diff_ci95_vs_linear'], 'Bootstrap RMSE Difference\n95th Percentile', '.2e', 0.0, None),
+                (['bootstrap_r2_diff_mean_vs_naive', 'bootstrap_r2_diff_mean_vs_seasonal', 'bootstrap_r2_diff_mean_vs_linear'], 'Bootstrap Coefficient of Determination Difference Mean', '.2f', 0.0, None),
+            ]
+            eff_builders = [
+                (lambda cols=cols, ylabel=ylabel, fmt=fmt, hline=hline, ylim=ylim: (lambda ax: _baseline_panel(ax, cols, ylabel, fmt, hline=hline, ylim=ylim)))()
+                for cols, ylabel, fmt, hline, ylim in eff_specs
+            ]
+            eff_panels = _save_individual_panels_from_builders(
+                out_dir=individual_dir,
+                base_name="summary_evidence_effects",
+                labels=labels,
+                builders=eff_builders,
+                figsize=(max(11, len(perf_df) * 0.85), 6.4),
+                dpi=300,
+                left=0.42,
+                bottom=0.30,
+            )
             plt.close(fig_eff)
             print(f"[INFO] Wrote evidence effects figure: {eff_path}")
             print(f"[INFO] Wrote {len(eff_panels)} evidence effect panel(s) to {individual_dir}")
@@ -1769,7 +1949,100 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             _finalize_stacked_figure(fig_int, axes_int, left=0.36, hspace=0.56)
             int_path = combined_dir / "summary_evidence_intervals_support.png"
             fig_int.savefig(int_path, dpi=300, bbox_inches='tight')
-            int_panels = _save_subplot_panels(fig_int, axes_int, individual_dir, "summary_evidence_intervals_support")
+
+            def _int_panel_picp(ax):
+                _draw_bar_group(
+                    ax, x, width,
+                    [_col('model_picp'), _col('naive_picp'), _col('seasonal_picp'), _col('linear_picp')],
+                    trio_colors,
+                    trio_methods,
+                    '.2f',
+                )
+                ax.axhline(1.0 - float(args.interval_alpha), color='black', linewidth=0.8, linestyle='--')
+                ax.set_ylabel('Prediction Interval Coverage\nProbability')
+                ax.set_ylim(0.0, 1.05)
+                ax.grid(axis='y', alpha=0.3)
+                ax.legend()
+
+            def _int_panel_deficit(ax):
+                _draw_bar_group(
+                    ax, x, width,
+                    [_col('model_coverage_deficit'), _col('naive_coverage_deficit'), _col('seasonal_coverage_deficit'), _col('linear_coverage_deficit')],
+                    trio_colors,
+                    trio_methods,
+                    '.3f',
+                )
+                ax.axhline(float(args.coverage_tolerance), color='black', linewidth=0.8, linestyle='--')
+                ax.set_ylabel('Coverage Deficit')
+                ax.grid(axis='y', alpha=0.3)
+                ax.legend()
+
+            def _int_panel_nmpiw(ax):
+                _draw_bar_group(
+                    ax, x, width,
+                    [_col('model_nmpiw'), _col('naive_nmpiw'), _col('seasonal_nmpiw'), _col('linear_nmpiw')],
+                    trio_colors,
+                    trio_methods,
+                    '.2f',
+                )
+                ax.set_ylabel('Normalized Mean Prediction\nInterval Width')
+                ax.grid(axis='y', alpha=0.3)
+                ax.legend()
+
+            def _int_panel_score(ax):
+                _draw_bar_group(
+                    ax, x, width,
+                    [_col('model_interval_score'), _col('naive_interval_score'), _col('seasonal_interval_score'), _col('linear_interval_score')],
+                    trio_colors,
+                    trio_methods,
+                    '.2e',
+                )
+                ax.set_ylabel('Interval Score')
+                ax.grid(axis='y', alpha=0.3)
+                ax.legend()
+
+            def _int_panel_picp_delta(ax):
+                _baseline_panel(ax, ['picp_delta_vs_naive', 'picp_delta_vs_seasonal', 'picp_delta_vs_linear'], 'Prediction Interval Coverage Probability Difference\n(Model minus Baseline)', '.2f', hline=0.0)
+
+            def _int_panel_nmpiw_delta(ax):
+                _baseline_panel(ax, ['nmpiw_delta_vs_naive', 'nmpiw_delta_vs_seasonal', 'nmpiw_delta_vs_linear'], 'Normalized Mean Prediction Interval Width Difference\n(Model minus Baseline)', '.2f', hline=0.0)
+
+            def _int_panel_interval_delta(ax):
+                _baseline_panel(ax, ['interval_score_delta_vs_naive', 'interval_score_delta_vs_seasonal', 'interval_score_delta_vs_linear'], 'Interval Score Delta', '.2e', hline=0.0)
+
+            def _int_panel_raw_segments(ax):
+                bars = ax.bar(x, _col('n_eval_raw_segments'), width=0.5, color='tab:orange')
+                _annotate_bars_within_ylim(ax, bars, '.0f')
+                ax.set_ylabel('Evaluated Independent Raw Segments (Count)')
+                ax.grid(axis='y', alpha=0.3)
+
+            def _int_panel_weight(ax):
+                bars = ax.bar(x, _col('sample_reliability_weight'), width=0.5, color='tab:purple')
+                _annotate_bars_within_ylim(ax, bars, '.2f')
+                ax.set_ylim(0.0, 1.05)
+                ax.set_ylabel('Sample Reliability Weight')
+                ax.grid(axis='y', alpha=0.3)
+
+            int_panels = _save_individual_panels_from_builders(
+                out_dir=individual_dir,
+                base_name="summary_evidence_intervals_support",
+                labels=labels,
+                builders=[
+                    _int_panel_picp,
+                    _int_panel_deficit,
+                    _int_panel_nmpiw,
+                    _int_panel_score,
+                    _int_panel_picp_delta,
+                    _int_panel_nmpiw_delta,
+                    _int_panel_interval_delta,
+                    _int_panel_raw_segments,
+                    _int_panel_weight,
+                ],
+                figsize=(max(11, len(perf_df) * 0.85), 6.4),
+                dpi=300,
+                left=0.42,
+                bottom=0.30,
+            )
             plt.close(fig_int)
             print(f"[INFO] Wrote evidence interval/support figure: {int_path}")
             print(f"[INFO] Wrote {len(int_panels)} interval/support panel(s) to {individual_dir}")
@@ -1796,7 +2069,21 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             _finalize_stacked_figure(fig_gate, axes_gate, left=0.40, hspace=0.60)
             gate_path = combined_dir / "summary_evidence_gates.png"
             fig_gate.savefig(gate_path, dpi=300, bbox_inches='tight')
-            gate_panels = _save_subplot_panels(fig_gate, axes_gate, individual_dir, "summary_evidence_gates")
+
+            gate_builders = [
+                (lambda g_cols=g_cols, ylab=ylab: (lambda ax: _baseline_panel(ax, g_cols, ylab, '.0f', ylim=(0.0, 1.05))))()
+                for g_cols, ylab in gate_specs
+            ]
+            gate_panels = _save_individual_panels_from_builders(
+                out_dir=individual_dir,
+                base_name="summary_evidence_gates",
+                labels=labels,
+                builders=gate_builders,
+                figsize=(max(11, len(perf_df) * 0.85), 6.4),
+                dpi=300,
+                left=0.46,
+                bottom=0.30,
+            )
             plt.close(fig_gate)
             print(f"[INFO] Wrote evidence gates figure: {gate_path}")
             print(f"[INFO] Wrote {len(gate_panels)} evidence gate panel(s) to {individual_dir}")
@@ -1841,7 +2128,31 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 _finalize_stacked_figure(fig_mc, axes_mc, left=0.38, hspace=0.58)
                 mc_path = combined_dir / "summary_mc_uncertainty_impact.png"
                 fig_mc.savefig(mc_path, dpi=300, bbox_inches='tight')
-                mc_panels = _save_subplot_panels(fig_mc, axes_mc, individual_dir, "summary_mc_uncertainty_impact")
+
+                mc_builders = []
+                for col_name, ylab, color, fmt, hline, ylim in mc_specs_informative:
+                    def _builder(ax, col_name=col_name, ylab=ylab, color=color, fmt=fmt, hline=hline, ylim=ylim):
+                        bars = ax.bar(x, _col(col_name), width=0.5, color=color)
+                        _annotate_bars_within_ylim(ax, bars, fmt)
+                        if hline is not None and np.isfinite(hline):
+                            ax.axhline(float(hline), color='black', linewidth=0.8, linestyle='--')
+                        if ylim is not None:
+                            ax.set_ylim(float(ylim[0]), float(ylim[1]))
+                        ax.set_ylabel(ylab)
+                        ax.grid(axis='y', alpha=0.3)
+
+                    mc_builders.append(_builder)
+
+                mc_panels = _save_individual_panels_from_builders(
+                    out_dir=individual_dir,
+                    base_name="summary_mc_uncertainty_impact",
+                    labels=labels,
+                    builders=mc_builders,
+                    figsize=(max(11, len(perf_df) * 0.85), 6.2),
+                    dpi=300,
+                    left=0.44,
+                    bottom=0.30,
+                )
                 plt.close(fig_mc)
                 print(f"[INFO] Wrote MC uncertainty impact figure: {mc_path}")
                 print(f"[INFO] Wrote {len(mc_panels)} MC uncertainty panel(s) to {individual_dir}")
@@ -2031,7 +2342,31 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 plt.tight_layout()
                 cv_path = combined_dir / "cross-validation.png"
                 fig_cv.savefig(cv_path, dpi=300, bbox_inches='tight')
-                cv_panels = _save_subplot_panels(fig_cv, cv_axes, individual_dir, "cross-validation")
+
+                cv_builders = []
+                for vals, ylabel, color, fmt in cv_panel_specs:
+                    def _builder(ax, vals=vals, ylabel=ylabel, color=color, fmt=fmt):
+                        bars = ax.bar(x, vals, width=0.5, color=color)
+                        if ylabel.startswith('Cross-Validation Coefficient of Determination'):
+                            ax.set_ylim(-0.1, 1.0)
+                        _annotate_bars_within_ylim(ax, bars, fmt)
+                        if ylabel.startswith('Generalization'):
+                            ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
+                        ax.set_ylabel(ylabel)
+                        ax.grid(axis='y', alpha=0.3)
+
+                    cv_builders.append(_builder)
+
+                cv_panels = _save_individual_panels_from_builders(
+                    out_dir=individual_dir,
+                    base_name="cross-validation",
+                    labels=labels,
+                    builders=cv_builders,
+                    figsize=(max(11, len(perf_df) * 0.85), 6.2),
+                    dpi=300,
+                    left=0.40,
+                    bottom=0.30,
+                )
                 plt.close(fig_cv)
                 print(f"[INFO] Wrote cross-validation figure: {cv_path}")
                 print(f"[INFO] Wrote {len(cv_panels)} cross-validation panel(s) to {individual_dir}")
