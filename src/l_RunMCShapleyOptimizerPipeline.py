@@ -121,6 +121,7 @@ def _build_shapley_args(args: argparse.Namespace) -> argparse.Namespace:
         keep_training_plots=args.keep_training_plots,
         keep_eval_plots=args.keep_eval_plots,
         keep_search_plots=args.keep_search_plots,
+        keep_shapley_plots=args.keep_shapley_plots,
         show_training_logs=args.show_training_logs,
         run_rolling_origin_cv=args.run_rolling_origin_cv,
         dry_run=args.dry_run,
@@ -213,6 +214,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep-training-plots", action="store_true")
     parser.add_argument("--keep-eval-plots", action="store_true")
     parser.add_argument("--keep-search-plots", action="store_true")
+    parser.add_argument("--keep-shapley-plots", action="store_true")
     parser.add_argument("--show-training-logs", action="store_true")
     parser.add_argument("--run-rolling-origin-cv", action="store_true")
 
