@@ -122,7 +122,7 @@ DEFAULT_GP_REGRESSOR_CONFIG = {
 
 DEFAULT_DATA_SPLIT_CONFIG = {
     "random_state": 42,
-    "test_size": 0.2,
+    "test_size": 0.3,
     "reuse_split": False,
     "split_source": None,
     "split_type": "random",

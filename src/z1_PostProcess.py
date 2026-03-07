@@ -1174,6 +1174,11 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
     if not data_root.is_absolute():
         data_root = (workspace_root / data_root).resolve()
 
+    print(
+        "[INFO] Postprocess uses existing stored split files and does not "
+        "retroactively rebalance final-top-k train/test splits."
+    )
+
     sweep_results: dict[str, dict[int, dict[str, tuple[float, int]]]] = {}
     datasets_with_outputs = 0
     best_model_performance = []

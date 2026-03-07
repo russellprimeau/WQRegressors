@@ -5,9 +5,13 @@ Search strategy:
 - Surrogate-guided beam backward elimination with swap refinement.
 - Objective: `objective = rmse + lambda_drop * drop_rate`.
 - `drop_rate` is computed from raw sample coverage after MC replicate collapse.
+- Search split behavior remains temporal-by-coverage (target 70/30 by default).
 
 Then:
 - Retrain/evaluate all discovered model configs on top-K subsets.
+- Final top-K evaluations enforce a minimum of 5 test samples per subset by
+    moving the latest samples from train -> test when needed; if fewer than 5
+    total valid split samples exist, that subset/model evaluation is skipped.
 - Write trace, selected subsets, and final metrics to the active sweep namespace.
 
 Key CLI groups (detailed):
@@ -93,6 +97,7 @@ from utils.training import load_samples, group_samples_by_segment
 
 
 SUPPORTED_CONFIG_SUFFIXES = {".yml", ".yaml", ".json"}
+FINAL_TOPK_MIN_TEST_SAMPLES = 5
 
 
 def _sweep_namespace() -> str:
@@ -1572,6 +1577,56 @@ def _write_search_outputs(
     return trace_csv, selected_csv, plot_path
 
 
+def _read_split_file_names(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if str(line).strip()]
+
+
+def _write_split_file_names(path: Path, names: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for name in names:
+            f.write(f"{name}\n")
+
+
+def _ensure_min_test_samples_for_final(
+    split_dir: Path,
+    min_test_samples: int = FINAL_TOPK_MIN_TEST_SAMPLES,
+) -> tuple[bool, str, int, int]:
+    """Rebalance split files for final-top-k evaluation.
+
+    Returns:
+      - skip_eval: True when total available split files are < min_test_samples.
+      - status: one of {'already_sufficient', 'rebalanced', 'insufficient_total'}.
+      - train_count: resulting train file count.
+      - test_count: resulting test file count.
+    """
+    train_file = split_dir / "train_files.txt"
+    test_file = split_dir / "test_files.txt"
+
+    train_names = _read_split_file_names(train_file)
+    test_names = _read_split_file_names(test_file)
+
+    if len(test_names) >= min_test_samples:
+        return False, "already_sufficient", len(train_names), len(test_names)
+
+    total = len(train_names) + len(test_names)
+    if total < min_test_samples:
+        return True, "insufficient_total", len(train_names), len(test_names)
+
+    deficit = min_test_samples - len(test_names)
+    moved = train_names[-deficit:] if deficit > 0 else []
+    new_train = train_names[:-deficit] if deficit > 0 else list(train_names)
+    # Keep temporal order: moved train tail should precede existing test tail.
+    new_test = moved + test_names
+
+    _write_split_file_names(train_file, new_train)
+    _write_split_file_names(test_file, new_test)
+    return False, "rebalanced", len(new_train), len(new_test)
+
+
 def _evaluate_selected_subsets_all_models(
     dataset_plan: DatasetPlan,
     dataset_prefix: str,
@@ -1607,15 +1662,33 @@ def _evaluate_selected_subsets_all_models(
                     disable_eval_plots=disable_eval_plots,
                     suppress_training_logs=suppress_training_logs,
                 )
-                _set_eval_overrides(
-                    eval_cfg,
-                    run_baselines=run_baselines_in_final,
+                skip_eval, split_status, train_n, test_n = _ensure_min_test_samples_for_final(
+                    split_dir=eval_cfg.parent,
+                    min_test_samples=FINAL_TOPK_MIN_TEST_SAMPLES,
                 )
-                eval_result = eval_module.evaluate_single_config(
-                    str(eval_cfg),
-                    save_plots_override=not disable_eval_plots,
-                )
-                summary_rows = [eval_result] if eval_result is not None else []
+                if split_status == "rebalanced":
+                    print(
+                        f"[INFO] Final split rebalance for {eval_cfg.parent.name}: "
+                        f"train={train_n}, test={test_n} "
+                        f"(min_test={FINAL_TOPK_MIN_TEST_SAMPLES})"
+                    )
+                if skip_eval:
+                    print(
+                        f"[WARN] Skipping final eval for {eval_cfg.parent.name}: "
+                        f"only {train_n + test_n} total split samples available "
+                        f"(< {FINAL_TOPK_MIN_TEST_SAMPLES})."
+                    )
+                    summary_rows = []
+                else:
+                    _set_eval_overrides(
+                        eval_cfg,
+                        run_baselines=run_baselines_in_final,
+                    )
+                    eval_result = eval_module.evaluate_single_config(
+                        str(eval_cfg),
+                        save_plots_override=not disable_eval_plots,
+                    )
+                    summary_rows = [eval_result] if eval_result is not None else []
             except Exception as e:
                 print(f"[ERROR] Evaluation failed for config {variant_cfg}: {e}")
                 summary_rows = []

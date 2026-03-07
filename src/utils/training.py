@@ -173,7 +173,7 @@ def write_config(config, data_dir, forecast_name, model_name, config_name='model
         json.dump(config, f)
 
 def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns, output_rows, fault_tolerant=True,
-             reuse_split=True, split_source=None, split_type='random', test_size=0.2, random_state=10,
+             reuse_split=True, split_source=None, split_type='random', test_size=0.3, random_state=10,
              sample_subdir='samples', nan_tolerance=None, input_aggregation='none'):
     ## If specified, reuse a train/test split previously written to file.
     train_samples = []

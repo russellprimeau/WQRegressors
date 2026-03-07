@@ -15,6 +15,11 @@ Stage behavior:
 - Stage 2 (Optimizer): writes optimizer artifacts under
     `forecasts/feature_sweeps` and by default reads Shapley seed subsets
     unless `--seed-subsets-csv` is provided.
+- Search phases keep standard temporal-by-coverage split behavior
+    (target 70/30 by default).
+- Final top-K phases enforce minimum test coverage (>=5 test samples):
+    latest train samples are moved into test when needed; subsets with
+    fewer than 5 total split samples are skipped.
 - Supports stage skipping for iterative workflows:
     `--skip-shapley-stage` or `--skip-optimizer-stage`.
 
@@ -274,6 +279,8 @@ def main() -> int:
     print(f"Optimizer seeds           : {optimizer_seeds}")
     print(f"Seed subsets CSV override : {args.seed_subsets_csv}")
     print(f"Use Shapley seed subsets  : {not bool(args.seed_subsets_csv)}")
+    print("Search split policy       : temporal coverage split (target 70/30)")
+    print("Final top-K split policy  : enforce >=5 test samples (skip if total<5)")
     print(f"Dry run                   : {args.dry_run}")
 
     prior_namespace = os.environ.get(_NAMESPACE_ENV)

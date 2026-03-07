@@ -31,7 +31,11 @@ Important behavior:
 - Search baseline controls now match `h` semantics:
     `--run-baselines-in-search` is mutually exclusive with
     `--disable-baselines-for-search`.
-- Search phase is performance-oriented; final phase restores evaluation outputs.
+- Search phase is performance-oriented and keeps standard temporal-by-coverage
+    split behavior (target 70/30 by default).
+- Final top-K evaluation enforces a minimum of 5 test samples by moving latest
+    train samples into test when needed; if fewer than 5 total split samples are
+    available, that model/subset evaluation is skipped.
 - Optional `--run-rolling-origin-cv` runs rolling-origin CV for best k01 model.
 - Visualization generation disabled by default for speed; enable with `--keep-shapley-plots`.
 

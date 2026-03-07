@@ -318,7 +318,7 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
         },
         'data_split': {
             'random_state': 42,
-            'test_size': 0.2,
+            'test_size': 0.3,
             'reuse_split': False,
             'split_source': None,
             'split_type': 'temporal',
@@ -388,7 +388,7 @@ def generate_transformer_config_template(output_dir, forecast_name, input_column
         },
         'data_split': {
             'random_state': 42,
-            'test_size': 0.2,
+            'test_size': 0.3,
             'reuse_split': False,
             'split_source': None,
             'split_type': 'temporal',
@@ -460,7 +460,7 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
         },
         'data_split': {
             'random_state': 42,
-            'test_size': 0.2,
+            'test_size': 0.3,
             'reuse_split': False,
             'split_source': None,
             'split_type': 'temporal',
