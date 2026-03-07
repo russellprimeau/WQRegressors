@@ -654,7 +654,9 @@ def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=No
         df_long_combined = pd.concat(combined_frames, ignore_index=True)
 
     if df_long_combined is not None:
-        plt.figure(figsize=(8, 6))
+        n_datasets = max(1, int(df_long_combined["Dataset"].nunique()))
+        fig_w = max(6.0, min(12.0, 3.0 + 1.1 * n_datasets))
+        plt.figure(figsize=(fig_w, 6))
         ax = plt.gca()
         sns.boxplot(x="Dataset", y="Error", data=df_long_combined,
                     showcaps=True, boxprops={'facecolor': 'lightgray', 'alpha': 0.3, 'linewidth': 0.5},
@@ -669,8 +671,13 @@ def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=No
 
         ax.set_ylabel("Error (Absolute)")
         ax.set_xlabel("Model")
+        ax.margins(x=0.02)
         plt.tight_layout()
-        plt.savefig(Path(directory, "forecasts", forecast_name, "boxplot.png"))
+        plt.savefig(
+            Path(directory, "forecasts", forecast_name, "boxplot.png"),
+            bbox_inches="tight",
+            pad_inches=0.1,
+        )
         plt.close()
 
     # Individual figures per pair comparing columns
@@ -715,8 +722,13 @@ def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=No
 
         ax.set_ylabel("Error")
         ax.set_xlabel("Column")
+        ax.margins(x=0.02)
         plt.tight_layout()
-        plt.savefig(Path(directory, "forecasts", forecast_name, f"{label.replace(' ', '_')}_overlay_emphasized.png"))
+        plt.savefig(
+            Path(directory, "forecasts", forecast_name, f"{label.replace(' ', '_')}_overlay_emphasized.png"),
+            bbox_inches="tight",
+            pad_inches=0.1,
+        )
         plt.close()
 
 def classification_visualizer(*pred_target_pairs, labels=None, directory='.', forecast_name='Classifier',

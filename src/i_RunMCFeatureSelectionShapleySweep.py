@@ -519,7 +519,6 @@ def _tmc_shapley_subsets(
 ) -> tuple[list[base.CandidateResult], list[base.CandidateResult], Path, Path, Path]:
     target_name = base._derive_target_name(dataset_dir.name, dataset_prefix)
     tmp_cfg_dir = base._forecast_sweeps_dir(dataset_dir) / "configs"
-    _ = keep_shapley_plots  # Legacy compatibility: Shapley visual outputs are always generated.
     _ = include_row_count_in_plot_names  # Reserved for parity with h_* plot-disambiguation flow.
 
     cfg = train_module.load_config(str(surrogate_config_path))
@@ -713,70 +712,72 @@ def _tmc_shapley_subsets(
         min_features=min_features,
     )
 
-    # Always generate per-dataset Shapley visualizations.
-    out_dir = base._forecast_sweeps_dir(dataset_dir)
-    dataset_name = dataset_dir.name
+    if keep_shapley_plots:
+        out_dir = base._forecast_sweeps_dir(dataset_dir)
+        dataset_name = dataset_dir.name
 
-    _plot_shapley_ranking_bar(
-        shapley_rows=shapley_rows,
-        dataset_name=dataset_name,
-        row_count=row_count,
-        output_dir=out_dir,
-        include_row_count_in_name=include_row_count_in_plot_names,
-    )
-    print(f"[INFO] Wrote Shapley ranking bar plot")
+        _plot_shapley_ranking_bar(
+            shapley_rows=shapley_rows,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            output_dir=out_dir,
+            include_row_count_in_name=include_row_count_in_plot_names,
+        )
+        print(f"[INFO] Wrote Shapley ranking bar plot")
 
-    _plot_shapley_distribution(
-        shapley_samples=shapley_samples,
-        shapley_rows=shapley_rows,
-        dataset_name=dataset_name,
-        row_count=row_count,
-        output_dir=out_dir,
-        include_row_count_in_name=include_row_count_in_plot_names,
-    )
-    print(f"[INFO] Wrote Shapley distribution plot")
+        _plot_shapley_distribution(
+            shapley_samples=shapley_samples,
+            shapley_rows=shapley_rows,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            output_dir=out_dir,
+            include_row_count_in_name=include_row_count_in_plot_names,
+        )
+        print(f"[INFO] Wrote Shapley distribution plot")
 
-    _plot_shapley_coverage(
-        shapley_rows=shapley_rows,
-        samples_per_feature=samples_per_feature,
-        dataset_name=dataset_name,
-        row_count=row_count,
-        output_dir=out_dir,
-        include_row_count_in_name=include_row_count_in_plot_names,
-    )
-    print(f"[INFO] Wrote Shapley coverage plot")
+        _plot_shapley_coverage(
+            shapley_rows=shapley_rows,
+            samples_per_feature=samples_per_feature,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            output_dir=out_dir,
+            include_row_count_in_name=include_row_count_in_plot_names,
+        )
+        print(f"[INFO] Wrote Shapley coverage plot")
 
-    _plot_search_budget(
-        eval_count=eval_count,
-        eval_budget=eval_budget,
-        permutation_runs=permutation_runs,
-        truncation_events=truncation_events,
-        dataset_name=dataset_name,
-        row_count=row_count,
-        output_dir=out_dir,
-        include_row_count_in_name=include_row_count_in_plot_names,
-    )
-    print(f"[INFO] Wrote search budget plot")
+        _plot_search_budget(
+            eval_count=eval_count,
+            eval_budget=eval_budget,
+            permutation_runs=permutation_runs,
+            truncation_events=truncation_events,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            output_dir=out_dir,
+            include_row_count_in_name=include_row_count_in_plot_names,
+        )
+        print(f"[INFO] Wrote search budget plot")
 
-    _plot_permutation_progression(
-        trace=trace,
-        permutation_runs=permutation_runs,
-        truncation_events=truncation_events,
-        dataset_name=dataset_name,
-        row_count=row_count,
-        output_dir=out_dir,
-        include_row_count_in_name=include_row_count_in_plot_names,
-    )
-    print(f"[INFO] Wrote permutation progression plot")
+        _plot_permutation_progression(
+            trace=trace,
+            permutation_runs=permutation_runs,
+            truncation_events=truncation_events,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            output_dir=out_dir,
+            include_row_count_in_name=include_row_count_in_plot_names,
+        )
+        print(f"[INFO] Wrote permutation progression plot")
 
-    _plot_rank_stability(
-        shapley_rows=shapley_rows,
-        dataset_name=dataset_name,
-        row_count=row_count,
-        output_dir=out_dir,
-        include_row_count_in_name=include_row_count_in_plot_names,
-    )
-    print(f"[INFO] Wrote rank stability plot")
+        _plot_rank_stability(
+            shapley_rows=shapley_rows,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            output_dir=out_dir,
+            include_row_count_in_name=include_row_count_in_plot_names,
+        )
+        print(f"[INFO] Wrote rank stability plot")
+    else:
+        print("[INFO] Shapley diagnostic plots disabled by default (use --keep-shapley-plots to enable).")
 
     _write_shapley_samples_json(
         dataset_dir=dataset_dir,
@@ -819,8 +820,9 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
 
     # Match h_* phase policy: search is performance-oriented; final phase restores outputs.
     search_run_baselines = bool(args.run_baselines_in_search) and (not args.disable_baselines_for_search)
-    search_disable_training_plots = False
-    search_disable_eval_plots = False
+    search_disable_training_plots = not bool(args.keep_training_plots)
+    search_disable_eval_plots = not bool(args.keep_eval_plots)
+    search_save_plots = bool(args.keep_search_plots)
     final_run_baselines = True
     final_disable_training_plots = False
     final_disable_eval_plots = False
@@ -844,7 +846,9 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
     print(f"Keep search plots         : {args.keep_search_plots}")
     print(f"Show train logs           : {args.show_training_logs}")
     print(f"Search run baselines      : {search_run_baselines}")
+    print(f"Search train plots enabled: {not search_disable_training_plots}")
     print(f"Search eval plots enabled : {not search_disable_eval_plots}")
+    print(f"Search summary plots      : {search_save_plots}")
     print(f"Final run baselines       : {final_run_baselines}")
     print(f"Final eval plots enabled  : {not final_disable_eval_plots}")
 
@@ -890,7 +894,7 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     disable_eval_plots=search_disable_eval_plots,
                     suppress_training_logs=not args.show_training_logs,
                     seed=args.seed,
-                    keep_shapley_plots=True,
+                    keep_shapley_plots=bool(args.keep_shapley_plots),
                     include_row_count_in_plot_names=include_row_count_in_plot_names,
                 )
                 selected = top_sorted[: args.final_top_k]
@@ -899,14 +903,17 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     row_count=row_count,
                     trace=trace,
                     selected=selected,
-                    save_plots=True,
+                    save_plots=search_save_plots,
                 )
                 print(f"[INFO] Wrote Shapley scores: {shapley_csv}")
                 print(f"[INFO] Wrote Shapley rankings: {shapley_rankings_json}")
                 print(f"[INFO] Wrote seed subsets: {seed_csv}")
                 print(f"[INFO] Wrote search trace: {trace_csv}")
                 print(f"[INFO] Wrote selected subsets: {selected_csv}")
-                print(f"[INFO] Wrote search plot: {plot_path}")
+                if search_save_plots:
+                    print(f"[INFO] Wrote search plot: {plot_path}")
+                else:
+                    print("[INFO] Search Pareto plot disabled by default (use --keep-search-plots to enable).")
 
                 final_metrics_csv = base._evaluate_selected_subsets_all_models(
                     dataset_plan=plan,
@@ -995,22 +1002,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--keep-training-plots",
         action="store_true",
-        help="Legacy no-op: training plots are always generated.",
+        help="Keep per-candidate training plots during search (disabled by default for speed).",
     )
     parser.add_argument(
         "--keep-eval-plots",
         action="store_true",
-        help="Legacy no-op: evaluation plots are always generated.",
+        help="Keep per-candidate evaluation plots during search (disabled by default for speed).",
     )
     parser.add_argument(
         "--keep-search-plots",
         action="store_true",
-        help="Legacy no-op: search Pareto plots are always generated.",
+        help="Keep search summary Pareto plots (disabled by default).",
     )
     parser.add_argument(
         "--keep-shapley-plots",
         action="store_true",
-        help="Legacy no-op: Shapley attribution and search progress plots are always generated.",
+        help="Keep Shapley attribution/search diagnostic plots (disabled by default).",
     )
     parser.add_argument(
         "--show-training-logs",

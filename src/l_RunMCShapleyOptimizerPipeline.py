@@ -177,22 +177,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", type=str, default="data/output/regression")
     parser.add_argument("--dataset-prefix", type=str, default="MC")
     parser.add_argument("--config-pattern", type=str, default="config_*.yml")
-    parser.add_argument("--limit-datasets", type=int, default=1)
+    parser.add_argument("--limit-datasets", type=int, default=14)
 
     parser.add_argument("--row-counts", type=str, default=None)
     parser.add_argument("--min-features", type=int, default=4)
     parser.add_argument("--lambda-drop", type=float, default=0.25)
     parser.add_argument("--final-top-k", type=int, default=4)
 
-    parser.add_argument("--shapley-eval-budget", type=int, default=180)
+    parser.add_argument("--shapley-eval-budget", type=int, default=270)
     parser.add_argument("--shapley-seed", type=int, default=42)
-    parser.add_argument("--shapley-samples-per-feature", type=int, default=3)
+    parser.add_argument("--shapley-samples-per-feature", type=int, default=10)
     parser.add_argument("--shapley-min-coalition-size", type=int, default=0)
     parser.add_argument("--tmc-max-permutations", type=int, default=0)
-    parser.add_argument("--tmc-truncation-epsilon", type=float, default=0.0025)
+    parser.add_argument("--tmc-truncation-epsilon", type=float, default=0.0005)
     parser.add_argument("--tmc-bootstrap-resamples", type=int, default=300)
 
-    parser.add_argument("--optimizer-eval-budget", type=int, default=180)
+    parser.add_argument("--optimizer-eval-budget", type=int, default=270)
     parser.add_argument("--optimizer-seed", type=int, default=42)
     parser.add_argument(
         "--optimizer-seeds",
@@ -200,10 +200,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Comma-separated optimizer seeds for multi-seed runs (overrides --optimizer-seed).",
     )
-    parser.add_argument("--beam-width", type=int, default=8)
-    parser.add_argument("--max-rounds", type=int, default=10)
+    parser.add_argument("--beam-width", type=int, default=16)
+    parser.add_argument("--max-rounds", type=int, default=30)
     parser.add_argument("--no-improve-patience", type=int, default=3)
-    parser.add_argument("--max-swap-attempts", type=int, default=60)
+    parser.add_argument("--max-swap-attempts", type=int, default=200)
 
     parser.add_argument("--seed-subsets-csv", type=str, default=None)
     parser.add_argument("--max-seed-subsets", type=int, default=0)
@@ -219,22 +219,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--keep-training-plots",
         action="store_true",
-        help="Legacy no-op: training plots are always generated.",
+        help="Keep per-candidate training plots during search (disabled by default for speed).",
     )
     parser.add_argument(
         "--keep-eval-plots",
         action="store_true",
-        help="Legacy no-op: evaluation plots are always generated.",
+        help="Keep per-candidate evaluation plots during search (disabled by default for speed).",
     )
     parser.add_argument(
         "--keep-search-plots",
         action="store_true",
-        help="Legacy no-op: search Pareto plots are always generated.",
+        help="Keep search summary Pareto plots (disabled by default).",
     )
     parser.add_argument(
         "--keep-shapley-plots",
         action="store_true",
-        help="Legacy no-op: Shapley visualizations are always generated.",
+        help="Keep Shapley attribution/search diagnostic plots (disabled by default).",
     )
     parser.add_argument("--show-training-logs", action="store_true")
     parser.add_argument("--run-rolling-origin-cv", action="store_true")

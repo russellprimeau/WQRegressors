@@ -714,10 +714,12 @@ def _evaluate_candidate(
             return None
         model_row = eval_result
 
-        rmse = float(model_row.get("rmse", np.nan))
-        r2 = float(model_row.get("r2", np.nan))
-        mae = float(model_row.get("mae", np.nan))
-        n_test_samples = float(model_row.get("n_test_samples", np.nan))
+        rmse = float(model_row.get("rmse", model_row.get("rmse_replicate", np.nan)))
+        r2 = float(model_row.get("r2", model_row.get("r2_replicate", np.nan)))
+        mae = float(model_row.get("mae", model_row.get("mae_replicate", np.nan)))
+        n_test_samples = float(model_row.get("n_test_independent", np.nan))
+        if not np.isfinite(n_test_samples):
+            n_test_samples = float(model_row.get("n_test_samples", model_row.get("n_eval_rows", np.nan)))
         input_dim = float(model_row.get("input_dim", np.nan))
         target_dim = float(model_row.get("target_dim", np.nan))
         objective = _objective_from_metrics(rmse=rmse, drop_rate=drop_rate, lambda_drop=lambda_drop)
@@ -1964,6 +1966,8 @@ def _evaluate_selected_subsets_all_models(
     target_name = _derive_target_name(dataset_plan.dataset_dir.name, dataset_prefix)
 
     for rank, cand in enumerate(selected, start=1):
+        # Keep one best row per baseline id (naive/seasonal/linear) across all model evaluations.
+        best_baseline_rows: dict[str, tuple[float, float, dict]] = {}
         for base_cfg in dataset_plan.train_configs:
             variant_cfg = _prepare_variant_config(
                 base_config_path=base_cfg,
@@ -2071,7 +2075,11 @@ def _evaluate_selected_subsets_all_models(
                     "objective_search": cand.objective,
                     "drop_rate_search": cand.drop_rate,
                     "model": model_name,
+                    "gp_uncertainty_mode": "",
                     "n_samples": float('nan'),
+                    "n_test_independent": float('nan'),
+                    "n_test_valid": float('nan'),
+                    "n_test_evals": float('nan'),
                     "input_dim": float('nan'),
                     "target_dim": float('nan'),
                     "mae": float('nan'),
@@ -2099,9 +2107,15 @@ def _evaluate_selected_subsets_all_models(
                 )
                 baseline_id = _normalize_baseline_label(srow.get("label", ""))
                 model_name = baseline_id if baseline_id is not None else model_name_default
+                gp_uncertainty_mode = str(srow.get("gp_uncertainty_mode", ""))
 
-                # n_samples: n_eval_rows is set by _compute_regression_summary to len(eval set)
-                n_samples = float(srow.get("n_eval_rows", np.nan))
+                # Prefer explicit independent-sample semantics for the primary count.
+                n_samples = float(srow.get("n_test_independent", np.nan))
+                if not np.isfinite(n_samples):
+                    n_samples = float(srow.get("n_eval_rows", np.nan))
+                n_test_independent = float(srow.get("n_test_independent", n_samples))
+                n_test_valid = float(srow.get("n_test_valid", np.nan))
+                n_test_evals = float(srow.get("n_test_evals", srow.get("n_eval_rows", np.nan)))
 
                 # input_dim: count input_columns from the eval config
                 _input_cols = _eval_cfg_data.get("data", {}).get("input_columns") or []
@@ -2135,27 +2149,46 @@ def _evaluate_selected_subsets_all_models(
                 except Exception as e:
                     print(f"[WARN] Could not compute std(target) for {dataset_plan.dataset_dir.name}: {e}")
 
-                rows.append(
-                    {
-                        "dataset": dataset_plan.dataset_dir.name,
-                        "target": target_name,
-                        "subset_rank": rank,
-                        "feature_tag": cand.feature_tag,
-                        "row_count": cand.row_count,
-                        "n_features": cand.n_features,
-                        "objective_search": cand.objective,
-                        "drop_rate_search": cand.drop_rate,
-                        "model": model_name,
-                        "n_samples": n_samples,
-                        "input_dim": input_dim,
-                        "target_dim": target_dim,
-                        "mae": float(srow.get("mae", np.nan)),
-                        "rmse": float(srow.get("rmse", np.nan)),
-                        "r2": float(srow.get("r2", np.nan)),
-                        "pearson_r": float(srow.get("pearson_r", np.nan)),
-                        "std_target": std_target,
-                    }
-                )
+                row_payload = {
+                    "dataset": dataset_plan.dataset_dir.name,
+                    "target": target_name,
+                    "subset_rank": rank,
+                    "feature_tag": cand.feature_tag,
+                    "row_count": cand.row_count,
+                    "n_features": cand.n_features,
+                    "objective_search": cand.objective,
+                    "drop_rate_search": cand.drop_rate,
+                    "model": model_name,
+                    "gp_uncertainty_mode": gp_uncertainty_mode,
+                    "n_samples": n_samples,
+                    "n_test_independent": n_test_independent,
+                    "n_test_valid": n_test_valid,
+                    "n_test_evals": n_test_evals,
+                    "input_dim": input_dim,
+                    "target_dim": target_dim,
+                    "mae": float(srow.get("mae", np.nan)),
+                    "rmse": float(srow.get("rmse", np.nan)),
+                    "r2": float(srow.get("r2", np.nan)),
+                    "pearson_r": float(srow.get("pearson_r", np.nan)),
+                    "std_target": std_target,
+                }
+
+                if baseline_id is None:
+                    rows.append(row_payload)
+                else:
+                    valid_score = n_test_valid if np.isfinite(n_test_valid) else float("-inf")
+                    eval_score = n_test_evals if np.isfinite(n_test_evals) else float("-inf")
+                    current = best_baseline_rows.get(baseline_id)
+                    if current is None or (valid_score, eval_score) > (current[0], current[1]):
+                        best_baseline_rows[baseline_id] = (valid_score, eval_score, row_payload)
+
+        for baseline_id in ("naive", "seasonal", "linear"):
+            best = best_baseline_rows.get(baseline_id)
+            if best is not None:
+                rows.append(best[2])
+        for baseline_id, (_, _, payload) in best_baseline_rows.items():
+            if baseline_id not in {"naive", "seasonal", "linear"}:
+                rows.append(payload)
 
     final_df = pd.DataFrame(rows)
     out_csv = output_dir / "feature_sweep_final_metrics.csv"

@@ -428,6 +428,12 @@ def _aligned_arrays(preds, targets, row_limit=None):
     pred_arr = np.array(preds)
     target_arr = np.array(targets)
 
+    # Keep model I/O untouched; normalize metric inputs to 2D (n_samples, n_outputs_flat).
+    if pred_arr.ndim > 2:
+        pred_arr = pred_arr.reshape(pred_arr.shape[0], -1)
+    if target_arr.ndim > 2:
+        target_arr = target_arr.reshape(target_arr.shape[0], -1)
+
     if pred_arr.ndim == 1:
         pred_arr = pred_arr.reshape(-1, 1)
     if target_arr.ndim == 1:
@@ -446,6 +452,117 @@ def _aligned_arrays(preds, targets, row_limit=None):
     pred_arr = pred_arr[:n_rows, :n_cols]
     target_arr = target_arr[:n_rows, :n_cols]
     return pred_arr, target_arr, n_rows, n_cols
+
+
+def _compute_flat_metrics(pred_arr: np.ndarray, target_arr: np.ndarray) -> dict:
+    pred_flat = pred_arr.reshape(-1)
+    target_flat = target_arr.reshape(-1)
+    finite_mask = np.isfinite(pred_flat) & np.isfinite(target_flat)
+    finite_count = int(np.sum(finite_mask))
+
+    if finite_count <= 0:
+        return {
+            "mae": np.nan,
+            "rmse": np.nan,
+            "r2": np.nan,
+            "pearson_r": np.nan,
+            "n_eval_points_finite": 0,
+        }
+
+    pred_vals = pred_flat[finite_mask]
+    target_vals = target_flat[finite_mask]
+    errors = pred_vals - target_vals
+
+    mae = float(np.mean(np.abs(errors)))
+    rmse = float(np.sqrt(np.mean(np.square(errors))))
+
+    if finite_count > 1:
+        ss_res = float(np.sum(np.square(errors)))
+        ss_tot = float(np.sum(np.square(target_vals - np.mean(target_vals))))
+        r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
+    else:
+        r2 = np.nan
+
+    if finite_count > 1 and np.std(pred_vals) > 0 and np.std(target_vals) > 0:
+        pearson_r = float(np.corrcoef(pred_vals, target_vals)[0, 1])
+    else:
+        pearson_r = np.nan
+
+    return {
+        "mae": mae,
+        "rmse": rmse,
+        "r2": r2,
+        "pearson_r": pearson_r,
+        "n_eval_points_finite": finite_count,
+    }
+
+
+def _aggregate_by_independent_sample(
+    pred_arr: np.ndarray,
+    target_arr: np.ndarray,
+    split_files: list[str] | None,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """Aggregate replicate rows into one mean row per independent sample id."""
+    n_rows = pred_arr.shape[0]
+    n_cols = pred_arr.shape[1] if pred_arr.ndim == 2 else 0
+    if n_rows <= 0 or n_cols <= 0:
+        return pred_arr[:0], target_arr[:0], 0, 0
+
+    if not split_files:
+        # No filename mapping available: treat each row as an independent sample.
+        return pred_arr.copy(), target_arr.copy(), int(n_rows), int(n_rows)
+
+    aligned_rows = min(n_rows, len(split_files))
+    if aligned_rows <= 0:
+        return pred_arr[:0], target_arr[:0], 0, 0
+
+    pred_arr = pred_arr[:aligned_rows, :]
+    target_arr = target_arr[:aligned_rows, :]
+
+    grouped_pred: dict[str, list[np.ndarray]] = {}
+    grouped_target: dict[str, list[np.ndarray]] = {}
+    group_order: list[str] = []
+
+    for idx in range(aligned_rows):
+        gid = _base_sample_id(split_files[idx])
+        if gid not in grouped_pred:
+            group_order.append(gid)
+            grouped_pred[gid] = []
+            grouped_target[gid] = []
+        grouped_pred[gid].append(pred_arr[idx, :])
+        grouped_target[gid].append(target_arr[idx, :])
+
+    agg_pred_rows: list[np.ndarray] = []
+    agg_target_rows: list[np.ndarray] = []
+    n_valid_independent = 0
+
+    for gid in group_order:
+        pred_group = np.asarray(grouped_pred[gid], dtype=float)
+        target_group = np.asarray(grouped_target[gid], dtype=float)
+
+        pred_count = np.sum(np.isfinite(pred_group), axis=0)
+        pred_sum = np.nansum(pred_group, axis=0)
+        pred_mean = np.full(pred_group.shape[1], np.nan, dtype=float)
+        np.divide(pred_sum, pred_count, out=pred_mean, where=pred_count > 0)
+
+        target_count = np.sum(np.isfinite(target_group), axis=0)
+        target_sum = np.nansum(target_group, axis=0)
+        target_mean = np.full(target_group.shape[1], np.nan, dtype=float)
+        np.divide(target_sum, target_count, out=target_mean, where=target_count > 0)
+
+        finite_pair_mask = np.isfinite(pred_mean) & np.isfinite(target_mean)
+        if np.any(finite_pair_mask):
+            n_valid_independent += 1
+
+        agg_pred_rows.append(pred_mean)
+        agg_target_rows.append(target_mean)
+
+    return (
+        np.asarray(agg_pred_rows, dtype=float),
+        np.asarray(agg_target_rows, dtype=float),
+        len(group_order),
+        n_valid_independent,
+    )
 
 
 def _sanitize_label_for_filename(label):
@@ -611,51 +728,46 @@ def _plot_uncertainty_boxplots(regression_pairs, regression_labels, split_files_
                 ax.tick_params(axis="both", labelsize=9)
 
         out_path = base_dir / f"predictions_uncertainty_boxplot_{_sanitize_label_for_filename(label)}.png"
-        fig.savefig(out_path, dpi=180)
+        fig.savefig(out_path, dpi=180, bbox_inches="tight", pad_inches=0.1)
         plt.close(fig)
         print(f"[INFO] Wrote uncertainty boxplot: {out_path}")
 
 
-def _compute_regression_summary(label, preds, targets, num_samples, metadata=None):
+def _compute_regression_summary(label, preds, targets, num_samples, metadata=None, split_files=None):
     metadata = metadata or {}
     pred_arr, target_arr, n_rows, n_cols = _aligned_arrays(preds, targets, row_limit=num_samples)
 
-    pred_flat = pred_arr.reshape(-1)
-    target_flat = target_arr.reshape(-1)
-    finite_mask = np.isfinite(pred_flat) & np.isfinite(target_flat)
-    finite_count = int(np.sum(finite_mask))
+    # Replicate-population metrics: preserves prior behavior for uncertainty diagnostics.
+    rep_metrics = _compute_flat_metrics(pred_arr, target_arr)
 
-    if finite_count > 0:
-        pred_vals = pred_flat[finite_mask]
-        target_vals = target_flat[finite_mask]
-        errors = pred_vals - target_vals
-        mae = float(np.mean(np.abs(errors)))
-        rmse = float(np.sqrt(np.mean(np.square(errors))))
-        if finite_count > 1:
-            ss_res = float(np.sum(np.square(errors)))
-            ss_tot = float(np.sum(np.square(target_vals - np.mean(target_vals))))
-            r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
-        else:
-            r2 = np.nan
-        if finite_count > 1 and np.std(pred_vals) > 0 and np.std(target_vals) > 0:
-            pearson_r = float(np.corrcoef(pred_vals, target_vals)[0, 1])
-        else:
-            pearson_r = np.nan
-    else:
-        mae = np.nan
-        rmse = np.nan
-        r2 = np.nan
-        pearson_r = np.nan
+    # Independent-sample metrics: aggregate replicates by base sample id, then score.
+    ind_pred, ind_target, n_test_independent, n_test_valid = _aggregate_by_independent_sample(
+        pred_arr,
+        target_arr,
+        split_files,
+    )
+    ind_metrics = _compute_flat_metrics(ind_pred, ind_target)
 
     row = {
         "label": label,
         "n_eval_rows": int(n_rows),
         "n_eval_outputs": int(n_cols),
-        "n_eval_points_finite": finite_count,
-        "mae": mae,
-        "rmse": rmse,
-        "r2": r2,
-        "pearson_r": pearson_r,
+        # Primary metrics for ranking/comparison: independent-sample aggregation.
+        "n_eval_points_finite": int(ind_metrics["n_eval_points_finite"]),
+        "mae": float(ind_metrics["mae"]),
+        "rmse": float(ind_metrics["rmse"]),
+        "r2": float(ind_metrics["r2"]),
+        "pearson_r": float(ind_metrics["pearson_r"]),
+        # Replicate-population diagnostic metrics.
+        "mae_replicate": float(rep_metrics["mae"]),
+        "rmse_replicate": float(rep_metrics["rmse"]),
+        "r2_replicate": float(rep_metrics["r2"]),
+        "pearson_r_replicate": float(rep_metrics["pearson_r"]),
+        "n_eval_points_finite_replicate": int(rep_metrics["n_eval_points_finite"]),
+        # Explicit count semantics.
+        "n_test_independent": int(n_test_independent),
+        "n_test_valid": int(n_test_valid),
+        "n_test_evals": int(n_rows),
     }
     row.update(metadata)
     return row
@@ -716,13 +828,22 @@ def _write_summary_csv(rows, output_path):
         "rmse",
         "r2",
         "pearson_r",
+        "mae_replicate",
+        "rmse_replicate",
+        "r2_replicate",
+        "pearson_r_replicate",
         "skill_v_naive",
         "kind",
+        "gp_uncertainty_mode",
+        "n_test_independent",
+        "n_test_valid",
+        "n_test_evals",
         "n_train_samples",
         "n_test_samples",
         "n_eval_rows",
         "n_eval_outputs",
         "n_eval_points_finite",
+        "n_eval_points_finite_replicate",
         "input_dim",
         "target_dim",
         "data_dir",
@@ -753,6 +874,18 @@ def _model_label(model_type):
 def _combined_model_label(data_cfg, model_type):
     base = data_cfg.get("forecast_name", "model")
     return str(base)
+
+
+def _resolve_gp_uncertainty_mode(model_type, model_config):
+    if str(model_type).lower() != "gp_regressor":
+        return "not_gp"
+
+    use_uncertain = bool(model_config.get("use_uncertain_input_kernel", True))
+    source_mode = str(model_config.get("uncertainty_source_mode_effective", "unknown")).strip() or "unknown"
+
+    if use_uncertain:
+        return f"uncertain_input_kernel:{source_mode}"
+    return "point_input_kernel"
 
 
 def _expand_config_inputs(config_args):
@@ -822,6 +955,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
         model_name,
         fallback_data=data_cfg,
     )
+    gp_uncertainty_mode = _resolve_gp_uncertainty_mode(model_type, model_config)
 
     input_columns = model_config["input_columns"]
     output_columns = model_config["output_columns"]
@@ -978,13 +1112,34 @@ def evaluate_single_config(config_path, save_plots_override=None):
             preds_all = model.predict(X_all).reshape(-1, y_all.shape[1] if y_all.ndim > 1 else 1)
         # Compute metrics for each set
         if preds_train is not None:
-            row_train = _compute_regression_summary(f"{_model_label(model_type)} (train)", preds_train, y_train, len(y_train), metadata={"kind": "train"})
+            row_train = _compute_regression_summary(
+                f"{_model_label(model_type)} (train)",
+                preds_train,
+                y_train,
+                len(y_train),
+                metadata={"kind": "train", "gp_uncertainty_mode": gp_uncertainty_mode},
+                split_files=(train_split_files or []),
+            )
             per_set_metrics.append(row_train)
         if preds_test is not None:
-            row_test = _compute_regression_summary(f"{_model_label(model_type)} (test)", preds_test, y_test, len(y_test), metadata={"kind": "test"})
+            row_test = _compute_regression_summary(
+                f"{_model_label(model_type)} (test)",
+                preds_test,
+                y_test,
+                len(y_test),
+                metadata={"kind": "test", "gp_uncertainty_mode": gp_uncertainty_mode},
+                split_files=model_split_files,
+            )
             per_set_metrics.append(row_test)
         if preds_all is not None:
-            row_all = _compute_regression_summary(f"{_model_label(model_type)} (combined)", preds_all, y_all, len(y_all), metadata={"kind": "combined"})
+            row_all = _compute_regression_summary(
+                f"{_model_label(model_type)} (combined)",
+                preds_all,
+                y_all,
+                len(y_all),
+                metadata={"kind": "combined", "gp_uncertainty_mode": gp_uncertainty_mode},
+                split_files=eval_split_files,
+            )
             per_set_metrics.append(row_all)
     # Add per-set metrics to summary_rows for CSV output
     summary_rows.extend(per_set_metrics)
@@ -1047,7 +1202,14 @@ def evaluate_single_config(config_path, save_plots_override=None):
         baseline_split_files = [eval_split_files] * 3
         # Add baseline metrics to summary_rows
         for (preds, targets), label in zip(baseline_pairs, baseline_labels):
-            row = _compute_regression_summary(label, preds, targets, len(eval_samples), metadata={"kind": "baseline"})
+            row = _compute_regression_summary(
+                label,
+                preds,
+                targets,
+                len(eval_samples),
+                metadata={"kind": "baseline", "gp_uncertainty_mode": gp_uncertainty_mode},
+                split_files=eval_split_files,
+            )
             summary_rows.append(row)
 
     # --- Plotting ---
