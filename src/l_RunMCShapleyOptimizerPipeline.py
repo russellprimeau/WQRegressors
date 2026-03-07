@@ -28,8 +28,8 @@ Common usage:
         python src/l_RunMCShapleyOptimizerPipeline.py --dry-run
 
 2) Full pipeline with explicit budgets:
-        python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 3 --shapley-eval-budget 80 --optimizer-eval-budget 80 --final-top-k 4
-
+        python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4
+        python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 --beam-width 16 --max-rounds 30 --max-swap-attempts 200
 3) Multi-seed optimizer stage in one run:
         python src/l_RunMCShapleyOptimizerPipeline.py \
             --dataset-prefix MC --optimizer-seeds 7,11,19
