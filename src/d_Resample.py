@@ -474,7 +474,11 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
             'input_standardize': True,
             'target_standardize': True,
             'use_uncertain_input_kernel': True,
+            'uncertain_kernel_mc_samples': 64,
+            'uncertain_kernel_mc_seed': 0,
+            'uncertainty_source_mode': 'aggregate_t',
             'uncertainty_summary_dir': None,
+            'uncertainty_aggregate_csv': None,
             'learning_rate': 0.01,
             'num_epochs': 250,
             'patience': 20,
@@ -490,6 +494,10 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
             'split_type': "Temporal split prevents data leakage. If MC replicates detected, temporal split is auto-enforced.",
             'fault_tolerant': "False - GP requires complete data without NaN in inputs",
             'nan_tolerance': "0.0 for strict no-NaN predictor policy.",
+            'kernel': "Use 'matern52' with use_uncertain_input_kernel=True to apply uncertainty-aware Matérn-5/2 via MC kernel expectation.",
+            'uncertainty_source_mode': "'aggregate_t' matches MC replicate assumptions using aggregate offset fits; falls back to summary std if unavailable.",
+            'uncertain_kernel_mc_samples': "MC samples used to approximate expected kernel under input uncertainty (higher = smoother but slower).",
+            'uncertain_kernel_mc_seed': "Seed for deterministic uncertain-kernel sampling so train/eval remain aligned.",
         }
     }
 

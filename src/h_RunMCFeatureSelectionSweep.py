@@ -1,52 +1,68 @@
 """
 Beam+swap feature-selection sweeper for MC datasets.
 
-Overview:
-- Discovers datasets/configs under `--data-root`.
-- Runs surrogate search using beam backward elimination plus swap refinement.
-- Uses objective: `objective = rmse + lambda_drop * drop_rate`.
-- Retrains/evaluates all discovered model configs on top-K selected subsets.
+Search strategy:
+- Surrogate-guided beam backward elimination with swap refinement.
+- Objective: `objective = rmse + lambda_drop * drop_rate`.
+- `drop_rate` is computed from raw sample coverage after MC replicate collapse.
+
+Then:
+- Retrain/evaluate all discovered model configs on top-K subsets.
+- Write trace, selected subsets, and final metrics to the active sweep namespace.
+
+Key CLI groups (detailed):
+- Data selection:
+    `--data-root PATH`: Root directory containing regression dataset folders.
+    `--dataset-prefix PREFIX`: Dataset name prefix filter (for example, `MC`).
+    `--config-pattern GLOB`: Glob used to discover per-dataset train configs.
+    `--limit-datasets N`: Max matching datasets to process (`0` means all).
+    `--include-regular`: Include regular (non-`_res`) datasets.
+    `--include-res`: Include `_res` datasets.
+    `--regular-only`: Include only regular datasets.
+    `--res-only`: Include only `_res` datasets.
+- Search controls:
+    `--row-counts CSV_INTS`: Comma-separated input window sizes to evaluate.
+    `--min-features N`: Minimum feature count allowed during elimination.
+    `--beam-width N`: Number of best candidates retained each search round.
+    `--max-rounds N`: Max beam-elimination rounds before swap refinement.
+    `--no-improve-patience N`: Stop beam rounds after N non-improving rounds.
+    `--eval-budget N`: Max candidate evaluations per dataset/row-count search.
+    `--max-swap-attempts N`: Cap on swap-refinement attempts.
+    `--lambda-drop FLOAT`: Penalty weight for sample drop rate in objective.
+    `--seed N`: Random seed for candidate ordering and swap sampling.
+- Seeded optimizer controls:
+    `--seed-subsets-csv PATH`: Seed subset CSV (or directory containing per-row seed CSVs).
+    `--seed-subsets-from-shapley`: Load seeds from `forecasts/Shapley_sweeps/feature_seed_subsets_r###.csv`.
+    `--max-seed-subsets N`: Cap loaded seed subsets (`0` means no explicit cap).
+- Final/model controls:
+    `--final-top-k N`: Number of best discovered subsets retrained in final stage.
+- Baselines/logging:
+    `--disable-baselines-for-search`: Disable baseline evals during search for speed.
+    `--run-baselines-in-search`: Enable baseline evals during search (mutually exclusive with disable flag).
+    `--show-training-logs`: Show verbose model training/sample logs.
+- Artifacts/runtime:
+    `--keep-training-plots`: Keep per-model training plots during sweeps.
+    `--keep-eval-plots`: Keep per-config evaluation plots during sweeps.
+    `--keep-search-plots`: Save search Pareto plot (`feature_search_pareto_r###.png`).
+    `--dry-run`: Print discovered execution plan and exit.
+    `--stop-on-error`: Raise immediately on first dataset failure.
 
 Search/output behavior:
 - Search artifacts are written under `forecasts/feature_sweeps` unless
     `WQ_FEATURE_SWEEP_NAMESPACE` overrides the namespace.
 - Writes `feature_search_trace_r###.csv`, `feature_selected_subsets_r###.csv`,
-    optional `feature_search_pareto_r###.png`, and
-    `feature_sweep_final_metrics.csv`.
+    optional `feature_search_pareto_r###.png`, and `feature_sweep_final_metrics.csv`.
 - Maintains baseline/report compatibility via post-final hooks
     (`_ensure_k01_baselines`, dataset-level `evaluation_summary.csv`).
-
-Seeded optimizer support:
-- `--seed-subsets-from-shapley` loads
-    `forecasts/Shapley_sweeps/feature_seed_subsets_r###.csv` per dataset/row_count.
-- `--seed-subsets-csv` points to a specific CSV (or directory containing per-row
-    seed files).
-- `--max-seed-subsets` caps loaded seed subsets (0 = no explicit cap).
-
-Key CLI groups:
-- Data selection: `--data-root`, `--dataset-prefix`, `--config-pattern`,
-    `--limit-datasets`, dataset include/exclude group flags.
-- Search controls: `--row-counts`, `--min-features`, `--beam-width`,
-    `--max-rounds`, `--no-improve-patience`, `--eval-budget`,
-    `--max-swap-attempts`, `--lambda-drop`, `--seed`.
-- Baselines/logging: `--run-baselines-in-search` (mutually exclusive with
-    `--disable-baselines-for-search`), `--show-training-logs`.
-- Artifacts/runtime: `--keep-training-plots`, `--keep-eval-plots`,
-    `--keep-search-plots`, `--dry-run`, `--stop-on-error`.
 
 Examples:
         python src/h_RunMCFeatureSelectionSweep.py --dry-run
 
-        python src/h_RunMCFeatureSelectionSweep.py \
-            --dataset-prefix MC --limit-datasets 0 --eval-budget 240 --final-top-k 4
+        python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --limit-datasets 0 --eval-budget 240 --final-top-k 4
 
-        python src/h_RunMCFeatureSelectionSweep.py \
-            --dataset-prefix MC --eval-budget 180 --seed-subsets-from-shapley
+        python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --eval-budget 180 --seed-subsets-from-shapley
 
-        python src/h_RunMCFeatureSelectionSweep.py \
-            --dataset-prefix MC --eval-budget 180 \
-            --seed-subsets-csv data/output/regression/MC_exColor_res/forecasts/Shapley_sweeps/feature_seed_subsets_r671.csv \
-            --max-seed-subsets 6
+        python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --eval-budget 180 --seed-subsets-csv data/output/regression/MC_exColor_res/forecasts/Shapley_sweeps/feature_seed_subsets_r671.csv --max-seed-subsets 6
 """
 from __future__ import annotations
 import contextlib
@@ -2137,16 +2153,19 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
             explicit_seed_csv = (workspace_root / explicit_seed_csv).resolve()
 
 
-    include_regular, include_res = _resolve_dataset_inclusion(args)
-
-    plans = discover_mc_dataset_plans(
-        data_root=data_root,
-        dataset_prefix=args.dataset_prefix,
-        config_pattern=args.config_pattern,
-        limit_datasets=args.limit_datasets,
-        include_regular=include_regular,
-        include_res=include_res,
-    )
+    single_plan = getattr(args, "_internal_single_plan", None)
+    if single_plan is not None:
+        plans = [single_plan]
+    else:
+        include_regular, include_res = _resolve_dataset_inclusion(args)
+        plans = discover_mc_dataset_plans(
+            data_root=data_root,
+            dataset_prefix=args.dataset_prefix,
+            config_pattern=args.config_pattern,
+            limit_datasets=args.limit_datasets,
+            include_regular=include_regular,
+            include_res=include_res,
+        )
 
     if args.run_baselines_in_search and args.disable_baselines_for_search:
         raise ValueError("Cannot use both --run-baselines-in-search and --disable-baselines-for-search.")

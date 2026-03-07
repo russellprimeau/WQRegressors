@@ -35,15 +35,41 @@ Important behavior:
 - Optional `--run-rolling-origin-cv` runs rolling-origin CV for best k01 model.
 - Visualization generation disabled by default for speed; enable with `--keep-shapley-plots`.
 
-Key CLI groups:
-- Data selection: `--data-root`, `--dataset-prefix`, `--config-pattern`,
-    `--limit-datasets`, `--row-counts`, include/exclude dataset flags.
-- Shapley controls: `--eval-budget`, `--shapley-samples-per-feature`,
-    `--shapley-min-coalition-size`, `--tmc-max-permutations`,
-    `--tmc-truncation-epsilon`, `--tmc-bootstrap-resamples`, `--seed`.
-- Final/model controls: `--min-features`, `--lambda-drop`, `--final-top-k`.
-- Runtime/logging: baseline search flags, `--keep-{training,eval,search,shapley}-plots`,
-    `--show-training-logs`, `--run-rolling-origin-cv`, `--dry-run`, `--stop-on-error`.
+Key CLI groups (detailed):
+- Data selection:
+    `--data-root PATH`: Root directory containing regression dataset folders.
+    `--dataset-prefix PREFIX`: Dataset name prefix filter (for example, `MC`).
+    `--config-pattern GLOB`: Glob used to discover per-dataset train configs.
+    `--limit-datasets N`: Max matching datasets to process (`0` means all).
+    `--row-counts CSV_INTS`: Comma-separated input window sizes to evaluate.
+    `--include-regular`: Include regular (non-`_res`) datasets.
+    `--include-res`: Include `_res` datasets.
+    `--regular-only`: Include only regular datasets.
+    `--res-only`: Include only `_res` datasets.
+- Shapley controls:
+    `--eval-budget N`: Max candidate evaluations for the TMC-Shapley stage.
+    `--shapley-samples-per-feature N`: Target marginal samples per feature before stopping.
+    `--shapley-min-coalition-size N`: Minimum coalition size to start each permutation path.
+    `--tmc-max-permutations N`: Hard cap on permutation runs (`0` means no explicit cap).
+    `--tmc-truncation-epsilon FLOAT`: Truncation tolerance near full-subset objective.
+    `--tmc-bootstrap-resamples N`: Bootstrap resamples for Shapley confidence intervals.
+    `--seed N`: Random seed for permutation ordering and bootstrap sampling.
+- Final/model controls:
+    `--min-features N`: Minimum feature count allowed for subset generation/search.
+    `--lambda-drop FLOAT`: Penalty weight for sample drop rate in objective.
+    `--final-top-k N`: Number of best discovered subsets retrained in final stage.
+- Baselines/logging:
+    `--disable-baselines-for-search`: Disable baseline evals during search for speed.
+    `--run-baselines-in-search`: Enable baseline evals during search (mutually exclusive with disable flag).
+    `--show-training-logs`: Show verbose model training/sample logs.
+- Artifacts/runtime:
+    `--keep-training-plots`: Keep per-model training plots during sweeps.
+    `--keep-eval-plots`: Keep per-config evaluation plots during sweeps.
+    `--keep-search-plots`: Keep feature-search Pareto plot outputs.
+    `--keep-shapley-plots`: Keep Shapley attribution/search diagnostic plots.
+    `--run-rolling-origin-cv`: Run rolling-origin CV for the best k01 model.
+    `--dry-run`: Print discovered execution plan and exit.
+    `--stop-on-error`: Raise immediately on first dataset failure.
 
 Examples:
         python src/i_RunMCFeatureSelectionShapleySweep.py --dry-run
@@ -826,15 +852,19 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
     if not data_root.is_absolute():
         data_root = (workspace_root / data_root).resolve()
 
-    include_regular, include_res = base._resolve_dataset_inclusion(args)
-    plans = base.discover_mc_dataset_plans(
-        data_root=data_root,
-        dataset_prefix=args.dataset_prefix,
-        config_pattern=args.config_pattern,
-        limit_datasets=args.limit_datasets,
-        include_regular=include_regular,
-        include_res=include_res,
-    )
+    single_plan = getattr(args, "_internal_single_plan", None)
+    if single_plan is not None:
+        plans = [single_plan]
+    else:
+        include_regular, include_res = base._resolve_dataset_inclusion(args)
+        plans = base.discover_mc_dataset_plans(
+            data_root=data_root,
+            dataset_prefix=args.dataset_prefix,
+            config_pattern=args.config_pattern,
+            limit_datasets=args.limit_datasets,
+            include_regular=include_regular,
+            include_res=include_res,
+        )
     if not plans:
         print("No matching datasets/configs found.")
         return 1

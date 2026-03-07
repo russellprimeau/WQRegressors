@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 import yaml
 
 
@@ -17,6 +18,134 @@ NORMALIZATION_OUTPUT_PATH = (
     / "sensors"
     / "normalization.json"
 )
+
+
+def _default_aggregate_offset_csv():
+    root = Path(__file__).resolve().parent.parent.parent
+    candidates = [
+        root / "data" / "output" / "calibration" / "aggregate" / "offset_gain_model_results.csv",
+        root / "data" / "output" / "calibration" / "summaries" / "aggregate" / "offset_gain_model_results.csv",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _normalize_aggregate_sensor_name(name):
+    text = str(name).strip().replace("Âµ", "µ")
+    if "Sp Cond" in text:
+        return "Sp Cond (microS_cm)"
+    return text
+
+
+def _load_aggregate_offset_map(aggregate_csv_path, verbose=True):
+    """
+    Load aggregate calibration offsets by canonical sensor name.
+
+    Returns dict: canonical_sensor_name -> np.ndarray(offsets)
+    """
+    if aggregate_csv_path is None:
+        return {}
+
+    agg_path = Path(aggregate_csv_path)
+    if not agg_path.exists():
+        if verbose:
+            print(f"[WARN] Aggregate offset CSV not found: {agg_path}")
+        return {}
+
+    try:
+        agg_df = pd.read_csv(agg_path)
+    except Exception as exc:
+        if verbose:
+            print(f"[WARN] Could not read aggregate offset CSV {agg_path}: {exc}")
+        return {}
+
+    if "Sensor" not in agg_df.columns or "Offset" not in agg_df.columns:
+        if verbose:
+            print(f"[WARN] Aggregate offset CSV missing Sensor/Offset columns: {agg_path}")
+        return {}
+
+    agg_df = agg_df.copy()
+    agg_df["Sensor_Normalized"] = agg_df["Sensor"].map(_normalize_aggregate_sensor_name)
+    agg_df["Sensor_Canonical"] = agg_df["Sensor_Normalized"].map(_canonical_feature_name)
+    agg_df["Offset"] = pd.to_numeric(agg_df["Offset"], errors="coerce")
+
+    out = {}
+    for canonical_name, group in agg_df.groupby("Sensor_Canonical"):
+        offsets = group["Offset"].dropna().to_numpy(dtype=float)
+        if offsets.size >= 3:
+            out[str(canonical_name)] = offsets
+
+    return out
+
+
+def _normalize_std_for_feature(raw_std, feature_name, norm_params):
+    """Scale a raw-space standard deviation into normalized space when possible."""
+    std = float(raw_std)
+    if std <= 0:
+        return 0.0, False
+    if feature_name not in norm_params:
+        return std, False
+
+    v_min = norm_params[feature_name].get("min", 0)
+    v_max = norm_params[feature_name].get("max", 1)
+    v_range = v_max - v_min
+    if v_range in (0, 0.0):
+        return std, False
+    return std / v_range, True
+
+
+def _fit_t_or_fallback_std(offsets):
+    """Return an estimated standard deviation from fitted Student's t or empirical fallback."""
+    offsets = np.asarray(offsets, dtype=float)
+    if offsets.size < 3:
+        return float(np.std(offsets, ddof=0)) if offsets.size > 0 else 0.0
+
+    try:
+        t_df, _t_loc, t_scale = stats.t.fit(offsets)
+        if np.isfinite(t_df) and np.isfinite(t_scale) and t_scale > 0 and t_df > 2:
+            return float(np.sqrt((t_scale ** 2) * (t_df / (t_df - 2.0))))
+    except Exception:
+        pass
+
+    return float(np.std(offsets, ddof=0))
+
+
+def _sample_offset_deltas(
+    offsets,
+    n_samples,
+    rng,
+    mode,
+):
+    """
+    Sample delta offsets (e1 - e2) used by uncertain-input MC kernel expectation.
+    """
+    offsets = np.asarray(offsets, dtype=float)
+    n_samples = int(max(1, n_samples))
+
+    if offsets.size == 0:
+        return np.zeros(n_samples, dtype=np.float32)
+
+    if mode == "aggregate_t":
+        try:
+            t_df, t_loc, t_scale = stats.t.fit(offsets)
+            if np.isfinite(t_df) and np.isfinite(t_loc) and np.isfinite(t_scale) and t_scale > 0:
+                e1 = stats.t.rvs(df=t_df, loc=t_loc, scale=t_scale, size=n_samples, random_state=rng)
+                e2 = stats.t.rvs(df=t_df, loc=t_loc, scale=t_scale, size=n_samples, random_state=rng)
+                return (e1 - e2).astype(np.float32)
+        except Exception:
+            pass
+
+    if mode in {"aggregate_t", "aggregate_empirical"}:
+        e1 = rng.choice(offsets, size=n_samples, replace=True)
+        e2 = rng.choice(offsets, size=n_samples, replace=True)
+        return (e1 - e2).astype(np.float32)
+
+    std = float(np.std(offsets, ddof=0))
+    if std <= 0:
+        return np.zeros(n_samples, dtype=np.float32)
+    return rng.normal(loc=0.0, scale=np.sqrt(2.0) * std, size=n_samples).astype(np.float32)
 
 
 def load_config(config_path):
@@ -141,13 +270,49 @@ def _build_feature_uncertainty_variance(data_cfg, hyper_cfg, config_dir, verbose
     directory, scaled by the normalization range when a normalization.json is present.
     Returns a 1-D float32 array of length ``n_features * seq_len``.
     """
+    bundle = _build_feature_uncertainty_bundle(data_cfg, hyper_cfg, config_dir, verbose=verbose)
+    return bundle["feature_variances"]
+
+
+def _build_feature_uncertainty_bundle(data_cfg, hyper_cfg, config_dir, verbose=True):
+    """
+    Build uncertainty information for uncertain-input GP kernels.
+
+    Returns dict with keys:
+    - feature_variances: flattened per-feature variance for each input timestep
+    - noise_delta_samples: MC delta offsets (e1 - e2) aligned to flattened input shape
+    - source_mode_effective: applied source mode string
+    - source_details: per-feature source diagnostics
+    """
     input_columns = data_cfg["input_columns"]
     seq_len = data_cfg["input_row_2"] - data_cfg["input_row_1"]
 
+    n_mc_samples = int(hyper_cfg.get("uncertain_kernel_mc_samples", 64))
+    mc_seed = int(hyper_cfg.get("uncertain_kernel_mc_seed", 0))
+    source_mode_requested = str(hyper_cfg.get("uncertainty_source_mode", "aggregate_t")).lower()
+    if source_mode_requested not in {"aggregate_t", "aggregate_empirical", "summary_std"}:
+        source_mode_requested = "aggregate_t"
+
     summary_dir = _resolve_summary_dir(hyper_cfg, config_dir)
     summary_std_map = _load_uncertainty_std_map(summary_dir, verbose=verbose)
+    aggregate_csv_path = hyper_cfg.get("uncertainty_aggregate_csv")
+    if aggregate_csv_path:
+        aggregate_csv_path = _resolve_path_from_config(aggregate_csv_path, config_dir)
+    else:
+        aggregate_csv_path = _default_aggregate_offset_csv()
+    aggregate_offsets_map = _load_aggregate_offset_map(aggregate_csv_path, verbose=verbose)
+
     if verbose:
-        print(f"[INFO] Uncertainty source directory: {summary_dir}")
+        print(f"[INFO] Uncertainty summary directory: {summary_dir}")
+        print(f"[INFO] Uncertainty aggregate CSV: {aggregate_csv_path}")
+
+    source_mode_effective = source_mode_requested
+    if source_mode_requested in {"aggregate_t", "aggregate_empirical"} and not aggregate_offsets_map:
+        source_mode_effective = "summary_std"
+        if verbose:
+            print(
+                "[WARN] Aggregate offsets unavailable; falling back to summary_std uncertainty mode for GP kernel."
+            )
 
     norm_path = NORMALIZATION_OUTPUT_PATH
     norm_params = {}
@@ -158,50 +323,82 @@ def _build_feature_uncertainty_variance(data_cfg, hyper_cfg, config_dir, verbose
         except Exception as exc:
             print(f"[WARN] Could not read normalization.json at {norm_path}: {exc}")
 
+    rng = np.random.default_rng(mc_seed)
     feature_variances = []
+    feature_deltas = []
+    source_details = []
+
     for feature in input_columns:
         candidates = [_canonical_feature_name(feature)]
         if " - " in feature:
             candidates.append(_canonical_feature_name(feature.split(" - ", 1)[1]))
 
-        matched_entry = None
         matched_key = None
         for candidate in candidates:
-            if candidate in summary_std_map:
-                matched_entry = summary_std_map[candidate]
+            if candidate in aggregate_offsets_map or candidate in summary_std_map:
                 matched_key = candidate
                 break
 
-        raw_std = 0.0 if matched_entry is None else float(matched_entry["offset_std"])
-        applied_std = raw_std
+        raw_std = 0.0
+        sensor_source = "none"
         scaling_applied = False
+        deltas = np.zeros(n_mc_samples, dtype=np.float32)
 
-        if applied_std > 0 and feature in norm_params:
+        if matched_key is not None and source_mode_effective in {"aggregate_t", "aggregate_empirical"}:
+            offsets = aggregate_offsets_map.get(matched_key)
+            if offsets is not None and offsets.size >= 3:
+                raw_std = _fit_t_or_fallback_std(offsets)
+                deltas = _sample_offset_deltas(offsets, n_mc_samples, rng, source_mode_effective)
+                sensor_source = f"aggregate:{source_mode_effective}"
+
+        if sensor_source == "none":
+            matched_entry = summary_std_map.get(matched_key) if matched_key is not None else None
+            raw_std = 0.0 if matched_entry is None else float(matched_entry["offset_std"])
+            if raw_std > 0:
+                deltas = rng.normal(loc=0.0, scale=np.sqrt(2.0) * raw_std, size=n_mc_samples).astype(np.float32)
+            sensor_source = "summary_std" if matched_entry is not None else "none"
+
+        applied_std, scaling_applied = _normalize_std_for_feature(raw_std, feature, norm_params)
+        if scaling_applied:
             v_min = norm_params[feature].get("min", 0)
             v_max = norm_params[feature].get("max", 1)
             v_range = v_max - v_min
             if v_range not in (0, 0.0):
-                applied_std = applied_std / v_range
-                scaling_applied = True
+                deltas = (deltas / float(v_range)).astype(np.float32)
 
         variance = float(applied_std ** 2)
         feature_variances.append(variance)
+        feature_deltas.append(deltas)
+
+        source_details.append(
+            {
+                "feature": feature,
+                "matched_key": matched_key,
+                "source": sensor_source,
+                "raw_std": float(raw_std),
+                "applied_std": float(applied_std),
+                "variance": variance,
+                "normalization_scaled": bool(scaling_applied),
+            }
+        )
 
         if verbose:
-            if matched_entry is None:
-                print(
-                    f"  [UNCERTAINTY] feature='{feature}' | source='none' | "
-                    f"matched_key='none' | raw_offset_std=0 | applied_std=0 | var=0"
-                )
-            else:
-                scaling_note = "scaled_by_normalization" if scaling_applied else "no_scaling"
-                print(
-                    f"  [UNCERTAINTY] feature='{feature}' | "
-                    f"source='{matched_entry['source_file']}' | "
-                    f"sensor='{matched_entry['sensor_name']}' | "
-                    f"matched_key='{matched_key}' | "
-                    f"raw_offset_std={raw_std:.6g} | applied_std={applied_std:.6g} | "
-                    f"var={variance:.6g} | {scaling_note}"
-                )
+            print(
+                f"  [UNCERTAINTY] feature='{feature}' | matched_key='{matched_key}' | "
+                f"source='{sensor_source}' | raw_std={raw_std:.6g} | "
+                f"applied_std={applied_std:.6g} | var={variance:.6g} | "
+                f"scaled={'yes' if scaling_applied else 'no'}"
+            )
 
-    return np.tile(np.array(feature_variances, dtype=np.float32), seq_len)
+    feature_variances_arr = np.array(feature_variances, dtype=np.float32)
+    feature_delta_samples = np.stack(feature_deltas, axis=1) if feature_deltas else np.zeros((n_mc_samples, 0), dtype=np.float32)
+
+    return {
+        "feature_variances": np.tile(feature_variances_arr, seq_len),
+        "noise_delta_samples": np.tile(feature_delta_samples, (1, seq_len)),
+        "source_mode_requested": source_mode_requested,
+        "source_mode_effective": source_mode_effective,
+        "aggregate_csv_path": str(aggregate_csv_path) if aggregate_csv_path is not None else None,
+        "summary_dir": str(summary_dir),
+        "source_details": source_details,
+    }

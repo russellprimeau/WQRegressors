@@ -20,7 +20,10 @@ import matplotlib.pyplot as plt
 import xgboost as xgb
 import torch
 from torch.utils.data import DataLoader
-import gpytorch
+try:
+    import gpytorch
+except ImportError:
+    gpytorch = None
 from utils.training import write_config, splitter
 from utils.transformer import (
     train_model as train_transformer,
@@ -35,8 +38,9 @@ from utils.config_utils import (
     _resolve_summary_dir,
     _load_uncertainty_std_map,
     _build_feature_uncertainty_variance,
+    _build_feature_uncertainty_bundle,
 )
-from utils.gp_utils import UncertainInputRBFKernel, build_base_kernel, ExactGPRegressor
+from utils.gp_utils import build_base_kernel, ExactGPRegressor
 
 
 NORMALIZATION_OUTPUT_PATH = (
@@ -105,7 +109,11 @@ DEFAULT_GP_REGRESSOR_CONFIG = {
     "input_standardize": True,
     "target_standardize": True,
     "use_uncertain_input_kernel": True,
+    "uncertain_kernel_mc_samples": 64,
+    "uncertain_kernel_mc_seed": 0,
+    "uncertainty_source_mode": "aggregate_t",
     "uncertainty_summary_dir": None,
+    "uncertainty_aggregate_csv": None,
     "learning_rate": 0.01,
     "num_epochs": 250,
     "patience": 20,
@@ -118,6 +126,7 @@ DEFAULT_DATA_SPLIT_CONFIG = {
     "reuse_split": False,
     "split_source": None,
     "split_type": "random",
+    "fault_tolerant": False,
     "nan_tolerance": 0.8,
 }
 
@@ -405,7 +414,7 @@ def train_gp_regressor_model(config, train_samples, test_samples):
     if y_test_np.ndim == 1:
         y_test_np = y_test_np.reshape(-1, 1)
 
-    max_train_size = hyper_cfg["max_train_size"]
+    max_train_size = hyper_cfg.get("max_train_size")
     if max_train_size is not None and len(X_train_np) > max_train_size:
         rng = np.random.default_rng(split_cfg["random_state"])
         keep_idx = rng.choice(len(X_train_np), size=max_train_size, replace=False)
@@ -417,7 +426,11 @@ def train_gp_regressor_model(config, train_samples, test_samples):
     x_std = X_train_np.std(axis=0)
     x_std[x_std < 1e-8] = 1.0
 
-    if hyper_cfg["input_standardize"]:
+    input_standardize = bool(hyper_cfg.get("input_standardize", True))
+    target_standardize = bool(hyper_cfg.get("target_standardize", True))
+    requested_ard = bool(hyper_cfg.get("ard", True))
+
+    if input_standardize:
         X_train_used = (X_train_np - x_mean) / x_std
         X_test_used = (X_test_np - x_mean) / x_std
     else:
@@ -429,20 +442,46 @@ def train_gp_regressor_model(config, train_samples, test_samples):
     X_train = torch.tensor(X_train_used, dtype=torch.float32, device=device)
     X_test = torch.tensor(X_test_used, dtype=torch.float32, device=device)
 
-    kernel_name = str(hyper_cfg["kernel"]).lower()
+    kernel_name = str(hyper_cfg.get("kernel", "matern52")).lower()
     use_uncertain_kernel = bool(hyper_cfg.get("use_uncertain_input_kernel", True))
+    mc_samples = int(hyper_cfg.get("uncertain_kernel_mc_samples", 64))
+    mc_seed = int(hyper_cfg.get("uncertain_kernel_mc_seed", 0))
 
-    if use_uncertain_kernel and not hyper_cfg["ard"]:
+    if use_uncertain_kernel and not requested_ard:
         print("[WARN] Uncertain-input kernel works best with ARD. Forcing ARD=True for GP kernel.")
 
-    ard_dims = X_train.shape[1] if (hyper_cfg["ard"] or use_uncertain_kernel) else None
+    effective_ard = bool(requested_ard or use_uncertain_kernel)
+    ard_dims = X_train.shape[1] if effective_ard else None
     input_uncertainty_var = None
+    uncertainty_noise_deltas = None
+    uncertainty_bundle = {
+        "source_mode_effective": "none",
+        "source_mode_requested": str(hyper_cfg.get("uncertainty_source_mode", "aggregate_t")).lower(),
+        "aggregate_csv_path": None,
+        "summary_dir": None,
+        "source_details": [],
+    }
     if use_uncertain_kernel:
+        uncertainty_bundle = _build_feature_uncertainty_bundle(
+            data_cfg,
+            hyper_cfg,
+            config["__config_dir"],
+            verbose=True,
+        )
         input_uncertainty_var = torch.tensor(
-            _build_feature_uncertainty_variance(data_cfg, hyper_cfg, config["__config_dir"]),
+            uncertainty_bundle["feature_variances"],
             dtype=torch.float32,
             device=device
         )
+        uncertainty_noise_deltas = torch.tensor(
+            uncertainty_bundle["noise_delta_samples"],
+            dtype=torch.float32,
+            device=device,
+        )
+
+    effective_kernel = "uncertain_matern52" if (use_uncertain_kernel and kernel_name == "matern52") else (
+        "uncertain_rbf" if (use_uncertain_kernel and kernel_name == "rbf") else kernel_name
+    )
 
     output_dim = y_train_np.shape[1]
     output_train_losses = []
@@ -461,7 +500,7 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         if y_std < 1e-8:
             y_std = 1.0
 
-        if hyper_cfg["target_standardize"]:
+        if target_standardize:
             y_train_used = (y_train_col - y_mean) / y_std
         else:
             y_train_used = y_train_col
@@ -473,7 +512,15 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
         model = ExactGPRegressor(
             X_train, y_train, likelihood,
-            build_base_kernel(kernel_name, use_uncertain_kernel, input_uncertainty_var, ard_dims)
+            build_base_kernel(
+                kernel_name,
+                use_uncertain_kernel,
+                input_uncertainty_var,
+                ard_dims,
+                uncertainty_noise_deltas=uncertainty_noise_deltas,
+                uncertain_kernel_mc_samples=mc_samples,
+                uncertain_kernel_mc_seed=mc_seed,
+            )
         ).to(device)
 
         model.train()
@@ -544,22 +591,51 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         'input_row_2': data_cfg["input_row_2"],
         'output_columns': data_cfg["output_columns"],
         'output_rows': data_cfg["output_rows"],
-        'kernel': hyper_cfg["kernel"],
-        'ard': hyper_cfg["ard"],
-        'input_standardize': hyper_cfg["input_standardize"],
-        'target_standardize': hyper_cfg["target_standardize"],
+        'kernel': kernel_name,
+        'ard': requested_ard,
+        'effective_ard': effective_ard,
+        'ard_num_dims': ard_dims,
+        'input_standardize': input_standardize,
+        'target_standardize': target_standardize,
         'use_uncertain_input_kernel': use_uncertain_kernel,
+        'effective_kernel': effective_kernel,
+        'uncertain_kernel_mc_samples': mc_samples,
+        'uncertain_kernel_mc_seed': mc_seed,
+        'uncertainty_source_mode_requested': uncertainty_bundle.get('source_mode_requested'),
+        'uncertainty_source_mode_effective': uncertainty_bundle.get('source_mode_effective'),
+        'uncertainty_summary_dir': uncertainty_bundle.get('summary_dir'),
+        'uncertainty_aggregate_csv': uncertainty_bundle.get('aggregate_csv_path'),
     }
     write_config(model_config, data_cfg["data_dir"], data_cfg["forecast_name"], "")
 
+    kernel_metadata = {
+        "requested_kernel": kernel_name,
+        "effective_kernel": effective_kernel,
+        "use_uncertain_kernel": use_uncertain_kernel,
+        "requested_ard": requested_ard,
+        "effective_ard": effective_ard,
+        "ard_num_dims": ard_dims,
+        "uncertain_kernel_mc_samples": mc_samples,
+        "uncertain_kernel_mc_seed": mc_seed,
+        "uncertainty_source_mode_requested": uncertainty_bundle.get("source_mode_requested"),
+        "uncertainty_source_mode_effective": uncertainty_bundle.get("source_mode_effective"),
+        "uncertainty_summary_dir": uncertainty_bundle.get("summary_dir"),
+        "uncertainty_aggregate_csv": uncertainty_bundle.get("aggregate_csv_path"),
+        "uncertainty_source_details": uncertainty_bundle.get("source_details", []),
+    }
+
     artifact = {
+        "artifact_version": 2,
         "model_type": "gp_regressor",
-        "hyperparameters": hyper_cfg,
+        "hyperparameters": dict(hyper_cfg),
         "input_mean": x_mean,
         "input_std": x_std,
         "input_dim": int(X_train.shape[1]),
         "output_dim": output_dim,
         "models": models_state,
+        "kernel_metadata": kernel_metadata,
+        "input_uncertainty_var": None if input_uncertainty_var is None else input_uncertainty_var.detach().cpu().numpy(),
+        "uncertainty_noise_deltas": None if uncertainty_noise_deltas is None else uncertainty_noise_deltas.detach().cpu().numpy(),
     }
     torch.save(artifact, save_path / "gp_model.pt")
     print(f"\nModel saved to: {save_path / 'gp_model.pt'}")

@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 import h_RunMCFeatureSelectionSweep as optimizer_module
 import i_RunMCFeatureSelectionShapleySweep as shapley_module
@@ -60,6 +61,26 @@ def _set_pipeline_stage_namespace(namespace: str | None) -> None:
         os.environ.pop(_NAMESPACE_ENV, None)
         return
     os.environ[_NAMESPACE_ENV] = str(namespace).strip()
+
+
+def _resolve_data_root(data_root_value: str) -> Path:
+    workspace_root = Path(__file__).resolve().parent.parent
+    data_root = Path(data_root_value)
+    if not data_root.is_absolute():
+        data_root = (workspace_root / data_root).resolve()
+    return data_root
+
+
+def _discover_pipeline_plans(args: argparse.Namespace) -> list[optimizer_module.DatasetPlan]:
+    include_regular, include_res = optimizer_module._resolve_dataset_inclusion(args)
+    return optimizer_module.discover_mc_dataset_plans(
+        data_root=_resolve_data_root(args.data_root),
+        dataset_prefix=args.dataset_prefix,
+        config_pattern=args.config_pattern,
+        limit_datasets=args.limit_datasets,
+        include_regular=include_regular,
+        include_res=include_res,
+    )
 
 
 def _parse_seed_list(raw: str | None) -> list[int]:
@@ -213,12 +234,20 @@ def main() -> int:
     if args.run_baselines_in_search and args.disable_baselines_for_search:
         raise ValueError("Cannot use both --run-baselines-in-search and --disable-baselines-for-search.")
 
+    plans = _discover_pipeline_plans(args)
+    if not plans:
+        print("No matching datasets/configs found.")
+        return 1
+
+    data_root_resolved = _resolve_data_root(args.data_root)
+
     print("\nPipeline plan")
     print("-" * 100)
     print(f"Shapley stage enabled     : {not args.skip_shapley_stage}")
     print(f"Optimizer stage enabled   : {not args.skip_optimizer_stage}")
-    print(f"Data root                 : {args.data_root}")
+    print(f"Data root                 : {data_root_resolved}")
     print(f"Dataset prefix            : {args.dataset_prefix}")
+    print(f"Datasets found            : {len(plans)}")
     print(f"Shapley eval budget       : {args.shapley_eval_budget}")
     print(f"Optimizer eval budget     : {args.optimizer_eval_budget}")
     optimizer_seeds = _parse_seed_list(args.optimizer_seeds)
@@ -230,42 +259,64 @@ def main() -> int:
     print(f"Dry run                   : {args.dry_run}")
 
     prior_namespace = os.environ.get(_NAMESPACE_ENV)
+    shapley_failures = 0
+    optimizer_failures = 0
     try:
-        if not args.skip_shapley_stage:
-            _set_pipeline_stage_namespace(_SHAPLEY_NAMESPACE)
-            print("\n[PIPELINE] Stage 1/2: Running Shapley attribution sweep...")
-            print(f"[PIPELINE] Stage 1 namespace      : {_SHAPLEY_NAMESPACE}")
-            shapley_rc = shapley_module.run_feature_selection_sweep(_build_shapley_args(args))
-            if shapley_rc != 0:
-                print(f"[PIPELINE] Shapley stage failed with exit code {shapley_rc}.")
-                return shapley_rc
+        for plan_idx, plan in enumerate(plans, start=1):
+            print("\n" + "=" * 100)
+            print(f"[PIPELINE] DATASET {plan_idx}/{len(plans)}: {plan.dataset_dir.name}")
+            print("=" * 100)
 
-        if not args.skip_optimizer_stage:
-            # Critical isolation: optimizer outputs must not inherit Shapley namespace.
-            _set_pipeline_stage_namespace(None)
-            print("\n[PIPELINE] Stage 2/2: Running seeded optimizer sweep(s)...")
-            print(f"[PIPELINE] Stage 2 namespace      : {_OPTIMIZER_DEFAULT_NAMESPACE}")
-            optimizer_failures = 0
-            for idx, seed in enumerate(optimizer_seeds, start=1):
-                run_args = _build_optimizer_args(args)
-                run_args.seed = int(seed)
-                print(f"[PIPELINE] Optimizer run {idx}/{len(optimizer_seeds)} (seed={seed})")
-                optimizer_rc = optimizer_module.run_feature_selection_sweep(run_args)
-                if optimizer_rc != 0:
-                    optimizer_failures += 1
-                    print(f"[PIPELINE] Optimizer seed {seed} failed with exit code {optimizer_rc}.")
+            if not args.skip_shapley_stage:
+                _set_pipeline_stage_namespace(_SHAPLEY_NAMESPACE)
+                shapley_args = _build_shapley_args(args)
+                shapley_args._internal_single_plan = plan
+
+                print("\n[PIPELINE] Stage 1/2: Running Shapley attribution sweep...")
+                print(f"[PIPELINE] Stage 1 namespace      : {_SHAPLEY_NAMESPACE}")
+                shapley_rc = shapley_module.run_feature_selection_sweep(shapley_args)
+                if shapley_rc != 0:
+                    shapley_failures += 1
+                    print(f"[PIPELINE] Shapley stage failed for {plan.dataset_dir.name} with exit code {shapley_rc}.")
                     if args.stop_on_error:
-                        return optimizer_rc
+                        return shapley_rc
+                    continue
 
-            if optimizer_failures > 0:
-                print(f"[PIPELINE] Optimizer stage completed with failures: {optimizer_failures}/{len(optimizer_seeds)}")
-                return 2
+            if not args.skip_optimizer_stage:
+                # Critical isolation: optimizer outputs must not inherit Shapley namespace.
+                _set_pipeline_stage_namespace(None)
+                print("\n[PIPELINE] Stage 2/2: Running seeded optimizer sweep(s)...")
+                print(f"[PIPELINE] Stage 2 namespace      : {_OPTIMIZER_DEFAULT_NAMESPACE}")
+                for seed_idx, seed in enumerate(optimizer_seeds, start=1):
+                    run_args = _build_optimizer_args(args)
+                    run_args.seed = int(seed)
+                    run_args._internal_single_plan = plan
+
+                    print(
+                        f"[PIPELINE] Optimizer run {seed_idx}/{len(optimizer_seeds)} "
+                        f"for {plan.dataset_dir.name} (seed={seed})"
+                    )
+                    optimizer_rc = optimizer_module.run_feature_selection_sweep(run_args)
+                    if optimizer_rc != 0:
+                        optimizer_failures += 1
+                        print(
+                            f"[PIPELINE] Optimizer seed {seed} failed for "
+                            f"{plan.dataset_dir.name} with exit code {optimizer_rc}."
+                        )
+                        if args.stop_on_error:
+                            return optimizer_rc
     finally:
         # Restore caller environment after pipeline completes.
         if prior_namespace is None:
             os.environ.pop(_NAMESPACE_ENV, None)
         else:
             os.environ[_NAMESPACE_ENV] = prior_namespace
+
+    if shapley_failures > 0 or optimizer_failures > 0:
+        print("\n[PIPELINE] Completed with failures.")
+        print(f"[PIPELINE] Shapley failures        : {shapley_failures}")
+        print(f"[PIPELINE] Optimizer failures      : {optimizer_failures}")
+        return 2
 
     print("\n[PIPELINE] Complete.")
     return 0

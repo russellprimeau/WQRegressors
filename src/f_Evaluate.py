@@ -29,7 +29,10 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 import torch
 import xgboost as xgb
-import gpytorch
+try:
+    import gpytorch
+except ImportError:
+    gpytorch = None
 
 from utils.training import load_samples
 from utils.transformer import TimeSeriesTargetDataset, TimeSeriesTransformer
@@ -53,6 +56,7 @@ from utils.config_utils import (
     _resolve_summary_dir,
     _load_uncertainty_std_map,
     _build_feature_uncertainty_variance,
+    _build_feature_uncertainty_bundle,
 )
 from utils.gp_utils import build_base_kernel, ExactGPRegressor
 from utils.limits import load_limits_records
@@ -174,6 +178,7 @@ def load_split_samples(
     split_file,
     split_source_dir=None,
     split_files_override=None,
+    fault_tolerant=False,
     input_aggregation="none",
 ):
     source_dir = Path(split_source_dir) if split_source_dir is not None else Path(data_dir, "forecasts", forecast_name)
@@ -186,7 +191,7 @@ def load_split_samples(
         input_rows=input_rows,
         output_rows=output_rows,
         file_list=split_files,
-        fault_tolerant=True,
+        fault_tolerant=fault_tolerant,
         input_aggregation=input_aggregation,
     )
 
@@ -216,9 +221,13 @@ def _prepare_gp_train_arrays(train_samples, split_cfg, hyper_cfg):
 
 
 def _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device, config_dir):
+    if gpytorch is None:
+        raise ImportError("gpytorch is not installed. Install it with: pip install gpytorch")
+
     model_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"], model_name)
     artifact = torch.load(model_path / "gp_model.pt", map_location=device, weights_only=False)
-    hyper_cfg = artifact["hyperparameters"]
+    hyper_cfg = artifact.get("hyperparameters", {})
+    kernel_meta = artifact.get("kernel_metadata", {})
 
     X_train_np, y_train_np = _prepare_gp_train_arrays(train_samples, split_cfg, hyper_cfg)
 
@@ -232,15 +241,31 @@ def _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device, conf
         X_train_used = X_train_np
 
     X_train = torch.tensor(X_train_used, dtype=torch.float32, device=device)
-    kernel_name = str(hyper_cfg.get("kernel", "matern52")).lower()
-    use_uncertain_kernel = bool(hyper_cfg.get("use_uncertain_input_kernel", True))
-    ard_dims = X_train.shape[1] if (hyper_cfg.get("ard", True) or use_uncertain_kernel) else None
+    kernel_name = str(kernel_meta.get("requested_kernel", hyper_cfg.get("kernel", "matern52"))).lower()
+    use_uncertain_kernel = bool(kernel_meta.get("use_uncertain_kernel", hyper_cfg.get("use_uncertain_input_kernel", True)))
+    effective_ard = bool(kernel_meta.get("effective_ard", (hyper_cfg.get("ard", True) or use_uncertain_kernel)))
+    ard_dims = X_train.shape[1] if effective_ard else None
+    mc_samples = int(kernel_meta.get("uncertain_kernel_mc_samples", hyper_cfg.get("uncertain_kernel_mc_samples", 64)))
+    mc_seed = int(kernel_meta.get("uncertain_kernel_mc_seed", hyper_cfg.get("uncertain_kernel_mc_seed", 0)))
 
     input_uncertainty_var = None
+    uncertainty_noise_deltas = None
     if use_uncertain_kernel:
-        input_uncertainty_var = torch.tensor(
-            _build_feature_uncertainty_variance(data_cfg, hyper_cfg, config_dir), dtype=torch.float32, device=device
-        )
+        saved_var = artifact.get("input_uncertainty_var")
+        saved_deltas = artifact.get("uncertainty_noise_deltas")
+        if saved_var is not None:
+            input_uncertainty_var = torch.tensor(saved_var, dtype=torch.float32, device=device)
+        if saved_deltas is not None:
+            uncertainty_noise_deltas = torch.tensor(saved_deltas, dtype=torch.float32, device=device)
+
+        if input_uncertainty_var is None:
+            uncertainty_bundle = _build_feature_uncertainty_bundle(data_cfg, hyper_cfg, config_dir, verbose=False)
+            input_uncertainty_var = torch.tensor(
+                uncertainty_bundle["feature_variances"], dtype=torch.float32, device=device
+            )
+            uncertainty_noise_deltas = torch.tensor(
+                uncertainty_bundle["noise_delta_samples"], dtype=torch.float32, device=device
+            )
 
     models = []
     for state in artifact["models"]:
@@ -255,7 +280,15 @@ def _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device, conf
         likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
         model = ExactGPRegressor(
             X_train, y_train, likelihood,
-            build_base_kernel(kernel_name, use_uncertain_kernel, input_uncertainty_var, ard_dims)
+            build_base_kernel(
+                kernel_name,
+                use_uncertain_kernel,
+                input_uncertainty_var,
+                ard_dims,
+                uncertainty_noise_deltas=uncertainty_noise_deltas,
+                uncertain_kernel_mc_samples=mc_samples,
+                uncertain_kernel_mc_seed=mc_seed,
+            )
         ).to(device)
         model.load_state_dict(state["model_state_dict"])
         likelihood.load_state_dict(state["likelihood_state_dict"])
@@ -751,6 +784,8 @@ def evaluate_single_config(config_path, save_plots_override=None):
     print(f"\n=== Evaluating config: {config_path} ===")
 
     config = load_config(config_path)
+    if gpytorch is None and str(config.get("model_type", "")) == "gp_regressor":
+        raise ImportError("gpytorch is not installed. Install it with: pip install gpytorch")
     config_dir = config["__config_dir"]
 
     model_type = config["model_type"]
@@ -785,6 +820,8 @@ def evaluate_single_config(config_path, save_plots_override=None):
     input_rows = slice(model_config["input_row_1"], model_config["input_row_2"])
     output_rows = model_config["output_rows"]
     input_aggregation = str(model_config.get("input_aggregation", data_cfg.get("input_aggregation", "none"))).lower()
+    split_cfg = config.get("data_split", {"random_state": 42})
+    split_fault_tolerant = bool(split_cfg.get("fault_tolerant", False))
 
 
     # Use the original forecast directory if present, else fallback to config_path.parent
@@ -800,6 +837,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
         output_rows,
         "test_files.txt",
         split_source_dir=split_base_dir,
+        fault_tolerant=split_fault_tolerant,
         input_aggregation=input_aggregation,
     )
     model_split_files = _read_split_files(
@@ -820,6 +858,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
             output_rows,
             "train_files.txt",
             split_source_dir=split_base_dir,
+            fault_tolerant=split_fault_tolerant,
             input_aggregation=input_aggregation,
         )
         train_split_files = _read_split_files(
@@ -839,6 +878,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 output_rows,
                 "train_files.txt",
                 split_source_dir=split_base_dir,
+                fault_tolerant=split_fault_tolerant,
                 input_aggregation=input_aggregation,
             )
             train_split_files = _read_split_files(
@@ -897,7 +937,6 @@ def evaluate_single_config(config_path, save_plots_override=None):
             X_all = X_test
             y_all = y_test
 
-    split_cfg = config.get("data_split", {"random_state": 42})
     model = load_model(model_type, data_cfg, split_cfg, model_name, model_config, device, train_samples, config_dir)
 
     regression_pairs = []
