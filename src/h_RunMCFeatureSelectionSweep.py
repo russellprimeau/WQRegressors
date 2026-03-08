@@ -942,52 +942,49 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         metric_vals = pd.to_numeric(grouped[metric], errors="coerce").to_numpy(dtype=float)
         finite_vals = metric_vals[np.isfinite(metric_vals)]
         if metric in ("mae", "rmse"):
-            # Error metrics are non-negative; anchor at zero for comparability.
+            # Error metrics remain zero-anchored for comparability across subsets.
             ymax = float(np.max(finite_vals)) if finite_vals.size > 0 else 1.0
             if ymax <= 0.0:
                 ymax = 1.0
-            ymin_base, ymax_base = 0.0, ymax * 1.08
+            ax.set_ylim(0.0, ymax * 1.08)
         elif metric in ("pearson_r", "r2"):
-            # Correlation and R^2 are interpreted on a bounded scale.
-            ymin_base, ymax_base = -1.0, 1.0
+            # Keep correlation-style panels on a fixed bounded scale.
+            ax.set_ylim(-1.0, 1.0)
         else:
             ymin_base = float(np.min(finite_vals)) if finite_vals.size > 0 else -1.0
             ymax_base = float(np.max(finite_vals)) if finite_vals.size > 0 else 1.0
+            ax.set_ylim(ymin_base, ymax_base)
 
         if not axis_vals:
-            ax.set_ylim(ymin_base, ymax_base)
             continue
-
-        span = float(ymax_base - ymin_base)
-        if not np.isfinite(span) or span <= 0.0:
-            span = 1.0
-        label_offset = 0.02 * span
-        label_pad = 0.04 * span
-        upper_needed = max((v + label_offset) if v >= 0 else v for v in axis_vals)
-        lower_needed = min((v - label_offset) if v < 0 else v for v in axis_vals)
-        ylim_low = min(ymin_base, lower_needed - label_pad)
-        ylim_high = max(ymax_base, upper_needed + label_pad)
-        ax.set_ylim(ylim_low, ylim_high)
 
         y_low, y_high = ax.get_ylim()
         y_span = float(y_high - y_low) if np.isfinite(y_high - y_low) and (y_high - y_low) > 0 else 1.0
         text_pad = 0.02 * y_span
+        edge_band = 0.03 * y_span
 
         for bars, vals in axis_bar_groups:
             for bar, val in zip(bars, vals):
                 if not np.isfinite(val):
                     continue
-                y = float(val) + text_pad if float(val) >= 0 else float(val) - text_pad
-                y = min(max(y, y_low + text_pad), y_high - text_pad)
+                f_val = float(val)
+                y_pref = f_val + text_pad if f_val >= 0 else f_val - text_pad
+                y = min(max(y_pref, y_low + text_pad), y_high - text_pad)
+                va = "bottom" if f_val >= 0 else "top"
+                # Keep clamped edge labels inside the panel while preserving readability.
+                if y >= (y_high - edge_band):
+                    va = "top"
+                elif y <= (y_low + edge_band):
+                    va = "bottom"
                 ax.text(
                     bar.get_x() + (bar.get_width() / 2.0),
                     y,
-                    _format_bar_label(float(val)),
+                    _format_bar_label(f_val),
                     ha="center",
-                    va="bottom" if float(val) >= 0 else "top",
+                    va=va,
                     fontsize=7,
                     rotation=90,
-                    clip_on=True,
+                    clip_on=False,
                 )
 
     axes[-1].set_xticks(x)
@@ -997,12 +994,12 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     for ax in axes[:-1]:
         ax.tick_params(axis="x", labelbottom=False)
 
-    fig.subplots_adjust(top=0.90, hspace=0.16)
+    fig.subplots_adjust(top=0.89, hspace=0.16)
     fig.legend(
         legend_handles,
         legend_labels,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.98),
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.905),
         ncol=6,
         frameon=True,
         fontsize=9,
