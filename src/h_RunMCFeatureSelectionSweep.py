@@ -36,7 +36,9 @@ Key CLI groups (detailed):
     `--seed N`: Random seed for candidate ordering and swap sampling.
 - Seeded optimizer controls:
     `--seed-subsets-csv PATH`: Seed subset CSV (or directory containing per-row seed CSVs).
-    `--seed-subsets-from-shapley`: Load seeds from `forecasts/Shapley_sweeps/feature_seed_subsets_r###.csv`.
+    `--seed-subsets-from-shapley`: Load seeds from
+        `forecasts/Shapley_sweeps/feature_seed_subsets_r###_d########.csv`
+        (legacy fallback: `feature_seed_subsets_r###.csv`).
     `--max-seed-subsets N`: Cap loaded seed subsets (`0` means no explicit cap).
 - Final/model controls:
     `--final-top-k N`: Number of best discovered subsets retrained in final stage.
@@ -75,7 +77,7 @@ Examples:
 
         python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --eval-budget 180 --seed-subsets-from-shapley
 
-        python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --eval-budget 180 --seed-subsets-csv data/output/regression/MC_exColor_res/forecasts/Shapley_sweeps/feature_seed_subsets_r671.csv --max-seed-subsets 6
+        python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --eval-budget 180 --seed-subsets-csv data/output/regression/MC_exColor_res/forecasts/Shapley_sweeps/feature_seed_subsets_r671_d1234abcd.csv --max-seed-subsets 6
 
         # Opt in to search-phase plots when diagnosing candidate behavior:
         python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --eval-budget 60 --keep-training-plots --keep-eval-plots --keep-search-plots
@@ -87,6 +89,7 @@ import copy
 import glob
 import hashlib
 import io
+import json
 import re
 import sys
 import time
@@ -345,19 +348,61 @@ def _parse_seed_features(raw: str) -> tuple[str, ...]:
     return tuple(parts)
 
 
+def _data_root_key(dataset_dir: Path) -> str:
+    """Return a short deterministic key for the parent dataset root."""
+    root = Path(dataset_dir).resolve().parent
+    return hashlib.sha1(str(root).encode("utf-8")).hexdigest()[:8]
+
+
+def _seed_subsets_filename(row_count: int, dataset_dir: Path | None = None) -> str:
+    """Build seed-subset filename; includes root key when dataset_dir is provided."""
+    if dataset_dir is None:
+        return f"feature_seed_subsets_r{row_count:03d}.csv"
+    return f"feature_seed_subsets_r{row_count:03d}_d{_data_root_key(dataset_dir)}.csv"
+
+
+def _resolve_seed_subsets_csv_candidates(
+    dataset_dir: Path,
+    row_count: int,
+    explicit_path: Path | None,
+    from_shapley: bool,
+) -> list[Path]:
+    """Return candidate seed-subset CSV paths in priority order."""
+    if from_shapley:
+        shapley_dir = dataset_dir / "forecasts" / "Shapley_sweeps"
+        return [
+            shapley_dir / _seed_subsets_filename(row_count, dataset_dir=dataset_dir),
+            shapley_dir / _seed_subsets_filename(row_count, dataset_dir=None),
+        ]
+
+    if explicit_path is None:
+        return []
+
+    if explicit_path.is_dir():
+        return [
+            explicit_path / _seed_subsets_filename(row_count, dataset_dir=dataset_dir),
+            explicit_path / _seed_subsets_filename(row_count, dataset_dir=None),
+        ]
+
+    return [explicit_path]
+
+
 def _resolve_seed_subsets_csv_path(
     dataset_dir: Path,
     row_count: int,
     explicit_path: Path | None,
     from_shapley: bool,
 ) -> Path | None:
-    if from_shapley:
-        return dataset_dir / "forecasts" / "Shapley_sweeps" / f"feature_seed_subsets_r{row_count:03d}.csv"
-    if explicit_path is None:
-        return None
-    if explicit_path.is_dir():
-        return explicit_path / f"feature_seed_subsets_r{row_count:03d}.csv"
-    return explicit_path
+    candidates = _resolve_seed_subsets_csv_candidates(
+        dataset_dir=dataset_dir,
+        row_count=row_count,
+        explicit_path=explicit_path,
+        from_shapley=from_shapley,
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0] if candidates else None
 
 
 def _load_seed_subsets(
@@ -1211,6 +1256,41 @@ def _load_feature_stats_artifacts(
     dataset_dir: Path,
     row_count: int,
 ) -> tuple[dict[str, tuple[float, int]], dict[str, int], dict[str, list[float]]]:
+    feature_sensitivities, feature_improvement_counts, feature_removal_deltas, _ = _load_feature_stats_artifacts_with_source(
+        dataset_dir=dataset_dir,
+        row_count=row_count,
+    )
+    return feature_sensitivities, feature_improvement_counts, feature_removal_deltas
+
+
+def _load_feature_stats_artifacts_with_source(
+    dataset_dir: Path,
+    row_count: int,
+) -> tuple[dict[str, tuple[float, int]], dict[str, int], dict[str, list[float]], str]:
+    """Load feature-importance artifacts and report their provenance.
+
+    Returns source in {"native_removal_delta", "shapley_marginal_samples", "shapley_score_estimate", "missing"}.
+    """
+    native_sens, native_counts, native_deltas = _load_native_feature_stats_artifacts(
+        dataset_dir=dataset_dir,
+        row_count=row_count,
+    )
+    if native_sens:
+        return native_sens, native_counts, native_deltas, "native_removal_delta"
+
+    shapley_sens, shapley_counts, shapley_deltas, shapley_source = _load_shapley_feature_stats_artifacts(
+        dataset_dir=dataset_dir,
+        row_count=row_count,
+    )
+    if shapley_sens:
+        return shapley_sens, shapley_counts, shapley_deltas, shapley_source
+    return {}, {}, {}, "missing"
+
+
+def _load_native_feature_stats_artifacts(
+    dataset_dir: Path,
+    row_count: int,
+) -> tuple[dict[str, tuple[float, int]], dict[str, int], dict[str, list[float]]]:
     out_dir = _forecast_sweeps_dir(dataset_dir)
     stats_csv = out_dir / f"feature_importance_stats_r{row_count:03d}.csv"
     deltas_csv = out_dir / f"feature_removal_deltas_r{row_count:03d}.csv"
@@ -1247,6 +1327,83 @@ def _load_feature_stats_artifacts(
                 feature_improvement_counts[key] = 0
 
     return feature_sensitivities, feature_improvement_counts, feature_removal_deltas
+
+
+def _load_shapley_feature_stats_artifacts(
+    dataset_dir: Path,
+    row_count: int,
+) -> tuple[dict[str, tuple[float, int]], dict[str, int], dict[str, list[float]], str]:
+    """Adapt Shapley outputs to the feature-sensitivity contract used by postprocess plots."""
+    out_dir = _forecast_sweeps_dir(dataset_dir)
+    samples_json = out_dir / f"feature_shapley_samples_r{row_count:03d}.json"
+    shapley_csv = out_dir / f"feature_shapley_scores_r{row_count:03d}.csv"
+
+    feature_sensitivities: dict[str, tuple[float, int]] = {}
+    feature_improvement_counts: dict[str, int] = {}
+    feature_removal_deltas: dict[str, list[float]] = {}
+    source = "missing"
+
+    if samples_json.exists():
+        try:
+            with open(samples_json, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            features_payload = payload.get("features", {}) if isinstance(payload, dict) else {}
+            if isinstance(features_payload, dict):
+                for feature, raw in features_payload.items():
+                    if not str(feature).strip():
+                        continue
+                    values = []
+                    if isinstance(raw, dict):
+                        values = raw.get("values", [])
+                    finite_vals: list[float] = []
+                    for val in list(values) if isinstance(values, list) else []:
+                        num = pd.to_numeric(val, errors="coerce")
+                        if np.isfinite(num):
+                            finite_vals.append(float(num))
+                    if not finite_vals:
+                        continue
+                    avg_delta = float(np.mean(finite_vals))
+                    improvement_count = int(np.sum(np.asarray(finite_vals, dtype=float) > 0.0))
+                    key = str(feature)
+                    feature_sensitivities[key] = (avg_delta, improvement_count)
+                    feature_improvement_counts[key] = improvement_count
+                    feature_removal_deltas[key] = finite_vals
+                if feature_sensitivities:
+                    source = "shapley_marginal_samples"
+        except Exception:
+            # Keep going and try CSV fallback.
+            pass
+
+    if shapley_csv.exists():
+        try:
+            df = pd.read_csv(shapley_csv)
+            for _, row in df.iterrows():
+                feature = str(row.get("feature", "")).strip()
+                if not feature:
+                    continue
+                est = float(pd.to_numeric(row.get("shapley_value_est", np.nan), errors="coerce"))
+                if not np.isfinite(est):
+                    continue
+                n_samples = int(pd.to_numeric(row.get("n_marginal_samples", 0), errors="coerce"))
+                n_samples = max(1, n_samples)
+                if feature not in feature_sensitivities:
+                    synthetic = [float(est)] * n_samples
+                    improvement_count = n_samples if est > 0 else 0
+                    feature_sensitivities[feature] = (float(est), int(improvement_count))
+                    feature_improvement_counts[feature] = int(improvement_count)
+                    feature_removal_deltas[feature] = synthetic
+                elif not feature_removal_deltas.get(feature):
+                    # Backfill sparse cases where JSON exists but this feature has no finite samples.
+                    synthetic = [float(est)] * n_samples
+                    feature_removal_deltas[feature] = synthetic
+                    if feature not in feature_improvement_counts:
+                        feature_improvement_counts[feature] = n_samples if est > 0 else 0
+                if source == "missing":
+                    source = "shapley_score_estimate"
+        except Exception:
+            pass
+
+    return feature_sensitivities, feature_improvement_counts, feature_removal_deltas, source
 
 
 def _available_row_counts_for_postprocess(dataset_dir: Path) -> list[int]:
@@ -1654,6 +1811,8 @@ def _select_surrogate_config(train_configs: list[Path]) -> Path:
 def _compile_multi_target_comparison(
     sweep_results: dict[str, dict],  # target -> {row_count -> feature_sensitivities}
     data_root: Path,
+    importance_label: str = "Removal Sensitivity (avg delta)",
+    summary_axis_label: str = "Total Removal Sensitivity (sum across targets)",
 ) -> Path:
     """Compile and visualize feature importance across multiple targets using removal sensitivity."""
     if not sweep_results:
@@ -1670,8 +1829,13 @@ def _compile_multi_target_comparison(
         # Track per-target feature presence for grouped ordering in summary figures
         target_feature_sets[target] = feature_set
 
-    # Read feature order from Consolidated_sparse.csv
-    csv_path = data_root.parent / "regression" / "Consolidated_sparse.csv"
+    # Read feature order from Consolidated_sparse.csv.
+    # Prefer the selected data root; keep legacy fallback for existing layouts.
+    csv_candidates = [
+        data_root / "Consolidated_sparse.csv",
+        data_root.parent / "regression" / "Consolidated_sparse.csv",
+    ]
+    csv_path = next((p for p in csv_candidates if p.exists()), csv_candidates[0])
     try:
         with open(csv_path, "r", encoding="utf-8") as f:
             header = f.readline().strip().split(",")
@@ -1738,7 +1902,8 @@ def _compile_multi_target_comparison(
                     matrix[i, j] = feature_sensitivities[feat][0]  # removal sensitivity
                     break
 
-    # Group feature order so common features come first, then single-target features.
+    # Group feature order so multi-target features (common + partial) come first,
+    # followed by strictly single-target features.
     feature_to_idx = {feat: idx for idx, feat in enumerate(all_features)}
     summed_sensitivity_raw = matrix.sum(axis=0)
     feature_total_score = {
@@ -1750,61 +1915,144 @@ def _compile_multi_target_comparison(
         for feat in all_features
     }
 
-    common_features = [feat for feat in all_features if presence_count.get(feat, 0) == n_targets]
+    multi_target_features = [feat for feat in all_features if presence_count.get(feat, 0) > 1]
     single_target_features = [feat for feat in all_features if presence_count.get(feat, 0) == 1]
-    partial_features = [
-        feat for feat in all_features
-        if 1 < presence_count.get(feat, 0) < n_targets
-    ]
 
-    common_features.sort(key=lambda feat: feature_total_score.get(feat, float("-inf")), reverse=True)
+    multi_target_features.sort(key=lambda feat: feature_total_score.get(feat, float("-inf")), reverse=True)
     single_target_features.sort(key=lambda feat: feature_total_score.get(feat, float("-inf")), reverse=True)
-    partial_features.sort(key=lambda feat: feature_total_score.get(feat, float("-inf")), reverse=True)
 
-    ordered_features = common_features + single_target_features + partial_features
+    ordered_features = multi_target_features + single_target_features
     if ordered_features:
         ordered_indices = [feature_to_idx[feat] for feat in ordered_features]
         matrix = matrix[:, ordered_indices]
         all_features = ordered_features
-    
-    fig, ax = plt.subplots(figsize=(max(12, len(all_features) * 0.4), max(8, len(targets) * 0.5)), constrained_layout=True)
-    vmin = np.percentile(matrix, 5)
-    vmax = np.percentile(matrix, 95)
-    annot_fmt = ".2e"
+
+    ordered_feature_to_idx = {feat: idx for idx, feat in enumerate(all_features)}
+    multi_target_features = [feat for feat in all_features if presence_count.get(feat, 0) > 1]
+    single_target_features = [feat for feat in all_features if presence_count.get(feat, 0) == 1]
+    multi_idx = [ordered_feature_to_idx[feat] for feat in multi_target_features]
+    single_idx = [ordered_feature_to_idx[feat] for feat in single_target_features]
+
+    if matrix.size:
+        vmin = float(np.percentile(matrix, 5))
+        vmax = float(np.percentile(matrix, 95))
+    else:
+        vmin, vmax = 0.0, 1.0
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        finite_vals = matrix[np.isfinite(matrix)] if matrix.size else np.array([], dtype=float)
+        if finite_vals.size:
+            vmin = float(np.min(finite_vals))
+            vmax = float(np.max(finite_vals))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+            vmax = float(vmin + 1.0)
+
     # Dynamically set font size based on grid size
-    min_dim = min(len(all_features), len(targets))
     annot_fontsize = max(5, min(8, int(120 / max(len(all_features), len(targets), 1))))
-    # Draw heatmap without annotation first
-    sns.heatmap(
-        matrix,
-        ax=ax,
-        cmap="RdYlGn",
-        vmin=vmin,
-        vmax=vmax,
-        annot=False,
-        cbar_kws={"label": "Removal Sensitivity (avg delta)"},
-        xticklabels=all_features,
-        yticklabels=yticklabels,
-        linewidths=0.5,
-        linecolor="#eeeeee",
-        square=False,
-    )
-    # Add rotated annotation labels manually, ensuring they fit in the cell
-    for i in range(matrix.shape[0]):
-        for j in range(matrix.shape[1]):
-            value = matrix[i, j]
-            ax.text(
-                j + 0.5, i + 0.5, f"{value:.2e}",
-                ha="center", va="center", color="black",
-                fontsize=annot_fontsize, rotation=90, clip_on=True
-            )
-    ax.set_xticklabels(all_features, rotation=45, ha='right', fontsize=8)
-    ax.set_yticklabels(targets, fontsize=9)
-    ax.set_xlabel("Feature")
-    ax.set_ylabel("Target")
+
+    def _annotate_heat_cells(ax_obj, values: np.ndarray, fontsize: int) -> None:
+        for row_i in range(values.shape[0]):
+            for col_j in range(values.shape[1]):
+                value = values[row_i, col_j]
+                ax_obj.text(
+                    col_j + 0.5,
+                    row_i + 0.5,
+                    f"{value:.2e}",
+                    ha="center",
+                    va="center",
+                    color="black",
+                    fontsize=fontsize,
+                    rotation=90,
+                    clip_on=True,
+                )
+
+    if multi_idx and single_idx:
+        heat_w = max(12, len(all_features) * 0.45)
+        heat_h = max(8, len(targets) * 0.5)
+        fig, (ax_left, ax_right) = plt.subplots(
+            1,
+            2,
+            figsize=(heat_w, heat_h),
+            gridspec_kw={
+                "width_ratios": [max(1, len(multi_target_features)), max(1, len(single_target_features))],
+                "wspace": 0.04,
+            },
+            constrained_layout=True,
+        )
+
+        left_matrix = matrix[:, multi_idx]
+        right_matrix = matrix[:, single_idx]
+
+        sns.heatmap(
+            left_matrix,
+            ax=ax_left,
+            cmap="RdYlGn",
+            vmin=vmin,
+            vmax=vmax,
+            annot=False,
+            cbar=False,
+            xticklabels=multi_target_features,
+            yticklabels=yticklabels,
+            linewidths=0.5,
+            linecolor="#eeeeee",
+            square=False,
+        )
+        sns.heatmap(
+            right_matrix,
+            ax=ax_right,
+            cmap="RdYlGn",
+            vmin=vmin,
+            vmax=vmax,
+            annot=False,
+            cbar=False,
+            xticklabels=single_target_features,
+            yticklabels=False,
+            linewidths=0.5,
+            linecolor="#eeeeee",
+            square=False,
+        )
+
+        _annotate_heat_cells(ax_left, left_matrix, annot_fontsize)
+        _annotate_heat_cells(ax_right, right_matrix, annot_fontsize)
+
+        ax_left.set_xticklabels(multi_target_features, rotation=45, ha='right', fontsize=8)
+        ax_right.set_xticklabels(single_target_features, rotation=45, ha='right', fontsize=8)
+        ax_left.set_yticklabels(yticklabels, fontsize=9)
+        ax_left.set_xlabel(f"Multi-target Features (n={len(multi_target_features)})")
+        ax_right.set_xlabel(f"Single-target Features (n={len(single_target_features)})")
+        ax_left.set_ylabel("Target")
+        ax_right.set_ylabel("")
+
+        sm = matplotlib.cm.ScalarMappable(norm=matplotlib.colors.Normalize(vmin=vmin, vmax=vmax), cmap="RdYlGn")
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=[ax_left, ax_right], fraction=0.025, pad=0.02)
+        cbar.set_label(str(importance_label))
+    else:
+        fig, ax = plt.subplots(
+            figsize=(max(12, len(all_features) * 0.4), max(8, len(targets) * 0.5)),
+            constrained_layout=True,
+        )
+        sns.heatmap(
+            matrix,
+            ax=ax,
+            cmap="RdYlGn",
+            vmin=vmin,
+            vmax=vmax,
+            annot=False,
+            cbar_kws={"label": str(importance_label)},
+            xticklabels=all_features,
+            yticklabels=yticklabels,
+            linewidths=0.5,
+            linecolor="#eeeeee",
+            square=False,
+        )
+        _annotate_heat_cells(ax, matrix, annot_fontsize)
+        ax.set_xticklabels(all_features, rotation=45, ha='right', fontsize=8)
+        ax.set_yticklabels(yticklabels, fontsize=9)
+        ax.set_xlabel("Feature")
+        ax.set_ylabel("Target")
 
     # Save to root output directory (namespace-specific for non-default sweeps)
-    summaries_dir = (data_root.parent / "regression" / "summaries").resolve()
+    summaries_dir = (data_root / "summaries").resolve()
     namespace = _sweep_namespace()
     if namespace != "feature_sweeps":
         summaries_dir = (summaries_dir / namespace).resolve()
@@ -1813,24 +2061,81 @@ def _compile_multi_target_comparison(
     fig.savefig(plot_path, dpi=180, bbox_inches='tight')
     plt.close(fig)
     
-    # Create a single bar chart: sum removal sensitivities for each predictor over all targets.
-    # Keep the same grouped order used by the heatmap (common first, then single-target).
+    # Create grouped bar charts: multi-target features and single-target features.
     summed_sensitivity = matrix.sum(axis=0)
     top_features = list(all_features)
     summed_scores = [float(v) for v in summed_sensitivity]
 
-    fig, ax = plt.subplots(figsize=(max(14, len(top_features) * 0.5), 6), constrained_layout=True)
-    x = np.arange(len(top_features))
-    bars = ax.bar(x, summed_scores, color=plt.cm.RdYlGn((np.array(summed_scores) - np.min(summed_scores)) / (np.ptp(summed_scores) if np.ptp(summed_scores) > 0 else 1)))
-    ax.set_xlabel("Feature (grouped: common across targets first, then single-target)")
-    ax.set_ylabel("Total Removal Sensitivity (sum across targets)")
-    ax.set_xticks(x)
-    ax.set_xticklabels(top_features, rotation=45, ha='right')
-    ax.grid(axis='y', alpha=0.3)
+    score_map = {feat: float(score) for feat, score in zip(top_features, summed_scores)}
+    multi_scores = [score_map[feat] for feat in multi_target_features if feat in score_map]
+    single_scores = [score_map[feat] for feat in single_target_features if feat in score_map]
+    all_scores = multi_scores + single_scores
 
-    # Add value labels (smaller font)
-    for bar, score in zip(bars, summed_scores):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{score:.2e}', ha='center', va='bottom', fontsize=7, rotation=90)
+    score_min = float(np.min(all_scores)) if all_scores else 0.0
+    score_max = float(np.max(all_scores)) if all_scores else 1.0
+    span = max(score_max - score_min, 1e-12)
+    pad = 0.08 * span
+    y_lower = min(score_min, 0.0) - pad
+    y_upper = max(score_max, 0.0) + pad
+    color_norm = matplotlib.colors.Normalize(vmin=score_min, vmax=score_max) if score_max > score_min else None
+
+    def _bar_colors(vals: list[float]) -> list:
+        if color_norm is None:
+            return [plt.cm.RdYlGn(0.5) for _ in vals]
+        return [plt.cm.RdYlGn(float(color_norm(v))) for v in vals]
+
+    def _draw_group_bars(ax_obj, features: list[str], values: list[float], title: str) -> None:
+        x_vals = np.arange(len(features), dtype=float)
+        bars = ax_obj.bar(x_vals, values, color=_bar_colors(values))
+        ax_obj.set_title(title, fontsize=10)
+        ax_obj.set_xticks(x_vals)
+        ax_obj.set_xticklabels(features, rotation=45, ha='right', fontsize=8)
+        ax_obj.grid(axis='y', alpha=0.3)
+        ax_obj.axhline(0.0, color='black', linewidth=0.8, linestyle='--', alpha=0.6)
+        for bar, val in zip(bars, values):
+            y = bar.get_height()
+            va = 'bottom' if y >= 0 else 'top'
+            offset = 0.01 * max(abs(y_upper - y_lower), 1.0)
+            y_text = y + offset if y >= 0 else y - offset
+            ax_obj.text(
+                bar.get_x() + bar.get_width() / 2,
+                y_text,
+                f"{val:.2e}",
+                ha='center',
+                va=va,
+                fontsize=7,
+                rotation=90,
+            )
+        ax_obj.set_ylim(y_lower, y_upper)
+
+    if multi_target_features and single_target_features:
+        fig, (ax_top, ax_bottom) = plt.subplots(
+            2,
+            1,
+            figsize=(max(14, len(top_features) * 0.5), 10),
+            sharey=True,
+            constrained_layout=True,
+        )
+        _draw_group_bars(
+            ax_top,
+            multi_target_features,
+            multi_scores,
+            f"Multi-target Features (n={len(multi_target_features)})",
+        )
+        _draw_group_bars(
+            ax_bottom,
+            single_target_features,
+            single_scores,
+            f"Single-target Features (n={len(single_target_features)})",
+        )
+        ax_top.set_ylabel(str(summary_axis_label))
+        ax_bottom.set_ylabel(str(summary_axis_label))
+        ax_bottom.set_xlabel("Feature")
+    else:
+        fig, ax = plt.subplots(figsize=(max(14, len(top_features) * 0.5), 6), constrained_layout=True)
+        _draw_group_bars(ax, top_features, summed_scores, "Feature Importance")
+        ax.set_ylabel(str(summary_axis_label))
+        ax.set_xlabel("Feature")
 
     bar_path = summaries_dir / "multi_target_importance_bars.png"
     fig.savefig(bar_path, dpi=180, bbox_inches='tight')
@@ -2851,12 +3156,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--seed-subsets-csv",
         type=str,
         default=None,
-        help="Path to seed subset CSV (or directory containing feature_seed_subsets_r###.csv).",
+        help=(
+            "Path to seed subset CSV (or directory containing "
+            "feature_seed_subsets_r###_d########.csv with legacy fallback to "
+            "feature_seed_subsets_r###.csv)."
+        ),
     )
     parser.add_argument(
         "--seed-subsets-from-shapley",
         action="store_true",
-        help="Load seed subsets from forecasts/Shapley_sweeps/feature_seed_subsets_r###.csv per dataset/row_count.",
+        help=(
+            "Load seed subsets from forecasts/Shapley_sweeps using root-isolated "
+            "feature_seed_subsets_r###_d########.csv (legacy fallback supported)."
+        ),
     )
     parser.add_argument(
         "--max-seed-subsets",

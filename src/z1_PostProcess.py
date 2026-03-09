@@ -22,6 +22,10 @@ Postprocess behavior highlights:
 - Regenerates `feature_sweep_final_metrics_summary.png` from
   `feature_sweep_final_metrics.csv` so full sweep re-run is not required.
 - Does not retroactively rewrite historical split files.
+- By default, scans all datasets matching `--dataset-prefix` under the selected
+    data root (`--limit-datasets 0` behavior in this script).
+- Use `--limit-datasets N` to cap discovery, or `--all-datasets` to clear
+    prefix filtering and process every dataset folder.
 
 Examples:
 python src/z1_PostProcess.py --keep-search-plots
@@ -30,6 +34,8 @@ python src/z1_PostProcess.py --sweep-namespace Shapley_sweeps
 python src/z1_PostProcess.py --path data/output/regression_alt --sweep-namespace Shapley_sweeps
 python src/z1_PostProcess.py --sweep-namespace feature_sweeps --run-rolling-cv
 python src/z1_PostProcess.py --path data/output/regression --sweep-namespace feature_sweeps --bootstrap-mode moving_block --bootstrap-block-len 5
+python src/z1_PostProcess.py --all-datasets
+python src/z1_PostProcess.py --limit-datasets 1
 """
 from __future__ import annotations
 import contextlib
@@ -58,7 +64,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from utils.training import load_samples, group_samples_by_segment
-from h_RunMCFeatureSelectionSweep import build_parser, discover_mc_dataset_plans, _derive_target_name, _select_surrogate_config, _parse_row_counts, _available_row_counts_for_postprocess, _regenerate_saved_outputs_for_row, _load_feature_stats_artifacts, _compile_multi_target_comparison, _resolve_dataset_inclusion, _run_rolling_origin_cv, _ensure_k01_baselines, _write_dataset_evaluation_summary, _forecast_sweeps_dir, _plot_final_metrics_comparison
+from h_RunMCFeatureSelectionSweep import build_parser, discover_mc_dataset_plans, _derive_target_name, _select_surrogate_config, _parse_row_counts, _available_row_counts_for_postprocess, _regenerate_saved_outputs_for_row, _load_feature_stats_artifacts_with_source, _compile_multi_target_comparison, _resolve_dataset_inclusion, _run_rolling_origin_cv, _ensure_k01_baselines, _write_dataset_evaluation_summary, _forecast_sweeps_dir, _plot_final_metrics_comparison
 
 try:
     from scipy import stats as scipy_stats
@@ -82,7 +88,8 @@ BASELINE_MODEL_IDS = {"naive", "seasonal", "linear"}
 
 
 def _resolve_summaries_dir(data_root: Path, sweep_namespace: str) -> Path:
-    base_dir = (data_root.parent / "regression" / "summaries").resolve()
+    # Keep summary outputs anchored to the selected data root.
+    base_dir = (data_root / "summaries").resolve()
     namespace = str(sweep_namespace).strip() or "feature_sweeps"
     if namespace == "feature_sweeps":
         return base_dir
@@ -1278,6 +1285,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
     )
 
     sweep_results: dict[str, dict[int, dict[str, tuple[float, int]]]] = {}
+    importance_sources_used: set[str] = set()
     datasets_with_outputs = 0
     best_model_performance = []
 
@@ -1360,7 +1368,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 include_row_count_in_plot_names=include_row_count_in_plot_names,
             )
 
-            feature_sensitivities, _, _ = _load_feature_stats_artifacts(
+            feature_sensitivities, _, _, importance_source = _load_feature_stats_artifacts_with_source(
                 dataset_dir=plan.dataset_dir,
                 row_count=row_count,
             )
@@ -1368,6 +1376,11 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 if target_name not in sweep_results:
                     sweep_results[target_name] = {}
                 sweep_results[target_name][row_count] = feature_sensitivities
+                importance_sources_used.add(str(importance_source))
+                print(
+                    f"[INFO] Loaded feature importance source for {plan.dataset_dir.name} "
+                    f"r{int(row_count):03d}: {importance_source}"
+                )
 
             if written:
                 wrote_any = True
@@ -1376,7 +1389,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             else:
                 print(
                     f"[WARN] Could not rebuild plots for {plan.dataset_dir.name} rows={row_count}; "
-                    "missing feature stats/delta artifacts."
+                    "missing native feature stats and Shapley fallback artifacts."
                 )
 
         # Run rolling origin CV and collect best model performance for summary plot
@@ -2497,7 +2510,22 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
         print("MULTI-TARGET FEATURE IMPORTANCE COMPARISON (POSTPROCESS)")
         print("=" * 100)
         try:
-            comparison_plot = _compile_multi_target_comparison(sweep_results, data_root)
+            if importance_sources_used and all(src.startswith("shapley_") for src in importance_sources_used):
+                comparison_plot = _compile_multi_target_comparison(
+                    sweep_results,
+                    data_root,
+                    importance_label="Shapley Expected Contribution (mean marginal objective delta)",
+                    summary_axis_label="Total Shapley Contribution (sum across targets)",
+                )
+            elif importance_sources_used and any(src.startswith("shapley_") for src in importance_sources_used):
+                comparison_plot = _compile_multi_target_comparison(
+                    sweep_results,
+                    data_root,
+                    importance_label="Feature Importance (mixed: removal delta + Shapley contribution)",
+                    summary_axis_label="Total Feature Importance (sum across targets)",
+                )
+            else:
+                comparison_plot = _compile_multi_target_comparison(sweep_results, data_root)
             if comparison_plot.exists():
                 print(f"[INFO] Wrote multi-target comparison plots to {comparison_plot.parent}")
         except Exception as e:
@@ -2513,6 +2541,8 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = build_parser()
+    # Override inherited sweep default so z1 processes all matching datasets unless capped.
+    parser.set_defaults(limit_datasets=0)
     parser.add_argument(
         "--path",
         type=str,
@@ -2550,6 +2580,14 @@ def main() -> int:
             "(e.g., 'feature_sweeps' or 'Shapley_sweeps')."
         ),
     )
+    parser.add_argument(
+        "--all-datasets",
+        action="store_true",
+        help=(
+            "Process all dataset folders in --data-root; clears dataset-prefix "
+            "filtering and disables dataset-count capping."
+        ),
+    )
     args = parser.parse_args()
     os.environ["WQ_FEATURE_SWEEP_NAMESPACE"] = str(args.sweep_namespace).strip() or "feature_sweeps"
     workspace_root = Path(__file__).resolve().parent.parent
@@ -2558,11 +2596,13 @@ def main() -> int:
     if not data_root.is_absolute():
         data_root = (workspace_root / data_root).resolve()
     include_regular, include_res = _resolve_dataset_inclusion(args)
+    dataset_prefix = "" if args.all_datasets else str(args.dataset_prefix)
+    limit_datasets = 0 if args.all_datasets else int(args.limit_datasets)
     plans = discover_mc_dataset_plans(
             data_root=data_root,
-            dataset_prefix="",  # match all
+            dataset_prefix=dataset_prefix,
             config_pattern=args.config_pattern,
-            limit_datasets=0,   # no limit
+            limit_datasets=limit_datasets,
             include_regular=include_regular,
             include_res=include_res,
         )

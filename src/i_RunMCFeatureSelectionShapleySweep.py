@@ -11,7 +11,8 @@ Overview:
 Outputs:
 - `feature_shapley_scores_r###.csv` (Shapley estimates + CI diagnostics).
 - `feature_shapley_rankings_r###.json` (ranked feature payload).
-- `feature_seed_subsets_r###.csv` (optimizer seed subsets from ranked prefixes).
+- `feature_seed_subsets_r###_d########.csv` (optimizer seed subsets from ranked prefixes;
+    legacy readers may still load `feature_seed_subsets_r###.csv`).
 - `feature_shapley_samples_r###.json` (full marginal sample lists for re-visualization).
 - Plot outputs (when --keep-shapley-plots enabled):
     - `feature_shapley_ranking_bar_r###.png` (ranked Shapley values with 95% CI error bars).
@@ -165,7 +166,7 @@ def _write_shapley_seed_artifacts(
             }
         )
 
-    seed_csv = out_dir / f"feature_seed_subsets_r{row_count:03d}.csv"
+    seed_csv = out_dir / base._seed_subsets_filename(row_count=row_count, dataset_dir=dataset_dir)
     pd.DataFrame(seed_rows).to_csv(seed_csv, index=False)
 
     rankings_json = out_dir / f"feature_shapley_rankings_r{row_count:03d}.json"

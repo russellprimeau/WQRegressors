@@ -224,6 +224,32 @@ def _resolve_eval_path_for_write(path_value, config_dir):
 
     return config_based
 
+
+def _preferred_eval_path_for_key(key: str, data_root: Path) -> Path | None:
+    """Return a preferred absolute path for eval defaults under the active data root."""
+    root = Path(data_root).resolve()
+    if key == "historic_path":
+        candidates = [
+            root / "Consolidated_sparse.csv",
+            root.parent / "regression" / "Consolidated_sparse.csv",
+        ]
+    elif key == "normalization_path":
+        candidates = [
+            root.parent / "sensors" / "normalization.json",
+            Path(NORMALIZATION_OUTPUT_PATH),
+        ]
+    elif key == "thresholds_path":
+        candidates = [
+            root.parent.parent / "input" / "Limits.csv",
+        ]
+    else:
+        return None
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
 def load_and_split_data(config):
     """Load and split data according to configuration."""
     data_cfg = config["data"]
@@ -281,7 +307,11 @@ def write_evaluation_config(config):
         evaluation_cfg["run_regression"] = False
         evaluation_cfg["run_pure_classification"] = True
 
-    evaluation_cfg["normalization_path"] = str(NORMALIZATION_OUTPUT_PATH)
+    data_root = Path(data_cfg["data_dir"]).resolve().parent
+    # Preserve explicit normalization path from user config; otherwise prefer active data root.
+    if "normalization_path" not in config.get("evaluation", {}):
+        preferred_norm = _preferred_eval_path_for_key("normalization_path", data_root)
+        evaluation_cfg["normalization_path"] = str(preferred_norm or NORMALIZATION_OUTPUT_PATH)
 
     save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
     os.makedirs(save_path, exist_ok=True)
@@ -290,7 +320,11 @@ def write_evaluation_config(config):
     relative_data_dir = os.path.relpath(data_cfg["data_dir"], start=save_path)
     for key in ["historic_path", "thresholds_path", "normalization_path"]:
         if evaluation_cfg.get(key):
-            abs_path = _resolve_eval_path_for_write(evaluation_cfg[key], config_dir)
+            preferred = _preferred_eval_path_for_key(key, data_root)
+            if preferred is not None and not Path(str(evaluation_cfg[key])).is_absolute():
+                abs_path = preferred
+            else:
+                abs_path = _resolve_eval_path_for_write(evaluation_cfg[key], config_dir)
             evaluation_cfg[key] = os.path.relpath(abs_path, start=save_path)
 
     eval_config = {

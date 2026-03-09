@@ -983,11 +983,14 @@ if __name__ == '__main__':
                         "Atmospheric pressure (mBar)", 'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
                         '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
         'SCADA - pH', 'SCADA - Temperature (°C)']
-    target_columns = ['Color_res',
-        'Turbidity (FNU)_res', 'pH', 'E.coli (CFU/100mL)_res', 'Intestinal enterococci (CFU/100mL)_res', 
-        'Colony Count 22°C (CFU/mL)_res', 'Total coliforms 37°C (CFU/100mL)_res', 'Arsenic (µg/L)_res',
-        'Lead (µg/L)_res', 'Cadmium (µg/L)_res', 'Copper filtered (mg/L)_res', 'Chromium (µg/L)_res', 'Nickel (µg/L)_res', 
-        'Zinc (µg/L)_res']  # alternative 1: name-based selection
+    
+    target_columns = ['pH_res']
+
+    # target_columns = ['Color_res',
+    #     'Turbidity (FNU)_res', 'pH_res', 'E.coli (CFU/100mL)_res', 'Intestinal enterococci (CFU/100mL)_res', 
+    #     'Colony Count 22°C (CFU/mL)_res', 'Total coliforms 37°C (CFU/100mL)_res', 'Arsenic (µg/L)_res',
+    #     'Lead (µg/L)_res', 'Cadmium (µg/L)_res', 'Copper filtered (mg/L)_res', 'Chromium (µg/L)_res', 'Nickel (µg/L)_res', 
+    #     'Zinc (µg/L)_res']  # alternative 1: name-based selection
     # target_columns = df.columns[-9:]  # alternative: index-based selection
 
     ## Alternative with better coverage
@@ -1063,7 +1066,7 @@ if __name__ == '__main__':
     # Normalize once and reuse across all per-target dataset writes.
     df_norm, normalization_params = _normalize_once(df, to_normalize, min_val=0, max_val=1)
     shared_sensor_uncertainties = _load_and_prepare_sensor_uncertainties(
-        output_dir="../data/output/regression",
+        output_dir="../data/output/missing",
         normalization_params=normalization_params,
         verbose=False,
     )
@@ -1078,7 +1081,7 @@ if __name__ == '__main__':
 
     for target in target_columns:
         target_slug = target.replace(" ", "_").replace("/", "_")
-        output_dir = os.path.join("../data/output/regression", f"MC_ex{target_slug}")
+        output_dir = os.path.join("../data/output/missing", f"MC_ex{target_slug}")
         if eurofins_summary_df is None:
             target_length = fallback_length
         else:
