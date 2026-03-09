@@ -3,7 +3,7 @@ Beam+swap feature-selection sweeper for MC datasets.
 
 Search strategy:
 - Surrogate-guided beam backward elimination with swap refinement.
-- Objective: `objective = rmse + lambda_drop * drop_rate`.
+- Objective: `objective = (1 - r2) + lambda_drop * drop_rate`.
 - `drop_rate` is computed from raw sample coverage after MC replicate collapse.
 - Search split behavior remains temporal-by-coverage (target 70/30 by default).
 
@@ -716,12 +716,19 @@ def _count_valid_samples_raw(
     return int(valid_raw), int(all_total_raw), int(loaded_count)
 
 
-def _objective_from_metrics(rmse: float, drop_rate: float, lambda_drop: float) -> float:
-    if not np.isfinite(rmse):
+def _objective_from_metrics(r2: float, drop_rate: float, lambda_drop: float) -> float:
+    """Convert maximize-R2 search intent into a minimized scalar objective."""
+    if not np.isfinite(r2):
         return float("inf")
     if not np.isfinite(drop_rate):
         drop_rate = 1.0
-    return float(rmse + lambda_drop * drop_rate)
+    return float((1.0 - r2) + lambda_drop * drop_rate)
+
+
+def _candidate_rank_key(item: CandidateResult) -> tuple[float, float, float, str]:
+    """Deterministic subset ranking key for objective minimization and R2 tie-breaks."""
+    r2_tie = -float(item.r2) if np.isfinite(item.r2) else float("inf")
+    return (float(item.objective), r2_tie, -float(item.n_features), str(item.feature_tag))
 
 
 def _evaluate_candidate(
@@ -802,7 +809,7 @@ def _evaluate_candidate(
         r2 = float(pd.to_numeric(model_row.get("r2", np.nan), errors="coerce"))
         input_dim = float(model_row.get("input_dim", np.nan))
         target_dim = float(model_row.get("target_dim", np.nan))
-        objective = _objective_from_metrics(rmse=rmse, drop_rate=drop_rate, lambda_drop=lambda_drop)
+        objective = _objective_from_metrics(r2=r2, drop_rate=drop_rate, lambda_drop=lambda_drop)
 
         return CandidateResult(
             dataset=dataset_dir.name,
@@ -841,7 +848,7 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     """Write a 4-panel clustered-bar comparison figure from final metrics rows.
 
     Panels: MAE, RMSE, Pearson's r, and R^2. Clusters are candidate subsets
-    ordered by ascending RMSE for the model type with the best (lowest) subset RMSE.
+    ordered by descending R^2 for the model type with the best (highest) subset R^2.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_path = output_dir / "feature_sweep_final_metrics_summary.png"
@@ -909,26 +916,26 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         for rank in sorted(grouped["subset_rank"].dropna().unique().tolist())
     }
 
-    rmse_pivot = grouped.pivot(index="subset_rank", columns="model_norm", values="rmse")
-    finite_min_rmse = {}
+    r2_pivot = grouped.pivot(index="subset_rank", columns="model_norm", values="r2")
+    finite_max_r2 = {}
     for model in FINAL_METRICS_MODEL_ORDER:
-        if model not in rmse_pivot.columns:
+        if model not in r2_pivot.columns:
             continue
-        vals = pd.to_numeric(rmse_pivot[model], errors="coerce").to_numpy(dtype=float)
+        vals = pd.to_numeric(r2_pivot[model], errors="coerce").to_numpy(dtype=float)
         vals = vals[np.isfinite(vals)]
         if vals.size > 0:
-            finite_min_rmse[model] = float(np.min(vals))
+            finite_max_r2[model] = float(np.max(vals))
 
-    if not finite_min_rmse:
-        raise ValueError("Cannot plot final metrics summary: RMSE values are all non-finite.")
+    if not finite_max_r2:
+        raise ValueError("Cannot plot final metrics summary: R2 values are all non-finite.")
 
-    best_model = min(finite_min_rmse.items(), key=lambda item: item[1])[0]
+    best_model = max(finite_max_r2.items(), key=lambda item: item[1])[0]
 
     subset_order = sorted(
         rank_to_label.keys(),
         key=lambda rank: (
-            float(rmse_pivot.loc[rank, best_model])
-            if (rank in rmse_pivot.index and best_model in rmse_pivot.columns and np.isfinite(rmse_pivot.loc[rank, best_model]))
+            -float(r2_pivot.loc[rank, best_model])
+            if (rank in r2_pivot.index and best_model in r2_pivot.columns and np.isfinite(r2_pivot.loc[rank, best_model]))
             else float("inf"),
             int(rank),
         ),
@@ -1613,13 +1620,13 @@ def _beam_search_subsets(
             if out is not None:
                 seeded_scored.append(out)
         if seeded_scored:
-            seeded_scored.sort(key=lambda x: (x.objective, x.rmse, -x.n_features))
-            beam = sorted([first] + seeded_scored, key=lambda x: (x.objective, x.rmse, -x.n_features))[:beam_width]
+            seeded_scored.sort(key=_candidate_rank_key)
+            beam = sorted([first] + seeded_scored, key=_candidate_rank_key)[:beam_width]
             best = beam[0]
-            print(f"[SEARCH] Seeded initialization: {len(seeded_scored)} subset(s) evaluated; best objective={best.objective:.4f} rmse={best.rmse:.6f} n_features={best.n_features}")
+            print(f"[SEARCH] Seeded initialization: {len(seeded_scored)} subset(s) evaluated; best objective={best.objective:.4f} r2={best.r2:.6f} n_features={best.n_features}")
 
     no_improve = 0
-    print(f"[SEARCH] Initial (all {len(full_features)} features): objective={best.objective:.4f} rmse={best.rmse:.6f} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
+    print(f"[SEARCH] Initial (all {len(full_features)} features): objective={best.objective:.4f} r2={best.r2:.6f} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
 
     for _round in range(max_rounds):
         candidates: list[tuple[str, ...]] = []
@@ -1669,19 +1676,18 @@ def _beam_search_subsets(
             print(f"[SEARCH] Round {_round + 1}: no scored candidates, stopping.")
             break
 
-        scored.sort(key=lambda x: (x.objective, x.rmse, -x.n_features))
+        scored.sort(key=_candidate_rank_key)
         beam = scored[:beam_width]
-        prev_best = best.objective
-        if beam and beam[0].objective + 1e-12 < best.objective:
+        if beam and _candidate_rank_key(beam[0]) < _candidate_rank_key(best):
             best = beam[0]
             no_improve = 0
             # Track features in improving solution (Option A)
             for feat in best.features:
                 feature_improvement_counts[feat] += 1
-            print(f"[SEARCH] Round {_round + 1}: improved! objective={best.objective:.4f} rmse={best.rmse:.6f} n_features={best.n_features} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
+            print(f"[SEARCH] Round {_round + 1}: improved! objective={best.objective:.4f} r2={best.r2:.6f} n_features={best.n_features} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
         else:
             no_improve += 1
-            print(f"[SEARCH] Round {_round + 1}: no improvement ({no_improve}/{no_improve_patience}). Best: objective={best.objective:.4f} rmse={best.rmse:.6f} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
+            print(f"[SEARCH] Round {_round + 1}: no improvement ({no_improve}/{no_improve_patience}). Best: objective={best.objective:.4f} r2={best.r2:.6f} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
             if no_improve >= no_improve_patience:
                 print(f"[SEARCH] Patience exhausted, stopping.")
 
@@ -1690,7 +1696,7 @@ def _beam_search_subsets(
     attempts = 0
     improved = True
     swap_iter = 0
-    print(f"[SEARCH] Starting swap refinement from: objective={current.objective:.4f} rmse={current.rmse:.6f} n_features={current.n_features} (ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
+    print(f"[SEARCH] Starting swap refinement from: objective={current.objective:.4f} r2={current.r2:.6f} n_features={current.n_features} (ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
     
     while improved and attempts < max_swap_attempts and eval_count < eval_budget:
         improved = False
@@ -1713,18 +1719,18 @@ def _beam_search_subsets(
             if out is None:
                 print(f"[SEARCH] Swap refinement: eval budget exhausted after {eval_count} evals.")
                 break
-            if out.objective + 1e-12 < current.objective:
+            if _candidate_rank_key(out) < _candidate_rank_key(current):
                 swap_iter += 1
                 current = out
                 best = out
                 improved = True
-                print(f"[SEARCH] Swap refinement #{swap_iter}: improved! objective={best.objective:.4f} rmse={best.rmse:.6f} n_features={best.n_features} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
+                print(f"[SEARCH] Swap refinement #{swap_iter}: improved! objective={best.objective:.4f} r2={best.r2:.6f} n_features={best.n_features} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
                 break
     
     if not improved and eval_count < eval_budget:
         print(f"[SEARCH] Swap refinement: no improvements found (attempts: {attempts}/{max_swap_attempts}, evals: {eval_count}/{eval_budget})")
 
-    top_sorted = sorted(trace, key=lambda x: (x.objective, x.rmse, -x.n_features))
+    top_sorted = sorted(trace, key=_candidate_rank_key)
     total_elapsed = time.time() - search_start_time
     elapsed_min = int(total_elapsed // 60)
     elapsed_sec = int(total_elapsed % 60)
@@ -1812,7 +1818,7 @@ def _compile_multi_target_comparison(
     sweep_results: dict[str, dict],  # target -> {row_count -> feature_sensitivities}
     data_root: Path,
     importance_label: str = "Removal Sensitivity (avg delta)",
-    summary_axis_label: str = "Total Removal Sensitivity (sum across targets)",
+    summary_axis_label: str = "Total Removal Sensitivity",
 ) -> Path:
     """Compile and visualize feature importance across multiple targets using removal sensitivity."""
     if not sweep_results:
@@ -2055,18 +2061,6 @@ def _compile_multi_target_comparison(
             fontsize=heat_axis_label_font,
         )
         ax_left.set_ylabel("Target", fontsize=heat_axis_label_font)
-        ax_left.set_xticklabels(multi_target_features, rotation=45, ha='right', fontsize=heat_xtick_font)
-        ax_right.set_xticklabels(single_target_features, rotation=45, ha='right', fontsize=heat_xtick_font)
-        ax_left.set_yticklabels(yticklabels, fontsize=heat_ytick_font)
-        ax_left.set_xlabel(
-            f"Multi-target Features (n={len(multi_target_features)})",
-            fontsize=heat_axis_label_font,
-        )
-        ax_right.set_xlabel(
-            f"Single-target Features (n={len(single_target_features)})",
-            fontsize=heat_axis_label_font,
-        )
-        ax_left.set_ylabel("Target", fontsize=heat_axis_label_font)
         ax_right.set_ylabel("")
 
         sm = matplotlib.cm.ScalarMappable(norm=matplotlib.colors.Normalize(vmin=vmin, vmax=vmax), cmap="RdYlGn")
@@ -2074,11 +2068,8 @@ def _compile_multi_target_comparison(
         cbar = fig.colorbar(sm, ax=[ax_left, ax_right], fraction=0.025, pad=0.02)
         cbar.set_label(str(importance_label), fontsize=heat_axis_label_font)
         cbar.ax.tick_params(labelsize=max(6, heat_xtick_font))
-        cbar.set_label(str(importance_label), fontsize=heat_axis_label_font)
-        cbar.ax.tick_params(labelsize=max(6, heat_xtick_font))
     else:
         fig, ax = plt.subplots(
-            figsize=(max(13, n_total_features * 0.5), max(8, len(targets) * 0.58)),
             figsize=(max(13, n_total_features * 0.5), max(8, len(targets) * 0.58)),
             constrained_layout=True,
         )
@@ -2097,10 +2088,6 @@ def _compile_multi_target_comparison(
             square=False,
         )
         _annotate_heat_cells(ax, matrix, annot_fontsize)
-        ax.set_xticklabels(all_features, rotation=45, ha='right', fontsize=heat_xtick_font)
-        ax.set_yticklabels(yticklabels, fontsize=heat_ytick_font)
-        ax.set_xlabel("Feature", fontsize=heat_axis_label_font)
-        ax.set_ylabel("Target", fontsize=heat_axis_label_font)
         ax.set_xticklabels(all_features, rotation=45, ha='right', fontsize=heat_xtick_font)
         ax.set_yticklabels(yticklabels, fontsize=heat_ytick_font)
         ax.set_xlabel("Feature", fontsize=heat_axis_label_font)
@@ -2144,9 +2131,7 @@ def _compile_multi_target_comparison(
         x_vals = np.arange(len(features), dtype=float)
         bars = ax_obj.bar(x_vals, values, color=_bar_colors(values))
         ax_obj.set_title(title, fontsize=bar_title_font)
-        ax_obj.set_title(title, fontsize=bar_title_font)
         ax_obj.set_xticks(x_vals)
-        ax_obj.set_xticklabels(features, rotation=45, ha='right', fontsize=bar_tick_font)
         ax_obj.set_xticklabels(features, rotation=45, ha='right', fontsize=bar_tick_font)
         ax_obj.grid(axis='y', alpha=0.3)
         ax_obj.axhline(0.0, color='black', linewidth=0.8, linestyle='--', alpha=0.6)
@@ -2159,7 +2144,6 @@ def _compile_multi_target_comparison(
             offset = 0.012 * y_span
             y_text = y + offset if y >= 0 else y - offset
             y_text = float(np.clip(y_text, y_lower + label_margin, y_upper - label_margin))
-            y_text = float(np.clip(y_text, y_lower + label_margin, y_upper - label_margin))
             ax_obj.text(
                 bar.get_x() + bar.get_width() / 2,
                 y_text,
@@ -2169,7 +2153,6 @@ def _compile_multi_target_comparison(
                 fontsize=bar_value_font,
                 rotation=90,
                 clip_on=True,
-                clip_on=True,
             )
         ax_obj.set_ylim(y_lower, y_upper)
 
@@ -2177,7 +2160,6 @@ def _compile_multi_target_comparison(
         fig, (ax_top, ax_bottom) = plt.subplots(
             2,
             1,
-            figsize=(max(15, len(top_features) * 0.58), max(10, 7 + 0.05 * len(top_features))),
             figsize=(max(15, len(top_features) * 0.58), max(10, 7 + 0.05 * len(top_features))),
             sharey=True,
             constrained_layout=True,
@@ -2197,15 +2179,9 @@ def _compile_multi_target_comparison(
         ax_top.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
         ax_bottom.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
         ax_bottom.set_xlabel("")
-        ax_top.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
-        ax_bottom.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
-        ax_bottom.set_xlabel("")
     else:
         fig, ax = plt.subplots(figsize=(max(15, len(top_features) * 0.58), 6.5), constrained_layout=True)
-        fig, ax = plt.subplots(figsize=(max(15, len(top_features) * 0.58), 6.5), constrained_layout=True)
         _draw_group_bars(ax, top_features, summed_scores, "Feature Importance")
-        ax.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
-        ax.set_xlabel("")
         ax.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
         ax.set_xlabel("")
 
