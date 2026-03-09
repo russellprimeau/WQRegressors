@@ -984,13 +984,12 @@ if __name__ == '__main__':
                         '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
         'SCADA - pH', 'SCADA - Temperature (°C)']
     
-    target_columns = ['pH_res']
-
-    # target_columns = ['Color_res',
-    #     'Turbidity (FNU)_res', 'pH_res', 'E.coli (CFU/100mL)_res', 'Intestinal enterococci (CFU/100mL)_res', 
-    #     'Colony Count 22°C (CFU/mL)_res', 'Total coliforms 37°C (CFU/100mL)_res', 'Arsenic (µg/L)_res',
-    #     'Lead (µg/L)_res', 'Cadmium (µg/L)_res', 'Copper filtered (mg/L)_res', 'Chromium (µg/L)_res', 'Nickel (µg/L)_res', 
-    #     'Zinc (µg/L)_res']  # alternative 1: name-based selection
+    target_columns = ['Color_res',
+        'Turbidity (FNU)_res', 'pH_res', 'E.coli (CFU/100mL)_res', 'Intestinal enterococci (CFU/100mL)_res', 
+        'Colony Count 22°C (CFU/mL)_res', 'Total coliforms 37°C (CFU/100mL)_res', 'Arsenic (µg/L)_res',
+        'Lead (µg/L)_res', 'Cadmium (µg/L)_res', 'Copper filtered (mg/L)_res', 'Chromium (µg/L)_res', 'Nickel (µg/L)_res', 
+        'Zinc (µg/L)_res']  # alternative 1: name-based selection
+    
     # target_columns = df.columns[-9:]  # alternative: index-based selection
 
     ## Alternative with better coverage

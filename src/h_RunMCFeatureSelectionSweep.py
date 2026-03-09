@@ -1842,6 +1842,13 @@ def _compile_multi_target_comparison(
         data_root.parent / "regression" / "Consolidated_sparse.csv",
     ]
     csv_path = next((p for p in csv_candidates if p.exists()), csv_candidates[0])
+
+    def _norm_name(value: str) -> str:
+        text = str(value).lower().replace('µ', 'u').replace('°', 'deg')
+        text = unicodedata.normalize('NFKD', text)
+        text = ''.join(c for c in text if not unicodedata.combining(c))
+        return re.sub(r'[^a-z0-9]', '', text)
+
     try:
         with open(csv_path, "r", encoding="utf-8") as f:
             header = f.readline().strip().split(",")
@@ -1866,13 +1873,6 @@ def _compile_multi_target_comparison(
         matched_keys = []
         yticklabels = []
         used_keys = set()
-        def norm(s):
-            # Lowercase, replace µ->u, °->deg, remove all non-alphanumeric chars
-            s = s.lower().replace('µ', 'u').replace('°', 'deg')
-            s = unicodedata.normalize('NFKD', s)
-            s = ''.join(c for c in s if not unicodedata.combining(c))
-            s = re.sub(r'[^a-z0-9]', '', s)
-            return s
 
         # Debug prints removed
 
@@ -1884,7 +1884,7 @@ def _compile_multi_target_comparison(
                 used_keys.add(csv_col)
                 continue
             # Otherwise, try suffix/unicode-normalized match
-            matches = [k for k in sweep_keys if norm(k).endswith(norm(csv_col)) and k not in used_keys]
+            matches = [k for k in sweep_keys if _norm_name(k).endswith(_norm_name(csv_col)) and k not in used_keys]
             if matches:
                 matched_keys.append(matches[0])
                 yticklabels.append(csv_col)
@@ -1921,11 +1921,77 @@ def _compile_multi_target_comparison(
         for feat in all_features
     }
 
+    target_rank = {target: idx for idx, target in enumerate(targets)}
+    target_rank_norm: dict[str, int] = {}
+    for target, idx in target_rank.items():
+        norm_target = _norm_name(target)
+        if norm_target:
+            target_rank_norm[norm_target] = min(idx, target_rank_norm.get(norm_target, idx))
+
+    def _feature_target_candidates(feature_name: str) -> list[str]:
+        feature_name = str(feature_name)
+        candidates = [feature_name]
+        if feature_name.endswith("_state"):
+            stem = feature_name[: -len("_state")]
+            candidates.extend([f"{stem}_res", stem])
+        elif feature_name.endswith("_res"):
+            candidates.append(feature_name[: -len("_res")])
+        else:
+            candidates.append(feature_name.replace("_state", "_res"))
+
+        out: list[str] = []
+        seen = set()
+        for cand in candidates:
+            cand = str(cand)
+            if cand and cand not in seen:
+                seen.add(cand)
+                out.append(cand)
+        return out
+
+    def _matching_target_rank(feature_name: str) -> int | None:
+        candidates = _feature_target_candidates(feature_name)
+        # Prefer exact target names first.
+        for cand in candidates:
+            if cand in target_rank:
+                return int(target_rank[cand])
+
+        # Fallback to normalized target matching.
+        best_rank: int | None = None
+        for cand in candidates:
+            norm_cand = _norm_name(cand)
+            if not norm_cand:
+                continue
+            if norm_cand in target_rank_norm:
+                rank = int(target_rank_norm[norm_cand])
+                best_rank = rank if best_rank is None else min(best_rank, rank)
+                continue
+            for norm_target, rank in target_rank_norm.items():
+                if norm_target == norm_cand or norm_target.endswith(norm_cand) or norm_cand.endswith(norm_target):
+                    best_rank = int(rank) if best_rank is None else min(best_rank, int(rank))
+        return best_rank
+
     multi_target_features = [feat for feat in all_features if presence_count.get(feat, 0) > 1]
     single_target_features = [feat for feat in all_features if presence_count.get(feat, 0) == 1]
 
     multi_target_features.sort(key=lambda feat: feature_total_score.get(feat, float("-inf")), reverse=True)
-    single_target_features.sort(key=lambda feat: feature_total_score.get(feat, float("-inf")), reverse=True)
+    single_target_rank = {feat: _matching_target_rank(feat) for feat in single_target_features}
+    single_matched = [feat for feat in single_target_features if single_target_rank.get(feat) is not None]
+    single_unmatched = [feat for feat in single_target_features if single_target_rank.get(feat) is None]
+
+    single_matched.sort(
+        key=lambda feat: (
+            int(single_target_rank.get(feat, 10**9)),
+            -float(feature_total_score.get(feat, float("-inf"))),
+            str(feat),
+        )
+    )
+    single_unmatched.sort(
+        key=lambda feat: (
+            -float(feature_total_score.get(feat, float("-inf"))),
+            str(feat),
+        )
+    )
+    single_target_features = single_matched + single_unmatched
 
     ordered_features = multi_target_features + single_target_features
     if ordered_features:
@@ -2000,16 +2066,13 @@ def _compile_multi_target_comparison(
     if multi_idx and single_idx:
         heat_w = max(14, n_total_features * 0.55)
         heat_h = max(8, len(targets) * 0.58)
-        heat_w = max(14, n_total_features * 0.55)
-        heat_h = max(8, len(targets) * 0.58)
         fig, (ax_left, ax_right) = plt.subplots(
             1,
             2,
             figsize=(heat_w, heat_h),
             gridspec_kw={
                 "width_ratios": [max(1, len(multi_target_features)), max(1, len(single_target_features))],
-                "wspace": 0.08,
-                "wspace": 0.08,
+                "wspace": 0.03,
             },
             constrained_layout=True,
         )
