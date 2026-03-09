@@ -5,13 +5,14 @@ Search strategy:
 - Surrogate-guided beam backward elimination with swap refinement.
 - Objective: `objective = (1 - r2) + lambda_drop * drop_rate`.
 - `drop_rate` is computed from raw sample coverage after MC replicate collapse.
-- Search split behavior remains temporal-by-coverage (target 70/30 by default).
+- Search and final sweep-generated train/evaluate runs enforce a minimum of 5
+    independent non-replicate test samples.
 
 Then:
 - Retrain/evaluate all discovered model configs on top-K subsets.
-- Final top-K evaluations enforce a minimum of 5 test samples per subset by
-    moving the latest samples from train -> test when needed; if fewer than 5
-    total valid split samples exist, that subset/model evaluation is skipped.
+- When a 70/30 split is short, the latest train groups are moved into test; if
+    fewer than 5 independent groups exist overall, that subset/model evaluation
+    fails compliance for that variant (outer loops continue unless stop-on-error).
 - Write trace, selected subsets, and final metrics to the active sweep namespace.
 
 Key CLI groups (detailed):
@@ -108,7 +109,7 @@ import seaborn as sns
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from utils.training import load_samples, group_samples_by_segment
+from utils.training import load_samples, group_samples_by_segment, SampleComplianceError
 
 
 SUPPORTED_CONFIG_SUFFIXES = {".yml", ".yaml", ".json"}
@@ -588,6 +589,12 @@ def _prepare_variant_config(
     if "evaluation" not in cfg_copy:
         cfg_copy["evaluation"] = {}
     cfg_copy["evaluation"]["run_baselines"] = True
+
+    # Sweep/pipeline variants must reserve enough independent non-replicate test samples.
+    split_cfg = cfg_copy.setdefault("data_split", {})
+    split_cfg.setdefault("split_type", "temporal")
+    split_cfg.setdefault("test_size", 0.3)
+    split_cfg["min_test_independent"] = int(FINAL_TOPK_MIN_TEST_SAMPLES)
 
     cfg_copy.pop("__config_dir", None)
 
@@ -1819,6 +1826,7 @@ def _compile_multi_target_comparison(
     data_root: Path,
     importance_label: str = "Removal Sensitivity (avg delta)",
     summary_axis_label: str = "Total Removal Sensitivity",
+    target_order: list[str] | None = None,
 ) -> Path:
     """Compile and visualize feature importance across multiple targets using removal sensitivity."""
     if not sweep_results:
@@ -1863,40 +1871,61 @@ def _compile_multi_target_comparison(
         return Path()
     
     # Build matrix: targets x features with removal sensitivity scores
-    # Sort targets by their order in the CSV, if present, otherwise alphabetically
-    # Use the same csv_path and header as above
-    try:
-        with open(csv_path, "r", encoding="utf-8") as f:
-            header = f.readline().strip().split(",")
-        res_targets = [col for col in header if col.endswith("_res")]
-        sweep_keys = list(sweep_results.keys())
-        matched_keys = []
-        yticklabels = []
-        used_keys = set()
+    sweep_keys = list(sweep_results.keys())
+    targets: list[str] = []
+    yticklabels: list[str] = []
+    used_keys: set[str] = set()
 
-        # Debug prints removed
-
-        for csv_col in res_targets:
-            # Prefer exact match
-            if csv_col in sweep_results:
-                matched_keys.append(csv_col)
-                yticklabels.append(csv_col)
-                used_keys.add(csv_col)
+    def _match_target_key(raw_name: str) -> str | None:
+        raw = str(raw_name)
+        if raw in sweep_results and raw not in used_keys:
+            return raw
+        norm_raw = _norm_name(raw)
+        if not norm_raw:
+            return None
+        for key in sweep_keys:
+            if key in used_keys:
                 continue
-            # Otherwise, try suffix/unicode-normalized match
-            matches = [k for k in sweep_keys if _norm_name(k).endswith(_norm_name(csv_col)) and k not in used_keys]
-            if matches:
-                matched_keys.append(matches[0])
+            norm_key = _norm_name(key)
+            if not norm_key:
+                continue
+            if norm_key == norm_raw or norm_key.endswith(norm_raw) or norm_raw.endswith(norm_key):
+                return key
+        return None
+
+    # Prefer explicit target order (for example, R2-ranked order from postprocess summary).
+    if target_order:
+        for requested in list(target_order):
+            matched = _match_target_key(str(requested))
+            if matched is None:
+                continue
+            targets.append(matched)
+            yticklabels.append(str(requested) if str(requested).strip() else matched)
+            used_keys.add(matched)
+
+    # Fallback to CSV-based target ordering when no explicit order is provided.
+    if not targets:
+        try:
+            with open(csv_path, "r", encoding="utf-8") as f:
+                header = f.readline().strip().split(",")
+            res_targets = [col for col in header if col.endswith("_res")]
+            for csv_col in res_targets:
+                matched = _match_target_key(csv_col)
+                if matched is None:
+                    continue
+                targets.append(matched)
                 yticklabels.append(csv_col)
-                used_keys.add(matches[0])
-        # Add any sweep_results keys not already used, at the end
-        extra_keys = [t for t in sweep_keys if t not in used_keys]
-        matched_keys += extra_keys
-        yticklabels += extra_keys
-        targets = matched_keys
-    except Exception:
-        targets = sorted(sweep_results.keys())
-        yticklabels = targets
+                used_keys.add(matched)
+        except Exception:
+            pass
+
+    # Always append unmatched targets deterministically so nothing is dropped.
+    for key in sweep_keys:
+        if key in used_keys:
+            continue
+        targets.append(key)
+        yticklabels.append(key)
+        used_keys.add(key)
 
     matrix = np.zeros((len(targets), len(all_features)))
 
@@ -2066,13 +2095,19 @@ def _compile_multi_target_comparison(
     if multi_idx and single_idx:
         heat_w = max(14, n_total_features * 0.55)
         heat_h = max(8, len(targets) * 0.58)
+        n_left = max(1, len(multi_target_features))
+        n_right = max(1, len(single_target_features))
+        # Convert desired one-column gap into gridspec wspace units.
+        # Approximation: one column gap in width-ratio units -> wspace ~= 2/(left+right).
+        dynamic_wspace = 2.0 / float(max(1, n_left + n_right))
+        dynamic_wspace = float(min(0.20, max(0.01, dynamic_wspace)))
         fig, (ax_left, ax_right) = plt.subplots(
             1,
             2,
             figsize=(heat_w, heat_h),
             gridspec_kw={
-                "width_ratios": [max(1, len(multi_target_features)), max(1, len(single_target_features))],
-                "wspace": 0.03,
+                "width_ratios": [n_left, n_right],
+                "wspace": dynamic_wspace,
             },
             constrained_layout=True,
         )
@@ -2361,14 +2396,22 @@ def _write_split_file_names(path: Path, names: list[str]) -> None:
             f.write(f"{name}\n")
 
 
+def _raw_file_name(name: str) -> str:
+    return re.sub(r"_mc_\d+(?=\.csv$)", "", str(name))
+
+
+def _independent_name_count(names: list[str]) -> int:
+    return len(dict.fromkeys(_raw_file_name(n) for n in names if str(n).strip()))
+
+
 def _ensure_min_test_samples_for_final(
     split_dir: Path,
     min_test_samples: int = FINAL_TOPK_MIN_TEST_SAMPLES,
 ) -> tuple[bool, str, int, int]:
-    """Rebalance split files for final-top-k evaluation.
+    """Rebalance split files for final-top-k evaluation using independent sample groups.
 
     Returns:
-      - skip_eval: True when total available split files are < min_test_samples.
+            - skip_eval: True when total available independent groups are < min_test_samples.
       - status: one of {'already_sufficient', 'rebalanced', 'insufficient_total'}.
       - train_count: resulting train file count.
       - test_count: resulting test file count.
@@ -2379,16 +2422,37 @@ def _ensure_min_test_samples_for_final(
     train_names = _read_split_file_names(train_file)
     test_names = _read_split_file_names(test_file)
 
-    if len(test_names) >= min_test_samples:
+    if _independent_name_count(test_names) >= min_test_samples:
         return False, "already_sufficient", len(train_names), len(test_names)
 
-    total = len(train_names) + len(test_names)
-    if total < min_test_samples:
+    total_independent = _independent_name_count(train_names + test_names)
+    if total_independent < min_test_samples:
         return True, "insufficient_total", len(train_names), len(test_names)
 
-    deficit = min_test_samples - len(test_names)
-    moved = train_names[-deficit:] if deficit > 0 else []
-    new_train = train_names[:-deficit] if deficit > 0 else list(train_names)
+    test_raw_ids = set(_raw_file_name(n) for n in test_names)
+    train_raw_order = []
+    seen_raw = set()
+    for name in train_names:
+        raw = _raw_file_name(name)
+        if raw not in seen_raw:
+            seen_raw.add(raw)
+            train_raw_order.append(raw)
+
+    moved_raw_ids: list[str] = []
+    for raw in reversed(train_raw_order):
+        if raw in test_raw_ids:
+            continue
+        moved_raw_ids.append(raw)
+        test_raw_ids.add(raw)
+        if len(test_raw_ids) >= min_test_samples:
+            break
+
+    if len(test_raw_ids) < min_test_samples:
+        return True, "insufficient_total", len(train_names), len(test_names)
+
+    moved_raw_set = set(moved_raw_ids)
+    moved = [name for name in train_names if _raw_file_name(name) in moved_raw_set]
+    new_train = [name for name in train_names if _raw_file_name(name) not in moved_raw_set]
     # Keep temporal order: moved train tail should precede existing test tail.
     new_test = moved + test_names
 
@@ -2442,15 +2506,23 @@ def _evaluate_selected_subsets_all_models(
                     print(
                         f"[INFO] Final split rebalance for {eval_cfg.parent.name}: "
                         f"train={train_n}, test={test_n} "
-                        f"(min_test={FINAL_TOPK_MIN_TEST_SAMPLES})"
+                        f"(min_test_independent={FINAL_TOPK_MIN_TEST_SAMPLES})"
                     )
                 if skip_eval:
-                    print(
-                        f"[WARN] Skipping final eval for {eval_cfg.parent.name}: "
-                        f"only {train_n + test_n} total split samples available "
-                        f"(< {FINAL_TOPK_MIN_TEST_SAMPLES})."
+                    raise SampleComplianceError(
+                        reason="insufficient_total_independent",
+                        message=(
+                            f"Final split for {eval_cfg.parent.name} cannot satisfy minimum "
+                            f"independent test groups ({FINAL_TOPK_MIN_TEST_SAMPLES})."
+                        ),
+                        context={
+                            "dataset": dataset_plan.dataset_dir.name,
+                            "variant_dir": str(eval_cfg.parent),
+                            "train_rows": int(train_n),
+                            "test_rows": int(test_n),
+                            "target_min_independent": int(FINAL_TOPK_MIN_TEST_SAMPLES),
+                        },
                     )
-                    summary_rows = []
                 else:
                     _set_eval_overrides(
                         eval_cfg,
@@ -2500,6 +2572,14 @@ def _evaluate_selected_subsets_all_models(
 
                     if not summary_rows and eval_result is not None:
                         summary_rows = [eval_result]
+            except SampleComplianceError as e:
+                ctx = getattr(e, "context", {}) or {}
+                print(
+                    f"[COMPLIANCE] {e.reason}: {e}. "
+                    f"dataset={ctx.get('dataset', dataset_plan.dataset_dir.name)} "
+                    f"variant={ctx.get('variant_dir', str(variant_cfg))}"
+                )
+                summary_rows = []
             except Exception as e:
                 print(f"[ERROR] Evaluation failed for config {variant_cfg}: {e}")
                 summary_rows = []
@@ -2572,6 +2652,25 @@ def _evaluate_selected_subsets_all_models(
                 n_test_independent = float(srow.get("n_test_independent", n_samples))
                 n_test_valid = float(srow.get("n_test_valid", np.nan))
                 n_test_evals = float(srow.get("n_test_evals", srow.get("n_eval_rows", np.nan)))
+
+                if baseline_id is None and (not np.isfinite(n_test_valid) or n_test_valid < float(FINAL_TOPK_MIN_TEST_SAMPLES)):
+                    raise SampleComplianceError(
+                        reason="insufficient_valid_independent",
+                        message=(
+                            f"Non-baseline evaluation has insufficient valid independent test samples "
+                            f"({n_test_valid}) for minimum {FINAL_TOPK_MIN_TEST_SAMPLES}."
+                        ),
+                        context={
+                            "dataset": dataset_plan.dataset_dir.name,
+                            "variant_dir": str(eval_cfg.parent),
+                            "subset_rank": int(rank),
+                            "row_count": int(cand.row_count),
+                            "feature_tag": str(cand.feature_tag),
+                            "model": str(model_name),
+                            "n_test_valid": float(n_test_valid) if np.isfinite(n_test_valid) else float("nan"),
+                            "target_min_independent": int(FINAL_TOPK_MIN_TEST_SAMPLES),
+                        },
+                    )
 
                 # input_dim: count input_columns from the eval config
                 _input_cols = _eval_cfg_data.get("data", {}).get("input_columns") or []
@@ -3229,6 +3328,16 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                 )
                 print(f"[INFO] Wrote final model metrics: {final_metrics_csv}")
 
+            except SampleComplianceError as exc:
+                failed += 1
+                ctx = getattr(exc, "context", {}) or {}
+                print(f"[COMPLIANCE] Dataset failed: {plan.dataset_dir.name}, row_count {row_count}")
+                print(
+                    f"[COMPLIANCE] reason={exc.reason} message={exc} "
+                    f"variant={ctx.get('variant_dir', 'n/a')}"
+                )
+                if args.stop_on_error:
+                    raise
             except Exception as exc:
                 failed += 1
                 print(f"[ERROR] Dataset failed: {plan.dataset_dir.name}, row_count {row_count}")

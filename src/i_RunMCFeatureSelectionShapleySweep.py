@@ -31,11 +31,11 @@ Important behavior:
 - Search baseline controls now match `h` semantics:
     `--run-baselines-in-search` is mutually exclusive with
     `--disable-baselines-for-search`.
-- Search phase is performance-oriented and keeps standard temporal-by-coverage
-    split behavior (target 70/30 by default).
-- Final top-K evaluation enforces a minimum of 5 test samples by moving latest
-    train samples into test when needed; if fewer than 5 total split samples are
-    available, that model/subset evaluation is skipped.
+- Search and final phases enforce a minimum of 5 independent non-replicate
+    test samples for sweep-generated train/evaluate runs. When a 70/30 split is
+    short, latest train groups are moved into test; if fewer than 5 independent
+    groups exist overall, that model/subset evaluation fails compliance for that
+    variant (outer loops continue unless stop-on-error).
 - Optional `--run-rolling-origin-cv` runs rolling-origin CV for best k01 model.
 - Visualization generation disabled by default for speed; enable with `--keep-shapley-plots`.
 
@@ -938,6 +938,16 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     if cv_summary is not None:
                         print(f"[INFO] Wrote rolling-origin summary: {cv_summary}")
 
+            except base.SampleComplianceError as exc:
+                failed += 1
+                ctx = getattr(exc, "context", {}) or {}
+                print(f"[COMPLIANCE] Dataset failed: {plan.dataset_dir.name}, row_count {row_count}")
+                print(
+                    f"[COMPLIANCE] reason={exc.reason} message={exc} "
+                    f"variant={ctx.get('variant_dir', 'n/a')}"
+                )
+                if args.stop_on_error:
+                    raise
             except Exception as exc:
                 failed += 1
                 print(f"[ERROR] Dataset failed: {plan.dataset_dir.name}, row_count {row_count}")

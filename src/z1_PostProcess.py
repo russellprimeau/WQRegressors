@@ -85,6 +85,7 @@ BASELINE_PLOT_COLORS = {
     "linear": "tab:orange",
 }
 BASELINE_MODEL_IDS = {"naive", "seasonal", "linear"}
+MIN_REQUIRED_VALID_INDEPENDENT = 5
 
 
 def _resolve_summaries_dir(data_root: Path, sweep_namespace: str) -> Path:
@@ -156,11 +157,16 @@ def _build_perf_entry(
     out = {
         'dataset': dataset_name,
         'model': str(row.get('model', '')),
+        'subset_rank': _safe_float(row.get('subset_rank', float('nan'))),
+        'row_count': _safe_float(row.get('row_count', float('nan'))),
+        'feature_tag': str(row.get('feature_tag', '')),
         'nrmse': _safe_float(row.get('nrmse', float('nan'))),
         'rmse': _safe_float(row.get('rmse', float('nan'))),
         'r2': _safe_float(row.get('r2', float('nan'))),
         'pearson_r': _safe_float(row.get('pearson_r', float('nan'))),
         'std_target': _safe_float(row.get('std_target', float('nan'))),
+        'n_test_independent_source': _safe_float(row.get('n_test_independent', float('nan'))),
+        'n_test_valid_source': _safe_float(row.get('n_test_valid', float('nan'))),
         'rolling_cv_r2': rolling_cv_r2,
         'rolling_cv_r2_median': rolling_cv_r2_median,
         'rolling_cv_r2_last50': rolling_cv_r2_last50,
@@ -188,6 +194,20 @@ def _filter_valid_rows(df: "pd.DataFrame") -> "pd.DataFrame":
     if 'r2' in out.columns:
         out = out[out['r2'].notnull() & np.isfinite(out['r2'])]
     return out
+
+
+def _filter_min_valid_independent(df: "pd.DataFrame", min_required: int = MIN_REQUIRED_VALID_INDEPENDENT) -> "pd.DataFrame":
+    """Keep rows with explicit valid independent test count meeting threshold."""
+    out = df.copy()
+    count_col = None
+    if "n_test_valid" in out.columns:
+        count_col = "n_test_valid"
+    elif "n_test_independent" in out.columns:
+        count_col = "n_test_independent"
+    if count_col is None:
+        return out
+    vals = pd.to_numeric(out[count_col], errors="coerce")
+    return out[np.isfinite(vals) & (vals >= int(min_required))].copy()
 
 
 def _annotate_bars_within_ylim(ax, bars, fmt: str, fontsize: int = 8) -> None:
@@ -434,12 +454,12 @@ def _base_sample_id(name: str) -> str:
     return re.sub(r"_mc_\d+(?=\.csv$)", "", Path(str(name)).name)
 
 
-def _find_best_variant_eval_config(plan: DatasetPlan, row: "pd.Series") -> "tuple[Path | None, Path | None]":
+def _find_best_variant_eval_config(plan: DatasetPlan, row: "pd.Series") -> "tuple[Path | None, Path | None, str]":
     try:
         row_count = int(row.get("row_count"))
         feature_tag = str(row.get("feature_tag", ""))
     except Exception:
-        return None, None
+        return None, None, "invalid_best_row"
 
     model_key = _normalize_model_key(str(row.get("model", "")))
     output_dir = _forecast_sweeps_dir(plan.dataset_dir)
@@ -448,7 +468,7 @@ def _find_best_variant_eval_config(plan: DatasetPlan, row: "pd.Series") -> "tupl
         if p.is_dir()
     ]
     if not variant_dirs:
-        return None, None
+        return None, None, "missing_variant_dir"
 
     best_fallback = None
     for variant_dir in variant_dirs:
@@ -467,9 +487,12 @@ def _find_best_variant_eval_config(plan: DatasetPlan, row: "pd.Series") -> "tupl
             _normalize_model_key(str(cfg.get("data", {}).get("forecast_name", ""))),
         ]
         if model_key and any(model_key == k or model_key in k or k in model_key for k in cfg_keys if k):
-            return variant_dir, eval_cfg
+            return variant_dir, eval_cfg, "exact_match"
 
-    return best_fallback if best_fallback is not None else (None, None)
+    if best_fallback is not None:
+        variant_dir, eval_cfg = best_fallback
+        return variant_dir, eval_cfg, "fallback_variant_mismatch"
+    return None, None, "missing_eval_config"
 
 
 def _safe_as_2d(arr) -> np.ndarray:
@@ -1035,7 +1058,12 @@ def _collect_prediction_payload(eval_cfg_path: Path) -> dict:
 
 def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args: argparse.Namespace) -> dict:
     evidence: dict[str, float | str | int | bool] = {}
-    variant_dir, eval_cfg_path = _find_best_variant_eval_config(plan, best_row)
+    variant_dir, eval_cfg_path, resolve_status = _find_best_variant_eval_config(plan, best_row)
+    evidence["evidence_variant_resolution"] = str(resolve_status)
+    if resolve_status == "fallback_variant_mismatch":
+        evidence["evidence_status"] = "variant_mismatch"
+        evidence["evidence_variant_dir"] = str(variant_dir) if variant_dir is not None else ""
+        return evidence
     if eval_cfg_path is None or not eval_cfg_path.exists():
         evidence["evidence_status"] = "missing_eval_config"
         return evidence
@@ -1288,6 +1316,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
     importance_sources_used: set[str] = set()
     datasets_with_outputs = 0
     best_model_performance = []
+    target_order_by_r2: list[str] = []
 
     for plan in plans:
         target_name = _derive_target_name(plan.dataset_dir.name, args.dataset_prefix)
@@ -1399,9 +1428,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 df = pd.read_csv(final_metrics_csv)
                 if not df.empty:
                     # Select best row across all models/subsets by R2
-                    valid_r2 = _exclude_baseline_metric_rows(_filter_valid_rows(df))
+                    valid_r2 = _exclude_baseline_metric_rows(
+                        _filter_min_valid_independent(_filter_valid_rows(df), min_required=MIN_REQUIRED_VALID_INDEPENDENT)
+                    )
                     if valid_r2.empty:
-                        print(f"[WARN] No valid r2 values in metrics for {plan.dataset_dir.name}; skipping rolling CV.")
+                        print(
+                            f"[WARN] No valid r2 rows meeting min valid independent test samples "
+                            f"({MIN_REQUIRED_VALID_INDEPENDENT}) for {plan.dataset_dir.name}; skipping rolling CV."
+                        )
                     else:
                         best_row = valid_r2.loc[valid_r2['r2'].idxmax()]
 
@@ -1514,7 +1548,12 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
                         # Re-read updated metrics and append best model performance entry
                         try:
-                            valid_r2_2 = _exclude_baseline_metric_rows(_filter_valid_rows(pd.read_csv(final_metrics_csv)))
+                            valid_r2_2 = _exclude_baseline_metric_rows(
+                                _filter_min_valid_independent(
+                                    _filter_valid_rows(pd.read_csv(final_metrics_csv)),
+                                    min_required=MIN_REQUIRED_VALID_INDEPENDENT,
+                                )
+                            )
                             if not valid_r2_2.empty:
                                 best_updated = valid_r2_2.loc[valid_r2_2['r2'].idxmax()]
                                 cv_r2_to_write = _safe_float(best_updated.get('rolling_cv_r2')) if run_rolling_cv else rolling_cv_r2
@@ -1608,6 +1647,34 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             perf_df = pd.DataFrame(best_model_performance)
             perf_df = perf_df.sort_values('r2', ascending=False)
+            valid_src = pd.to_numeric(perf_df.get('n_test_valid_source', np.nan), errors='coerce')
+            evidence_ok = perf_df.get('evidence_status', '').astype(str).str.lower().eq('ok') if 'evidence_status' in perf_df.columns else pd.Series(False, index=perf_df.index)
+            perf_df['compliance_status'] = np.where(
+                np.isfinite(valid_src) & (valid_src >= float(MIN_REQUIRED_VALID_INDEPENDENT)) & evidence_ok,
+                'ok',
+                'failed',
+            )
+            perf_df['compliance_reason'] = np.where(
+                perf_df['compliance_status'].eq('ok'),
+                '',
+                np.where(
+                    ~np.isfinite(valid_src),
+                    'missing_n_test_valid_source',
+                    np.where(
+                        valid_src < float(MIN_REQUIRED_VALID_INDEPENDENT),
+                        f'n_test_valid_source_below_{MIN_REQUIRED_VALID_INDEPENDENT}',
+                        perf_df.get('evidence_status', 'evidence_not_ok').astype(str) if 'evidence_status' in perf_df.columns else 'evidence_not_ok',
+                    ),
+                ),
+            )
+            # Reuse the same R2 ranking source for downstream multi-target heatmap y-order.
+            target_order_by_r2 = []
+            seen_targets = set()
+            for dataset_name in perf_df['dataset'].astype(str).tolist():
+                tgt = _derive_target_name(dataset_name, args.dataset_prefix)
+                if tgt not in seen_targets:
+                    seen_targets.add(tgt)
+                    target_order_by_r2.append(tgt)
             summary_csv = summaries_dir / "summary_best_model_performance.csv"
             perf_df.to_csv(summary_csv, index=False)
             print(f"[INFO] Wrote summary CSV: {summary_csv}")
@@ -2515,17 +2582,23 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     sweep_results,
                     data_root,
                     importance_label="Shapley Expected Contribution (mean marginal objective delta)",
-                    summary_axis_label="Total Shapley Contribution (sum across targets)",
+                    summary_axis_label="Total Shapley Contribution",
+                    target_order=target_order_by_r2,
                 )
             elif importance_sources_used and any(src.startswith("shapley_") for src in importance_sources_used):
                 comparison_plot = _compile_multi_target_comparison(
                     sweep_results,
                     data_root,
                     importance_label="Feature Importance (mixed: removal delta + Shapley contribution)",
-                    summary_axis_label="Total Feature Importance (sum across targets)",
+                    summary_axis_label="Total Feature Importance",
+                    target_order=target_order_by_r2,
                 )
             else:
-                comparison_plot = _compile_multi_target_comparison(sweep_results, data_root)
+                comparison_plot = _compile_multi_target_comparison(
+                    sweep_results,
+                    data_root,
+                    target_order=target_order_by_r2,
+                )
             if comparison_plot.exists():
                 print(f"[INFO] Wrote multi-target comparison plots to {comparison_plot.parent}")
         except Exception as e:

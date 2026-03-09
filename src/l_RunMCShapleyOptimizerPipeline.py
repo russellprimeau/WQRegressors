@@ -28,8 +28,11 @@ Common usage:
         python src/l_RunMCShapleyOptimizerPipeline.py --dry-run
 
 2) Full pipeline with explicit budgets:
-        python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4
-        python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 --beam-width 16 --max-rounds 30 --max-swap-attempts 200 --keep-shapley-plots --keep-search-plots
+
+python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4
+python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 3 --shapley-eval-budget 3 --optimizer-eval-budget 3 --final-top-k 1 --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 --beam-width 16 --max-rounds 30 --max-swap-attempts 200 --keep-shapley-plots --keep-search-plots
+python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 --beam-width 16 --max-rounds 30 --max-swap-attempts 200 --keep-shapley-plots --keep-search-plots
+
 
 3) Multi-seed optimizer stage in one run:
         python src/l_RunMCShapleyOptimizerPipeline.py \
@@ -280,8 +283,8 @@ def main() -> int:
     print(f"Optimizer seeds           : {optimizer_seeds}")
     print(f"Seed subsets CSV override : {args.seed_subsets_csv}")
     print(f"Use Shapley seed subsets  : {not bool(args.seed_subsets_csv)}")
-    print("Search split policy       : temporal coverage split (target 70/30)")
-    print("Final top-K split policy  : enforce >=5 test samples (skip if total<5)")
+    print("Search split policy       : temporal coverage split (target 70/30), require >=5 independent test groups")
+    print("Final top-K split policy  : hard fail per variant when independent/valid minimum is not met; loop continues unless --stop-on-error")
     print(f"Dry run                   : {args.dry_run}")
 
     prior_namespace = os.environ.get(_NAMESPACE_ENV)

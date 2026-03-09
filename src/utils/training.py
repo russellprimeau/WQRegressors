@@ -6,6 +6,15 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
+
+class SampleComplianceError(RuntimeError):
+    """Raised when sweep split/sample-count compliance requirements are not met."""
+
+    def __init__(self, reason: str, message: str, context: dict | None = None):
+        super().__init__(message)
+        self.reason = str(reason)
+        self.context = dict(context or {})
+
 def load_samples(directory, input_columns, output_columns, input_rows, output_rows, file_list=None,
                  fault_tolerant=False, source=None, input_aggregation='none'):
     samples = []
@@ -165,6 +174,66 @@ def _split_index_from_cumulative_valid_counts(items, count_fn, train_fraction):
     train_valid = int(np.sum(valid_counts[:split_idx]))
     return split_idx, total_valid, train_valid
 
+
+def _base_sample_id(name: str) -> str:
+    """Collapse MC replicate suffixes so counts reflect independent raw samples."""
+    filename = Path(str(name)).name
+    return re.sub(r"_mc_\d+(?=\.csv$)", "", filename)
+
+
+def _independent_count(names: list[str]) -> int:
+    return len(dict.fromkeys(_base_sample_id(name) for name in names if str(name).strip()))
+
+
+def _rebalance_to_min_test_independent(
+    train_names: list[str],
+    test_names: list[str],
+    min_test_independent: int,
+) -> tuple[bool, str, list[str], list[str]]:
+    """Move latest independent train groups to test until minimum independent test count is met."""
+    min_req = int(max(0, min_test_independent))
+    if min_req <= 0:
+        return False, "disabled", list(train_names), list(test_names)
+
+    train_names = [str(n) for n in list(train_names) if str(n).strip()]
+    test_names = [str(n) for n in list(test_names) if str(n).strip()]
+
+    test_independent = _independent_count(test_names)
+    if test_independent >= min_req:
+        return False, "already_sufficient", train_names, test_names
+
+    total_independent = _independent_count(train_names + test_names)
+    if total_independent < min_req:
+        return True, "insufficient_total", train_names, test_names
+
+    test_ids = set(_base_sample_id(n) for n in test_names)
+    train_ids_order = []
+    seen_train_ids = set()
+    for name in train_names:
+        gid = _base_sample_id(name)
+        if gid not in seen_train_ids:
+            seen_train_ids.add(gid)
+            train_ids_order.append(gid)
+
+    moved_ids = []
+    for gid in reversed(train_ids_order):
+        if gid in test_ids:
+            continue
+        moved_ids.append(gid)
+        test_ids.add(gid)
+        if len(test_ids) >= min_req:
+            break
+
+    if len(test_ids) < min_req:
+        return True, "insufficient_total", train_names, test_names
+
+    moved_set = set(moved_ids)
+    moved_names = [name for name in train_names if _base_sample_id(name) in moved_set]
+    new_train = [name for name in train_names if _base_sample_id(name) not in moved_set]
+    # Keep temporal ordering by prepending moved train tail ahead of existing test rows.
+    new_test = moved_names + test_names
+    return False, "rebalanced", new_train, new_test
+
 def write_config(config, data_dir, forecast_name, model_name, config_name='model_config.json'):
     ## Write model configuration dictionary to file so it can be re-run and re-used for other model types
     filepath = Path(data_dir, 'forecasts', forecast_name, model_name, config_name)
@@ -174,7 +243,8 @@ def write_config(config, data_dir, forecast_name, model_name, config_name='model
 
 def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns, output_rows, fault_tolerant=True,
              reuse_split=True, split_source=None, split_type='random', test_size=0.3, random_state=10,
-             sample_subdir='samples', nan_tolerance=None, input_aggregation='none'):
+             sample_subdir='samples', nan_tolerance=None, input_aggregation='none',
+             min_test_independent=None):
     ## If specified, reuse a train/test split previously written to file.
     train_samples = []
     test_samples = []
@@ -184,17 +254,70 @@ def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns,
         try:
             if split_source is None:
                 split_source = Path(data_dir, "forecasts", forecast_name)
+            split_source = Path(split_source)
+            train_file = split_source / "train_files.txt"
+            test_file = split_source / "test_files.txt"
+            train_file_names = [line.strip() for line in train_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+            test_file_names = [line.strip() for line in test_file.read_text(encoding="utf-8").splitlines() if line.strip()]
             train_samples = load_samples(sample_dir, input_columns=input_columns,
                                          output_columns=output_columns,
                                          input_rows=input_rows, output_rows=output_rows, file_list=None,
-                                         fault_tolerant=fault_tolerant, source=Path(split_source, "train_files.txt"),
+                                         fault_tolerant=fault_tolerant, source=train_file,
                                          input_aggregation=input_aggregation)
             test_samples = load_samples(sample_dir, input_columns=input_columns,
                                         output_columns=output_columns,
                                         input_rows=input_rows, output_rows=output_rows, file_list=None,
-                                        fault_tolerant=fault_tolerant, source=Path(split_source, "test_files.txt"),
+                                        fault_tolerant=fault_tolerant, source=test_file,
                                         input_aggregation=input_aggregation)
+
+            if min_test_independent is not None:
+                train_valid_names = {str(sample[2]) for sample in train_samples}
+                test_valid_names = {str(sample[2]) for sample in test_samples}
+                train_ordered_valid = [n for n in train_file_names if n in train_valid_names]
+                test_ordered_valid = [n for n in test_file_names if n in test_valid_names]
+                skip_eval, status, new_train_names, new_test_names = _rebalance_to_min_test_independent(
+                    train_ordered_valid,
+                    test_ordered_valid,
+                    int(min_test_independent),
+                )
+                before_indep = _independent_count(test_ordered_valid)
+                after_indep = _independent_count(new_test_names)
+                if status == "rebalanced":
+                    print(
+                        f"Rebalanced reused split for min independent test samples: "
+                        f"test_independent {before_indep} -> {after_indep} "
+                        f"(target={int(min_test_independent)})."
+                    )
+                    train_file.write_text("\n".join(new_train_names) + ("\n" if new_train_names else ""), encoding="utf-8")
+                    test_file.write_text("\n".join(new_test_names) + ("\n" if new_test_names else ""), encoding="utf-8")
+                    train_samples = load_samples(sample_dir, input_columns=input_columns,
+                                                 output_columns=output_columns,
+                                                 input_rows=input_rows, output_rows=output_rows, file_list=None,
+                                                 fault_tolerant=fault_tolerant, source=train_file,
+                                                 input_aggregation=input_aggregation)
+                    test_samples = load_samples(sample_dir, input_columns=input_columns,
+                                                output_columns=output_columns,
+                                                input_rows=input_rows, output_rows=output_rows, file_list=None,
+                                                fault_tolerant=fault_tolerant, source=test_file,
+                                                input_aggregation=input_aggregation)
+                elif skip_eval:
+                    raise SampleComplianceError(
+                        reason="insufficient_total_independent",
+                        message=(
+                            "Reused split cannot satisfy min independent test samples "
+                            f"(test_independent={before_indep}, target={int(min_test_independent)})."
+                        ),
+                        context={
+                            "split_mode": "reuse",
+                            "split_source": str(split_source),
+                            "test_independent": int(before_indep),
+                            "target_min_independent": int(min_test_independent),
+                        },
+                    )
+
             print(f'Reused split in {split_source}. Training set: {len(train_samples)} samples. Test set: {len(test_samples)} samples')
+        except SampleComplianceError:
+            raise
         except Exception as e:
             print(f"No previous split available for reuse: {e}")
     else:
@@ -275,9 +398,53 @@ def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns,
         ## Write new split to file, to enable error checking and reuse
         file1 = Path(data_dir, "forecasts", forecast_name, "train_files.txt")
         file1.parent.mkdir(parents=True, exist_ok=True)
-        with open(file1, "w") as f:
-            f.writelines(f"{s[2]}\n" for s in train_samples)
         file2 = Path(data_dir, "forecasts", forecast_name, "test_files.txt")
+
+        train_names = [str(s[2]) for s in train_samples]
+        test_names = [str(s[2]) for s in test_samples]
+        if min_test_independent is not None:
+            skip_eval, status, train_names, test_names = _rebalance_to_min_test_independent(
+                train_names,
+                test_names,
+                int(min_test_independent),
+            )
+            before_indep = _independent_count([str(s[2]) for s in test_samples])
+            after_indep = _independent_count(test_names)
+            if status == "rebalanced":
+                print(
+                    f"Rebalanced new split for min independent test samples: "
+                    f"test_independent {before_indep} -> {after_indep} "
+                    f"(target={int(min_test_independent)})."
+                )
+            elif skip_eval:
+                raise SampleComplianceError(
+                    reason="insufficient_total_independent",
+                    message=(
+                        "New split cannot satisfy min independent test samples "
+                        f"(test_independent={before_indep}, target={int(min_test_independent)})."
+                    ),
+                    context={
+                        "split_mode": "new",
+                        "forecast_name": str(forecast_name),
+                        "data_dir": str(data_dir),
+                        "test_independent": int(before_indep),
+                        "target_min_independent": int(min_test_independent),
+                    },
+                )
+
+        with open(file1, "w") as f:
+            f.writelines(f"{name}\n" for name in train_names)
         with open(file2, "w") as f:
-            f.writelines(f"{s[2]}\n" for s in test_samples)
+            f.writelines(f"{name}\n" for name in test_names)
+
+        train_samples = load_samples(sample_dir, input_columns=input_columns,
+                                     output_columns=output_columns,
+                                     input_rows=input_rows, output_rows=output_rows, file_list=None,
+                                     fault_tolerant=fault_tolerant, source=file1,
+                                     input_aggregation=input_aggregation)
+        test_samples = load_samples(sample_dir, input_columns=input_columns,
+                                    output_columns=output_columns,
+                                    input_rows=input_rows, output_rows=output_rows, file_list=None,
+                                    fault_tolerant=fault_tolerant, source=file2,
+                                    input_aggregation=input_aggregation)
     return train_samples, test_samples

@@ -128,6 +128,7 @@ DEFAULT_DATA_SPLIT_CONFIG = {
     "split_type": "random",
     "fault_tolerant": False,
     "nan_tolerance": 0.8,
+    "min_test_independent": None,
 }
 
 DEFAULT_EVALUATION_CONFIG = {
@@ -288,6 +289,7 @@ def load_and_split_data(config):
         data_cfg["sample_subdir"],
         nan_tolerance,
         input_aggregation,
+        split_cfg.get("min_test_independent"),
     )
     
     return train_samples, test_samples
