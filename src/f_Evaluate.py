@@ -91,6 +91,37 @@ EVAL_METRIC_SEMANTICS = "independent_sample_primary"
 EVAL_METRIC_CONTRACT_VERSION = 1
 
 
+def _parse_xgb_version() -> tuple[int, int]:
+    """Parse xgboost major/minor version safely for runtime feature gating."""
+    raw = str(getattr(xgb, "__version__", "0.0"))
+    parts = []
+    for token in raw.split("."):
+        digits = ""
+        for ch in token:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if digits:
+            parts.append(int(digits))
+        else:
+            parts.append(0)
+    major = parts[0] if len(parts) > 0 else 0
+    minor = parts[1] if len(parts) > 1 else 0
+    return int(major), int(minor)
+
+
+def _xgb_eval_model_kwargs(device: torch.device) -> dict:
+    """Build XGBoost model kwargs for GPU where available, with version fallback."""
+    use_cuda = bool(torch.cuda.is_available()) and (str(device).lower().startswith("cuda"))
+    major, _minor = _parse_xgb_version()
+    if not use_cuda:
+        return {"tree_method": "hist"}
+    if major >= 2:
+        return {"tree_method": "hist", "device": "cuda"}
+    return {"tree_method": "gpu_hist", "predictor": "gpu_predictor"}
+
+
 
 def merge_eval_config(cfg):
     eval_cfg = cfg.get("evaluation", {})
@@ -390,19 +421,33 @@ def load_model(model_type, data_cfg, split_cfg, model_name, model_config, device
                 raise FileNotFoundError(f"GP model not found in {direct_path} or {subdir_path}: {e}")
 
     if model_type == "xgb_regressor":
-        model = xgb.XGBRegressor()
+        model = xgb.XGBRegressor(**_xgb_eval_model_kwargs(device))
         model_file = try_file("xgboost_model.json")
         if not model_file:
             raise FileNotFoundError(f"xgboost_model.json not found in {direct_path} or {subdir_path}")
         model.load_model(model_file)
+        print(
+            "XGBoost eval runtime mode: "
+            f"tree_method={model.get_params().get('tree_method')}, "
+            f"device={model.get_params().get('device', 'n/a')}, "
+            f"predictor={model.get_params().get('predictor', 'n/a')}, "
+            f"xgboost_version={getattr(xgb, '__version__', 'unknown')}"
+        )
         return model
 
     if model_type == "xgb_classifier":
-        model = xgb.XGBClassifier()
+        model = xgb.XGBClassifier(**_xgb_eval_model_kwargs(device))
         model_file = try_file("xgboost_model.json")
         if not model_file:
             raise FileNotFoundError(f"xgboost_model.json not found in {direct_path} or {subdir_path}")
         model.load_model(model_file)
+        print(
+            "XGBoost eval runtime mode: "
+            f"tree_method={model.get_params().get('tree_method')}, "
+            f"device={model.get_params().get('device', 'n/a')}, "
+            f"predictor={model.get_params().get('predictor', 'n/a')}, "
+            f"xgboost_version={getattr(xgb, '__version__', 'unknown')}"
+        )
         return model
 
     raise ValueError(f"Unknown model_type: {model_type}")

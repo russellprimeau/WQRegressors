@@ -31,7 +31,7 @@ Common usage:
 
 python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4
 python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 3 --shapley-eval-budget 3 --optimizer-eval-budget 3 --final-top-k 1 --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 --beam-width 16 --max-rounds 30 --max-swap-attempts 200 --keep-shapley-plots --keep-search-plots
-python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 --beam-width 16 --max-rounds 30 --max-swap-attempts 200 --keep-shapley-plots --keep-search-plots
+python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 --beam-width 16 --max-rounds 30 --max-swap-attempts 200 --keep-shapley-plots --keep-search-plots --parallel-evaluators 1
 
 
 3) Multi-seed optimizer stage in one run:
@@ -171,6 +171,7 @@ def _build_optimizer_args(args: argparse.Namespace) -> argparse.Namespace:
         row_counts=args.row_counts,
         min_features=args.min_features,
         beam_width=args.beam_width,
+        parallel_evaluators=args.parallel_evaluators,
         max_rounds=args.max_rounds,
         no_improve_patience=args.no_improve_patience,
         eval_budget=args.optimizer_eval_budget,
@@ -229,6 +230,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated optimizer seeds for multi-seed runs (overrides --optimizer-seed).",
     )
     parser.add_argument("--beam-width", type=int, default=16)
+    parser.add_argument(
+        "--parallel-evaluators",
+        type=int,
+        default=1,
+        help="Number of parallel candidate evaluators for optimizer beam rounds (1 keeps sequential behavior).",
+    )
     parser.add_argument("--max-rounds", type=int, default=30)
     parser.add_argument("--no-improve-patience", type=int, default=3)
     parser.add_argument("--max-swap-attempts", type=int, default=200)
@@ -313,6 +320,7 @@ def _run_pipeline(args: argparse.Namespace, data_root_resolved: Path) -> int:
     print(f"Datasets found            : {len(plans)}")
     print(f"Shapley eval budget       : {args.shapley_eval_budget}")
     print(f"Optimizer eval budget     : {args.optimizer_eval_budget}")
+    print(f"Parallel evaluators       : {max(1, int(args.parallel_evaluators))}")
     optimizer_seeds = _parse_seed_list(args.optimizer_seeds)
     if not optimizer_seeds:
         optimizer_seeds = [int(args.optimizer_seed)]

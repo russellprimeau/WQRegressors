@@ -94,6 +94,7 @@ import json
 import re
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 import pandas as pd
 import importlib.util
 import matplotlib
@@ -873,6 +874,24 @@ def _evaluate_candidate(
         return None
 
 
+def _evaluate_candidate_worker(payload: dict) -> CandidateResult | None:
+    """Process worker for candidate evaluation payloads."""
+    return _evaluate_candidate(
+        dataset_dir=Path(payload["dataset_dir"]),
+        target_name=str(payload["target_name"]),
+        surrogate_config_path=Path(payload["surrogate_config_path"]),
+        row_count=int(payload["row_count"]),
+        features=tuple(payload["features"]),
+        feature_tag=str(payload["feature_tag"]),
+        lambda_drop=float(payload["lambda_drop"]),
+        tmp_cfg_dir=Path(payload["tmp_cfg_dir"]),
+        disable_baselines_for_search=bool(payload["disable_baselines_for_search"]),
+        disable_training_plots=bool(payload["disable_training_plots"]),
+        disable_eval_plots=bool(payload["disable_eval_plots"]),
+        suppress_training_logs=bool(payload["suppress_training_logs"]),
+    )
+
+
 def _candidate_key(row_count: int, features: tuple[str, ...]) -> tuple[int, tuple[str, ...]]:
     return int(row_count), tuple(features)
 
@@ -1552,6 +1571,7 @@ def _beam_search_subsets(
     suppress_training_logs: bool,
     seed: int,
     save_search_plots: bool,
+    parallel_evaluators: int = 1,
     include_row_count_in_plot_names: bool = False,
     seeded_subsets: list[tuple[str, ...]] | None = None,
 ) -> tuple[list[CandidateResult], list[CandidateResult], dict[str, tuple[float, int]]]:
@@ -1598,6 +1618,9 @@ def _beam_search_subsets(
         raise ValueError(f"min_features={min_features} must be < number of features ({len(full_features)})")
 
     rng = np.random.default_rng(seed)
+    parallel_workers = max(1, int(parallel_evaluators))
+    if parallel_workers > 1:
+        print(f"[SEARCH] Parallel evaluators enabled: {parallel_workers}")
     cache: dict[tuple[int, tuple[str, ...]], CandidateResult] = {}
     trace: list[CandidateResult] = []
     eval_count = 0
@@ -1631,7 +1654,8 @@ def _beam_search_subsets(
             suppress_training_logs=suppress_training_logs,
         )
         cache[key] = result
-        trace.append(result)
+        if result is not None:
+            trace.append(result)
         eval_count += 1
         return result
 
@@ -1687,23 +1711,67 @@ def _beam_search_subsets(
 
         rng.shuffle(candidates)
         scored: list[CandidateResult] = []
-        for child in candidates:
-            out = _eval(child)
-            if out is None:
-                print(f"[SEARCH] Round {_round + 1}: eval budget exhausted after {eval_count} evals.")
-                break
-            scored.append(out)
-            
-            # Track removal sensitivity: which feature was removed from beam members to create this child?
-            # Find parent by checking which single feature difference exists
-            for parent_item in beam:
-                parent_set = set(parent_item.features)
-                child_set = set(child)
-                if len(parent_set - child_set) == 1:  # exactly one feature removed
-                    removed_feat = list(parent_set - child_set)[0]
-                    delta = out.objective - parent_item.objective
-                    feature_removal_deltas[removed_feat].append(delta)
+        remaining_budget = max(0, int(eval_budget - eval_count))
+        batch = list(candidates[:remaining_budget])
+
+        if parallel_workers <= 1 or len(batch) <= 1:
+            for child in batch:
+                out = _eval(child)
+                if out is None:
+                    print(f"[SEARCH] Round {_round + 1}: eval budget exhausted after {eval_count} evals.")
                     break
+                scored.append(out)
+
+                # Track removal sensitivity: which feature was removed from beam members to create this child?
+                # Find parent by checking which single feature difference exists
+                for parent_item in beam:
+                    parent_set = set(parent_item.features)
+                    child_set = set(child)
+                    if len(parent_set - child_set) == 1:  # exactly one feature removed
+                        removed_feat = list(parent_set - child_set)[0]
+                        delta = out.objective - parent_item.objective
+                        feature_removal_deltas[removed_feat].append(delta)
+                        break
+        else:
+            payloads = []
+            payload_features = []
+            for child in batch:
+                payload_features.append(child)
+                payloads.append(
+                    {
+                        "dataset_dir": str(dataset_dir),
+                        "target_name": target_name,
+                        "surrogate_config_path": str(surrogate_config_path),
+                        "row_count": int(row_count),
+                        "features": list(child),
+                        "feature_tag": _feature_tag(child),
+                        "lambda_drop": float(lambda_drop),
+                        "tmp_cfg_dir": str(tmp_cfg_dir),
+                        "disable_baselines_for_search": bool(disable_baselines_for_search),
+                        "disable_training_plots": bool(disable_training_plots),
+                        "disable_eval_plots": bool(disable_eval_plots),
+                        "suppress_training_logs": bool(suppress_training_logs),
+                    }
+                )
+
+            with ProcessPoolExecutor(max_workers=parallel_workers) as pool:
+                for child, out in zip(payload_features, pool.map(_evaluate_candidate_worker, payloads)):
+                    key = _candidate_key(row_count, child)
+                    cache[key] = out
+                    if out is not None:
+                        trace.append(out)
+                    eval_count += 1
+                    if out is None:
+                        continue
+                    scored.append(out)
+                    for parent_item in beam:
+                        parent_set = set(parent_item.features)
+                        child_set = set(child)
+                        if len(parent_set - child_set) == 1:
+                            removed_feat = list(parent_set - child_set)[0]
+                            delta = out.objective - parent_item.objective
+                            feature_removal_deltas[removed_feat].append(delta)
+                            break
 
         if not scored:
             print(f"[SEARCH] Round {_round + 1}: no scored candidates, stopping.")
@@ -3275,6 +3343,8 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
     print(f"Search train plots enabled: {not search_disable_training_plots}")
     print(f"Search eval plots enabled : {not search_disable_eval_plots}")
     print(f"Search summary plots      : {search_save_plots}")
+    parallel_evaluators = max(1, int(getattr(args, "parallel_evaluators", 1)))
+    print(f"Parallel evaluators       : {parallel_evaluators}")
     print(f"Final run baselines       : {final_run_baselines}")
     print(f"Final eval plots enabled  : {not final_disable_eval_plots}")
     print(f"Seed subsets from Shapley : {args.seed_subsets_from_shapley}")
@@ -3330,6 +3400,7 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     suppress_training_logs=not args.show_training_logs,
                     seed=args.seed,
                     save_search_plots=search_save_plots,
+                    parallel_evaluators=parallel_evaluators,
                     include_row_count_in_plot_names=include_row_count_in_plot_names,
                     seeded_subsets=seeded_subsets,
                 )
@@ -3403,6 +3474,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-drop", type=float, default=0.25)
     parser.add_argument("--final-top-k", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--parallel-evaluators",
+        type=int,
+        default=1,
+        help="Number of parallel candidate evaluators for beam rounds (1 keeps sequential behavior).",
+    )
     parser.add_argument(
         "--seed-subsets-csv",
         type=str,

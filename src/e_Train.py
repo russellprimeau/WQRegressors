@@ -75,6 +75,10 @@ DEFAULT_TRANSFORMER_CONFIG = {
     "corr_lambda": 0.1,
     "corr_eps": 1e-8,
     "corr_clip": True,
+    "num_workers": 0,
+    "pin_memory": True,
+    "persistent_workers": True,
+    "prefetch_factor": 2,
 }
 
 DEFAULT_XGB_REGRESSOR_CONFIG = {
@@ -102,6 +106,54 @@ DEFAULT_XGB_CLASSIFIER_CONFIG = {
     "n_jobs": -1,
     "early_stopping_rounds": 50,
 }
+
+
+def _parse_xgb_version() -> tuple[int, int]:
+    """Parse xgboost major/minor version safely for runtime feature gating."""
+    raw = str(getattr(xgb, "__version__", "0.0"))
+    parts = []
+    for token in raw.split("."):
+        digits = ""
+        for ch in token:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if digits:
+            parts.append(int(digits))
+        else:
+            parts.append(0)
+    major = parts[0] if len(parts) > 0 else 0
+    minor = parts[1] if len(parts) > 1 else 0
+    return int(major), int(minor)
+
+
+def _resolve_xgb_runtime_hyperparameters(hyper_cfg: dict, preferred_device: str) -> dict:
+    """Return effective XGB hyperparameters with version-aware GPU defaults."""
+    effective = dict(hyper_cfg)
+    prefer_cuda = str(preferred_device).lower().startswith("cuda") and torch.cuda.is_available()
+    major, _minor = _parse_xgb_version()
+
+    if prefer_cuda:
+        if major >= 2:
+            effective.setdefault("device", "cuda")
+            effective.setdefault("tree_method", "hist")
+            # predictor is not required in xgboost >= 2 and can be ignored.
+            effective.pop("predictor", None)
+        else:
+            effective.setdefault("tree_method", "gpu_hist")
+            effective.setdefault("predictor", "gpu_predictor")
+            effective.pop("device", None)
+        # In GPU mode, avoid high host CPU contention from n_jobs=-1.
+        effective["n_jobs"] = int(effective.get("n_jobs", 1)) if int(effective.get("n_jobs", 1)) > 0 else 1
+    else:
+        effective.setdefault("tree_method", "hist")
+        effective.setdefault("n_jobs", -1)
+        effective.pop("device", None)
+        if str(effective.get("predictor", "")).strip().lower() == "gpu_predictor":
+            effective.pop("predictor", None)
+
+    return effective
 
 DEFAULT_GP_REGRESSOR_CONFIG = {
     "kernel": "matern52",
@@ -201,6 +253,13 @@ def merge_with_defaults(config, model_type):
     # Add training plot toggle if not specified
     if "save_training_plots" not in merged_config:
         merged_config["save_training_plots"] = DEFAULT_COMMON_CONFIG["save_training_plots"]
+
+    if model_type in {"xgb_regressor", "xgb_classifier"}:
+        effective_hyper = _resolve_xgb_runtime_hyperparameters(
+            merged_config["hyperparameters"],
+            merged_config["device"],
+        )
+        merged_config["hyperparameters"] = effective_hyper
     
     return merged_config
 
@@ -371,8 +430,20 @@ def train_transformer_model(config, train_samples, test_samples):
     # Prepare data
     train_dataset = TimeSeriesTargetDataset(train_samples)
     test_dataset = TimeSeriesTargetDataset(test_samples)
-    trainloader = DataLoader(train_dataset, batch_size=hyper_cfg["batch_size"], shuffle=True)
-    testloader = DataLoader(test_dataset, batch_size=hyper_cfg["batch_size"], shuffle=True)
+    num_workers = max(0, int(hyper_cfg.get("num_workers", 0)))
+    pin_memory = bool(hyper_cfg.get("pin_memory", device.type == "cuda")) and (device.type == "cuda")
+    persistent_workers = bool(hyper_cfg.get("persistent_workers", True)) and (num_workers > 0)
+    loader_kwargs = {
+        "batch_size": hyper_cfg["batch_size"],
+        "shuffle": True,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = max(1, int(hyper_cfg.get("prefetch_factor", 2)))
+    trainloader = DataLoader(train_dataset, **loader_kwargs)
+    testloader = DataLoader(test_dataset, **loader_kwargs)
     
     model_config = {
         'input_dim': len(data_cfg["input_columns"]),
@@ -702,16 +773,16 @@ def _train_xgb_model(config, train_samples, test_samples, model_cls, metric_key,
     print("="*80)
 
     data_cfg = config["data"]
-    hyper_cfg = config["hyperparameters"]
+    hyper_cfg = _resolve_xgb_runtime_hyperparameters(config["hyperparameters"], config.get("device", "cpu"))
 
-    X_train = np.array([s[0].flatten() for s in train_samples])
-    X_test = np.array([s[0].flatten() for s in test_samples])
+    X_train = np.ascontiguousarray(np.array([s[0].flatten() for s in train_samples], dtype=np.float32))
+    X_test = np.ascontiguousarray(np.array([s[0].flatten() for s in test_samples], dtype=np.float32))
     if cast_y is not None:
-        y_train = np.array([cast_y(s[1].flatten()[0]) for s in train_samples])
-        y_test = np.array([cast_y(s[1].flatten()[0]) for s in test_samples])
+        y_train = np.ascontiguousarray(np.array([cast_y(s[1].flatten()[0]) for s in train_samples]))
+        y_test = np.ascontiguousarray(np.array([cast_y(s[1].flatten()[0]) for s in test_samples]))
     else:
-        y_train = np.array([s[1].flatten()[0] for s in train_samples])
-        y_test = np.array([s[1].flatten()[0] for s in test_samples])
+        y_train = np.ascontiguousarray(np.array([s[1].flatten()[0] for s in train_samples], dtype=np.float32))
+        y_test = np.ascontiguousarray(np.array([s[1].flatten()[0] for s in test_samples], dtype=np.float32))
 
     model_config = {
         'input_dim': len(data_cfg["input_columns"]),
@@ -726,18 +797,37 @@ def _train_xgb_model(config, train_samples, test_samples, model_cls, metric_key,
     write_config(model_config, data_cfg["data_dir"], data_cfg["forecast_name"], "")
 
     metric = hyper_cfg[metric_key]
-    extra_kwargs = {"eval_metric": metric} if metric_key == "eval_metric" else {}
-    model = model_cls(
-        tree_method=hyper_cfg["tree_method"],
-        objective=hyper_cfg["objective"],
-        n_estimators=hyper_cfg["n_estimators"],
-        max_depth=hyper_cfg["max_depth"],
-        subsample=hyper_cfg["subsample"],
-        colsample_bytree=hyper_cfg["colsample_bytree"],
-        learning_rate=hyper_cfg["learning_rate"],
-        n_jobs=hyper_cfg["n_jobs"],
-        early_stopping_rounds=hyper_cfg["early_stopping_rounds"],
-        **extra_kwargs
+    model_kwargs = {
+        "tree_method": hyper_cfg["tree_method"],
+        "objective": hyper_cfg["objective"],
+        "n_estimators": hyper_cfg["n_estimators"],
+        "max_depth": hyper_cfg["max_depth"],
+        "subsample": hyper_cfg["subsample"],
+        "colsample_bytree": hyper_cfg["colsample_bytree"],
+        "learning_rate": hyper_cfg["learning_rate"],
+        "early_stopping_rounds": hyper_cfg["early_stopping_rounds"],
+        "n_jobs": int(hyper_cfg.get("n_jobs", -1)),
+    }
+    if metric_key == "eval_metric":
+        model_kwargs["eval_metric"] = metric
+    if "device" in hyper_cfg:
+        model_kwargs["device"] = hyper_cfg["device"]
+    if "predictor" in hyper_cfg:
+        model_kwargs["predictor"] = hyper_cfg["predictor"]
+
+    model = model_cls(**model_kwargs)
+
+    is_gpu_mode = (
+        str(hyper_cfg.get("device", "")).lower().startswith("cuda")
+        or str(hyper_cfg.get("tree_method", "")).lower() == "gpu_hist"
+    )
+    print(
+        "XGBoost runtime mode: "
+        f"{'GPU' if is_gpu_mode else 'CPU'} "
+        f"(tree_method={hyper_cfg.get('tree_method')}, "
+        f"device={hyper_cfg.get('device', 'n/a')}, "
+        f"predictor={hyper_cfg.get('predictor', 'n/a')}, "
+        f"xgboost_version={getattr(xgb, '__version__', 'unknown')})"
     )
 
     print(f"Training {model_cls.__name__}...")
