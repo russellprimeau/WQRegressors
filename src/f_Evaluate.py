@@ -83,6 +83,8 @@ DEFAULT_EVAL_CONFIG = {
     "baseline_match_mc_to_raw": True,
     "save_plots": True,
     "evaluate_all": False,  # If true, combine train and test samples for evaluation
+    "collapse_mc_replicates_for_eval": False,
+    "include_mc_stats_in_predictions": True,
 }
 
 EVAL_METRIC_SEMANTICS = "independent_sample_primary"
@@ -168,6 +170,19 @@ def _map_split_files_mc_to_raw(split_files):
             seen.add(mapped_name)
             mapped.append(mapped_name)
     return mapped
+
+
+def _dedupe_split_files_by_base_sample(split_files):
+    """Keep one existing split entry per base sample id while preserving order."""
+    deduped = []
+    seen = set()
+    for file_name in split_files:
+        base_name = re.sub(r"_mc_\d+(?=\.csv$)", "", str(file_name))
+        if base_name in seen:
+            continue
+        seen.add(base_name)
+        deduped.append(str(file_name))
+    return deduped
 
 
 def load_split_samples(
@@ -736,6 +751,35 @@ def _plot_uncertainty_boxplots(regression_pairs, regression_labels, split_files_
         print(f"[INFO] Wrote uncertainty boxplot: {out_path}")
 
 
+def _has_mc_replicate_distribution_for_uncertainty_plot(
+    regression_pairs,
+    split_files_by_pair,
+    row_limit=None,
+):
+    """Return True when any model plot entry contains >1 evaluated rows for a base sample id."""
+    for pair, split_files in zip(regression_pairs, split_files_by_pair):
+        if split_files is None:
+            continue
+        preds, targets = pair
+        _, _, n_rows, n_cols = _aligned_arrays(preds, targets, row_limit=row_limit)
+        if n_rows <= 0 or n_cols <= 0:
+            continue
+
+        aligned_rows = min(n_rows, len(split_files))
+        if aligned_rows <= 1:
+            continue
+
+        counts_by_base = {}
+        for idx in range(aligned_rows):
+            base_id = _base_sample_id(split_files[idx])
+            counts_by_base[base_id] = counts_by_base.get(base_id, 0) + 1
+
+        if any(count > 1 for count in counts_by_base.values()):
+            return True
+
+    return False
+
+
 def _compute_regression_summary(label, preds, targets, num_samples, metadata=None, split_files=None):
     metadata = metadata or {}
     pred_arr, target_arr, n_rows, n_cols = _aligned_arrays(preds, targets, row_limit=num_samples)
@@ -871,6 +915,240 @@ def _write_summary_csv(rows, output_path):
     print(f"[INFO] Wrote evaluation summary CSV: {output_path}")
 
 
+def _prediction_target_columns(n_outputs):
+    if n_outputs <= 1:
+        return ["target"]
+    return [f"target_{i}" for i in range(n_outputs)]
+
+
+def _prediction_value_columns(label, n_outputs):
+    base = str(label)
+    if n_outputs <= 1:
+        return [base]
+    return [f"{base}_{i}" for i in range(n_outputs)]
+
+
+def _extract_mc_index(file_name):
+    match = re.search(r"_mc_(\d+)(?=\.csv$)", Path(str(file_name)).name)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _prediction_mc_columns(replicate_ids, n_outputs):
+    ordered_ids = sorted(int(r) for r in replicate_ids)
+    cols = []
+    if n_outputs <= 1:
+        for rep_id in ordered_ids:
+            cols.append(f"mc_{rep_id:03d}")
+        return cols
+
+    for rep_id in ordered_ids:
+        for out_idx in range(n_outputs):
+            cols.append(f"mc_{rep_id:03d}_{out_idx}")
+    return cols
+
+
+def _group_independent_prediction_stats(preds, targets, split_files):
+    pred_arr, target_arr, n_rows, n_cols = _aligned_arrays(preds, targets)
+    if n_rows <= 0 or n_cols <= 0:
+        return [], 0
+
+    if split_files:
+        n_rows = min(n_rows, len(split_files))
+        split_names = [Path(str(s)).name for s in split_files[:n_rows]]
+    else:
+        split_names = [f"sample_{i:06d}.csv" for i in range(n_rows)]
+
+    if n_rows <= 0:
+        return [], 0
+
+    pred_arr = pred_arr[:n_rows, :]
+    target_arr = target_arr[:n_rows, :]
+
+    grouped_pred = {}
+    grouped_target = {}
+    grouped_replicates = {}
+    grouped_used_rep_ids = {}
+    grouped_next_rep_id = {}
+    group_order = []
+
+    for idx in range(n_rows):
+        sample_file = _base_sample_id(split_names[idx])
+        if sample_file not in grouped_pred:
+            group_order.append(sample_file)
+            grouped_pred[sample_file] = []
+            grouped_target[sample_file] = []
+            grouped_replicates[sample_file] = []
+            grouped_used_rep_ids[sample_file] = set()
+            grouped_next_rep_id[sample_file] = 1
+        grouped_pred[sample_file].append(pred_arr[idx, :])
+        grouped_target[sample_file].append(target_arr[idx, :])
+
+        rep_id = _extract_mc_index(split_names[idx])
+        if rep_id is None:
+            rep_id = grouped_next_rep_id[sample_file]
+        while rep_id in grouped_used_rep_ids[sample_file]:
+            rep_id += 1
+        grouped_used_rep_ids[sample_file].add(rep_id)
+        grouped_next_rep_id[sample_file] = max(grouped_next_rep_id[sample_file], rep_id + 1)
+        grouped_replicates[sample_file].append((int(rep_id), np.asarray(pred_arr[idx, :], dtype=float).copy()))
+
+    grouped_rows = []
+    for sample_file in group_order:
+        pred_group = np.asarray(grouped_pred[sample_file], dtype=float)
+        target_group = np.asarray(grouped_target[sample_file], dtype=float)
+
+        pred_count = np.sum(np.isfinite(pred_group), axis=0)
+        pred_sum = np.nansum(pred_group, axis=0)
+        pred_mean = np.full(pred_group.shape[1], np.nan, dtype=float)
+        np.divide(pred_sum, pred_count, out=pred_mean, where=pred_count > 0)
+
+        pred_std = np.full(pred_group.shape[1], np.nan, dtype=float)
+        for col_idx in range(pred_group.shape[1]):
+            col_vals = pred_group[:, col_idx]
+            col_vals = col_vals[np.isfinite(col_vals)]
+            if len(col_vals) > 0:
+                pred_std[col_idx] = float(np.std(col_vals, ddof=0))
+
+        target_count = np.sum(np.isfinite(target_group), axis=0)
+        target_sum = np.nansum(target_group, axis=0)
+        target_mean = np.full(target_group.shape[1], np.nan, dtype=float)
+        np.divide(target_sum, target_count, out=target_mean, where=target_count > 0)
+
+        grouped_rows.append(
+            {
+                "sample_file": sample_file,
+                "target_mean": target_mean,
+                "pred_mean": pred_mean,
+                "pred_std": pred_std,
+                "replicate_preds": sorted(grouped_replicates[sample_file], key=lambda item: item[0]),
+                "n_replicates": int(pred_group.shape[0]),
+            }
+        )
+
+    return grouped_rows, int(n_cols)
+
+
+def _build_predictions_table(entries, gp_uncertainty_mode, include_mc_output_columns=True):
+    rows_by_key = {}
+    key_order = []
+    predictor_columns = []
+    target_columns = []
+    mc_mean_columns = []
+    mc_std_columns = []
+    mc_replicate_ids = set()
+    n_outputs_ref = None
+
+    for entry in entries:
+        grouped_rows, n_outputs = _group_independent_prediction_stats(
+            entry.get("preds"),
+            entry.get("targets"),
+            entry.get("split_files"),
+        )
+        if not grouped_rows or n_outputs <= 0:
+            continue
+
+        if n_outputs_ref is None:
+            n_outputs_ref = n_outputs
+            target_columns = _prediction_target_columns(n_outputs_ref)
+            mc_mean_columns = _prediction_value_columns("mc_pred_mean", n_outputs_ref)
+            mc_std_columns = _prediction_value_columns("mc_pred_std", n_outputs_ref)
+        elif n_outputs != n_outputs_ref:
+            # Keep a single stable schema across model/baseline entries.
+            for row in grouped_rows:
+                row["target_mean"] = row["target_mean"][:n_outputs_ref]
+                row["pred_mean"] = row["pred_mean"][:n_outputs_ref]
+                row["pred_std"] = row["pred_std"][:n_outputs_ref]
+                row["replicate_preds"] = [
+                    (rep_id, np.asarray(rep_vals, dtype=float)[:n_outputs_ref]) for rep_id, rep_vals in row["replicate_preds"]
+                ]
+
+        value_columns = _prediction_value_columns(entry["label"], n_outputs_ref)
+        for col in value_columns:
+            if col not in predictor_columns:
+                predictor_columns.append(col)
+
+        kind = str(entry.get("kind", "test"))
+        include_mc_stats = bool(entry.get("include_mc_stats", False))
+        if include_mc_stats:
+            for grouped in grouped_rows:
+                for rep_id, _ in grouped.get("replicate_preds", []):
+                    mc_replicate_ids.add(int(rep_id))
+        for grouped in grouped_rows:
+            key = (kind, grouped["sample_file"])
+            if key not in rows_by_key:
+                row_template = {
+                    "kind": kind,
+                    "sample_file": grouped["sample_file"],
+                    "gp_uncertainty_mode": gp_uncertainty_mode,
+                    "metric_semantics": EVAL_METRIC_SEMANTICS,
+                    "metric_contract_version": int(EVAL_METRIC_CONTRACT_VERSION),
+                }
+                if include_mc_output_columns:
+                    row_template["mc_n_replicates"] = np.nan
+                rows_by_key[key] = row_template
+                key_order.append(key)
+
+            row = rows_by_key[key]
+            for col_idx, target_col in enumerate(target_columns):
+                target_val = float(grouped["target_mean"][col_idx])
+                if target_col not in row or not np.isfinite(row[target_col]):
+                    row[target_col] = target_val
+
+            for col_idx, pred_col in enumerate(value_columns):
+                row[pred_col] = float(grouped["pred_mean"][col_idx])
+
+            if include_mc_output_columns and include_mc_stats:
+                row["mc_n_replicates"] = int(grouped["n_replicates"])
+                for rep_id, rep_vals in grouped.get("replicate_preds", []):
+                    if n_outputs_ref <= 1:
+                        row[f"mc_{int(rep_id):03d}"] = float(rep_vals[0])
+                    else:
+                        for out_idx in range(n_outputs_ref):
+                            row[f"mc_{int(rep_id):03d}_{out_idx}"] = float(rep_vals[out_idx])
+                for col_idx, mc_col in enumerate(mc_mean_columns):
+                    row[mc_col] = float(grouped["pred_mean"][col_idx])
+                for col_idx, mc_col in enumerate(mc_std_columns):
+                    row[mc_col] = float(grouped["pred_std"][col_idx])
+
+    rows = [rows_by_key[key] for key in key_order]
+    ordered_columns = [
+        "kind",
+        "sample_file",
+        "gp_uncertainty_mode",
+        "metric_semantics",
+        "metric_contract_version",
+    ]
+    if include_mc_output_columns:
+        ordered_columns.append("mc_n_replicates")
+    ordered_columns.extend(target_columns)
+    ordered_columns.extend(predictor_columns)
+    if include_mc_output_columns:
+        ordered_columns.extend(_prediction_mc_columns(mc_replicate_ids, n_outputs_ref if n_outputs_ref is not None else 0))
+        ordered_columns.extend(mc_mean_columns)
+        ordered_columns.extend(mc_std_columns)
+
+    return rows, ordered_columns
+
+
+def _write_predictions_csv(rows, output_path, ordered_columns):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if rows:
+        df = pd.DataFrame(rows)
+        for col in ordered_columns:
+            if col not in df.columns:
+                df[col] = np.nan
+        df = df[ordered_columns]
+    else:
+        df = pd.DataFrame(columns=ordered_columns)
+
+    df.to_csv(output_path, index=False)
+    print(f"[INFO] Wrote predictions CSV: {output_path}")
+
+
 def _model_label(model_type):
     mapping = {
         "transformer": "Transformer",
@@ -974,11 +1252,19 @@ def evaluate_single_config(config_path, save_plots_override=None):
     input_aggregation = str(model_config.get("input_aggregation", data_cfg.get("input_aggregation", "none"))).lower()
     split_cfg = config.get("data_split", {"random_state": 42})
     split_fault_tolerant = bool(split_cfg.get("fault_tolerant", False))
+    collapse_mc_for_eval = bool(eval_cfg.get("collapse_mc_replicates_for_eval", False))
+    include_mc_stats_in_predictions = bool(eval_cfg.get("include_mc_stats_in_predictions", True))
 
 
     # Use the original forecast directory if present, else fallback to config_path.parent
     config_path = Path(config_path)
     split_base_dir = Path(data_cfg.get("forecast_dir", config_path.parent))
+    model_split_files = _read_split_files(
+        split_base_dir,
+        "test_files.txt",
+    )
+    if collapse_mc_for_eval:
+        model_split_files = _dedupe_split_files_by_base_sample(model_split_files)
     test_samples = load_split_samples(
         data_cfg["data_dir"],
         data_cfg["sample_subdir"],
@@ -989,13 +1275,15 @@ def evaluate_single_config(config_path, save_plots_override=None):
         output_rows,
         "test_files.txt",
         split_source_dir=split_base_dir,
+        split_files_override=model_split_files,
         fault_tolerant=split_fault_tolerant,
         input_aggregation=input_aggregation,
     )
-    model_split_files = _read_split_files(
-        split_base_dir,
-        "test_files.txt",
-    )
+    if collapse_mc_for_eval:
+        print(
+            "[MC-POLICY] collapse_mc_replicates_for_eval=True "
+            f"(test split unique samples: {len(model_split_files)})"
+        )
     test_dataset = TimeSeriesTargetDataset(test_samples)
     train_samples = None
     train_split_files = None
@@ -1010,13 +1298,17 @@ def evaluate_single_config(config_path, save_plots_override=None):
             output_rows,
             "train_files.txt",
             split_source_dir=split_base_dir,
+            split_files_override=(
+                _dedupe_split_files_by_base_sample(_read_split_files(split_base_dir, "train_files.txt"))
+                if collapse_mc_for_eval
+                else None
+            ),
             fault_tolerant=split_fault_tolerant,
             input_aggregation=input_aggregation,
         )
-        train_split_files = _read_split_files(
-            split_base_dir,
-            "train_files.txt",
-        )
+        train_split_files = _read_split_files(split_base_dir, "train_files.txt")
+        if collapse_mc_for_eval:
+            train_split_files = _dedupe_split_files_by_base_sample(train_split_files)
     elif model_type in ("xgb_regressor", "transformer", "xgb_classifier"):
         # For these, optionally load train samples if evaluate_all is set
         if eval_cfg.get("evaluate_all", False):
@@ -1030,13 +1322,17 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 output_rows,
                 "train_files.txt",
                 split_source_dir=split_base_dir,
+                split_files_override=(
+                    _dedupe_split_files_by_base_sample(_read_split_files(split_base_dir, "train_files.txt"))
+                    if collapse_mc_for_eval
+                    else None
+                ),
                 fault_tolerant=split_fault_tolerant,
                 input_aggregation=input_aggregation,
             )
-            train_split_files = _read_split_files(
-                split_base_dir,
-                "train_files.txt",
-            )
+            train_split_files = _read_split_files(split_base_dir, "train_files.txt")
+            if collapse_mc_for_eval:
+                train_split_files = _dedupe_split_files_by_base_sample(train_split_files)
 
     # If evaluate_all is true, combine train and test samples for evaluation, but keep track of which is which
     if eval_cfg.get("evaluate_all", False) and train_samples is not None:
@@ -1098,11 +1394,13 @@ def evaluate_single_config(config_path, save_plots_override=None):
     summary_rows = []
     baseline_split_files = []
     per_set_metrics = []
+    predictions_entries = []
 
     # --- Regression metrics for train/test and optional combined set ---
     # Combined metrics are emitted only when evaluate_all truly evaluates train+test.
     if eval_cfg.get("run_regression", True):
         include_combined_metrics = bool(eval_cfg.get("evaluate_all", False) and train_samples is not None)
+        model_column_label = _model_label(model_type)
         preds_train = None
         preds_test = None
         preds_all = None
@@ -1135,6 +1433,16 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 split_files=(train_split_files or []),
             )
             per_set_metrics.append(row_train)
+            predictions_entries.append(
+                {
+                    "kind": "train",
+                    "label": model_column_label,
+                    "preds": preds_train,
+                    "targets": y_train,
+                    "split_files": (train_split_files or []),
+                    "include_mc_stats": include_mc_stats_in_predictions,
+                }
+            )
         if preds_test is not None:
             row_test = _compute_regression_summary(
                 f"{_model_label(model_type)} (test)",
@@ -1145,6 +1453,16 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 split_files=model_split_files,
             )
             per_set_metrics.append(row_test)
+            predictions_entries.append(
+                {
+                    "kind": "test",
+                    "label": model_column_label,
+                    "preds": preds_test,
+                    "targets": y_test,
+                    "split_files": model_split_files,
+                    "include_mc_stats": include_mc_stats_in_predictions,
+                }
+            )
         if preds_all is not None:
             row_all = _compute_regression_summary(
                 f"{_model_label(model_type)} (combined)",
@@ -1155,6 +1473,16 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 split_files=eval_split_files,
             )
             per_set_metrics.append(row_all)
+            predictions_entries.append(
+                {
+                    "kind": "combined",
+                    "label": model_column_label,
+                    "preds": preds_all,
+                    "targets": y_all,
+                    "split_files": eval_split_files,
+                    "include_mc_stats": include_mc_stats_in_predictions,
+                }
+            )
     # Add per-set metrics to summary_rows for CSV output.
     summary_rows.extend(per_set_metrics)
 
@@ -1213,7 +1541,10 @@ def evaluate_single_config(config_path, save_plots_override=None):
             (preds_linear, targets_linear),
         ]
         baseline_labels = ["Naive", "Seasonal", "Linear"]
-        baseline_split_files = [eval_split_files] * 3
+        # Baselines are deterministic per independent sample; collapse MC replicates for plotting.
+        baseline_plot_split_files = _dedupe_split_files_by_base_sample(eval_split_files)
+        baseline_split_files = [baseline_plot_split_files] * 3
+        baseline_kind = "combined" if (eval_cfg.get("evaluate_all", False) and train_samples is not None) else "test"
         # Add baseline metrics to summary_rows
         for (preds, targets), label in zip(baseline_pairs, baseline_labels):
             row = _compute_regression_summary(
@@ -1225,6 +1556,16 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 split_files=eval_split_files,
             )
             summary_rows.append(row)
+            predictions_entries.append(
+                {
+                    "kind": baseline_kind,
+                    "label": label,
+                    "preds": preds,
+                    "targets": targets,
+                    "split_files": eval_split_files,
+                    "include_mc_stats": False,
+                }
+            )
 
     # --- Plotting ---
     # Always plot model and baselines together
@@ -1250,6 +1591,9 @@ def evaluate_single_config(config_path, save_plots_override=None):
     plot_labels.extend(baseline_labels)
     plot_split_files.extend(baseline_split_files)
 
+    model_plot_count = len(plot_pairs) - len(baseline_pairs)
+    collapse_error_points_by_pair = ([False] * model_plot_count) + ([True] * len(baseline_pairs))
+
     # Call visualizer and uncertainty plots only when plot output is enabled.
     if plot_pairs and save_plots:
         visualizer(
@@ -1259,16 +1603,35 @@ def evaluate_single_config(config_path, save_plots_override=None):
             directory=data_cfg["data_dir"],
             num_samples=eval_cfg.get("num_samples", 200),
             sample_labels=None,
+            split_files_by_pair=plot_split_files,
+            collapse_error_points_by_pair=collapse_error_points_by_pair,
         )
-        _plot_uncertainty_boxplots(
-            plot_pairs,
-            plot_labels,
-            plot_split_files,
-            directory=data_cfg["data_dir"],
-            forecast_name=data_cfg["forecast_name"],
-            num_samples=eval_cfg.get("num_samples", 200),
-            sample_labels=None,
+        model_plot_pairs = plot_pairs[:model_plot_count]
+        model_plot_labels = plot_labels[:model_plot_count]
+        model_plot_split_files = plot_split_files[:model_plot_count]
+
+        has_model_mc_distribution = _has_mc_replicate_distribution_for_uncertainty_plot(
+            model_plot_pairs,
+            model_plot_split_files,
+            row_limit=eval_cfg.get("num_samples", 200),
         )
+        # Keep uncertainty boxplots model-only and only when replicate distributions exist.
+        # This matches predictions.csv semantics where mc_xxx columns appear only with MC replicate evaluations.
+        if has_model_mc_distribution:
+            _plot_uncertainty_boxplots(
+                model_plot_pairs,
+                model_plot_labels,
+                model_plot_split_files,
+                directory=data_cfg["data_dir"],
+                forecast_name=data_cfg["forecast_name"],
+                num_samples=eval_cfg.get("num_samples", 200),
+                sample_labels=None,
+            )
+        else:
+            print(
+                "[PLOT-POLICY] Skipping model uncertainty boxplots: "
+                "no MC replicate distributions were evaluated."
+            )
 
     # Write summary CSV for regression/classification results.
     # Model rows include test always, train optionally, and combined only when evaluate_all=true.
@@ -1277,6 +1640,15 @@ def evaluate_single_config(config_path, save_plots_override=None):
     summary_dir.mkdir(parents=True, exist_ok=True)
     summary_path = summary_dir / "evaluation_summary.csv"
     _write_summary_csv(summary_rows, summary_path)
+
+    # Write per-sample prediction table (one row per independent sample file).
+    predictions_rows, predictions_columns = _build_predictions_table(
+        predictions_entries,
+        gp_uncertainty_mode,
+        include_mc_output_columns=include_mc_stats_in_predictions,
+    )
+    predictions_path = summary_dir / "predictions.csv"
+    _write_predictions_csv(predictions_rows, predictions_path, predictions_columns)
 
     # Return the main model summary row (prefer test, then combined, then train)
     # Look for kind == 'test', else 'combined', else 'train', else first row

@@ -134,6 +134,21 @@ FINAL_METRICS_MODEL_STYLE = {
 
 _EXPECTED_EVAL_METRIC_SEMANTICS = "independent_sample_primary"
 
+# Only these predictors currently carry uncertainty distributions used to
+# generate meaningful Monte Carlo perturbation replicates.
+UNCERTAINTY_DISTRIBUTION_FEATURES = {
+    "Pfl - Sp Cond (microS_cm)",
+    "Pfl - pH",
+    "Pfl - DO (% Sat)",
+    "Pfl - Turbidity (FNU)",
+    "Pfl - fDOM (RFU)",
+    "Pfl - fDOM (QSU)",
+}
+
+
+def _candidate_uses_uncertainty_distributions(features: tuple[str, ...]) -> bool:
+    return any(str(feat) in UNCERTAINTY_DISTRIBUTION_FEATURES for feat in features)
+
 
 def _extract_required_independent_metric(model_row: dict, key: str, context: str) -> float:
     """Read a required primary independent-sample metric as a finite float."""
@@ -588,7 +603,12 @@ def _prepare_variant_config(
 
     if "evaluation" not in cfg_copy:
         cfg_copy["evaluation"] = {}
+    uses_uncertainty = _candidate_uses_uncertainty_distributions(tuple(features))
     cfg_copy["evaluation"]["run_baselines"] = True
+    # If no uncertainty-enabled predictors are present, evaluating MC replicates
+    # is redundant because replicate predictions are identical.
+    cfg_copy["evaluation"]["collapse_mc_replicates_for_eval"] = not uses_uncertainty
+    cfg_copy["evaluation"]["include_mc_stats_in_predictions"] = uses_uncertainty
 
     # Sweep/pipeline variants must reserve enough independent non-replicate test samples.
     split_cfg = cfg_copy.setdefault("data_split", {})
@@ -753,6 +773,7 @@ def _evaluate_candidate(
     suppress_training_logs: bool,
 ) -> CandidateResult:
     try:
+        uses_uncertainty = _candidate_uses_uncertainty_distributions(tuple(features))
         base_cfg = train_module.load_config(str(surrogate_config_path))
         base_data = base_cfg["data"]
         base_stop = int(base_data["input_row_2"])
@@ -789,6 +810,11 @@ def _evaluate_candidate(
             disable_eval_plots=disable_eval_plots,
             suppress_training_logs=suppress_training_logs,
         )
+        if not uses_uncertainty:
+            print(
+                f"[MC-POLICY] {dataset_dir.name} r{int(row_count):03d} {feature_tag}: "
+                "no uncertainty-enabled predictors in subset; evaluating collapsed originals only."
+            )
         _set_eval_overrides(
             eval_cfg,
             run_baselines=not disable_baselines_for_search,
@@ -2478,6 +2504,11 @@ def _evaluate_selected_subsets_all_models(
     target_name = _derive_target_name(dataset_plan.dataset_dir.name, dataset_prefix)
 
     for rank, cand in enumerate(selected, start=1):
+        if not _candidate_uses_uncertainty_distributions(tuple(cand.features)):
+            print(
+                f"[MC-POLICY] Final top-k subset rank={rank} ({cand.feature_tag}) has no uncertainty-enabled predictors; "
+                "evaluation will use collapsed original samples and omit MC prediction stats."
+            )
         # Keep one best row per baseline id (naive/seasonal/linear) across all model evaluations.
         best_baseline_rows: dict[str, tuple[float, float, dict]] = {}
         for base_cfg in dataset_plan.train_configs:

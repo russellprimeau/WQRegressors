@@ -63,7 +63,7 @@ import seaborn as sns
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from utils.training import load_samples, group_samples_by_segment
+from utils.training import load_samples, group_samples_by_segment, _filter_samples_by_nan_tolerance
 from h_RunMCFeatureSelectionSweep import build_parser, discover_mc_dataset_plans, _derive_target_name, _select_surrogate_config, _parse_row_counts, _available_row_counts_for_postprocess, _regenerate_saved_outputs_for_row, _load_feature_stats_artifacts_with_source, _compile_multi_target_comparison, _resolve_dataset_inclusion, _run_rolling_origin_cv, _ensure_k01_baselines, _write_dataset_evaluation_summary, _forecast_sweeps_dir, _plot_final_metrics_comparison
 
 try:
@@ -452,6 +452,31 @@ def _normalize_model_key(value: str) -> str:
 
 def _base_sample_id(name: str) -> str:
     return re.sub(r"_mc_\d+(?=\.csv$)", "", Path(str(name)).name)
+
+
+def _model_sample_policy(model_type: str, split_cfg: dict) -> tuple[bool, float | None]:
+    """Return enforced (fault_tolerant, nan_tolerance) for postprocess sample loading."""
+    model_key = str(model_type).strip().lower()
+    if model_key == "xgb_regressor":
+        tol = split_cfg.get("nan_tolerance", train_module.DEFAULT_DATA_SPLIT_CONFIG.get("nan_tolerance", 0.8))
+        try:
+            tol_val = float(tol)
+        except (TypeError, ValueError):
+            tol_val = float(train_module.DEFAULT_DATA_SPLIT_CONFIG.get("nan_tolerance", 0.8))
+        tol_val = float(min(1.0, max(0.0, tol_val)))
+        return True, tol_val
+    if model_key in {"gp_regressor", "transformer"}:
+        return False, None
+    # Conservative fallback for any unexpected model types.
+    return False, None
+
+
+def _sample_names_from_loaded_samples(samples) -> list[str]:
+    names: list[str] = []
+    for sample in samples:
+        if isinstance(sample, (tuple, list)) and len(sample) >= 3:
+            names.append(Path(str(sample[2])).name)
+    return names
 
 
 def _find_best_variant_eval_config(plan: DatasetPlan, row: "pd.Series") -> "tuple[Path | None, Path | None, str]":
@@ -965,6 +990,8 @@ def _collect_prediction_payload(eval_cfg_path: Path) -> dict:
     input_rows = slice(model_config["input_row_1"], model_config["input_row_2"])
     output_rows = model_config["output_rows"]
     input_aggregation = str(model_config.get("input_aggregation", data_cfg.get("input_aggregation", "none"))).lower()
+    split_cfg = cfg.get("data_split", {"random_state": 42})
+    load_fault_tolerant, enforced_nan_tolerance = _model_sample_policy(model_type, split_cfg)
 
     split_base_dir = Path(data_cfg.get("forecast_dir", eval_cfg_path.parent))
     test_samples = eval_module.load_split_samples(
@@ -977,9 +1004,24 @@ def _collect_prediction_payload(eval_cfg_path: Path) -> dict:
         output_rows,
         "test_files.txt",
         split_source_dir=split_base_dir,
+        fault_tolerant=load_fault_tolerant,
         input_aggregation=input_aggregation,
     )
-    split_files = eval_module._read_split_files(split_base_dir, "test_files.txt")
+    if load_fault_tolerant and enforced_nan_tolerance is not None:
+        before_n = len(test_samples)
+        test_samples = _filter_samples_by_nan_tolerance(test_samples, float(enforced_nan_tolerance))
+        dropped_n = max(0, before_n - len(test_samples))
+        if dropped_n > 0:
+            print(
+                f"[INFO] {eval_cfg_path.parent.name}: model={model_type} "
+                f"enforced fault_tolerant=True with nan_tolerance={enforced_nan_tolerance:.3f}; "
+                f"dropped {dropped_n} test sample(s)."
+            )
+
+    # Use filenames from loaded samples so evidence support counts reflect evaluated rows.
+    split_files = _sample_names_from_loaded_samples(test_samples)
+    if not split_files:
+        split_files = eval_module._read_split_files(split_base_dir, "test_files.txt")
 
     train_samples = None
     if model_type == "gp_regressor":
@@ -993,6 +1035,7 @@ def _collect_prediction_payload(eval_cfg_path: Path) -> dict:
             output_rows,
             "train_files.txt",
             split_source_dir=split_base_dir,
+            fault_tolerant=load_fault_tolerant,
             input_aggregation=input_aggregation,
         )
 
@@ -1003,7 +1046,6 @@ def _collect_prediction_payload(eval_cfg_path: Path) -> dict:
         X_test = np.array([s[0].flatten() for s in test_samples], dtype=float)
         y_test = np.array([s[1].flatten() for s in test_samples], dtype=float)
 
-    split_cfg = cfg.get("data_split", {"random_state": 42})
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = eval_module.load_model(model_type, data_cfg, split_cfg, model_name, model_config, device, train_samples, config_dir)
 

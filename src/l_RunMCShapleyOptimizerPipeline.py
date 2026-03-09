@@ -51,8 +51,10 @@ python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datase
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import h_RunMCFeatureSelectionSweep as optimizer_module
@@ -62,6 +64,28 @@ import i_RunMCFeatureSelectionShapleySweep as shapley_module
 _NAMESPACE_ENV = "WQ_FEATURE_SWEEP_NAMESPACE"
 _SHAPLEY_NAMESPACE = "Shapley_sweeps"
 _OPTIMIZER_DEFAULT_NAMESPACE = "feature_sweeps"
+
+
+class _TeeTextIO:
+    """Write-through stream that mirrors output to multiple text streams."""
+
+    def __init__(self, *streams) -> None:
+        self._streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self._streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            stream.flush()
+
+
+def _build_pipeline_log_path(data_root: Path) -> Path:
+    log_dir = (data_root.parent / "pipeline_logs").resolve()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return log_dir / f"shapley_optimizer_pipeline_{timestamp}.log"
 
 
 def _set_pipeline_stage_namespace(namespace: str | None) -> None:
@@ -255,6 +279,20 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
+    data_root_resolved = _resolve_data_root(args.data_root)
+    log_path = _build_pipeline_log_path(data_root_resolved)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(log_path, mode="w", encoding="utf-8") as log_file:
+        tee_stdout = _TeeTextIO(sys.stdout, log_file)
+        tee_stderr = _TeeTextIO(sys.stderr, log_file)
+        with contextlib.redirect_stdout(tee_stdout), contextlib.redirect_stderr(tee_stderr):
+            print(f"[PIPELINE] Logging terminal output to: {log_path}")
+            return _run_pipeline(args, data_root_resolved)
+
+
+def _run_pipeline(args: argparse.Namespace, data_root_resolved: Path) -> int:
+
     if args.skip_shapley_stage and args.skip_optimizer_stage:
         raise ValueError("Cannot skip both stages.")
 
@@ -265,8 +303,6 @@ def main() -> int:
     if not plans:
         print("No matching datasets/configs found.")
         return 1
-
-    data_root_resolved = _resolve_data_root(args.data_root)
 
     print("\nPipeline plan")
     print("-" * 100)

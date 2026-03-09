@@ -511,7 +511,16 @@ def binarize_predictions(preds, output_columns, thresholds_df):
         binarized[:, i] = exceed.astype(int)
     return binarized
 
-def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=None, num_samples=200, sample_labels=None):
+def visualizer(
+    *pred_target_pairs,
+    labels=None,
+    directory=None,
+    forecast_name=None,
+    num_samples=200,
+    sample_labels=None,
+    split_files_by_pair=None,
+    collapse_error_points_by_pair=None,
+):
     """
     Visualize predictions and targets for a range of gaps from time series.
     :param pred_target_pairs:
@@ -531,6 +540,68 @@ def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=No
             targets_flat = targets_flat[:limit]
         n = min(len(preds_flat), len(targets_flat))
         return preds_flat[:n], targets_flat[:n]
+
+    def _aligned_matrix(preds, targets, row_limit=None):
+        pred_arr = np.asarray(preds)
+        target_arr = np.asarray(targets)
+
+        if pred_arr.ndim > 2:
+            pred_arr = pred_arr.reshape(pred_arr.shape[0], -1)
+        if target_arr.ndim > 2:
+            target_arr = target_arr.reshape(target_arr.shape[0], -1)
+        if pred_arr.ndim == 1:
+            pred_arr = pred_arr.reshape(-1, 1)
+        if target_arr.ndim == 1:
+            target_arr = target_arr.reshape(-1, 1)
+
+        if row_limit is not None:
+            pred_arr = pred_arr[:row_limit]
+            target_arr = target_arr[:row_limit]
+
+        n_rows = min(pred_arr.shape[0], target_arr.shape[0])
+        n_cols = min(pred_arr.shape[1], target_arr.shape[1])
+        if n_rows <= 0 or n_cols <= 0:
+            return pred_arr[:0], target_arr[:0], 0, 0
+
+        pred_arr = pred_arr[:n_rows, :n_cols]
+        target_arr = target_arr[:n_rows, :n_cols]
+        return pred_arr, target_arr, n_rows, n_cols
+
+    def _collapse_errors_by_base_sample(preds, targets, split_files, row_limit=None):
+        pred_arr, target_arr, n_rows, n_cols = _aligned_matrix(preds, targets, row_limit=row_limit)
+        if n_rows <= 0 or n_cols <= 0:
+            return np.array([], dtype=float)
+
+        if not split_files:
+            return np.array([], dtype=float)
+
+        aligned_rows = min(n_rows, len(split_files))
+        if aligned_rows <= 0:
+            return np.array([], dtype=float)
+
+        pred_arr = pred_arr[:aligned_rows, :]
+        target_arr = target_arr[:aligned_rows, :]
+
+        grouped_errors = {}
+        group_order = []
+        for row_idx in range(aligned_rows):
+            group_id = re.sub(r"_mc_\d+(?=\.csv$)", "", Path(str(split_files[row_idx])).name)
+            if group_id not in grouped_errors:
+                grouped_errors[group_id] = []
+                group_order.append(group_id)
+
+            row_errors = pred_arr[row_idx, :] - target_arr[row_idx, :]
+            finite_row_errors = row_errors[np.isfinite(row_errors)]
+            if finite_row_errors.size > 0:
+                grouped_errors[group_id].append(float(np.mean(finite_row_errors)))
+
+        collapsed_errors = []
+        for group_id in group_order:
+            values = grouped_errors[group_id]
+            if values:
+                collapsed_errors.append(float(np.mean(values)))
+
+        return np.asarray(collapsed_errors, dtype=float)
 
     # === Scatter plot of predictions vs actuals ===
     fig, ax = plt.subplots(figsize=(8, 8))
@@ -635,14 +706,39 @@ def visualizer(*pred_target_pairs, labels=None, directory=None, forecast_name=No
     elif len(labels) != n_sets:
         raise ValueError("Length of labels must match number of result sets.")
 
+    if split_files_by_pair is None:
+        split_files_by_pair = [None] * n_sets
+    elif len(split_files_by_pair) != n_sets:
+        raise ValueError("Length of split_files_by_pair must match number of result sets.")
+
+    if collapse_error_points_by_pair is None:
+        collapse_error_points_by_pair = [False] * n_sets
+    elif len(collapse_error_points_by_pair) != n_sets:
+        raise ValueError("Length of collapse_error_points_by_pair must match number of result sets.")
+
     # Prepare combined error data (supports different lengths per model)
     combined_frames = []
-    for (pred, target), label in zip(pred_target_pairs, labels):
-        pred_flat, target_flat = _aligned_flat(pred, target)
-        if len(pred_flat) == 0:
-            continue
-        errors = pred_flat - target_flat
-        errors = errors[np.isfinite(errors)]
+    for idx, ((pred, target), label) in enumerate(zip(pred_target_pairs, labels)):
+        collapse_errors = bool(collapse_error_points_by_pair[idx])
+        split_files = split_files_by_pair[idx]
+
+        if collapse_errors:
+            # Baseline series are deterministic across MC replicates, so show one error point per base sample.
+            errors = _collapse_errors_by_base_sample(pred, target, split_files, row_limit=num_samples)
+            if errors.size == 0:
+                # Fallback preserves legacy behavior if split-file mapping is unavailable.
+                pred_flat, target_flat = _aligned_flat(pred, target)
+                if len(pred_flat) == 0:
+                    continue
+                errors = pred_flat - target_flat
+                errors = errors[np.isfinite(errors)]
+        else:
+            pred_flat, target_flat = _aligned_flat(pred, target)
+            if len(pred_flat) == 0:
+                continue
+            errors = pred_flat - target_flat
+            errors = errors[np.isfinite(errors)]
+
         if errors.size == 0:
             continue
         combined_frames.append(pd.DataFrame({"Dataset": label, "Error": errors}))
