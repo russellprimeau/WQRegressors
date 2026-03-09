@@ -1944,6 +1944,18 @@ def _compile_multi_target_comparison(
     bar_title_font = max(12, min(16, int(420 / max_group_len)))
     bar_value_font = max(7, min(11, int(320 / max_group_len)))
     bar_axis_label_font = max(11, min(15, int(360 / max_group_len)))
+    max_group_len = max(len(multi_target_features), len(single_target_features), 1)
+    n_total_features = max(len(all_features), 1)
+
+    # Density-aware typography keeps dense plots readable without changing plot semantics.
+    heat_xtick_font = max(5, min(8, int(200 / max_group_len)))
+    heat_ytick_font = max(6, min(9, int(140 / max(len(targets), 1))))
+    heat_axis_label_font = max(8, min(10, int(170 / max_group_len)))
+    # Bar typography is tuned for document embedding where figures are often resized down.
+    bar_tick_font = max(8, min(13, int(340 / max_group_len)))
+    bar_title_font = max(12, min(16, int(420 / max_group_len)))
+    bar_value_font = max(7, min(11, int(320 / max_group_len)))
+    bar_axis_label_font = max(11, min(15, int(360 / max_group_len)))
 
     if matrix.size:
         vmin = float(np.percentile(matrix, 5))
@@ -1958,6 +1970,8 @@ def _compile_multi_target_comparison(
         if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
             vmax = float(vmin + 1.0)
 
+    # Dynamically set font size based on grid density
+    annot_fontsize = max(3, min(8, int(120 / max(len(all_features), len(targets), 1))))
     # Dynamically set font size based on grid density
     annot_fontsize = max(3, min(8, int(120 / max(len(all_features), len(targets), 1))))
 
@@ -1980,12 +1994,15 @@ def _compile_multi_target_comparison(
     if multi_idx and single_idx:
         heat_w = max(14, n_total_features * 0.55)
         heat_h = max(8, len(targets) * 0.58)
+        heat_w = max(14, n_total_features * 0.55)
+        heat_h = max(8, len(targets) * 0.58)
         fig, (ax_left, ax_right) = plt.subplots(
             1,
             2,
             figsize=(heat_w, heat_h),
             gridspec_kw={
                 "width_ratios": [max(1, len(multi_target_features)), max(1, len(single_target_features))],
+                "wspace": 0.08,
                 "wspace": 0.08,
             },
             constrained_layout=True,
@@ -2038,6 +2055,18 @@ def _compile_multi_target_comparison(
             fontsize=heat_axis_label_font,
         )
         ax_left.set_ylabel("Target", fontsize=heat_axis_label_font)
+        ax_left.set_xticklabels(multi_target_features, rotation=45, ha='right', fontsize=heat_xtick_font)
+        ax_right.set_xticklabels(single_target_features, rotation=45, ha='right', fontsize=heat_xtick_font)
+        ax_left.set_yticklabels(yticklabels, fontsize=heat_ytick_font)
+        ax_left.set_xlabel(
+            f"Multi-target Features (n={len(multi_target_features)})",
+            fontsize=heat_axis_label_font,
+        )
+        ax_right.set_xlabel(
+            f"Single-target Features (n={len(single_target_features)})",
+            fontsize=heat_axis_label_font,
+        )
+        ax_left.set_ylabel("Target", fontsize=heat_axis_label_font)
         ax_right.set_ylabel("")
 
         sm = matplotlib.cm.ScalarMappable(norm=matplotlib.colors.Normalize(vmin=vmin, vmax=vmax), cmap="RdYlGn")
@@ -2045,8 +2074,11 @@ def _compile_multi_target_comparison(
         cbar = fig.colorbar(sm, ax=[ax_left, ax_right], fraction=0.025, pad=0.02)
         cbar.set_label(str(importance_label), fontsize=heat_axis_label_font)
         cbar.ax.tick_params(labelsize=max(6, heat_xtick_font))
+        cbar.set_label(str(importance_label), fontsize=heat_axis_label_font)
+        cbar.ax.tick_params(labelsize=max(6, heat_xtick_font))
     else:
         fig, ax = plt.subplots(
+            figsize=(max(13, n_total_features * 0.5), max(8, len(targets) * 0.58)),
             figsize=(max(13, n_total_features * 0.5), max(8, len(targets) * 0.58)),
             constrained_layout=True,
         )
@@ -2065,6 +2097,10 @@ def _compile_multi_target_comparison(
             square=False,
         )
         _annotate_heat_cells(ax, matrix, annot_fontsize)
+        ax.set_xticklabels(all_features, rotation=45, ha='right', fontsize=heat_xtick_font)
+        ax.set_yticklabels(yticklabels, fontsize=heat_ytick_font)
+        ax.set_xlabel("Feature", fontsize=heat_axis_label_font)
+        ax.set_ylabel("Target", fontsize=heat_axis_label_font)
         ax.set_xticklabels(all_features, rotation=45, ha='right', fontsize=heat_xtick_font)
         ax.set_yticklabels(yticklabels, fontsize=heat_ytick_font)
         ax.set_xlabel("Feature", fontsize=heat_axis_label_font)
@@ -2108,7 +2144,9 @@ def _compile_multi_target_comparison(
         x_vals = np.arange(len(features), dtype=float)
         bars = ax_obj.bar(x_vals, values, color=_bar_colors(values))
         ax_obj.set_title(title, fontsize=bar_title_font)
+        ax_obj.set_title(title, fontsize=bar_title_font)
         ax_obj.set_xticks(x_vals)
+        ax_obj.set_xticklabels(features, rotation=45, ha='right', fontsize=bar_tick_font)
         ax_obj.set_xticklabels(features, rotation=45, ha='right', fontsize=bar_tick_font)
         ax_obj.grid(axis='y', alpha=0.3)
         ax_obj.axhline(0.0, color='black', linewidth=0.8, linestyle='--', alpha=0.6)
@@ -2121,6 +2159,7 @@ def _compile_multi_target_comparison(
             offset = 0.012 * y_span
             y_text = y + offset if y >= 0 else y - offset
             y_text = float(np.clip(y_text, y_lower + label_margin, y_upper - label_margin))
+            y_text = float(np.clip(y_text, y_lower + label_margin, y_upper - label_margin))
             ax_obj.text(
                 bar.get_x() + bar.get_width() / 2,
                 y_text,
@@ -2130,6 +2169,7 @@ def _compile_multi_target_comparison(
                 fontsize=bar_value_font,
                 rotation=90,
                 clip_on=True,
+                clip_on=True,
             )
         ax_obj.set_ylim(y_lower, y_upper)
 
@@ -2137,6 +2177,7 @@ def _compile_multi_target_comparison(
         fig, (ax_top, ax_bottom) = plt.subplots(
             2,
             1,
+            figsize=(max(15, len(top_features) * 0.58), max(10, 7 + 0.05 * len(top_features))),
             figsize=(max(15, len(top_features) * 0.58), max(10, 7 + 0.05 * len(top_features))),
             sharey=True,
             constrained_layout=True,
@@ -2156,9 +2197,15 @@ def _compile_multi_target_comparison(
         ax_top.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
         ax_bottom.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
         ax_bottom.set_xlabel("")
+        ax_top.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
+        ax_bottom.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
+        ax_bottom.set_xlabel("")
     else:
         fig, ax = plt.subplots(figsize=(max(15, len(top_features) * 0.58), 6.5), constrained_layout=True)
+        fig, ax = plt.subplots(figsize=(max(15, len(top_features) * 0.58), 6.5), constrained_layout=True)
         _draw_group_bars(ax, top_features, summed_scores, "Feature Importance")
+        ax.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
+        ax.set_xlabel("")
         ax.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
         ax.set_xlabel("")
 
