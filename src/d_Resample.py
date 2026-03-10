@@ -330,13 +330,20 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
             'metric': 'rmse',
             'tree_method': 'hist',
             'objective': 'reg:squarederror',
-            'n_estimators': 1100,
-            'max_depth': 10,
+            'n_estimators': 800,
+            'max_depth': 7,
             'subsample': 0.2,
             'colsample_bytree': 0.8,
+            'min_child_weight': 3,
+            'gamma': 0,
+            'reg_lambda': 1,
+            'reg_alpha': 0,
             'learning_rate': 0.01,
             'n_jobs': -1,
-            'early_stopping_rounds': 200,
+            'early_stopping_rounds': 10,
+            # Optional second stop rule (disabled unless both keys are set)
+            'train_loss_plateau_rounds': 10,
+            'train_loss_min_relative_improvement': 0.002,
         },
         '_comments': {
             'model_type': "Options: 'transformer', 'gp_regressor', 'xgb_regressor', 'xgb_classifier'",
@@ -348,6 +355,9 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
             'split_type': "Temporal split prevents data leakage. If MC replicates detected, temporal split is auto-enforced.",
             'fault_tolerant': "True for XGBoost (handles NaN in inputs), False for Transformer/GP (require complete data)",
             'nan_tolerance': "Applied in e_Train.py before split when fault_tolerant=True. Maximum allowed NaN fraction in predictor windows.",
+            'train_loss_plateau_rounds': "Optional rolling window size for train-loss plateau stopping. Rule is disabled when not provided.",
+            'train_loss_min_relative_improvement': "Optional minimum relative improvement threshold (e.g., 0.001 = 0.1%). Used with train_loss_plateau_rounds.",
+            'stop_rule_combination': "If enabled, train-loss plateau stop is non-exclusive with early_stopping_rounds (training stops when either rule triggers first).",
         }
     }
     
@@ -983,12 +993,14 @@ if __name__ == '__main__':
                         "Atmospheric pressure (mBar)", 'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
                         '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
         'SCADA - pH', 'SCADA - Temperature (°C)']
+
+    target_columns = ['Cadmium (µg/L)_res', 'pH_res', 'Total coliforms 37°C (CFU/100mL)_res']  # alternative 1: name-based selection
     
-    target_columns = ['Color_res',
-        'Turbidity (FNU)_res', 'pH_res', 'E.coli (CFU/100mL)_res', 'Intestinal enterococci (CFU/100mL)_res', 
-        'Colony Count 22°C (CFU/mL)_res', 'Total coliforms 37°C (CFU/100mL)_res', 'Arsenic (µg/L)_res',
-        'Lead (µg/L)_res', 'Cadmium (µg/L)_res', 'Copper filtered (mg/L)_res', 'Chromium (µg/L)_res', 'Nickel (µg/L)_res', 
-        'Zinc (µg/L)_res']  # alternative 1: name-based selection
+    # target_columns = ['Color_res',
+    #     'Turbidity (FNU)_res', 'pH_res', 'E.coli (CFU/100mL)_res', 'Intestinal enterococci (CFU/100mL)_res', 
+    #     'Colony Count 22°C (CFU/mL)_res', 'Total coliforms 37°C (CFU/100mL)_res', 'Arsenic (µg/L)_res',
+    #     'Lead (µg/L)_res', 'Cadmium (µg/L)_res', 'Copper filtered (mg/L)_res', 'Chromium (µg/L)_res', 'Nickel (µg/L)_res', 
+    #     'Zinc (µg/L)_res']  # alternative 1: name-based selection
     
     # target_columns = df.columns[-9:]  # alternative: index-based selection
 
@@ -1065,7 +1077,7 @@ if __name__ == '__main__':
     # Normalize once and reuse across all per-target dataset writes.
     df_norm, normalization_params = _normalize_once(df, to_normalize, min_val=0, max_val=1)
     shared_sensor_uncertainties = _load_and_prepare_sensor_uncertainties(
-        output_dir="../data/output/missing",
+        output_dir="../data/output/side3",
         normalization_params=normalization_params,
         verbose=False,
     )
@@ -1080,7 +1092,7 @@ if __name__ == '__main__':
 
     for target in target_columns:
         target_slug = target.replace(" ", "_").replace("/", "_")
-        output_dir = os.path.join("../data/output/missing", f"MC_ex{target_slug}")
+        output_dir = os.path.join("../data/output/side3", f"MC_ex{target_slug}")
         if eurofins_summary_df is None:
             target_length = fallback_length
         else:

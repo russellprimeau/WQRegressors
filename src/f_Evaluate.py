@@ -47,6 +47,7 @@ from utils.evaluation import (
     reverse_normalize,
     binarize_predictions,
     apply_saved_normalize,
+    boxplot_from_error_rows,
 )
 from utils.config_utils import (
     load_config,
@@ -1194,6 +1195,91 @@ def _write_predictions_csv(rows, output_path, ordered_columns):
     print(f"[INFO] Wrote predictions CSV: {output_path}")
 
 
+def _build_boxplot_error_rows_from_predictions(
+    predictions_rows,
+    model_label=None,
+    baseline_labels=None,
+):
+    """Build long-form boxplot rows from predictions-table semantics.
+
+    Output columns: Dataset, Error, Kind.
+    - ML model uses mc replicate columns (if present), otherwise model column.
+    - Baselines always use their own prediction columns.
+    - All row kinds are retained (train/test/combined/etc.).
+    """
+    baseline_labels = baseline_labels or []
+    if not predictions_rows:
+        return pd.DataFrame(columns=["Dataset", "Error", "Kind"])
+
+    df = pd.DataFrame(predictions_rows)
+    if df.empty:
+        return pd.DataFrame(columns=["Dataset", "Error", "Kind"])
+
+    kind_series = df.get("kind", pd.Series(["unknown"] * len(df)))
+    kind_series = kind_series.fillna("unknown").astype(str)
+
+    target_specs = []
+    if "target" in df.columns:
+        target_specs.append((None, "target"))
+
+    indexed_targets = []
+    for col in df.columns:
+        match = re.fullmatch(r"target_(\d+)", str(col))
+        if match:
+            indexed_targets.append((int(match.group(1)), str(col)))
+    indexed_targets.sort(key=lambda x: x[0])
+    target_specs.extend(indexed_targets)
+
+    if not target_specs:
+        return pd.DataFrame(columns=["Dataset", "Error", "Kind"])
+
+    out_frames = []
+
+    def _append_errors(dataset_label, pred_series, target_series):
+        pred_vals = pd.to_numeric(pred_series, errors="coerce")
+        target_vals = pd.to_numeric(target_series, errors="coerce")
+        err_vals = pred_vals - target_vals
+        finite_mask = np.isfinite(err_vals.to_numpy(dtype=float))
+        if not np.any(finite_mask):
+            return
+        out_frames.append(
+            pd.DataFrame(
+                {
+                    "Dataset": [str(dataset_label)] * int(np.sum(finite_mask)),
+                    "Error": err_vals.to_numpy(dtype=float)[finite_mask],
+                    "Kind": kind_series.to_numpy()[finite_mask],
+                }
+            )
+        )
+
+    for output_idx, target_col in target_specs:
+        target_vals = df[target_col]
+
+        if output_idx is None:
+            mc_cols = sorted([c for c in df.columns if re.fullmatch(r"mc_\d{3}", str(c))])
+            model_col = str(model_label) if model_label else None
+        else:
+            mc_cols = sorted([c for c in df.columns if re.fullmatch(rf"mc_\d{{3}}_{output_idx}", str(c))])
+            model_col = f"{model_label}_{output_idx}" if model_label else None
+
+        if model_col and model_col in df.columns:
+            if mc_cols:
+                for mc_col in mc_cols:
+                    _append_errors(model_col, df[mc_col], target_vals)
+            else:
+                _append_errors(model_col, df[model_col], target_vals)
+
+        for baseline_label in baseline_labels:
+            baseline_col = str(baseline_label) if output_idx is None else f"{baseline_label}_{output_idx}"
+            if baseline_col in df.columns:
+                _append_errors(baseline_col, df[baseline_col], target_vals)
+
+    if not out_frames:
+        return pd.DataFrame(columns=["Dataset", "Error", "Kind"])
+
+    return pd.concat(out_frames, ignore_index=True)
+
+
 def _model_label(model_type):
     mapping = {
         "transformer": "Transformer",
@@ -1440,6 +1526,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
     baseline_split_files = []
     per_set_metrics = []
     predictions_entries = []
+    model_column_label = None
 
     # --- Regression metrics for train/test and optional combined set ---
     # Combined metrics are emitted only when evaluate_all truly evaluates train+test.
@@ -1694,6 +1781,18 @@ def evaluate_single_config(config_path, save_plots_override=None):
     )
     predictions_path = summary_dir / "predictions.csv"
     _write_predictions_csv(predictions_rows, predictions_path, predictions_columns)
+
+    if save_plots:
+        boxplot_rows = _build_boxplot_error_rows_from_predictions(
+            predictions_rows,
+            model_label=model_column_label,
+            baseline_labels=baseline_labels,
+        )
+        boxplot_from_error_rows(
+            boxplot_rows,
+            directory=data_cfg["data_dir"],
+            forecast_name=data_cfg["forecast_name"],
+        )
 
     # Return the main model summary row (prefer test, then combined, then train)
     # Look for kind == 'test', else 'combined', else 'train', else first row

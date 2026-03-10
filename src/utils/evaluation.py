@@ -827,6 +827,77 @@ def visualizer(
         )
         plt.close()
 
+
+def boxplot_from_error_rows(error_rows_df, directory, forecast_name):
+    """Render boxplot.png from precomputed long-form error rows.
+
+    Expected columns: Dataset, Error, Kind.
+    """
+    if error_rows_df is None or len(error_rows_df) == 0:
+        print("[WARN] Skipping error distribution plot: no rows provided.")
+        return
+
+    df = error_rows_df.copy()
+    required = {"Dataset", "Error", "Kind"}
+    if not required.issubset(set(df.columns)):
+        print("[WARN] Skipping error distribution plot: missing required columns.")
+        return
+
+    df["Dataset"] = df["Dataset"].astype(str)
+    df["Kind"] = df["Kind"].fillna("unknown").astype(str)
+    df["Error"] = pd.to_numeric(df["Error"], errors="coerce")
+    df = df[np.isfinite(df["Error"])]
+    if df.empty:
+        print("[WARN] Skipping error distribution plot: no finite errors available.")
+        return
+
+    n_datasets = max(1, int(df["Dataset"].nunique()))
+    fig_w = max(6.0, min(12.0, 3.0 + 1.1 * n_datasets))
+    plt.figure(figsize=(fig_w, 6))
+    ax = plt.gca()
+
+    sns.boxplot(
+        x="Dataset",
+        y="Error",
+        data=df,
+        showcaps=True,
+        boxprops={"facecolor": "lightgray", "alpha": 0.3, "linewidth": 0.5},
+        whiskerprops={"linewidth": 0.5},
+        medianprops={"color": "blue", "linewidth": 1},
+        showfliers=False,
+        ax=ax,
+    )
+
+    sns.stripplot(
+        x="Dataset",
+        y="Error",
+        hue="Kind",
+        data=df,
+        jitter=True,
+        size=5,
+        alpha=0.8,
+        ax=ax,
+    )
+
+    handles, labels = ax.get_legend_handles_labels()
+    if handles and labels:
+        unique = {}
+        for handle, label in zip(handles, labels):
+            if label not in unique:
+                unique[label] = handle
+        ax.legend(unique.values(), unique.keys(), title="Kind")
+
+    ax.set_ylabel("Error (Prediction - Target)")
+    ax.set_xlabel("Model")
+    ax.margins(x=0.02)
+    plt.tight_layout()
+    plt.savefig(
+        Path(directory, "forecasts", forecast_name, "boxplot.png"),
+        bbox_inches="tight",
+        pad_inches=0.1,
+    )
+    plt.close()
+
 def classification_visualizer(*pred_target_pairs, labels=None, directory='.', forecast_name='Classifier',
                               num_samples=200):
     os.makedirs(os.path.join(directory, "forecasts", forecast_name, "classification"), exist_ok=True)

@@ -10,6 +10,7 @@ python src/e_Train.py --config data/output/regression/MC_pH/config_xgb_01.yml
 
 import os
 import sys
+import math
 from pathlib import Path
 import argparse
 import yaml
@@ -19,6 +20,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import xgboost as xgb
 import torch
+import inspect
 from torch.utils.data import DataLoader
 try:
     import gpytorch
@@ -86,26 +88,130 @@ DEFAULT_XGB_REGRESSOR_CONFIG = {
     "tree_method": "hist",
     "objective": "reg:squarederror",
     "n_estimators": 1100,
-    "max_depth": 10,
+    "max_depth": 7,
     "subsample": 0.2,
     "colsample_bytree": 0.8,
+    "min_child_weight": 1,
+    "gamma": 0,
+    "reg_lambda": 1,
+    "reg_alpha": 0,
     "learning_rate": 0.01,
     "n_jobs": -1,
     "early_stopping_rounds": 200,
+    # Optional second stop rule (disabled unless both keys are set in config).
+    "train_loss_plateau_rounds": None,
+    "train_loss_min_relative_improvement": None,
 }
 
 DEFAULT_XGB_CLASSIFIER_CONFIG = {
     "eval_metric": "logloss",
     "tree_method": "hist",
     "objective": "binary:logistic",
-    "n_estimators": 1500,
-    "max_depth": 10,
+    "n_estimators": 1100,
+    "max_depth": 7,
     "subsample": 0.2,
     "colsample_bytree": 0.8,
+    "min_child_weight": 1,
+    "gamma": 0,
+    "reg_lambda": 1,
+    "reg_alpha": 0,
     "learning_rate": 0.01,
     "n_jobs": -1,
     "early_stopping_rounds": 50,
+    # Optional second stop rule (disabled unless both keys are set in config).
+    "train_loss_plateau_rounds": None,
+    "train_loss_min_relative_improvement": None,
 }
+
+
+class _TrainLossPlateauCallback(xgb.callback.TrainingCallback):
+    """Stop training when train metric relative improvement plateaus."""
+
+    def __init__(self, metric_name: str, patience_rounds: int, min_relative_improvement: float, state: dict):
+        self.metric_name = str(metric_name)
+        self.patience_rounds = int(patience_rounds)
+        self.min_relative_improvement = float(min_relative_improvement)
+        self.state = state
+        self.best_metric = None
+        self.best_iteration = None
+        self.no_improve_count = 0
+
+    def after_iteration(self, model, epoch: int, evals_log: dict) -> bool:
+        eval0 = evals_log.get("validation_0", {})
+        metric_history = eval0.get(self.metric_name)
+        if not metric_history:
+            return False
+
+        raw_value = metric_history[-1]
+        if isinstance(raw_value, (list, tuple)):
+            raw_value = raw_value[0]
+        try:
+            current = float(raw_value)
+        except Exception:
+            return False
+        if not math.isfinite(current):
+            return False
+
+        if self.best_metric is None:
+            self.best_metric = current
+            self.best_iteration = int(epoch)
+            self.state["best_metric"] = self.best_metric
+            self.state["best_iteration"] = self.best_iteration
+            return False
+
+        denom = max(abs(self.best_metric), 1e-12)
+        rel_improvement = (self.best_metric - current) / denom
+        improved = rel_improvement >= self.min_relative_improvement
+
+        if improved:
+            self.best_metric = current
+            self.best_iteration = int(epoch)
+            self.no_improve_count = 0
+            self.state["best_metric"] = self.best_metric
+            self.state["best_iteration"] = self.best_iteration
+            return False
+
+        self.no_improve_count += 1
+        if self.no_improve_count >= self.patience_rounds:
+            self.state["triggered"] = True
+            self.state["trigger_iteration"] = int(epoch)
+            self.state["stop_reason"] = "train_loss_plateau"
+            return True
+
+        return False
+
+
+def _build_train_loss_plateau_callback(hyper_cfg: dict, metric_name: str):
+    """Build optional XGB callback for train-loss plateau stop criterion."""
+    patience = hyper_cfg.get("train_loss_plateau_rounds")
+    min_rel = hyper_cfg.get("train_loss_min_relative_improvement")
+
+    # Rule is opt-in and only active when both arguments are explicitly provided.
+    if patience is None or min_rel is None:
+        return None, None
+
+    patience = int(patience)
+    min_rel = float(min_rel)
+    if patience <= 0:
+        raise ValueError(f"hyperparameters.train_loss_plateau_rounds must be > 0, got {patience}")
+    if min_rel < 0:
+        raise ValueError(
+            "hyperparameters.train_loss_min_relative_improvement must be >= 0, "
+            f"got {min_rel}"
+        )
+
+    state = {
+        "enabled": True,
+        "triggered": False,
+        "trigger_iteration": None,
+        "best_metric": None,
+        "best_iteration": None,
+        "metric_name": str(metric_name),
+        "patience_rounds": patience,
+        "min_relative_improvement": min_rel,
+    }
+    cb = _TrainLossPlateauCallback(str(metric_name), patience, min_rel, state)
+    return cb, state
 
 
 def _parse_xgb_version() -> tuple[int, int]:
@@ -793,10 +899,15 @@ def _train_xgb_model(config, train_samples, test_samples, model_cls, metric_key,
         'input_row_2': data_cfg["input_row_2"],
         'output_columns': data_cfg["output_columns"],
         'output_rows': data_cfg["output_rows"],
+        'min_child_weight': hyper_cfg["min_child_weight"],
+        'gamma': hyper_cfg["gamma"],
+        'reg_lambda': hyper_cfg["reg_lambda"],
+        'reg_alpha': hyper_cfg["reg_alpha"],
     }
     write_config(model_config, data_cfg["data_dir"], data_cfg["forecast_name"], "")
 
     metric = hyper_cfg[metric_key]
+    plateau_callback, plateau_state = _build_train_loss_plateau_callback(hyper_cfg, metric)
     model_kwargs = {
         "tree_method": hyper_cfg["tree_method"],
         "objective": hyper_cfg["objective"],
@@ -804,6 +915,10 @@ def _train_xgb_model(config, train_samples, test_samples, model_cls, metric_key,
         "max_depth": hyper_cfg["max_depth"],
         "subsample": hyper_cfg["subsample"],
         "colsample_bytree": hyper_cfg["colsample_bytree"],
+        "min_child_weight": hyper_cfg["min_child_weight"],
+        "gamma": hyper_cfg["gamma"],
+        "reg_lambda": hyper_cfg["reg_lambda"],
+        "reg_alpha": hyper_cfg["reg_alpha"],
         "learning_rate": hyper_cfg["learning_rate"],
         "early_stopping_rounds": hyper_cfg["early_stopping_rounds"],
         "n_jobs": int(hyper_cfg.get("n_jobs", -1)),
@@ -831,7 +946,30 @@ def _train_xgb_model(config, train_samples, test_samples, model_cls, metric_key,
     )
 
     print(f"Training {model_cls.__name__}...")
-    model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_test, y_test)], verbose=True)
+    fit_kwargs = {
+        "eval_set": [(X_train, y_train), (X_test, y_test)],
+        "verbose": True,
+    }
+
+    supports_callbacks = "callbacks" in inspect.signature(model.fit).parameters
+
+    if plateau_callback is not None:
+        if supports_callbacks:
+            fit_kwargs["callbacks"] = [plateau_callback]
+        else:
+            print(
+                "[WARN] train-loss plateau stop requested but this xgboost sklearn "
+                "version does not support fit(callbacks=...). Skipping plateau rule."
+            )
+    model.fit(X_train, y_train, **fit_kwargs)
+
+    if plateau_state and plateau_state.get("triggered"):
+        print(
+            "Additional stop rule triggered: "
+            f"training loss plateau at boosting round {plateau_state.get('trigger_iteration')}"
+        )
+    elif plateau_state and plateau_state.get("enabled"):
+        print("Additional stop rule enabled but did not trigger before training end.")
 
     save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
     os.makedirs(save_path, exist_ok=True)
@@ -844,6 +982,22 @@ def _train_xgb_model(config, train_samples, test_samples, model_cls, metric_key,
         plt.figure(figsize=(8, 5))
         plt.loglog(range(epochs), results['validation_0'][metric], label='Training Loss')
         plt.loglog(range(epochs), results['validation_1'][metric], label='Validation Loss')
+        if hasattr(model, "best_iteration") and getattr(model, "best_iteration") is not None:
+            plt.axvline(
+                float(model.best_iteration),
+                color="#d62728",
+                linestyle="--",
+                linewidth=1.0,
+                label=f"Validation stop/best iter ({model.best_iteration})",
+            )
+        if plateau_state and plateau_state.get("triggered") and plateau_state.get("trigger_iteration") is not None:
+            plt.axvline(
+                float(plateau_state["trigger_iteration"]),
+                color="#ff7f0e",
+                linestyle="--",
+                linewidth=1.0,
+                label=f"Train plateau stop ({plateau_state['trigger_iteration']})",
+            )
         plt.xlabel('Boosting Rounds')
         plt.ylabel(metric)
         plt.grid(True, which="both", ls="--")
