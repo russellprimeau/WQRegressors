@@ -15,6 +15,13 @@ Stage behavior:
 - Stage 2 (Optimizer): writes optimizer artifacts under
     `forecasts/feature_sweeps` and by default reads Shapley seed subsets
     unless `--seed-subsets-csv` is provided.
+ - CV tuning policy for XGBoost:
+     * The pipeline enables CV tuning the first time it encounters an XGB config
+       (train-set-only, no test exposure).
+     * The first tuned run writes a dataset-level cache
+       `forecasts/xgb_cv_tuning_cache.json`.
+     * Subsequent runs reuse cached hyperparameters for consistent regularization
+       across feature subsets and to reduce compute.
 - Search phases keep standard temporal-by-coverage split behavior
     (target 70/30 by default).
 - Final top-K phases enforce minimum test coverage (>=5 test samples):
@@ -54,11 +61,14 @@ import argparse
 import contextlib
 import os
 import sys
+import json
+import yaml
 from datetime import datetime
 from pathlib import Path
 
 import h_RunMCFeatureSelectionSweep as optimizer_module
 import i_RunMCFeatureSelectionShapleySweep as shapley_module
+import e_Train as train_module
 
 
 _NAMESPACE_ENV = "WQ_FEATURE_SWEEP_NAMESPACE"
@@ -114,6 +124,113 @@ def _discover_pipeline_plans(args: argparse.Namespace) -> list[optimizer_module.
         include_regular=include_regular,
         include_res=include_res,
     )
+
+
+def _load_raw_config(path: Path) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    if path.suffix in {".yml", ".yaml"}:
+        return yaml.safe_load(text)
+    if path.suffix == ".json":
+        return json.loads(text)
+    raise ValueError(f"Unsupported config format: {path.suffix}")
+
+
+def _write_raw_config(path: Path, cfg: dict) -> None:
+    cfg = dict(cfg)
+    cfg.pop("__config_dir", None)
+    if path.suffix in {".yml", ".yaml"}:
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+        return
+    if path.suffix == ".json":
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        return
+    raise ValueError(f"Unsupported config format: {path.suffix}")
+
+
+def _resolve_data_dir(cfg: dict, cfg_path: Path) -> Path:
+    data_cfg = cfg.get("data", {}) or {}
+    data_dir_raw = data_cfg.get("data_dir")
+    if not data_dir_raw:
+        raise ValueError(f"Missing data.data_dir in {cfg_path}")
+    config_dir = cfg.get("__config_dir", str(cfg_path.parent))
+    return Path(train_module._resolve_path_from_config(data_dir_raw, config_dir))
+
+
+def _tuning_artifact_path(cfg: dict, cfg_path: Path) -> Path | None:
+    data_cfg = cfg.get("data", {}) or {}
+    forecast_name = data_cfg.get("forecast_name")
+    if not forecast_name:
+        return None
+    data_dir = _resolve_data_dir(cfg, cfg_path)
+    return data_dir / "forecasts" / str(forecast_name) / "xgb_cv_tuning.json"
+
+
+def _cv_cache_path(cfg: dict, cfg_path: Path) -> Path:
+    data_dir = _resolve_data_dir(cfg, cfg_path)
+    return data_dir / "forecasts" / "xgb_cv_tuning_cache.json"
+
+
+def _apply_tuned_hyperparameters(cfg: dict, tuned: dict) -> dict:
+    hyper_cfg = cfg.setdefault("hyperparameters", {})
+    tuned_hyper = tuned.get("tuned_hyperparameters") or tuned.get("best_params")
+    if not isinstance(tuned_hyper, dict) or not tuned_hyper:
+        return cfg
+    hyper_cfg.update(tuned_hyper)
+    cv_cfg = hyper_cfg.get("cv_tuning")
+    if isinstance(cv_cfg, dict):
+        cv_cfg.setdefault("enabled", False)
+        cv_cfg["enabled"] = False
+        cv_cfg["source"] = "xgb_cv_tuning.json"
+    return cfg
+
+
+def _sync_tuned_hyperparameters(plans: list[optimizer_module.DatasetPlan]) -> None:
+    for plan in plans:
+        cache_payload = None
+        cache_path = None
+        for cfg_path in plan.train_configs:
+            try:
+                cfg = train_module.load_config(str(cfg_path))
+                model_type = str(cfg.get("model_type", ""))
+                if model_type not in {"xgb_regressor", "xgb_classifier"}:
+                    continue
+
+                if cache_payload is None:
+                    cache_path = _cv_cache_path(cfg, cfg_path)
+                    if cache_path.exists():
+                        with open(cache_path, "r", encoding="utf-8") as f:
+                            cache_payload = json.load(f)
+
+                if cache_payload is not None:
+                    raw_cfg = _load_raw_config(cfg_path)
+                    raw_cfg = _apply_tuned_hyperparameters(raw_cfg, cache_payload)
+                    _write_raw_config(cfg_path, raw_cfg)
+                    print(f"[PIPELINE] Applied cached CV hyperparameters from {cache_path} -> {cfg_path}")
+                    continue
+
+                artifact_path = _tuning_artifact_path(cfg, cfg_path)
+                if artifact_path is None or not artifact_path.exists():
+                    raw_cfg = _load_raw_config(cfg_path)
+                    hyper_cfg = raw_cfg.setdefault("hyperparameters", {})
+                    cv_cfg = hyper_cfg.get("cv_tuning")
+                    if isinstance(cv_cfg, dict):
+                        cv_cfg["enabled"] = True
+                    else:
+                        hyper_cfg["cv_tuning"] = {"enabled": True}
+                    _write_raw_config(cfg_path, raw_cfg)
+                    print(f"[PIPELINE] Enabled CV tuning for first encounter: {cfg_path}")
+                    continue
+                with open(artifact_path, "r", encoding="utf-8") as f:
+                    tuned_payload = json.load(f)
+                raw_cfg = _load_raw_config(cfg_path)
+                raw_cfg = _apply_tuned_hyperparameters(raw_cfg, tuned_payload)
+                _write_raw_config(cfg_path, raw_cfg)
+                print(f"[PIPELINE] Applied tuned hyperparameters from {artifact_path} -> {cfg_path}")
+            except Exception as exc:
+                print(f"[PIPELINE][WARN] Could not apply tuned hyperparameters for {cfg_path}: {exc}")
 
 
 def _parse_seed_list(raw: str | None) -> list[int]:
@@ -310,6 +427,8 @@ def _run_pipeline(args: argparse.Namespace, data_root_resolved: Path) -> int:
     if not plans:
         print("No matching datasets/configs found.")
         return 1
+
+    _sync_tuned_hyperparameters(plans)
 
     print("\nPipeline plan")
     print("-" * 100)

@@ -6,6 +6,13 @@ Example terminal usage:
 python src/e_Train.py --config data/output/regression/MC_pH/config_gp_01.yml
 python src/e_Train.py --config data/output/regression/MC_pH/config_transformer_01.yml
 python src/e_Train.py --config data/output/regression/MC_pH/config_xgb_01.yml
+
+Notes:
+- Optional XGBoost CV tuning (train-set only) is controlled by
+  hyperparameters.cv_tuning.enabled. When enabled, tuned hyperparameters are
+  saved in `forecasts/<forecast_name>/xgb_cv_tuning.json`.
+- A dataset-level cache `forecasts/xgb_cv_tuning_cache.json` is also written and
+  reused to keep regularization consistent across feature subsets.
 """
 
 import os
@@ -86,6 +93,32 @@ DEFAULT_TRANSFORMER_CONFIG = {
     "prefetch_factor": 2,
 }
 
+DEFAULT_XGB_CV_TUNING_REGRESSOR = {
+    "enabled": False,
+    "n_folds": 5,
+    "n_trials": 24,
+    "seed": 42,
+    "parallel_jobs": 1,
+    "metric": "rmse",
+    "use_early_stopping": False,
+    "early_stopping_rounds": None,
+    "verbose": False,
+    "param_space": {
+        "max_depth": {"low": 2, "high": 9, "type": "int"},
+        "min_child_weight": {"low": 1, "high": 10, "type": "int"},
+        "gamma": {"low": 0.0, "high": 5.0, "type": "float"},
+        "subsample": {"low": 0.5, "high": 1.0, "type": "float"},
+        "colsample_bytree": {"low": 0.5, "high": 1.0, "type": "float"},
+        "reg_lambda": {"low": 1e-3, "high": 10.0, "type": "log"},
+        "reg_alpha": {"low": 1e-4, "high": 5.0, "type": "log"},
+    },
+}
+
+DEFAULT_XGB_CV_TUNING_CLASSIFIER = {
+    **DEFAULT_XGB_CV_TUNING_REGRESSOR,
+    "metric": "logloss",
+}
+
 DEFAULT_XGB_REGRESSOR_CONFIG = {
     "metric": "rmse",
     "tree_method": "hist",
@@ -126,31 +159,6 @@ DEFAULT_XGB_CLASSIFIER_CONFIG = {
     "train_loss_plateau_rounds": None,
     "train_loss_min_relative_improvement": None,
     "cv_tuning": DEFAULT_XGB_CV_TUNING_CLASSIFIER,
-}
-
-DEFAULT_XGB_CV_TUNING_REGRESSOR = {
-    "enabled": False,
-    "n_folds": 5,
-    "n_trials": 24,
-    "seed": 42,
-    "parallel_jobs": 1,
-    "metric": "rmse",
-    "use_early_stopping": False,
-    "early_stopping_rounds": None,
-    "param_space": {
-        "max_depth": {"low": 2, "high": 9, "type": "int"},
-        "min_child_weight": {"low": 1, "high": 10, "type": "int"},
-        "gamma": {"low": 0.0, "high": 5.0, "type": "float"},
-        "subsample": {"low": 0.5, "high": 1.0, "type": "float"},
-        "colsample_bytree": {"low": 0.5, "high": 1.0, "type": "float"},
-        "reg_lambda": {"low": 1e-3, "high": 10.0, "type": "log"},
-        "reg_alpha": {"low": 1e-4, "high": 5.0, "type": "log"},
-    },
-}
-
-DEFAULT_XGB_CV_TUNING_CLASSIFIER = {
-    **DEFAULT_XGB_CV_TUNING_REGRESSOR,
-    "metric": "logloss",
 }
 
 
@@ -1121,6 +1129,7 @@ def _xgb_tune_hyperparameters_cv(
         base_kwargs["early_stopping_rounds"] = None
 
     metric = str(cv_cfg.get("metric", "rmse")).lower()
+    verbose = bool(cv_cfg.get("verbose", False))
     trial_results: list[dict] = []
     best_score = float("inf")
     best_params: dict = {}
@@ -1199,6 +1208,11 @@ def _xgb_tune_hyperparameters_cv(
             if mean_score < best_score:
                 best_score = mean_score
                 best_params = dict(sampled)
+            if verbose:
+                print(
+                    f"[CV] Trial {trial_idx + 1}/{n_trials} "
+                    f"mean={mean_score:.6f} std={std_score:.6f} params={sampled}"
+                )
     finally:
         if executor is not None:
             executor.shutdown(wait=True)
@@ -1232,6 +1246,72 @@ def _write_xgb_cv_tuning_artifact(data_cfg: dict, hyper_cfg: dict, best_params: 
     out_path = forecast_dir / "xgb_cv_tuning.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
+    return out_path
+
+
+def _xgb_cv_cache_path(data_cfg: dict) -> Path:
+    return Path(data_cfg["data_dir"], "forecasts", "xgb_cv_tuning_cache.json")
+
+
+def _write_xgb_cv_tuning_cache(data_cfg: dict, hyper_cfg: dict, best_params: dict, summary: dict) -> Path:
+    cache_path = _xgb_cv_cache_path(data_cfg)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tuned_hyper = dict(hyper_cfg)
+    tuned_hyper.update(best_params)
+    payload = {
+        "artifact_version": 1,
+        "tuned_hyperparameters": tuned_hyper,
+        "best_params": best_params,
+        "cv_summary": summary,
+        "scope": "dataset_cache",
+    }
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return cache_path
+
+
+def _write_xgb_cv_trials_csv(data_cfg: dict, summary: dict) -> Path | None:
+    trials = summary.get("trials") if isinstance(summary, dict) else None
+    if not isinstance(trials, list) or not trials:
+        return None
+    forecast_dir = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
+    forecast_dir.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(trials)
+    out_path = forecast_dir / "xgb_cv_trials.csv"
+    df.to_csv(out_path, index=False)
+    return out_path
+
+
+def _write_xgb_cv_trials_plot(data_cfg: dict, summary: dict) -> Path | None:
+    trials = summary.get("trials") if isinstance(summary, dict) else None
+    if not isinstance(trials, list) or not trials:
+        return None
+    df = pd.DataFrame(trials)
+    if df.empty or "trial" not in df.columns or "mean_score" not in df.columns:
+        return None
+    forecast_dir = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
+    forecast_dir.mkdir(parents=True, exist_ok=True)
+    x = pd.to_numeric(df["trial"], errors="coerce")
+    y = pd.to_numeric(df["mean_score"], errors="coerce")
+    valid = x.notna() & y.notna()
+    if not valid.any():
+        return None
+    x = x[valid]
+    y = y[valid]
+    best_idx = int(y.idxmin()) if not y.empty else None
+    plt.figure(figsize=(8, 4.5))
+    plt.plot(x, y, marker="o", linestyle="-", label="Mean CV score")
+    if best_idx is not None and best_idx in df.index:
+        plt.scatter([df.loc[best_idx, "trial"]], [df.loc[best_idx, "mean_score"]], color="#d62728", zorder=3, label="Best")
+    plt.xlabel("Trial")
+    plt.ylabel("Mean CV score")
+    plt.grid(True, ls="--", alpha=0.4)
+    plt.title("XGB CV tuning: mean score by trial")
+    plt.legend()
+    out_path = forecast_dir / "xgb_cv_trials.png"
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
     return out_path
 
 def _train_xgb_model(
@@ -1404,13 +1484,34 @@ def _train_xgb_model_cv_tuned(
     cv_cfg = hyper_cfg.get("cv_tuning", {}) or {}
     cv_requested = bool(cv_cfg.get("enabled", False))
 
-    best_params, summary = _xgb_tune_hyperparameters_cv(
-        config=config,
-        train_samples=train_samples,
-        model_kind=model_kind,
-        metric_key=metric_key,
-        cast_y=cast_y,
-    )
+    data_cfg = config["data"]
+    cache_path = _xgb_cv_cache_path(data_cfg)
+    best_params = {}
+    summary = {"enabled": False}
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            cached_params = cached.get("tuned_hyperparameters") or cached.get("best_params")
+            if isinstance(cached_params, dict) and cached_params:
+                best_params = dict(cached_params)
+                summary = cached.get("cv_summary", {}) or {"enabled": False}
+                summary["source"] = "cache"
+                print(f"[INFO] Using cached CV hyperparameters from {cache_path}")
+        except Exception as exc:
+            print(f"[WARN] Failed to read CV cache {cache_path}: {exc}")
+
+    if not best_params:
+        best_params, summary = _xgb_tune_hyperparameters_cv(
+            config=config,
+            train_samples=train_samples,
+            model_kind=model_kind,
+            metric_key=metric_key,
+            cast_y=cast_y,
+        )
+        if cv_requested and best_params:
+            cache_written = _write_xgb_cv_tuning_cache(data_cfg, hyper_cfg, best_params, summary)
+            print(f"[INFO] CV tuning cache saved to: {cache_written}")
 
     tuned_config = copy.deepcopy(config)
     tuned_hyper = _resolve_xgb_runtime_hyperparameters(
@@ -1424,12 +1525,18 @@ def _train_xgb_model_cv_tuned(
     tuned_hyper["early_stopping_rounds"] = None
     tuned_config["hyperparameters"] = tuned_hyper
 
-    data_cfg = tuned_config["data"]
     artifact_path = _write_xgb_cv_tuning_artifact(data_cfg, tuned_hyper, best_params, summary)
     print(f"[INFO] CV tuning artifact saved to: {artifact_path}")
+    trials_csv = _write_xgb_cv_trials_csv(data_cfg, summary)
+    if trials_csv is not None:
+        print(f"[INFO] CV tuning trials CSV saved to: {trials_csv}")
+    trials_plot = _write_xgb_cv_trials_plot(data_cfg, summary)
+    if trials_plot is not None:
+        print(f"[INFO] CV tuning trials plot saved to: {trials_plot}")
 
     X_train, y_train, _ = _xgb_samples_to_arrays(train_samples, cast_y=cast_y)
-    eval_set_override = [(X_train, y_train)]
+    X_test, y_test, _ = _xgb_samples_to_arrays(test_samples, cast_y=cast_y)
+    eval_set_override = [(X_train, y_train), (X_test, y_test)]
 
     _train_xgb_model(
         tuned_config,

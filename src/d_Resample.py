@@ -299,6 +299,11 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
     :param sample_length: Length of each sample (number of rows)
     :param model_type: Type of model for naming ('xgb' or 'transformer')
     :return: Path to the generated config file
+
+    Notes:
+    - XGBoost configs now include optional train-set-only CV tuning settings
+      under hyperparameters.cv_tuning (including param_space). These are
+      disabled by default and can be enabled by pipeline logic when needed.
     """
     # Create the template configuration
     config = {
@@ -344,6 +349,27 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
             # Optional second stop rule (disabled unless both keys are set)
             'train_loss_plateau_rounds': 10,
             'train_loss_min_relative_improvement': 0.002,
+            # Optional CV tuning for regularization (train-set only).
+            'cv_tuning': {
+                'enabled': False,
+                'n_folds': 5,
+                'n_trials': 24,
+                'seed': 42,
+                'parallel_jobs': 1,
+                'metric': 'rmse',
+                'use_early_stopping': False,
+                'early_stopping_rounds': None,
+                'verbose': False,
+                'param_space': {
+                    'max_depth': {'low': 2, 'high': 9, 'type': 'int'},
+                    'min_child_weight': {'low': 1, 'high': 10, 'type': 'int'},
+                    'gamma': {'low': 0.0, 'high': 5.0, 'type': 'float'},
+                    'subsample': {'low': 0.5, 'high': 1.0, 'type': 'float'},
+                    'colsample_bytree': {'low': 0.5, 'high': 1.0, 'type': 'float'},
+                    'reg_lambda': {'low': 1e-3, 'high': 10.0, 'type': 'log'},
+                    'reg_alpha': {'low': 1e-4, 'high': 5.0, 'type': 'log'},
+                },
+            },
         },
         '_comments': {
             'model_type': "Options: 'transformer', 'gp_regressor', 'xgb_regressor', 'xgb_classifier'",
@@ -358,6 +384,7 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
             'train_loss_plateau_rounds': "Optional rolling window size for train-loss plateau stopping. Rule is disabled when not provided.",
             'train_loss_min_relative_improvement': "Optional minimum relative improvement threshold (e.g., 0.001 = 0.1%). Used with train_loss_plateau_rounds.",
             'stop_rule_combination': "If enabled, train-loss plateau stop is non-exclusive with early_stopping_rounds (training stops when either rule triggers first).",
+            'cv_tuning': "Optional train-set-only CV tuning for regularization. When enabled, tuned hyperparameters are saved and reused in future runs.",
         }
     }
     
@@ -1077,7 +1104,7 @@ if __name__ == '__main__':
     # Normalize once and reuse across all per-target dataset writes.
     df_norm, normalization_params = _normalize_once(df, to_normalize, min_val=0, max_val=1)
     shared_sensor_uncertainties = _load_and_prepare_sensor_uncertainties(
-        output_dir="../data/output/min_child8",
+        output_dir="../data/output/CV",
         normalization_params=normalization_params,
         verbose=False,
     )
@@ -1092,7 +1119,7 @@ if __name__ == '__main__':
 
     for target in target_columns:
         target_slug = target.replace(" ", "_").replace("/", "_")
-        output_dir = os.path.join("../data/output/min_child8", f"MC_ex{target_slug}")
+        output_dir = os.path.join("../data/output/CV", f"MC_ex{target_slug}")
         if eurofins_summary_df is None:
             target_length = fallback_length
         else:
