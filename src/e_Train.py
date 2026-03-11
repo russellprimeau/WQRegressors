@@ -1249,12 +1249,18 @@ def _write_xgb_cv_tuning_artifact(data_cfg: dict, hyper_cfg: dict, best_params: 
     return out_path
 
 
-def _xgb_cv_cache_path(data_cfg: dict) -> Path:
+def _resolve_cv_cache_path(config: dict) -> Path:
+    hyper_cfg = config.get("hyperparameters", {}) or {}
+    cv_cfg = hyper_cfg.get("cv_tuning", {}) or {}
+    cache_path = cv_cfg.get("cache_path")
+    data_cfg = config.get("data", {}) or {}
+    if cache_path:
+        cfg_dir = config.get("__config_dir", str(Path.cwd()))
+        return Path(_resolve_path_from_config(str(cache_path), cfg_dir))
     return Path(data_cfg["data_dir"], "forecasts", "xgb_cv_tuning_cache.json")
 
 
-def _write_xgb_cv_tuning_cache(data_cfg: dict, hyper_cfg: dict, best_params: dict, summary: dict) -> Path:
-    cache_path = _xgb_cv_cache_path(data_cfg)
+def _write_xgb_cv_tuning_cache(cache_path: Path, hyper_cfg: dict, best_params: dict, summary: dict) -> Path:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tuned_hyper = dict(hyper_cfg)
     tuned_hyper.update(best_params)
@@ -1268,6 +1274,64 @@ def _write_xgb_cv_tuning_cache(data_cfg: dict, hyper_cfg: dict, best_params: dic
     with open(cache_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     return cache_path
+
+
+def run_xgb_cv_tuning_only(
+    config: dict,
+    train_samples,
+    model_kind: str,
+    metric_key: str,
+    cast_y=None,
+    use_cache: bool = True,
+    write_cache: bool = True,
+) -> tuple[dict, dict]:
+    """Run XGB CV tuning only (no final model training). Returns (best_params, summary)."""
+    hyper_cfg = _resolve_xgb_runtime_hyperparameters(config["hyperparameters"], config.get("device", "cpu"))
+    cv_cfg = hyper_cfg.get("cv_tuning", {}) or {}
+    cv_requested = bool(cv_cfg.get("enabled", False))
+    data_cfg = config["data"]
+
+    best_params: dict = {}
+    summary: dict = {"enabled": False}
+
+    cache_path = _resolve_cv_cache_path(config)
+    if use_cache and cache_path.exists():
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            cached_params = cached.get("tuned_hyperparameters") or cached.get("best_params")
+            if isinstance(cached_params, dict) and cached_params:
+                best_params = dict(cached_params)
+                summary = cached.get("cv_summary", {}) or {"enabled": False}
+                summary["source"] = "cache"
+                print(f"[INFO] Using cached CV hyperparameters from {cache_path}")
+        except Exception as exc:
+            print(f"[WARN] Failed to read CV cache {cache_path}: {exc}")
+
+    if not best_params:
+        best_params, summary = _xgb_tune_hyperparameters_cv(
+            config=config,
+            train_samples=train_samples,
+            model_kind=model_kind,
+            metric_key=metric_key,
+            cast_y=cast_y,
+        )
+        if cv_requested and best_params and write_cache:
+            cache_written = _write_xgb_cv_tuning_cache(cache_path, hyper_cfg, best_params, summary)
+            print(f"[INFO] CV tuning cache saved to: {cache_written}")
+
+    tuned_hyper = dict(hyper_cfg)
+    tuned_hyper.update(best_params)
+    artifact_path = _write_xgb_cv_tuning_artifact(data_cfg, tuned_hyper, best_params, summary)
+    print(f"[INFO] CV tuning artifact saved to: {artifact_path}")
+    trials_csv = _write_xgb_cv_trials_csv(data_cfg, summary)
+    if trials_csv is not None:
+        print(f"[INFO] CV tuning trials CSV saved to: {trials_csv}")
+    trials_plot = _write_xgb_cv_trials_plot(data_cfg, summary)
+    if trials_plot is not None:
+        print(f"[INFO] CV tuning trials plot saved to: {trials_plot}")
+
+    return best_params, summary
 
 
 def _write_xgb_cv_trials_csv(data_cfg: dict, summary: dict) -> Path | None:
@@ -1485,7 +1549,7 @@ def _train_xgb_model_cv_tuned(
     cv_requested = bool(cv_cfg.get("enabled", False))
 
     data_cfg = config["data"]
-    cache_path = _xgb_cv_cache_path(data_cfg)
+    cache_path = _resolve_cv_cache_path(config)
     best_params = {}
     summary = {"enabled": False}
     if cache_path.exists():
@@ -1510,7 +1574,7 @@ def _train_xgb_model_cv_tuned(
             cast_y=cast_y,
         )
         if cv_requested and best_params:
-            cache_written = _write_xgb_cv_tuning_cache(data_cfg, hyper_cfg, best_params, summary)
+            cache_written = _write_xgb_cv_tuning_cache(cache_path, hyper_cfg, best_params, summary)
             print(f"[INFO] CV tuning cache saved to: {cache_written}")
 
     tuned_config = copy.deepcopy(config)

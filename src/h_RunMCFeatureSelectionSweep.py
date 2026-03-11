@@ -209,6 +209,55 @@ def _forecast_sweeps_dir(dataset_dir: Path) -> Path:
     return dataset_dir / "forecasts" / _sweep_namespace()
 
 
+def _feature_sweep_cache_path(dataset_dir: Path) -> Path:
+    return _forecast_sweeps_dir(dataset_dir) / "xgb_cv_tuning_cache.json"
+
+
+def _load_feature_sweep_cache(dataset_dir: Path) -> dict | None:
+    cache_path = _feature_sweep_cache_path(dataset_dir)
+    if not cache_path.exists():
+        return None
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _ensure_feature_sweep_cache(plan: DatasetPlan) -> None:
+    cache_path = _feature_sweep_cache_path(plan.dataset_dir)
+    if cache_path.exists():
+        return
+    base_cfg = _select_surrogate_config(plan.train_configs)
+    if base_cfg is None:
+        return
+    cfg = train_module.load_config(str(base_cfg))
+    if str(cfg.get("model_type")) not in {"xgb_regressor", "xgb_classifier"}:
+        return
+    cfg = train_module.merge_with_defaults(cfg, cfg.get("model_type", "xgb_regressor"))
+    hyper_cfg = cfg.setdefault("hyperparameters", {})
+    cv_cfg = hyper_cfg.get("cv_tuning")
+    if isinstance(cv_cfg, dict):
+        cv_cfg["enabled"] = True
+        cv_cfg["cache_path"] = str(cache_path)
+    else:
+        hyper_cfg["cv_tuning"] = {"enabled": True, "cache_path": str(cache_path)}
+    train_samples, _ = train_module.load_and_split_data(cfg)
+    model_kind = "classifier" if str(cfg.get("model_type")) == "xgb_classifier" else "regressor"
+    metric_key = "eval_metric" if model_kind == "classifier" else "metric"
+    cast_y = (lambda v: int(round(v))) if model_kind == "classifier" else None
+    print(f"[INFO] Feature sweep CV tuning (full features) -> {cache_path}")
+    train_module.run_xgb_cv_tuning_only(
+        config=cfg,
+        train_samples=train_samples,
+        model_kind=model_kind,
+        metric_key=metric_key,
+        cast_y=cast_y,
+        use_cache=True,
+        write_cache=True,
+    )
+
+
 @dataclass
 class DatasetPlan:
     dataset_dir: Path
@@ -650,6 +699,20 @@ def _train_single_config(
     config = train_module.merge_with_defaults(config, model_type)
     if disable_training_plots:
         config["save_training_plots"] = False
+
+    if model_type in {"xgb_regressor", "xgb_classifier"}:
+        cache_payload = _load_feature_sweep_cache(dataset_dir)
+        if cache_payload is not None:
+            tuned = cache_payload.get("tuned_hyperparameters") or cache_payload.get("best_params") or {}
+            if isinstance(tuned, dict) and tuned:
+                hyper_cfg = config.setdefault("hyperparameters", {})
+                hyper_cfg.update(tuned)
+                cv_cfg = hyper_cfg.get("cv_tuning")
+                if isinstance(cv_cfg, dict):
+                    cv_cfg["enabled"] = False
+                    cv_cfg["cache_path"] = str(_feature_sweep_cache_path(dataset_dir))
+                else:
+                    hyper_cfg["cv_tuning"] = {"enabled": False, "cache_path": str(_feature_sweep_cache_path(dataset_dir))}
 
     device = torch.device(config["device"])
     matplotlib.use(config["matplotlib_backend"])
@@ -3326,6 +3389,9 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
     if not plans:
         print("No matching datasets/configs found.")
         return 1
+
+    for plan in plans:
+        _ensure_feature_sweep_cache(plan)
 
     print("\nExecution plan")
     print("-" * 100)

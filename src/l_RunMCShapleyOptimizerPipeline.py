@@ -15,13 +15,17 @@ Stage behavior:
 - Stage 2 (Optimizer): writes optimizer artifacts under
     `forecasts/feature_sweeps` and by default reads Shapley seed subsets
     unless `--seed-subsets-csv` is provided.
- - CV tuning policy for XGBoost:
-     * The pipeline enables CV tuning the first time it encounters an XGB config
-       (train-set-only, no test exposure).
-     * The first tuned run writes a dataset-level cache
-       `forecasts/xgb_cv_tuning_cache.json`.
-     * Subsequent runs reuse cached hyperparameters for consistent regularization
-       across feature subsets and to reduce compute.
+- CV tuning policy for XGBoost:
+    * The pipeline enables CV tuning the first time it encounters an XGB config
+      (train-set-only, no test exposure).
+    * The first tuned run writes a dataset-level cache
+      `forecasts/xgb_cv_tuning_cache.json`.
+    * Subsequent runs reuse cached hyperparameters for consistent regularization
+      across feature subsets and to reduce compute.
+    * Stage A (pre-Shapley): run CV tuning on the full feature set.
+    * Stage B (post-Shapley): run CV tuning on top-k Shapley subsets and write
+      comparison artifacts (`xgb_cv_topk_params_r###.csv/.png`) under
+      `forecasts/Shapley_sweeps`.
 - Search phases keep standard temporal-by-coverage split behavior
     (target 70/30 by default).
 - Final top-K phases enforce minimum test coverage (>=5 test samples):
@@ -66,6 +70,9 @@ import yaml
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 import h_RunMCFeatureSelectionSweep as optimizer_module
 import i_RunMCFeatureSelectionShapleySweep as shapley_module
 import e_Train as train_module
@@ -168,9 +175,12 @@ def _tuning_artifact_path(cfg: dict, cfg_path: Path) -> Path | None:
     return data_dir / "forecasts" / str(forecast_name) / "xgb_cv_tuning.json"
 
 
-def _cv_cache_path(cfg: dict, cfg_path: Path) -> Path:
-    data_dir = _resolve_data_dir(cfg, cfg_path)
-    return data_dir / "forecasts" / "xgb_cv_tuning_cache.json"
+def _shapley_cache_path(dataset_dir: Path) -> Path:
+    return dataset_dir / "forecasts" / _SHAPLEY_NAMESPACE / "xgb_cv_tuning_cache.json"
+
+
+def _feature_sweep_cache_path(dataset_dir: Path) -> Path:
+    return dataset_dir / "forecasts" / _OPTIMIZER_DEFAULT_NAMESPACE / "xgb_cv_tuning_cache.json"
 
 
 def _apply_tuned_hyperparameters(cfg: dict, tuned: dict) -> dict:
@@ -187,50 +197,273 @@ def _apply_tuned_hyperparameters(cfg: dict, tuned: dict) -> dict:
     return cfg
 
 
-def _sync_tuned_hyperparameters(plans: list[optimizer_module.DatasetPlan]) -> None:
+def _sync_feature_sweep_cache(plans: list[optimizer_module.DatasetPlan]) -> None:
     for plan in plans:
-        cache_payload = None
-        cache_path = None
+        cache_path = _feature_sweep_cache_path(plan.dataset_dir)
+        if not cache_path.exists():
+            continue
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache_payload = json.load(f)
+        except Exception as exc:
+            print(f"[PIPELINE][WARN] Failed to read feature_sweeps cache {cache_path}: {exc}")
+            continue
+
         for cfg_path in plan.train_configs:
             try:
                 cfg = train_module.load_config(str(cfg_path))
                 model_type = str(cfg.get("model_type", ""))
                 if model_type not in {"xgb_regressor", "xgb_classifier"}:
                     continue
-
-                if cache_payload is None:
-                    cache_path = _cv_cache_path(cfg, cfg_path)
-                    if cache_path.exists():
-                        with open(cache_path, "r", encoding="utf-8") as f:
-                            cache_payload = json.load(f)
-
-                if cache_payload is not None:
-                    raw_cfg = _load_raw_config(cfg_path)
-                    raw_cfg = _apply_tuned_hyperparameters(raw_cfg, cache_payload)
-                    _write_raw_config(cfg_path, raw_cfg)
-                    print(f"[PIPELINE] Applied cached CV hyperparameters from {cache_path} -> {cfg_path}")
-                    continue
-
-                artifact_path = _tuning_artifact_path(cfg, cfg_path)
-                if artifact_path is None or not artifact_path.exists():
-                    raw_cfg = _load_raw_config(cfg_path)
-                    hyper_cfg = raw_cfg.setdefault("hyperparameters", {})
-                    cv_cfg = hyper_cfg.get("cv_tuning")
-                    if isinstance(cv_cfg, dict):
-                        cv_cfg["enabled"] = True
-                    else:
-                        hyper_cfg["cv_tuning"] = {"enabled": True}
-                    _write_raw_config(cfg_path, raw_cfg)
-                    print(f"[PIPELINE] Enabled CV tuning for first encounter: {cfg_path}")
-                    continue
-                with open(artifact_path, "r", encoding="utf-8") as f:
-                    tuned_payload = json.load(f)
                 raw_cfg = _load_raw_config(cfg_path)
-                raw_cfg = _apply_tuned_hyperparameters(raw_cfg, tuned_payload)
+                raw_cfg = _apply_tuned_hyperparameters(raw_cfg, cache_payload)
                 _write_raw_config(cfg_path, raw_cfg)
-                print(f"[PIPELINE] Applied tuned hyperparameters from {artifact_path} -> {cfg_path}")
+                print(f"[PIPELINE] Applied feature_sweeps cache {cache_path} -> {cfg_path}")
             except Exception as exc:
-                print(f"[PIPELINE][WARN] Could not apply tuned hyperparameters for {cfg_path}: {exc}")
+                print(f"[PIPELINE][WARN] Could not apply feature_sweeps cache for {cfg_path}: {exc}")
+
+
+def _find_first_xgb_config(plan: optimizer_module.DatasetPlan) -> Path | None:
+    for cfg_path in plan.train_configs:
+        try:
+            cfg = train_module.load_config(str(cfg_path))
+            if str(cfg.get("model_type", "")) in {"xgb_regressor", "xgb_classifier"}:
+                return cfg_path
+        except Exception:
+            continue
+    return None
+
+
+def _run_full_feature_cv_tuning(plan: optimizer_module.DatasetPlan) -> None:
+    base_cfg_path = _find_first_xgb_config(plan)
+    if base_cfg_path is None:
+        return
+    cache_path = _shapley_cache_path(plan.dataset_dir)
+    if cache_path.exists():
+        return
+
+    cfg = train_module.load_config(str(base_cfg_path))
+    cfg = train_module.merge_with_defaults(cfg, cfg.get("model_type", "xgb_regressor"))
+    hyper_cfg = cfg.setdefault("hyperparameters", {})
+    cv_cfg = hyper_cfg.get("cv_tuning")
+    if isinstance(cv_cfg, dict):
+        cv_cfg["enabled"] = True
+        cv_cfg["cache_path"] = str(cache_path)
+    else:
+        hyper_cfg["cv_tuning"] = {"enabled": True, "cache_path": str(cache_path)}
+
+    train_samples, _ = train_module.load_and_split_data(cfg)
+    model_kind = "classifier" if str(cfg.get("model_type")) == "xgb_classifier" else "regressor"
+    metric_key = "eval_metric" if model_kind == "classifier" else "metric"
+    cast_y = (lambda v: int(round(v))) if model_kind == "classifier" else None
+
+    print(f"[PIPELINE] Stage A CV tuning (full features): {base_cfg_path}")
+    train_module.run_xgb_cv_tuning_only(
+        config=cfg,
+        train_samples=train_samples,
+        model_kind=model_kind,
+        metric_key=metric_key,
+        cast_y=cast_y,
+        use_cache=True,
+        write_cache=True,
+    )
+
+
+def _load_topk_shapley_subsets(plan: optimizer_module.DatasetPlan, row_count: int, top_k: int) -> list[tuple[str, ...]]:
+    seed_csv = optimizer_module._resolve_seed_subsets_csv_path(
+        dataset_dir=plan.dataset_dir,
+        row_count=row_count,
+        explicit_path=None,
+        from_shapley=True,
+    )
+    if seed_csv is None or not seed_csv.exists():
+        return []
+    try:
+        df = pd.read_csv(seed_csv)
+    except Exception:
+        return []
+    if "features" not in df.columns:
+        return []
+    subsets: list[tuple[str, ...]] = []
+    for raw in df["features"].tolist():
+        feats = tuple([p.strip() for p in str(raw).split("|") if p.strip()])
+        if feats:
+            subsets.append(feats)
+        if len(subsets) >= top_k:
+            break
+    return subsets
+
+
+def _write_topk_param_reports(
+    out_dir: Path,
+    row_count: int,
+    records: list[dict],
+) -> None:
+    if not records:
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(records)
+    csv_path = out_dir / f"xgb_cv_topk_params_r{row_count:03d}.csv"
+    df.to_csv(csv_path, index=False)
+
+    param_cols = [c for c in df.columns if c.startswith("param__")]
+    if not param_cols:
+        return
+    data = []
+    labels = []
+    for col in param_cols:
+        series = pd.to_numeric(df[col], errors="coerce").dropna()
+        if series.empty:
+            continue
+        data.append(series.to_numpy(dtype=float))
+        labels.append(col.replace("param__", ""))
+    if not data:
+        return
+    plt.figure(figsize=(max(8, 1.2 * len(labels)), 4.8))
+    plt.boxplot(data, labels=labels, showfliers=False)
+    plt.title("Stage B: CV-tuned parameter distribution (top-k subsets)")
+    plt.ylabel("Value")
+    plt.grid(axis="y", alpha=0.35)
+    plot_path = out_dir / f"xgb_cv_topk_params_r{row_count:03d}.png"
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=180)
+    plt.close()
+
+
+def _compute_consensus_params(records: list[dict]) -> dict:
+    if not records:
+        return {}
+    df = pd.DataFrame(records)
+    param_cols = [c for c in df.columns if c.startswith("param__")]
+    consensus: dict = {}
+    for col in param_cols:
+        vals = pd.to_numeric(df[col], errors="coerce").dropna()
+        if vals.empty:
+            continue
+        # Determine if values are effectively integers
+        is_int_like = np.all(np.isclose(vals, np.round(vals)))
+        if is_int_like:
+            mode_val = vals.round().mode()
+            if not mode_val.empty:
+                consensus[col.replace("param__", "")] = int(mode_val.iloc[0])
+        else:
+            consensus[col.replace("param__", "")] = float(vals.mean())
+    return consensus
+
+
+def _run_topk_subset_cv_tuning(
+    plan: optimizer_module.DatasetPlan,
+    row_counts: list[int],
+    top_k: int,
+) -> None:
+    base_cfg_path = _find_first_xgb_config(plan)
+    if base_cfg_path is None:
+        return
+    base_cfg = train_module.load_config(str(base_cfg_path))
+    base_cfg = train_module.merge_with_defaults(base_cfg, base_cfg.get("model_type", "xgb_regressor"))
+
+    stage_a_cache = _shapley_cache_path(plan.dataset_dir)
+    stage_a_payload = None
+    if stage_a_cache.exists():
+        try:
+            with open(stage_a_cache, "r", encoding="utf-8") as f:
+                stage_a_payload = json.load(f)
+        except Exception:
+            stage_a_payload = None
+
+    for row_count in row_counts:
+        subsets = _load_topk_shapley_subsets(plan, row_count, top_k)
+        if not subsets:
+            continue
+        out_dir = plan.dataset_dir / "forecasts" / _SHAPLEY_NAMESPACE / "CVtune"
+        records: list[dict] = []
+        tmp_dir = out_dir / "_cv_tuning_tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        if stage_a_payload is not None:
+            stage_a_params = stage_a_payload.get("tuned_hyperparameters") or stage_a_payload.get("best_params") or {}
+            stage_a_record = {
+                "row_count": int(row_count),
+                "feature_tag": "stage_a_full",
+                "n_features": int(len(base_cfg.get("data", {}).get("input_columns", []))),
+                "metric": (stage_a_payload.get("cv_summary") or {}).get("metric"),
+                "best_score": (stage_a_payload.get("cv_summary") or {}).get("best_score"),
+            }
+            for k, v in stage_a_params.items():
+                stage_a_record[f"param__{k}"] = v
+            records.append(stage_a_record)
+
+        for feats in subsets:
+            feature_tag = optimizer_module._feature_tag(feats)
+            cfg_path = optimizer_module._prepare_variant_config(
+                base_config_path=base_cfg_path,
+                row_count=row_count,
+                features=feats,
+                feature_tag=feature_tag,
+                tmp_dir=tmp_dir,
+                forced_data_dir=plan.dataset_dir,
+            )
+            cfg = train_module.load_config(str(cfg_path))
+            cfg = train_module.merge_with_defaults(cfg, cfg.get("model_type", "xgb_regressor"))
+            hyper_cfg = cfg.setdefault("hyperparameters", {})
+            cv_cfg = hyper_cfg.get("cv_tuning")
+            if isinstance(cv_cfg, dict):
+                cv_cfg["enabled"] = True
+            else:
+                hyper_cfg["cv_tuning"] = {"enabled": True}
+
+            train_samples, _ = train_module.load_and_split_data(cfg)
+            model_kind = "classifier" if str(cfg.get("model_type")) == "xgb_classifier" else "regressor"
+            metric_key = "eval_metric" if model_kind == "classifier" else "metric"
+            cast_y = (lambda v: int(round(v))) if model_kind == "classifier" else None
+
+            best_params, summary = train_module.run_xgb_cv_tuning_only(
+                config=cfg,
+                train_samples=train_samples,
+                model_kind=model_kind,
+                metric_key=metric_key,
+                cast_y=cast_y,
+                use_cache=False,
+                write_cache=False,
+            )
+
+            record = {
+                "row_count": int(row_count),
+                "feature_tag": feature_tag,
+                "n_features": int(len(feats)),
+                "metric": summary.get("metric"),
+                "best_score": summary.get("best_score"),
+            }
+            for k, v in (best_params or {}).items():
+                record[f"param__{k}"] = v
+            records.append(record)
+
+        _write_topk_param_reports(out_dir, row_count, records)
+
+    # Build consensus across all records and write feature_sweeps cache + summary
+    all_records = []
+    cvtune_dir = plan.dataset_dir / "forecasts" / _SHAPLEY_NAMESPACE / "CVtune"
+    for row_count in row_counts:
+        csv_path = cvtune_dir / f"xgb_cv_topk_params_r{row_count:03d}.csv"
+        if csv_path.exists():
+            try:
+                all_records.extend(pd.read_csv(csv_path).to_dict(orient="records"))
+            except Exception:
+                pass
+    consensus = _compute_consensus_params(all_records)
+    if consensus:
+        feature_cache = _feature_sweep_cache_path(plan.dataset_dir)
+        base_cfg_for_cache = train_module.load_config(str(base_cfg_path))
+        base_cfg_for_cache = train_module.merge_with_defaults(base_cfg_for_cache, base_cfg_for_cache.get("model_type", "xgb_regressor"))
+        hyper_cfg = base_cfg_for_cache.get("hyperparameters", {})
+        train_module._write_xgb_cv_tuning_cache(feature_cache, hyper_cfg, consensus, {
+            "enabled": True,
+            "metric": None,
+            "source": "stage_b_consensus",
+        })
+        summary_path = cvtune_dir / "xgb_cv_consensus_params.json"
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump({"consensus_params": consensus}, f, indent=2)
 
 
 def _parse_seed_list(raw: str | None) -> list[int]:
@@ -428,7 +661,6 @@ def _run_pipeline(args: argparse.Namespace, data_root_resolved: Path) -> int:
         print("No matching datasets/configs found.")
         return 1
 
-    _sync_tuned_hyperparameters(plans)
 
     print("\nPipeline plan")
     print("-" * 100)
@@ -459,6 +691,13 @@ def _run_pipeline(args: argparse.Namespace, data_root_resolved: Path) -> int:
             print(f"[PIPELINE] DATASET {plan_idx}/{len(plans)}: {plan.dataset_dir.name}")
             print("=" * 100)
 
+            surrogate_cfg = optimizer_module._select_surrogate_config(plan.train_configs)
+            surrogate_data = train_module.load_config(str(surrogate_cfg))["data"]
+            base_span = int(surrogate_data["input_row_2"]) - int(surrogate_data["input_row_1"])
+            row_counts = optimizer_module._parse_row_counts(args.row_counts, default_span=base_span)
+
+            _run_full_feature_cv_tuning(plan)
+
             if not args.skip_shapley_stage:
                 _set_pipeline_stage_namespace(_SHAPLEY_NAMESPACE)
                 shapley_args = _build_shapley_args(args)
@@ -474,9 +713,12 @@ def _run_pipeline(args: argparse.Namespace, data_root_resolved: Path) -> int:
                         return shapley_rc
                     continue
 
+                _run_topk_subset_cv_tuning(plan, row_counts=row_counts, top_k=int(args.final_top_k))
+
             if not args.skip_optimizer_stage:
                 # Critical isolation: optimizer outputs must not inherit Shapley namespace.
                 _set_pipeline_stage_namespace(None)
+                _sync_feature_sweep_cache([plan])
                 print("\n[PIPELINE] Stage 2/2: Running seeded optimizer sweep(s)...")
                 print(f"[PIPELINE] Stage 2 namespace      : {_OPTIMIZER_DEFAULT_NAMESPACE}")
                 for seed_idx, seed in enumerate(optimizer_seeds, start=1):
