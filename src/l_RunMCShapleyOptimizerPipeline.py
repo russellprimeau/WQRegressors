@@ -81,6 +81,8 @@ import e_Train as train_module
 _NAMESPACE_ENV = "WQ_FEATURE_SWEEP_NAMESPACE"
 _SHAPLEY_NAMESPACE = "Shapley_sweeps"
 _OPTIMIZER_DEFAULT_NAMESPACE = "feature_sweeps"
+_CONSENSUS_VERSION = 2
+_CONSENSUS_METHOD = "elite_trial_observed_candidate"
 
 
 class _TeeTextIO:
@@ -166,15 +168,6 @@ def _resolve_data_dir(cfg: dict, cfg_path: Path) -> Path:
     return Path(train_module._resolve_path_from_config(data_dir_raw, config_dir))
 
 
-def _tuning_artifact_path(cfg: dict, cfg_path: Path) -> Path | None:
-    data_cfg = cfg.get("data", {}) or {}
-    forecast_name = data_cfg.get("forecast_name")
-    if not forecast_name:
-        return None
-    data_dir = _resolve_data_dir(cfg, cfg_path)
-    return data_dir / "forecasts" / str(forecast_name) / "xgb_cv_tuning.json"
-
-
 def _shapley_cache_path(dataset_dir: Path) -> Path:
     return dataset_dir / "forecasts" / _SHAPLEY_NAMESPACE / "xgb_cv_tuning_cache.json"
 
@@ -193,7 +186,7 @@ def _apply_tuned_hyperparameters(cfg: dict, tuned: dict) -> dict:
     if isinstance(cv_cfg, dict):
         cv_cfg.setdefault("enabled", False)
         cv_cfg["enabled"] = False
-        cv_cfg["source"] = "xgb_cv_tuning.json"
+        cv_cfg["source"] = "xgb_cv_tuning_cache.json"
     return cfg
 
 
@@ -249,8 +242,13 @@ def _run_full_feature_cv_tuning(plan: optimizer_module.DatasetPlan) -> None:
     if isinstance(cv_cfg, dict):
         cv_cfg["enabled"] = True
         cv_cfg["cache_path"] = str(cache_path)
+        cv_cfg["artifact_dir"] = str(_shapley_cache_path(plan.dataset_dir).parent)
     else:
-        hyper_cfg["cv_tuning"] = {"enabled": True, "cache_path": str(cache_path)}
+        hyper_cfg["cv_tuning"] = {
+            "enabled": True,
+            "cache_path": str(cache_path),
+            "artifact_dir": str(_shapley_cache_path(plan.dataset_dir).parent),
+        }
 
     train_samples, _ = train_module.load_and_split_data(cfg)
     model_kind = "classifier" if str(cfg.get("model_type")) == "xgb_classifier" else "regressor"
@@ -351,6 +349,213 @@ def _compute_consensus_params(records: list[dict]) -> dict:
     return consensus
 
 
+def _extract_elite_trials(
+    summary: dict,
+    *,
+    rel_margin: float = 0.01,
+    abs_margin: float = 0.0,
+    include_one_se: bool = True,
+) -> list[dict]:
+    """Return near-optimal trials from one CV run using run-local tolerance."""
+    trials = summary.get("trials") if isinstance(summary, dict) else None
+    if not isinstance(trials, list) or not trials:
+        return []
+
+    parsed = []
+    for item in trials:
+        if not isinstance(item, dict):
+            continue
+        params = item.get("params")
+        if not isinstance(params, dict) or not params:
+            continue
+        mean = pd.to_numeric(pd.Series([item.get("mean_score")]), errors="coerce").iloc[0]
+        if pd.isna(mean):
+            continue
+        std = pd.to_numeric(pd.Series([item.get("std_score")]), errors="coerce").iloc[0]
+        parsed.append(
+            {
+                "trial": item.get("trial"),
+                "mean_score": float(mean),
+                "std_score": float(std) if not pd.isna(std) else float("nan"),
+                "params": dict(params),
+            }
+        )
+
+    if not parsed:
+        return []
+
+    best_mean = min(x["mean_score"] for x in parsed)
+    best_std_vals = [x["std_score"] for x in parsed if np.isfinite(x["std_score"]) and x["mean_score"] == best_mean]
+    best_std = float(best_std_vals[0]) if best_std_vals else 0.0
+
+    rel_tol = abs(float(rel_margin)) * max(abs(best_mean), 1e-12)
+    tol = max(float(abs_margin), rel_tol)
+    if include_one_se:
+        tol = max(tol, max(0.0, best_std))
+
+    elite = [x for x in parsed if x["mean_score"] <= (best_mean + tol)]
+    if not elite:
+        elite = [min(parsed, key=lambda x: x["mean_score"])]
+
+    out = []
+    for row in elite:
+        delta = max(0.0, float(row["mean_score"] - best_mean))
+        std = float(row["std_score"]) if np.isfinite(row["std_score"]) else 0.0
+        # Prefer low delta and low fold spread; denominator keeps scale bounded.
+        score_weight = 1.0 / (1.0 + (delta / max(tol, 1e-12)))
+        stability_weight = 1.0 / (1.0 + std)
+        out.append(
+            {
+                **row,
+                "best_mean": float(best_mean),
+                "tolerance": float(tol),
+                "delta_from_best": float(delta),
+                "candidate_weight_raw": float(score_weight * stability_weight),
+            }
+        )
+    return out
+
+
+def _params_signature(params: dict) -> str:
+    safe = {str(k): params[k] for k in sorted(params.keys())}
+    return json.dumps(safe, sort_keys=True, separators=(",", ":"))
+
+
+def _select_consensus_from_candidates(candidates: list[dict]) -> tuple[dict, dict]:
+    """Choose one observed hyperparameter set from elite-trial candidates."""
+    if not candidates:
+        return {}, {
+            "method": _CONSENSUS_METHOD,
+            "version": _CONSENSUS_VERSION,
+            "reason": "no_candidates",
+        }
+
+    by_sig: dict[str, dict] = {}
+    for cand in candidates:
+        params = cand.get("params")
+        if not isinstance(params, dict) or not params:
+            continue
+        sig = _params_signature(params)
+        bucket = by_sig.setdefault(
+            sig,
+            {
+                "params": dict(params),
+                "support": 0,
+                "weight": 0.0,
+                "avg_delta_num": 0.0,
+                "avg_std_num": 0.0,
+                "sources": [],
+            },
+        )
+        w = float(max(0.0, cand.get("candidate_weight", cand.get("candidate_weight_raw", 0.0))))
+        delta = float(max(0.0, cand.get("delta_from_best", 0.0)))
+        std = cand.get("std_score", float("nan"))
+        std = float(std) if np.isfinite(std) else 0.0
+        bucket["support"] += 1
+        bucket["weight"] += w
+        bucket["avg_delta_num"] += w * delta
+        bucket["avg_std_num"] += w * std
+        bucket["sources"].append(
+            {
+                "row_count": cand.get("row_count"),
+                "feature_tag": cand.get("feature_tag"),
+                "trial": cand.get("trial"),
+            }
+        )
+
+    if not by_sig:
+        return {}, {
+            "method": _CONSENSUS_METHOD,
+            "version": _CONSENSUS_VERSION,
+            "reason": "invalid_candidates",
+        }
+
+    flattened = []
+    for sig, bucket in by_sig.items():
+        denom = max(bucket["weight"], 1e-12)
+        flattened.append(
+            {
+                "signature": sig,
+                "params": bucket["params"],
+                "support": int(bucket["support"]),
+                "weight": float(bucket["weight"]),
+                "weighted_avg_delta": float(bucket["avg_delta_num"] / denom),
+                "weighted_avg_std": float(bucket["avg_std_num"] / denom),
+                "sources": bucket["sources"],
+            }
+        )
+
+    # Deterministic preference: max weight, then support, then lower delta/std.
+    flattened.sort(
+        key=lambda x: (
+            -x["weight"],
+            -x["support"],
+            x["weighted_avg_delta"],
+            x["weighted_avg_std"],
+            x["signature"],
+        )
+    )
+    chosen = flattened[0]
+    meta = {
+        "method": _CONSENSUS_METHOD,
+        "version": _CONSENSUS_VERSION,
+        "candidate_count": len(candidates),
+        "unique_param_sets": len(flattened),
+        "selected_signature": chosen["signature"],
+        "selected_weight": chosen["weight"],
+        "selected_support": chosen["support"],
+        "selected_weighted_avg_delta": chosen["weighted_avg_delta"],
+        "selected_weighted_avg_std": chosen["weighted_avg_std"],
+        "top_candidates": [
+            {
+                "signature": c["signature"],
+                "support": c["support"],
+                "weight": c["weight"],
+                "weighted_avg_delta": c["weighted_avg_delta"],
+                "weighted_avg_std": c["weighted_avg_std"],
+            }
+            for c in flattened[:10]
+        ],
+    }
+    return dict(chosen["params"]), meta
+
+
+def _write_stage_b_consensus_artifacts(
+    cvtune_dir: Path,
+    all_records: list[dict],
+    candidates: list[dict],
+    selected_params: dict,
+    meta: dict,
+) -> None:
+    cvtune_dir.mkdir(parents=True, exist_ok=True)
+    derivation_path = cvtune_dir / "xgb_cv_consensus_derivation.json"
+    with open(derivation_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "artifact_version": _CONSENSUS_VERSION,
+                "consensus_method": _CONSENSUS_METHOD,
+                "selected_params": selected_params,
+                "meta": meta,
+            },
+            f,
+            indent=2,
+        )
+
+    metadata_path = cvtune_dir / "xgb_cv_stage_b_metadata.json"
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "artifact_version": _CONSENSUS_VERSION,
+                "consensus_method": _CONSENSUS_METHOD,
+                "records": all_records,
+                "elite_candidates": candidates,
+                "selected_params": selected_params,
+            },
+            f,
+            indent=2,
+        )
+
+
 def _run_topk_subset_cv_tuning(
     plan: optimizer_module.DatasetPlan,
     row_counts: list[int],
@@ -371,6 +576,22 @@ def _run_topk_subset_cv_tuning(
         except Exception:
             stage_a_payload = None
 
+    all_records: list[dict] = []
+    elite_candidates: list[dict] = []
+
+    if stage_a_payload is not None:
+        stage_a_summary = stage_a_payload.get("cv_summary") if isinstance(stage_a_payload, dict) else None
+        stage_a_candidates = _extract_elite_trials(stage_a_summary or {})
+        if stage_a_candidates:
+            norm = sum(max(0.0, c.get("candidate_weight_raw", 0.0)) for c in stage_a_candidates)
+            norm = norm if norm > 0 else float(len(stage_a_candidates))
+            for c in stage_a_candidates:
+                weight = max(0.0, c.get("candidate_weight_raw", 0.0))
+                c["candidate_weight"] = float((weight if norm > 0 else 1.0) / norm)
+                c["row_count"] = "stage_a"
+                c["feature_tag"] = "stage_a_full"
+                elite_candidates.append(c)
+
     for row_count in row_counts:
         subsets = _load_topk_shapley_subsets(plan, row_count, top_k)
         if not subsets:
@@ -386,6 +607,9 @@ def _run_topk_subset_cv_tuning(
                 "row_count": int(row_count),
                 "feature_tag": "stage_a_full",
                 "n_features": int(len(base_cfg.get("data", {}).get("input_columns", []))),
+                "input_dim": int(len(base_cfg.get("data", {}).get("input_columns", []))),
+                "n_train_samples": None,
+                "seed": (stage_a_payload.get("cv_summary") or {}).get("seed"),
                 "metric": (stage_a_payload.get("cv_summary") or {}).get("metric"),
                 "best_score": (stage_a_payload.get("cv_summary") or {}).get("best_score"),
             }
@@ -409,8 +633,15 @@ def _run_topk_subset_cv_tuning(
             cv_cfg = hyper_cfg.get("cv_tuning")
             if isinstance(cv_cfg, dict):
                 cv_cfg["enabled"] = True
+                cv_cfg["artifact_dir"] = str(out_dir / f"subset_{feature_tag}")
+                # Vary seed per subset to avoid identical trial sequences.
+                cv_cfg["seed"] = int(abs(hash(feature_tag)) % 10_000_000)
             else:
-                hyper_cfg["cv_tuning"] = {"enabled": True}
+                hyper_cfg["cv_tuning"] = {
+                    "enabled": True,
+                    "artifact_dir": str(out_dir / f"subset_{feature_tag}"),
+                    "seed": int(abs(hash(feature_tag)) % 10_000_000),
+                }
 
             train_samples, _ = train_module.load_and_split_data(cfg)
             model_kind = "classifier" if str(cfg.get("model_type")) == "xgb_classifier" else "regressor"
@@ -427,10 +658,25 @@ def _run_topk_subset_cv_tuning(
                 write_cache=False,
             )
 
+            run_candidates = _extract_elite_trials(summary or {})
+            if run_candidates:
+                norm = sum(max(0.0, c.get("candidate_weight_raw", 0.0)) for c in run_candidates)
+                norm = norm if norm > 0 else float(len(run_candidates))
+                for c in run_candidates:
+                    weight = max(0.0, c.get("candidate_weight_raw", 0.0))
+                    c["candidate_weight"] = float((weight if norm > 0 else 1.0) / norm)
+                    c["row_count"] = int(row_count)
+                    c["feature_tag"] = feature_tag
+                    elite_candidates.append(c)
+
+            input_dim = int(len(cfg.get("data", {}).get("input_columns", [])))
             record = {
                 "row_count": int(row_count),
                 "feature_tag": feature_tag,
                 "n_features": int(len(feats)),
+                "input_dim": input_dim,
+                "n_train_samples": int(len(train_samples)),
+                "seed": (summary.get("seed") if isinstance(summary, dict) else None),
                 "metric": summary.get("metric"),
                 "best_score": summary.get("best_score"),
             }
@@ -438,19 +684,23 @@ def _run_topk_subset_cv_tuning(
                 record[f"param__{k}"] = v
             records.append(record)
 
+        all_records.extend(records)
+
         _write_topk_param_reports(out_dir, row_count, records)
 
     # Build consensus across all records and write feature_sweeps cache + summary
-    all_records = []
     cvtune_dir = plan.dataset_dir / "forecasts" / _SHAPLEY_NAMESPACE / "CVtune"
-    for row_count in row_counts:
-        csv_path = cvtune_dir / f"xgb_cv_topk_params_r{row_count:03d}.csv"
-        if csv_path.exists():
-            try:
-                all_records.extend(pd.read_csv(csv_path).to_dict(orient="records"))
-            except Exception:
-                pass
-    consensus = _compute_consensus_params(all_records)
+    consensus, consensus_meta = _select_consensus_from_candidates(elite_candidates)
+    if not consensus and all_records:
+        consensus = _compute_consensus_params(all_records)
+        consensus_meta = {
+            "method": "fallback_paramwise_mean_mode",
+            "version": 1,
+            "reason": "no_elite_candidates",
+        }
+
+    if consensus:
+        _write_stage_b_consensus_artifacts(cvtune_dir, all_records, elite_candidates, consensus, consensus_meta)
     if consensus:
         feature_cache = _feature_sweep_cache_path(plan.dataset_dir)
         base_cfg_for_cache = train_module.load_config(str(base_cfg_path))
@@ -460,10 +710,17 @@ def _run_topk_subset_cv_tuning(
             "enabled": True,
             "metric": None,
             "source": "stage_b_consensus",
+            "consensus_method": consensus_meta.get("method"),
+            "consensus_version": consensus_meta.get("version"),
+            "consensus_derivation_path": str(cvtune_dir / "xgb_cv_consensus_derivation.json"),
+            "consensus_metadata_path": str(cvtune_dir / "xgb_cv_stage_b_metadata.json"),
         })
         summary_path = cvtune_dir / "xgb_cv_consensus_params.json"
         with open(summary_path, "w", encoding="utf-8") as f:
-            json.dump({"consensus_params": consensus}, f, indent=2)
+            json.dump({
+                "consensus_params": consensus,
+                "consensus_meta": consensus_meta,
+            }, f, indent=2)
 
 
 def _parse_seed_list(raw: str | None) -> list[int]:

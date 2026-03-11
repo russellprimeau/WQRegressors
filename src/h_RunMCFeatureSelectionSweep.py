@@ -283,6 +283,8 @@ class CandidateResult:
     n_test_samples: float
     input_dim: float
     target_dim: float
+    source: str = "search"
+    seeded_input_rank: int | None = None
 
 
 _MODEL_ID_ALIASES: dict[str, str] = {
@@ -1716,18 +1718,53 @@ def _beam_search_subsets(
     cache: dict[tuple[int, tuple[str, ...]], CandidateResult] = {}
     trace: list[CandidateResult] = []
     eval_count = 0
+    effective_eval_budget = int(eval_budget)
     search_start_time = time.time()
     
     # Feature importance tracking
     feature_removal_deltas: dict[str, list[float]] = {feat: [] for feat in full_features}
     feature_improvement_counts: dict[str, int] = {feat: 0 for feat in full_features}
 
+    # Prepare seeded subsets up front so their evaluations can be guaranteed.
+    seeded_prepared: list[tuple[tuple[str, ...], int]] = []
+    seeded_seen: set[tuple[str, ...]] = set()
+    seeded_loaded_count = len(seeded_subsets or [])
+    seeded_skipped_too_small = 0
+    seeded_skipped_empty = 0
+    seeded_skipped_duplicate = 0
+    seeded_evaluated_count = 0
+    if seeded_subsets:
+        for in_rank, raw_feats in enumerate(seeded_subsets, start=1):
+            filtered = [f for f in raw_feats if f in full_features]
+            deduped = list(dict.fromkeys(filtered))
+            if not deduped:
+                seeded_skipped_empty += 1
+                continue
+            if len(deduped) < min_features:
+                seeded_skipped_too_small += 1
+                continue
+            ordered = tuple(sorted(deduped, key=lambda s: full_features.index(s)))
+            if ordered in seeded_seen:
+                seeded_skipped_duplicate += 1
+                continue
+            seeded_seen.add(ordered)
+            seeded_prepared.append((ordered, in_rank))
+
+    # Guarantee room for full-feature anchor + all valid seeded subsets.
+    guaranteed_seed_budget = 1 + len(seeded_prepared)
+    if seeded_prepared and effective_eval_budget < guaranteed_seed_budget:
+        print(
+            f"[SEARCH] Expanding eval budget from {effective_eval_budget} to {guaranteed_seed_budget} "
+            "to guarantee seeded subset inclusion."
+        )
+        effective_eval_budget = guaranteed_seed_budget
+
     def _eval(features: tuple[str, ...]) -> CandidateResult | None:
         nonlocal eval_count
         key = _candidate_key(row_count, features)
         if key in cache:
             return cache[key]
-        if eval_count >= eval_budget:
+        if eval_count >= effective_eval_budget:
             return None
 
         tag = _feature_tag(features)
@@ -1754,28 +1791,35 @@ def _beam_search_subsets(
     first = _eval(full_features)
     if first is None:
         raise RuntimeError("Search budget exhausted before evaluating initial subset.")
+    first.source = "search"
 
     beam: list[CandidateResult] = [first]
     best = first
-    if seeded_subsets:
+    if seeded_prepared:
         seeded_scored: list[CandidateResult] = []
-        for raw_feats in seeded_subsets:
-            filtered = [f for f in raw_feats if f in full_features]
-            deduped = list(dict.fromkeys(filtered))
-            if len(deduped) < min_features:
-                continue
-            ordered = tuple(sorted(deduped, key=lambda s: full_features.index(s)))
+        for ordered, in_rank in seeded_prepared:
             out = _eval(ordered)
             if out is not None:
+                out.source = "shapley_seed"
+                out.seeded_input_rank = int(in_rank)
                 seeded_scored.append(out)
+                seeded_evaluated_count += 1
         if seeded_scored:
             seeded_scored.sort(key=_candidate_rank_key)
             beam = sorted([first] + seeded_scored, key=_candidate_rank_key)[:beam_width]
             best = beam[0]
             print(f"[SEARCH] Seeded initialization: {len(seeded_scored)} subset(s) evaluated; best objective={best.objective:.4f} r2={best.r2:.6f} n_features={best.n_features}")
+    if seeded_loaded_count > 0:
+        print(
+            "[SEARCH] Seed summary: "
+            f"loaded={seeded_loaded_count}, valid_unique={len(seeded_prepared)}, "
+            f"evaluated={seeded_evaluated_count}, "
+            f"skipped_empty={seeded_skipped_empty}, skipped_too_small={seeded_skipped_too_small}, "
+            f"skipped_duplicate={seeded_skipped_duplicate}"
+        )
 
     no_improve = 0
-    print(f"[SEARCH] Initial (all {len(full_features)} features): objective={best.objective:.4f} r2={best.r2:.6f} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
+    print(f"[SEARCH] Initial (all {len(full_features)} features): objective={best.objective:.4f} r2={best.r2:.6f} (evals: {eval_count}/{effective_eval_budget}, ETA: {_format_eta(search_start_time, eval_count, effective_eval_budget)})")
 
     for _round in range(max_rounds):
         candidates: list[tuple[str, ...]] = []
@@ -1803,7 +1847,7 @@ def _beam_search_subsets(
 
         rng.shuffle(candidates)
         scored: list[CandidateResult] = []
-        remaining_budget = max(0, int(eval_budget - eval_count))
+        remaining_budget = max(0, int(effective_eval_budget - eval_count))
         batch = list(candidates[:remaining_budget])
 
         if parallel_workers <= 1 or len(batch) <= 1:
@@ -1851,6 +1895,7 @@ def _beam_search_subsets(
                     key = _candidate_key(row_count, child)
                     cache[key] = out
                     if out is not None:
+                        out.source = "search"
                         trace.append(out)
                     eval_count += 1
                     if out is None:
@@ -1877,10 +1922,10 @@ def _beam_search_subsets(
             # Track features in improving solution (Option A)
             for feat in best.features:
                 feature_improvement_counts[feat] += 1
-            print(f"[SEARCH] Round {_round + 1}: improved! objective={best.objective:.4f} r2={best.r2:.6f} n_features={best.n_features} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
+            print(f"[SEARCH] Round {_round + 1}: improved! objective={best.objective:.4f} r2={best.r2:.6f} n_features={best.n_features} (evals: {eval_count}/{effective_eval_budget}, ETA: {_format_eta(search_start_time, eval_count, effective_eval_budget)})")
         else:
             no_improve += 1
-            print(f"[SEARCH] Round {_round + 1}: no improvement ({no_improve}/{no_improve_patience}). Best: objective={best.objective:.4f} r2={best.r2:.6f} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
+            print(f"[SEARCH] Round {_round + 1}: no improvement ({no_improve}/{no_improve_patience}). Best: objective={best.objective:.4f} r2={best.r2:.6f} (evals: {eval_count}/{effective_eval_budget}, ETA: {_format_eta(search_start_time, eval_count, effective_eval_budget)})")
             if no_improve >= no_improve_patience:
                 print(f"[SEARCH] Patience exhausted, stopping.")
 
@@ -1889,9 +1934,9 @@ def _beam_search_subsets(
     attempts = 0
     improved = True
     swap_iter = 0
-    print(f"[SEARCH] Starting swap refinement from: objective={current.objective:.4f} r2={current.r2:.6f} n_features={current.n_features} (ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
+    print(f"[SEARCH] Starting swap refinement from: objective={current.objective:.4f} r2={current.r2:.6f} n_features={current.n_features} (ETA: {_format_eta(search_start_time, eval_count, effective_eval_budget)})")
     
-    while improved and attempts < max_swap_attempts and eval_count < eval_budget:
+    while improved and attempts < max_swap_attempts and eval_count < effective_eval_budget:
         improved = False
         included = list(current.features)
         excluded = list(all_features_set - set(included))
@@ -1917,18 +1962,18 @@ def _beam_search_subsets(
                 current = out
                 best = out
                 improved = True
-                print(f"[SEARCH] Swap refinement #{swap_iter}: improved! objective={best.objective:.4f} r2={best.r2:.6f} n_features={best.n_features} (evals: {eval_count}/{eval_budget}, ETA: {_format_eta(search_start_time, eval_count, eval_budget)})")
+                print(f"[SEARCH] Swap refinement #{swap_iter}: improved! objective={best.objective:.4f} r2={best.r2:.6f} n_features={best.n_features} (evals: {eval_count}/{effective_eval_budget}, ETA: {_format_eta(search_start_time, eval_count, effective_eval_budget)})")
                 break
     
-    if not improved and eval_count < eval_budget:
-        print(f"[SEARCH] Swap refinement: no improvements found (attempts: {attempts}/{max_swap_attempts}, evals: {eval_count}/{eval_budget})")
+    if not improved and eval_count < effective_eval_budget:
+        print(f"[SEARCH] Swap refinement: no improvements found (attempts: {attempts}/{max_swap_attempts}, evals: {eval_count}/{effective_eval_budget})")
 
     top_sorted = sorted(trace, key=_candidate_rank_key)
     total_elapsed = time.time() - search_start_time
     elapsed_min = int(total_elapsed // 60)
     elapsed_sec = int(total_elapsed % 60)
     avg_time_per_eval = total_elapsed / eval_count if eval_count > 0 else 0
-    print(f"[SEARCH] Complete: {eval_count}/{eval_budget} evaluations in {elapsed_min}m {elapsed_sec}s ({avg_time_per_eval:.1f}s/eval). Best: objective={best.objective:.4f} rmse={best.rmse:.6f} r2={best.r2:.6f} n_features={best.n_features}")
+    print(f"[SEARCH] Complete: {eval_count}/{effective_eval_budget} evaluations in {elapsed_min}m {elapsed_sec}s ({avg_time_per_eval:.1f}s/eval). Best: objective={best.objective:.4f} rmse={best.rmse:.6f} r2={best.r2:.6f} n_features={best.n_features}")
     
     # Compute average removal sensitivity for each feature
     feature_sensitivities: dict[str, tuple[float, int]] = {}  # (avg_removal_delta, frequency_count)
@@ -2523,6 +2568,8 @@ def _write_search_outputs(
                 "n_test_samples": item.n_test_samples,
                 "input_dim": item.input_dim,
                 "target_dim": item.target_dim,
+                "source": item.source,
+                "seeded_input_rank": item.seeded_input_rank,
                 "features": "|".join(item.features),
             }
         )
@@ -2546,6 +2593,8 @@ def _write_search_outputs(
                 "drop_rate": item.drop_rate,
                 "n_valid_raw": item.n_valid_raw,
                 "n_total_raw": item.n_total_raw,
+                "source": item.source,
+                "seeded_input_rank": item.seeded_input_rank,
                 "features": "|".join(item.features),
             }
         )

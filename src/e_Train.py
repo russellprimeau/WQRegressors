@@ -10,9 +10,9 @@ python src/e_Train.py --config data/output/regression/MC_pH/config_xgb_01.yml
 Notes:
 - Optional XGBoost CV tuning (train-set only) is controlled by
   hyperparameters.cv_tuning.enabled. When enabled, tuned hyperparameters are
-  saved in `forecasts/<forecast_name>/xgb_cv_tuning.json`.
-- A dataset-level cache `forecasts/xgb_cv_tuning_cache.json` is also written and
-  reused to keep regularization consistent across feature subsets.
+    reused via dataset-level cache `forecasts/xgb_cv_tuning_cache.json`.
+- Trial-level diagnostics are written to `xgb_cv_trials.csv` under the CV
+    artifact directory.
 """
 
 import os
@@ -24,6 +24,14 @@ from pathlib import Path
 import argparse
 import yaml
 import json
+try:
+    import optuna
+except Exception:
+    optuna = None
+try:
+    import plotly.express as px
+except Exception:
+    px = None
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -31,12 +39,16 @@ import matplotlib.pyplot as plt
 import xgboost as xgb
 import torch
 import inspect
+try:
+    import cupy as cp
+except ImportError:
+    cp = None
 from torch.utils.data import DataLoader
 try:
     import gpytorch
 except ImportError:
     gpytorch = None
-from utils.training import write_config, splitter, _base_sample_id
+from utils.training import write_config, splitter, _base_sample_id, load_samples
 from utils.transformer import (
     train_model as train_transformer,
     TimeSeriesTransformer,
@@ -52,7 +64,12 @@ from utils.config_utils import (
     _build_feature_uncertainty_variance,
     _build_feature_uncertainty_bundle,
 )
-from utils.gp_utils import build_base_kernel, ExactGPRegressor
+from utils.gp_utils import (
+    apply_gp_constraints_and_priors,
+    build_base_kernel,
+    describe_effective_kernel,
+    ExactGPRegressor,
+)
 
 
 NORMALIZATION_OUTPUT_PATH = (
@@ -63,6 +80,9 @@ NORMALIZATION_OUTPUT_PATH = (
     / "normalization.json"
 )
 
+# Avoid repeated spam when GPU CV runs without CuPy GPU arrays.
+_XGB_GPU_CPU_INPUT_WARNING_EMITTED = False
+
 
 # ===========================================================================================
 # DEFAULT CONFIGURATIONS
@@ -71,7 +91,6 @@ NORMALIZATION_OUTPUT_PATH = (
 DEFAULT_COMMON_CONFIG = {
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "matplotlib_backend": "Agg",
-    "save_training_plots": True,
 }
 
 DEFAULT_TRANSFORMER_CONFIG = {
@@ -100,10 +119,15 @@ DEFAULT_XGB_CV_TUNING_REGRESSOR = {
     "seed": 42,
     "parallel_jobs": 1,
     "metric": "rmse",
+    "search_method": "random",
+    "optuna_sampler": "tpe",
+    "optuna_startup_trials": 10,
+    "random_start_trials": 10,
     "use_early_stopping": False,
     "early_stopping_rounds": None,
     "verbose": False,
     "param_space": {
+        "n_estimators": {"low": 200, "high": 1600, "type": "int"},
         "max_depth": {"low": 2, "high": 9, "type": "int"},
         "min_child_weight": {"low": 1, "high": 10, "type": "int"},
         "gamma": {"low": 0.0, "high": 5.0, "type": "float"},
@@ -111,6 +135,7 @@ DEFAULT_XGB_CV_TUNING_REGRESSOR = {
         "colsample_bytree": {"low": 0.5, "high": 1.0, "type": "float"},
         "reg_lambda": {"low": 1e-3, "high": 10.0, "type": "log"},
         "reg_alpha": {"low": 1e-4, "high": 5.0, "type": "log"},
+        "learning_rate": {"low": 0.003, "high": 0.2, "type": "log"},
     },
 }
 
@@ -300,7 +325,7 @@ def _resolve_xgb_runtime_hyperparameters(hyper_cfg: dict, preferred_device: str)
     return effective
 
 DEFAULT_GP_REGRESSOR_CONFIG = {
-    "kernel": "matern52",
+    "kernel": "matern52+linear",
     "ard": True,
     "input_standardize": True,
     "target_standardize": True,
@@ -310,6 +335,14 @@ DEFAULT_GP_REGRESSOR_CONFIG = {
     "uncertainty_source_mode": "aggregate_t",
     "uncertainty_summary_dir": None,
     "uncertainty_aggregate_csv": None,
+    "early_stop_metric": "val_rmse",
+    "early_stop_alpha": 0.5,
+    "lengthscale_min": 0.05,
+    "lengthscale_max": 10.0,
+    "noise_min": 1e-5,
+    "noise_max": 1.0,
+    "outputscale_prior": {"type": "gamma", "shape": 2.0, "rate": 0.15},
+    "noise_prior": {"type": "gamma", "shape": 1.5, "rate": 0.5},
     "learning_rate": 0.01,
     "num_epochs": 250,
     "patience": 20,
@@ -422,10 +455,6 @@ def merge_with_defaults(config, model_type):
     # Add matplotlib backend if not specified
     if "matplotlib_backend" not in merged_config:
         merged_config["matplotlib_backend"] = DEFAULT_COMMON_CONFIG["matplotlib_backend"]
-
-    # Add training plot toggle if not specified
-    if "save_training_plots" not in merged_config:
-        merged_config["save_training_plots"] = DEFAULT_COMMON_CONFIG["save_training_plots"]
 
     if model_type in {"xgb_regressor", "xgb_classifier"}:
         effective_hyper = _resolve_xgb_runtime_hyperparameters(
@@ -759,12 +788,11 @@ def train_gp_regressor_model(config, train_samples, test_samples):
             device=device,
         )
 
-    effective_kernel = "uncertain_matern52" if (use_uncertain_kernel and kernel_name == "matern52") else (
-        "uncertain_rbf" if (use_uncertain_kernel and kernel_name == "rbf") else kernel_name
-    )
+    effective_kernel = describe_effective_kernel(kernel_name, use_uncertain_kernel)
 
     output_dim = y_train_np.shape[1]
     output_train_losses = []
+    output_val_rmse_history = []
     output_rmse = []
     models_state = []
 
@@ -802,6 +830,9 @@ def train_gp_regressor_model(config, train_samples, test_samples):
                 uncertain_kernel_mc_seed=mc_seed,
             )
         ).to(device)
+        constraint_meta = apply_gp_constraints_and_priors(model, likelihood, hyper_cfg)
+        if any(value is not None for value in constraint_meta.values()):
+            print(f"[INFO] Applied GP constraints/priors: {constraint_meta}")
 
         model.train()
         likelihood.train()
@@ -810,10 +841,24 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
 
         losses = []
+        val_rmse_list = []
         best_loss = float("inf")
+        best_val_rmse = float("inf")
+        best_score = float("inf")
         patience_counter = 0
         best_model_state = None
         best_likelihood_state = None
+        baseline_train_nll = None
+        baseline_val_rmse = None
+        early_stop_metric = str(hyper_cfg.get("early_stop_metric", "train_nll")).lower()
+        early_stop_alpha = float(hyper_cfg.get("early_stop_alpha", 0.5))
+        if early_stop_metric not in {"train_nll", "val_rmse", "mixed"}:
+            raise ValueError(
+                "hyperparameters.early_stop_metric must be one of "
+                "['train_nll', 'val_rmse', 'mixed']"
+            )
+        if early_stop_metric == "mixed" and not (0.0 <= early_stop_alpha <= 1.0):
+            raise ValueError("hyperparameters.early_stop_alpha must be in [0, 1]")
 
         for epoch in range(hyper_cfg["num_epochs"]):
             optimizer.zero_grad()
@@ -823,10 +868,39 @@ def train_gp_regressor_model(config, train_samples, test_samples):
             optimizer.step()
 
             loss_value = float(loss.item())
+            if not math.isfinite(loss_value):
+                loss_value = float("inf")
             losses.append(loss_value)
 
-            if loss_value < best_loss:
+            model.eval()
+            likelihood.eval()
+            with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                _pred_val = likelihood(model(X_test)).mean.detach().cpu().numpy()
+            val_rmse = float(np.sqrt(np.mean((_pred_val * y_std + y_mean - y_test_col) ** 2)))
+            if not math.isfinite(val_rmse):
+                val_rmse = float("inf")
+            val_rmse_list.append(val_rmse)
+            model.train()
+            likelihood.train()
+
+            if baseline_train_nll is None:
+                baseline_train_nll = loss_value if math.isfinite(loss_value) else 1.0
+            if baseline_val_rmse is None:
+                baseline_val_rmse = val_rmse if math.isfinite(val_rmse) else 1.0
+
+            if early_stop_metric == "train_nll":
+                score = loss_value
+            elif early_stop_metric == "val_rmse":
+                score = val_rmse
+            else:
+                train_den = max(baseline_train_nll, 1e-12)
+                val_den = max(baseline_val_rmse, 1e-12)
+                score = early_stop_alpha * (loss_value / train_den) + (1.0 - early_stop_alpha) * (val_rmse / val_den)
+
+            if score < best_score:
+                best_score = score
                 best_loss = loss_value
+                best_val_rmse = val_rmse
                 patience_counter = 0
                 best_model_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
                 best_likelihood_state = {k: v.detach().cpu() for k, v in likelihood.state_dict().items()}
@@ -849,6 +923,7 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         rmse = float(np.sqrt(np.mean((pred_mean - y_test_col) ** 2)))
 
         output_train_losses.append(losses)
+        output_val_rmse_history.append(val_rmse_list)
         output_rmse.append(rmse)
         models_state.append({
             "output_index": output_idx,
@@ -857,6 +932,7 @@ def train_gp_regressor_model(config, train_samples, test_samples):
             "target_mean": y_mean,
             "target_std": y_std,
             "train_nll": best_loss,
+            "val_rmse_at_best": best_val_rmse,
             "test_rmse": rmse,
         })
 
@@ -920,18 +996,29 @@ def train_gp_regressor_model(config, train_samples, test_samples):
     torch.save(artifact, save_path / "gp_model.pt")
     print(f"\nModel saved to: {save_path / 'gp_model.pt'}")
 
-    if config.get("save_training_plots", True):
-        plt.figure(figsize=(8, 5))
-        for idx, losses in enumerate(output_train_losses):
-            plt.plot(range(1, len(losses) + 1), losses, label=f'Output {idx + 1} train NLL')
-        plt.xlabel('Epoch')
-        plt.ylabel('Negative Log Marginal Likelihood')
-        plt.grid(True, ls="--")
-        plt.title('GP Training Loss by Output')
-        plt.legend()
-        plt.savefig(save_path / "loss_plot.png")
-        plt.close()
-        print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")
+    fig, ax1 = plt.subplots(figsize=(9, 5))
+    ax2 = ax1.twinx()
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    for idx, (train_nll, val_rmse) in enumerate(zip(output_train_losses, output_val_rmse_history)):
+        color = color_cycle[idx % len(color_cycle)]
+        label_suffix = f" (out {idx + 1})" if output_dim > 1 else ""
+        ax1.plot(range(1, len(train_nll) + 1), train_nll,
+                 color=color, linestyle="-", label=f"Train NLL{label_suffix}")
+        if val_rmse:
+            ax2.plot(range(1, len(val_rmse) + 1), val_rmse,
+                     color=color, linestyle="--", label=f"Val RMSE{label_suffix}")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Train Negative Log Marginal Likelihood")
+    ax2.set_ylabel("Validation RMSE")
+    ax1.grid(True, ls="--", alpha=0.4)
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8)
+    plt.title("GP Training Loss and Validation RMSE by Output")
+    plt.tight_layout()
+    plt.savefig(save_path / "loss_plot.png")
+    plt.close()
+    print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")
     write_evaluation_config(config)
 
 
@@ -953,6 +1040,140 @@ def _xgb_samples_to_arrays(samples, cast_y=None):
         y = np.ascontiguousarray(np.array([s[1].flatten()[0] for s in samples], dtype=np.float32))
     names = [str(s[2]) for s in samples]
     return X, y, names
+
+
+def _resolve_cv_raw_sample_source(config: dict, train_samples) -> dict:
+    """Resolve a de-duplicated list of raw sample filenames for CV tuning.
+
+    Reads train_files.txt (preferred) or falls back to filenames carried in
+    train_samples.  Strips any _mc_NNN replicate suffix via _base_sample_id
+    (which is a no-op for datasets that have no MC replicates) then deduplicates
+    with dict.fromkeys to produce one entry per independent raw sample.
+
+    Returns a dict with keys:
+        raw_base_ids        : list[str] – ordered unique base filenames
+        resolved_files      : list[str] – base IDs confirmed present in samples/
+        unresolved_base_ids : list[str] – base IDs not found in samples/
+        samples_dir         : Path      – <data_dir>/samples
+        name_source         : str       – "train_files_txt" | "train_samples_fallback"
+    """
+    data_cfg = config["data"]
+    data_dir = Path(data_cfg["data_dir"])
+    forecast_name = data_cfg["forecast_name"]
+
+    # Prefer train_files.txt written by the outer splitter; it lists the
+    # exact set of files (possibly mc_replicates) that belong to the train split.
+    train_txt = data_dir / "forecasts" / str(forecast_name) / "train_files.txt"
+    if train_txt.is_file():
+        source_names = [
+            line.strip()
+            for line in train_txt.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        name_source = "train_files_txt"
+    else:
+        source_names = [str(s[2]) for s in train_samples]
+        name_source = "train_samples_fallback"
+
+    # Collapse to base IDs (strips _mc_NNN suffix; no-op for non-MC names)
+    # and deduplicate preserving first-occurrence order.
+    raw_base_ids = list(dict.fromkeys(
+        _base_sample_id(n) for n in source_names if n.strip()
+    ))
+
+    samples_dir = data_dir / "samples"
+    if not samples_dir.is_dir():
+        print(f"[WARN] CV raw-sample resolution: samples/ directory not found: {samples_dir}")
+        return {
+            "raw_base_ids": raw_base_ids,
+            "resolved_files": [],
+            "unresolved_base_ids": raw_base_ids,
+            "samples_dir": samples_dir,
+            "name_source": name_source,
+        }
+
+    existing = {f.name for f in samples_dir.iterdir() if f.suffix == ".csv"}
+    resolved = [bid for bid in raw_base_ids if bid in existing]
+    unresolved = [bid for bid in raw_base_ids if bid not in existing]
+    return {
+        "raw_base_ids": raw_base_ids,
+        "resolved_files": resolved,
+        "unresolved_base_ids": unresolved,
+        "samples_dir": samples_dir,
+        "name_source": name_source,
+    }
+
+
+def _load_cv_raw_samples(
+    config: dict,
+    train_samples,
+    cast_y=None,
+) -> tuple[np.ndarray, np.ndarray, list, dict]:
+    """Load raw (non-replicate) samples from <data_dir>/samples/ for CV tuning.
+
+    Delegates resolution to _resolve_cv_raw_sample_source then calls load_samples
+    with fault_tolerant=True so that partially-bad raw files are skipped rather
+    than aborting the CV run.  Returns (X, y, names, diagnostics).  On failure
+    X and y are empty, names is [], and cv_dataset_source is set to
+    "train_samples_fallback" so the caller can switch paths cleanly.
+    """
+    data_cfg = config["data"]
+    resolution = _resolve_cv_raw_sample_source(config, train_samples)
+
+    diagnostics = {
+        "cv_dataset_source": "raw_samples",
+        "name_source": resolution["name_source"],
+        "raw_unique_base_count": len(resolution["raw_base_ids"]),
+        "raw_resolved_count": len(resolution["resolved_files"]),
+        "unresolved_base_ids": resolution["unresolved_base_ids"],
+    }
+
+    if resolution["unresolved_base_ids"]:
+        print(
+            f"[WARN] CV raw-sample resolution: "
+            f"{len(resolution['unresolved_base_ids'])} base ID(s) not found in "
+            f"{resolution['samples_dir']}; missing: {resolution['unresolved_base_ids']}"
+        )
+
+    if not resolution["resolved_files"]:
+        print(
+            "[WARN] CV raw-sample resolution: no raw samples resolved; "
+            "CV will use train_samples instead."
+        )
+        diagnostics["cv_dataset_source"] = "train_samples_fallback"
+        return (
+            np.empty((0, 0), dtype=np.float32),
+            np.empty(0, dtype=np.float32),
+            [],
+            diagnostics,
+        )
+
+    raw_samples = load_samples(
+        directory=resolution["samples_dir"],
+        input_columns=data_cfg["input_columns"],
+        output_columns=data_cfg["output_columns"],
+        input_rows=slice(data_cfg["input_row_1"], data_cfg["input_row_2"]),
+        output_rows=data_cfg["output_rows"],
+        file_list=resolution["resolved_files"],
+        fault_tolerant=True,
+        input_aggregation=str(data_cfg.get("input_aggregation", "none")).lower(),
+    )
+
+    if not raw_samples:
+        print(
+            "[WARN] CV raw-sample resolution: load_samples returned no samples; "
+            "CV will use train_samples instead."
+        )
+        diagnostics["cv_dataset_source"] = "train_samples_fallback"
+        return (
+            np.empty((0, 0), dtype=np.float32),
+            np.empty(0, dtype=np.float32),
+            [],
+            diagnostics,
+        )
+
+    X, y, names = _xgb_samples_to_arrays(raw_samples, cast_y=cast_y)
+    return X, y, names, diagnostics
 
 
 def _build_group_folds(file_names: list[str], n_folds: int, seed: int) -> list[list[int]]:
@@ -1005,8 +1226,31 @@ def _sample_cv_param(rng: np.random.Generator, spec, param_name: str):
     return spec
 
 
+def _optuna_suggest_param(trial, spec, param_name: str):
+    if isinstance(spec, dict):
+        low = spec.get("low")
+        high = spec.get("high")
+        mode = str(spec.get("type", "float")).lower()
+        if spec.get("log", False):
+            mode = "log"
+        if low is None or high is None:
+            return spec.get("value")
+        if mode == "int":
+            return trial.suggest_int(param_name, int(low), int(high))
+        if mode == "log":
+            low = max(float(low), 1e-12)
+            high = max(float(high), low * 1.000001)
+            return trial.suggest_float(param_name, float(low), float(high), log=True)
+        return trial.suggest_float(param_name, float(low), float(high))
+    if isinstance(spec, (list, tuple)):
+        return trial.suggest_categorical(param_name, list(spec))
+    return spec
+
+
 def _sanitize_xgb_params(params: dict) -> dict:
     out = dict(params)
+    if "n_estimators" in out and out["n_estimators"] is not None:
+        out["n_estimators"] = int(max(1, int(out["n_estimators"])))
     for key in ("subsample", "colsample_bytree"):
         if key in out and out[key] is not None:
             out[key] = float(min(1.0, max(0.05, float(out[key]))))
@@ -1038,10 +1282,29 @@ def _xgb_cv_fold_score(
     use_early_stopping: bool,
     early_stopping_rounds: int | None,
 ) -> float:
+    global _XGB_GPU_CPU_INPUT_WARNING_EMITTED
+
     X_train = X[train_idx]
     y_train = y[train_idx]
     X_val = X[val_idx]
     y_val = y[val_idx]
+
+    is_gpu_mode = (
+        str(model_kwargs.get("device", "")).lower().startswith("cuda")
+        or str(model_kwargs.get("tree_method", "")).lower() == "gpu_hist"
+    )
+    use_gpu_arrays = bool(is_gpu_mode and cp is not None)
+
+    if use_gpu_arrays:
+        X_train_fit = cp.asarray(X_train)
+        y_train_fit = cp.asarray(y_train)
+        X_val_fit = cp.asarray(X_val)
+        y_val_fit = cp.asarray(y_val)
+    else:
+        X_train_fit = X_train
+        y_train_fit = y_train
+        X_val_fit = X_val
+        y_val_fit = y_val
 
     if model_kind == "classifier":
         model = xgb.XGBClassifier(**model_kwargs)
@@ -1050,17 +1313,37 @@ def _xgb_cv_fold_score(
 
     fit_kwargs = {"verbose": False}
     if use_early_stopping:
-        fit_kwargs["eval_set"] = [(X_train, y_train), (X_val, y_val)]
+        fit_kwargs["eval_set"] = [(X_train_fit, y_train_fit), (X_val_fit, y_val_fit)]
         if early_stopping_rounds is not None:
             model.set_params(early_stopping_rounds=int(early_stopping_rounds))
 
-    model.fit(X_train, y_train, **fit_kwargs)
+    model.fit(X_train_fit, y_train_fit, **fit_kwargs)
 
     if model_kind == "classifier":
-        probs = model.predict_proba(X_val)[:, 1]
+        if use_gpu_arrays:
+            raw_probs = model.get_booster().inplace_predict(X_val_fit, validate_features=False)
+            probs = cp.asnumpy(raw_probs).reshape(-1)
+        else:
+            if is_gpu_mode and (not _XGB_GPU_CPU_INPUT_WARNING_EMITTED):
+                print(
+                    "[WARN] GPU CV fold scoring is using CPU numpy arrays because CuPy is not available; "
+                    "XGBoost may fall back to DMatrix for prediction with extra overhead."
+                )
+                _XGB_GPU_CPU_INPUT_WARNING_EMITTED = True
+            probs = model.predict_proba(X_val)[:, 1]
         score = _binary_logloss(y_val, probs)
     else:
-        preds = model.predict(X_val)
+        if use_gpu_arrays:
+            raw_preds = model.get_booster().inplace_predict(X_val_fit, validate_features=False)
+            preds = cp.asnumpy(raw_preds).reshape(-1)
+        else:
+            if is_gpu_mode and (not _XGB_GPU_CPU_INPUT_WARNING_EMITTED):
+                print(
+                    "[WARN] GPU CV fold scoring is using CPU numpy arrays because CuPy is not available; "
+                    "XGBoost may fall back to DMatrix for prediction with extra overhead."
+                )
+                _XGB_GPU_CPU_INPUT_WARNING_EMITTED = True
+            preds = model.predict(X_val)
         score = float(np.sqrt(np.mean(np.square(preds - y_val))))
 
     return score
@@ -1078,12 +1361,42 @@ def _xgb_tune_hyperparameters_cv(
     if not cv_cfg.get("enabled", False):
         return {}, {"enabled": False}
 
-    X, y, names = _xgb_samples_to_arrays(train_samples, cast_y=cast_y)
-    if len(names) < 2:
-        print("[WARN] CV tuning skipped: not enough training samples.")
-        return {}, {"enabled": False, "reason": "insufficient_samples"}
+    # --- Attempt to build the CV dataset from the original raw samples/ files ---
+    # _base_sample_id is idempotent (no-op) when names carry no _mc_NNN suffix,
+    # so both MC-replicate and plain-sample datasets are handled correctly.
+    X_raw, y_raw, names_raw, raw_diagnostics = _load_cv_raw_samples(
+        config, train_samples, cast_y=cast_y
+    )
+    raw_folds = (
+        _build_group_folds(names_raw, int(cv_cfg.get("n_folds", 5)), int(cv_cfg.get("seed", 42)))
+        if len(names_raw) >= 2
+        else []
+    )
 
-    folds = _build_group_folds(names, int(cv_cfg.get("n_folds", 5)), int(cv_cfg.get("seed", 42)))
+    if len(names_raw) >= 2 and len(raw_folds) >= 2:
+        X, y, names = X_raw, y_raw, names_raw
+        folds = raw_folds
+        print(
+            f"[INFO] CV tuning dataset: {len(names)} raw samples "
+            f"({raw_diagnostics['raw_resolved_count']} resolved from "
+            f"{raw_diagnostics['raw_unique_base_count']} unique base IDs, "
+            f"source={raw_diagnostics['name_source']})"
+        )
+    else:
+        # Fall back to the full train_samples set (the behaviour prior to this change).
+        if raw_diagnostics.get("cv_dataset_source") != "train_samples_fallback":
+            print(
+                f"[WARN] CV raw-sample dataset insufficient for folding "
+                f"(resolved={len(names_raw)}, folds={len(raw_folds)}); "
+                f"falling back to train_samples."
+            )
+        raw_diagnostics["cv_dataset_source"] = "train_samples_fallback"
+        X, y, names = _xgb_samples_to_arrays(train_samples, cast_y=cast_y)
+        if len(names) < 2:
+            print("[WARN] CV tuning skipped: not enough training samples.")
+            return {}, {"enabled": False, "reason": "insufficient_samples"}
+        folds = _build_group_folds(names, int(cv_cfg.get("n_folds", 5)), int(cv_cfg.get("seed", 42)))
+
     if len(folds) < 2:
         print("[WARN] CV tuning skipped: not enough independent groups for folds.")
         return {}, {"enabled": False, "reason": "insufficient_groups"}
@@ -1130,6 +1443,7 @@ def _xgb_tune_hyperparameters_cv(
 
     metric = str(cv_cfg.get("metric", "rmse")).lower()
     verbose = bool(cv_cfg.get("verbose", False))
+    search_method = str(cv_cfg.get("search_method", "random")).lower()
     trial_results: list[dict] = []
     best_score = float("inf")
     best_params: dict = {}
@@ -1139,29 +1453,63 @@ def _xgb_tune_hyperparameters_cv(
         if parallel_jobs > 1:
             executor = ProcessPoolExecutor(max_workers=parallel_jobs)
 
-        for trial_idx in range(n_trials):
-            sampled = {}
-            for param_name, spec in param_space.items():
-                sampled[param_name] = _sample_cv_param(rng, spec, param_name)
-            sampled = _sanitize_xgb_params(sampled)
+        if search_method == "optuna":
+            if optuna is None:
+                raise RuntimeError("Optuna is not installed but search_method='optuna' was requested.")
+            sampler_name = str(cv_cfg.get("optuna_sampler", "tpe")).lower()
+            startup_trials = int(cv_cfg.get("random_start_trials", cv_cfg.get("optuna_startup_trials", 10)))
+            if sampler_name == "cmaes":
+                sampler = optuna.samplers.CmaEsSampler(seed=int(cv_cfg.get("seed", 42)))
+            else:
+                sampler = optuna.samplers.TPESampler(
+                    seed=int(cv_cfg.get("seed", 42)),
+                    n_startup_trials=max(0, startup_trials),
+                )
 
-            trial_kwargs = dict(base_kwargs)
-            trial_kwargs.update(sampled)
-            if parallel_jobs > 1:
-                trial_kwargs["n_jobs"] = 1
+            def _objective(trial):
+                sampled = {}
+                for param_name, spec in param_space.items():
+                    sampled[param_name] = _optuna_suggest_param(trial, spec, param_name)
+                sampled = _sanitize_xgb_params(sampled)
 
-            fold_scores: list[float] = []
-            if executor is not None:
-                futures = []
-                for fold_idx in range(len(folds)):
-                    val_idx = np.array(folds[fold_idx], dtype=int)
-                    train_idx = np.array(
-                        [i for f_idx, f in enumerate(folds) if f_idx != fold_idx for i in f],
-                        dtype=int,
-                    )
-                    futures.append(
-                        executor.submit(
-                            _xgb_cv_fold_score,
+                trial_kwargs = dict(base_kwargs)
+                trial_kwargs.update(sampled)
+                if parallel_jobs > 1:
+                    trial_kwargs["n_jobs"] = 1
+
+                fold_scores: list[float] = []
+                if executor is not None:
+                    futures = []
+                    for fold_idx in range(len(folds)):
+                        val_idx = np.array(folds[fold_idx], dtype=int)
+                        train_idx = np.array(
+                            [i for f_idx, f in enumerate(folds) if f_idx != fold_idx for i in f],
+                            dtype=int,
+                        )
+                        futures.append(
+                            executor.submit(
+                                _xgb_cv_fold_score,
+                                model_kind,
+                                trial_kwargs,
+                                X,
+                                y,
+                                train_idx,
+                                val_idx,
+                                metric,
+                                use_early_stopping,
+                                early_stop_rounds,
+                            )
+                        )
+                    for future in as_completed(futures):
+                        fold_scores.append(float(future.result()))
+                else:
+                    for fold_idx in range(len(folds)):
+                        val_idx = np.array(folds[fold_idx], dtype=int)
+                        train_idx = np.array(
+                            [i for f_idx, f in enumerate(folds) if f_idx != fold_idx for i in f],
+                            dtype=int,
+                        )
+                        score = _xgb_cv_fold_score(
                             model_kind,
                             trial_kwargs,
                             X,
@@ -1172,47 +1520,107 @@ def _xgb_tune_hyperparameters_cv(
                             use_early_stopping,
                             early_stop_rounds,
                         )
-                    )
-                for future in as_completed(futures):
-                    fold_scores.append(float(future.result()))
-            else:
-                for fold_idx in range(len(folds)):
-                    val_idx = np.array(folds[fold_idx], dtype=int)
-                    train_idx = np.array(
-                        [i for f_idx, f in enumerate(folds) if f_idx != fold_idx for i in f],
-                        dtype=int,
-                    )
-                    score = _xgb_cv_fold_score(
-                        model_kind,
-                        trial_kwargs,
-                        X,
-                        y,
-                        train_idx,
-                        val_idx,
-                        metric,
-                        use_early_stopping,
-                        early_stop_rounds,
-                    )
-                    fold_scores.append(float(score))
+                        fold_scores.append(float(score))
 
-            mean_score = float(np.mean(fold_scores)) if fold_scores else float("inf")
-            std_score = float(np.std(fold_scores)) if fold_scores else float("nan")
-            trial_results.append(
-                {
-                    "trial": int(trial_idx + 1),
-                    "mean_score": mean_score,
-                    "std_score": std_score,
-                    "params": dict(sampled),
-                }
-            )
-            if mean_score < best_score:
-                best_score = mean_score
-                best_params = dict(sampled)
-            if verbose:
-                print(
-                    f"[CV] Trial {trial_idx + 1}/{n_trials} "
-                    f"mean={mean_score:.6f} std={std_score:.6f} params={sampled}"
+                mean_score = float(np.mean(fold_scores)) if fold_scores else float("inf")
+                std_score = float(np.std(fold_scores)) if fold_scores else float("nan")
+                trial.set_user_attr("std_score", std_score)
+                trial.set_user_attr("params", sampled)
+                if verbose:
+                    print(
+                        f"[CV] Trial {trial.number + 1}/{n_trials} "
+                        f"mean={mean_score:.6f} std={std_score:.6f} params={sampled}"
+                    )
+                return mean_score
+
+            study = optuna.create_study(direction="minimize", sampler=sampler)
+            study.optimize(_objective, n_trials=n_trials)
+            best_params = dict(study.best_trial.user_attrs.get("params", {}))
+            best_score = float(study.best_value)
+            for t in study.trials:
+                trial_results.append(
+                    {
+                        "trial": int(t.number + 1),
+                        "mean_score": float(t.value) if t.value is not None else float("nan"),
+                        "std_score": float(t.user_attrs.get("std_score", float("nan"))),
+                        "params": dict(t.user_attrs.get("params", {})),
+                    }
                 )
+        else:
+            for trial_idx in range(n_trials):
+                sampled = {}
+                for param_name, spec in param_space.items():
+                    sampled[param_name] = _sample_cv_param(rng, spec, param_name)
+                sampled = _sanitize_xgb_params(sampled)
+
+                trial_kwargs = dict(base_kwargs)
+                trial_kwargs.update(sampled)
+                if parallel_jobs > 1:
+                    trial_kwargs["n_jobs"] = 1
+
+                fold_scores: list[float] = []
+                if executor is not None:
+                    futures = []
+                    for fold_idx in range(len(folds)):
+                        val_idx = np.array(folds[fold_idx], dtype=int)
+                        train_idx = np.array(
+                            [i for f_idx, f in enumerate(folds) if f_idx != fold_idx for i in f],
+                            dtype=int,
+                        )
+                        futures.append(
+                            executor.submit(
+                                _xgb_cv_fold_score,
+                                model_kind,
+                                trial_kwargs,
+                                X,
+                                y,
+                                train_idx,
+                                val_idx,
+                                metric,
+                                use_early_stopping,
+                                early_stop_rounds,
+                            )
+                        )
+                    for future in as_completed(futures):
+                        fold_scores.append(float(future.result()))
+                else:
+                    for fold_idx in range(len(folds)):
+                        val_idx = np.array(folds[fold_idx], dtype=int)
+                        train_idx = np.array(
+                            [i for f_idx, f in enumerate(folds) if f_idx != fold_idx for i in f],
+                            dtype=int,
+                        )
+                        score = _xgb_cv_fold_score(
+                            model_kind,
+                            trial_kwargs,
+                            X,
+                            y,
+                            train_idx,
+                            val_idx,
+                            metric,
+                            use_early_stopping,
+                            early_stop_rounds,
+                        )
+                        fold_scores.append(float(score))
+
+                mean_score = float(np.mean(fold_scores)) if fold_scores else float("inf")
+                std_score = float(np.std(fold_scores)) if fold_scores else float("nan")
+                trial_results.append(
+                    {
+                        "trial": int(trial_idx + 1),
+                        "mean_score": mean_score,
+                        "std_score": std_score,
+                        "params": dict(sampled),
+                    }
+                )
+                if mean_score < best_score:
+                    best_score = mean_score
+                    best_params = dict(sampled)
+                if verbose:
+                    print(
+                        f"[CV] Trial {trial_idx + 1}/{n_trials} "
+                        f"mean={mean_score:.6f} std={std_score:.6f} params={sampled}"
+                    )
     finally:
         if executor is not None:
             executor.shutdown(wait=True)
@@ -1223,30 +1631,35 @@ def _xgb_tune_hyperparameters_cv(
         "n_folds": int(len(folds)),
         "n_trials": int(n_trials),
         "seed": int(cv_cfg.get("seed", 42)),
+        "search_method": search_method,
         "use_early_stopping": bool(use_early_stopping),
         "early_stopping_rounds": None if early_stop_rounds is None else int(early_stop_rounds),
         "best_score": float(best_score),
         "trials": trial_results,
         "param_space": param_space,
+        "cv_dataset_source": raw_diagnostics.get("cv_dataset_source", "unknown"),
+        "name_source": raw_diagnostics.get("name_source", "unknown"),
+        "raw_unique_base_count": raw_diagnostics.get("raw_unique_base_count", 0),
+        "raw_resolved_count": raw_diagnostics.get("raw_resolved_count", 0),
+        "unresolved_base_ids": raw_diagnostics.get("unresolved_base_ids", []),
+        "gpu_mode": bool(is_gpu_mode),
+        "gpu_array_backend": (
+            "cupy" if bool(is_gpu_mode and cp is not None) else
+            ("numpy_cpu_inputs" if bool(is_gpu_mode) else "numpy_cpu")
+        ),
     }
     return best_params, summary
 
 
-def _write_xgb_cv_tuning_artifact(data_cfg: dict, hyper_cfg: dict, best_params: dict, summary: dict) -> Path:
-    forecast_dir = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
-    forecast_dir.mkdir(parents=True, exist_ok=True)
-    tuned_hyper = dict(hyper_cfg)
-    tuned_hyper.update(best_params)
-    payload = {
-        "artifact_version": 1,
-        "tuned_hyperparameters": tuned_hyper,
-        "best_params": best_params,
-        "cv_summary": summary,
-    }
-    out_path = forecast_dir / "xgb_cv_tuning.json"
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-    return out_path
+def _resolve_cv_artifact_dir(config: dict) -> Path:
+    hyper_cfg = config.get("hyperparameters", {}) or {}
+    cv_cfg = hyper_cfg.get("cv_tuning", {}) or {}
+    artifact_dir = cv_cfg.get("artifact_dir")
+    data_cfg = config.get("data", {}) or {}
+    if artifact_dir:
+        cfg_dir = config.get("__config_dir", str(Path.cwd()))
+        return Path(_resolve_path_from_config(str(artifact_dir), cfg_dir))
+    return Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
 
 
 def _resolve_cv_cache_path(config: dict) -> Path:
@@ -1293,6 +1706,8 @@ def run_xgb_cv_tuning_only(
 
     best_params: dict = {}
     summary: dict = {"enabled": False}
+    tuning_ran = False
+    tuning_ran = False
 
     cache_path = _resolve_cv_cache_path(config)
     if use_cache and cache_path.exists():
@@ -1316,29 +1731,33 @@ def run_xgb_cv_tuning_only(
             metric_key=metric_key,
             cast_y=cast_y,
         )
+        tuning_ran = True
         if cv_requested and best_params and write_cache:
             cache_written = _write_xgb_cv_tuning_cache(cache_path, hyper_cfg, best_params, summary)
             print(f"[INFO] CV tuning cache saved to: {cache_written}")
 
-    tuned_hyper = dict(hyper_cfg)
-    tuned_hyper.update(best_params)
-    artifact_path = _write_xgb_cv_tuning_artifact(data_cfg, tuned_hyper, best_params, summary)
-    print(f"[INFO] CV tuning artifact saved to: {artifact_path}")
-    trials_csv = _write_xgb_cv_trials_csv(data_cfg, summary)
-    if trials_csv is not None:
-        print(f"[INFO] CV tuning trials CSV saved to: {trials_csv}")
-    trials_plot = _write_xgb_cv_trials_plot(data_cfg, summary)
-    if trials_plot is not None:
-        print(f"[INFO] CV tuning trials plot saved to: {trials_plot}")
+    if tuning_ran:
+        trials_csv = _write_xgb_cv_trials_csv(config, summary)
+        if trials_csv is not None:
+            print(f"[INFO] CV tuning trials CSV saved to: {trials_csv}")
+        trials_plot = _write_xgb_cv_trials_plot(config, summary)
+        if trials_plot is not None:
+            print(f"[INFO] CV tuning trials plot saved to: {trials_plot}")
+        parallel_plot = _write_xgb_cv_parallel_coords_plot(config, summary, top_k=20)
+        if parallel_plot is not None:
+            print(f"[INFO] CV tuning parallel-coordinates plot saved to: {parallel_plot}")
+        parallel_plot = _write_xgb_cv_parallel_coords_plot(config, summary, top_k=20)
+        if parallel_plot is not None:
+            print(f"[INFO] CV tuning parallel-coordinates plot saved to: {parallel_plot}")
 
     return best_params, summary
 
 
-def _write_xgb_cv_trials_csv(data_cfg: dict, summary: dict) -> Path | None:
+def _write_xgb_cv_trials_csv(config: dict, summary: dict) -> Path | None:
     trials = summary.get("trials") if isinstance(summary, dict) else None
     if not isinstance(trials, list) or not trials:
         return None
-    forecast_dir = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
+    forecast_dir = _resolve_cv_artifact_dir(config)
     forecast_dir.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(trials)
     out_path = forecast_dir / "xgb_cv_trials.csv"
@@ -1346,14 +1765,14 @@ def _write_xgb_cv_trials_csv(data_cfg: dict, summary: dict) -> Path | None:
     return out_path
 
 
-def _write_xgb_cv_trials_plot(data_cfg: dict, summary: dict) -> Path | None:
+def _write_xgb_cv_trials_plot(config: dict, summary: dict) -> Path | None:
     trials = summary.get("trials") if isinstance(summary, dict) else None
     if not isinstance(trials, list) or not trials:
         return None
     df = pd.DataFrame(trials)
     if df.empty or "trial" not in df.columns or "mean_score" not in df.columns:
         return None
-    forecast_dir = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
+    forecast_dir = _resolve_cv_artifact_dir(config)
     forecast_dir.mkdir(parents=True, exist_ok=True)
     x = pd.to_numeric(df["trial"], errors="coerce")
     y = pd.to_numeric(df["mean_score"], errors="coerce")
@@ -1373,6 +1792,71 @@ def _write_xgb_cv_trials_plot(data_cfg: dict, summary: dict) -> Path | None:
     plt.title("XGB CV tuning: mean score by trial")
     plt.legend()
     out_path = forecast_dir / "xgb_cv_trials.png"
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
+    return out_path
+
+
+def _write_xgb_cv_parallel_coords_plot(config: dict, summary: dict, top_k: int = 20) -> Path | None:
+    trials = summary.get("trials") if isinstance(summary, dict) else None
+    if not isinstance(trials, list) or not trials:
+        return None
+    df = pd.DataFrame(trials)
+    if df.empty or "mean_score" not in df.columns or "params" not in df.columns:
+        return None
+    df = df.sort_values("mean_score", ascending=True, kind="stable").head(int(top_k))
+    if df.empty:
+        return None
+
+    params_expanded = pd.json_normalize(df["params"])
+    params_expanded = params_expanded.apply(pd.to_numeric, errors="coerce")
+    plot_df = pd.concat([df[["mean_score"]].reset_index(drop=True), params_expanded.reset_index(drop=True)], axis=1)
+    plot_df = plot_df.dropna(axis=1, how="all")
+    if plot_df.shape[1] <= 1:
+        return None
+
+    # Normalize to [0,1] for parallel coordinates.
+    norm_df = plot_df.copy()
+    for col in norm_df.columns:
+        col_vals = pd.to_numeric(norm_df[col], errors="coerce")
+        col_min = float(col_vals.min()) if col_vals.notna().any() else 0.0
+        col_max = float(col_vals.max()) if col_vals.notna().any() else 1.0
+        if col_max - col_min > 0:
+            norm_df[col] = (col_vals - col_min) / (col_max - col_min)
+        else:
+            norm_df[col] = 0.5
+
+    forecast_dir = _resolve_cv_artifact_dir(config)
+    forecast_dir.mkdir(parents=True, exist_ok=True)
+    out_path = forecast_dir / "xgb_cv_top_trials_parallel_coords.png"
+
+    fig, ax = plt.subplots(figsize=(max(8, 1.2 * norm_df.shape[1]), 4.8))
+    x = np.arange(len(norm_df.columns))
+    cmap = plt.cm.viridis
+    scores = pd.to_numeric(df["mean_score"], errors="coerce").to_numpy()
+    if np.all(~np.isfinite(scores)):
+        scores = np.linspace(0, 1, len(norm_df))
+    score_min = np.nanmin(scores)
+    score_max = np.nanmax(scores)
+    denom = (score_max - score_min) if score_max > score_min else 1.0
+    colors = cmap((scores - score_min) / denom)
+
+    for idx, row in norm_df.iterrows():
+        ax.plot(x, row.to_numpy(dtype=float), color=colors[idx], alpha=0.8, linewidth=1.2)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(norm_df.columns, rotation=35, ha="right")
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("Normalized value")
+    ax.set_title(f"XGB CV tuning: top-{min(len(norm_df), int(top_k))} trials")
+    ax.grid(axis="y", alpha=0.3)
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=score_min, vmax=score_max))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, pad=0.01)
+    cbar.set_label("Mean CV score")
+
     plt.tight_layout()
     plt.savefig(out_path, dpi=180)
     plt.close()
@@ -1435,9 +1919,10 @@ def _train_xgb_model(
         "reg_lambda": hyper_cfg["reg_lambda"],
         "reg_alpha": hyper_cfg["reg_alpha"],
         "learning_rate": hyper_cfg["learning_rate"],
-        "early_stopping_rounds": hyper_cfg["early_stopping_rounds"],
         "n_jobs": int(hyper_cfg.get("n_jobs", -1)),
     }
+    if hyper_cfg.get("early_stopping_rounds") is not None:
+        model_kwargs["early_stopping_rounds"] = hyper_cfg["early_stopping_rounds"]
     if disable_early_stopping:
         model_kwargs.pop("early_stopping_rounds", None)
     if metric_key == "eval_metric":
@@ -1496,42 +1981,41 @@ def _train_xgb_model(
     model.save_model(save_path / "xgboost_model.json")
     print(f"\nModel saved to: {save_path / 'xgboost_model.json'}")
 
-    if config.get("save_training_plots", True):
-        results = model.evals_result()
-        train_series = results.get("validation_0", {}).get(metric)
-        val_series = results.get("validation_1", {}).get(metric)
-        if train_series:
-            epochs = len(train_series)
-            plt.figure(figsize=(8, 5))
-            plt.loglog(range(epochs), train_series, label='Training Loss')
-            if val_series:
-                plt.loglog(range(len(val_series)), val_series, label='Validation Loss')
-            if hasattr(model, "best_iteration") and getattr(model, "best_iteration") is not None:
-                plt.axvline(
-                    float(model.best_iteration),
-                    color="#d62728",
-                    linestyle="--",
-                    linewidth=1.0,
-                    label=f"Validation stop/best iter ({model.best_iteration})",
-                )
-            if plateau_state and plateau_state.get("triggered") and plateau_state.get("trigger_iteration") is not None:
-                plt.axvline(
-                    float(plateau_state["trigger_iteration"]),
-                    color="#ff7f0e",
-                    linestyle="--",
-                    linewidth=1.0,
-                    label=f"Train plateau stop ({plateau_state['trigger_iteration']})",
-                )
-            plt.xlabel('Boosting Rounds')
-            plt.ylabel(metric)
-            plt.grid(True, which="both", ls="--")
-            plt.title('Training vs Validation Loss' if val_series else 'Training Loss')
-            plt.legend()
-            plt.savefig(save_path / "loss_plot.png")
-            plt.close()
-            print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")
-        else:
-            print("[WARN] Training plot skipped: no evaluation history found.")
+    results = model.evals_result()
+    train_series = results.get("validation_0", {}).get(metric)
+    val_series = results.get("validation_1", {}).get(metric)
+    if train_series:
+        epochs = len(train_series)
+        plt.figure(figsize=(8, 5))
+        plt.loglog(range(epochs), train_series, label='Training Loss')
+        if val_series:
+            plt.loglog(range(len(val_series)), val_series, label='Validation Loss')
+        if hasattr(model, "best_iteration") and getattr(model, "best_iteration") is not None:
+            plt.axvline(
+                float(model.best_iteration),
+                color="#d62728",
+                linestyle="--",
+                linewidth=1.0,
+                label=f"Validation stop/best iter ({model.best_iteration})",
+            )
+        if plateau_state and plateau_state.get("triggered") and plateau_state.get("trigger_iteration") is not None:
+            plt.axvline(
+                float(plateau_state["trigger_iteration"]),
+                color="#ff7f0e",
+                linestyle="--",
+                linewidth=1.0,
+                label=f"Train plateau stop ({plateau_state['trigger_iteration']})",
+            )
+        plt.xlabel('Boosting Rounds')
+        plt.ylabel(metric)
+        plt.grid(True, which="both", ls="--")
+        plt.title('Training vs Validation Loss' if val_series else 'Training Loss')
+        plt.legend()
+        plt.savefig(save_path / "loss_plot.png")
+        plt.close()
+        print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")
+    else:
+        print("[WARN] Training plot skipped: no evaluation history found.")
     write_evaluation_config(config)
 
 
@@ -1573,6 +2057,7 @@ def _train_xgb_model_cv_tuned(
             metric_key=metric_key,
             cast_y=cast_y,
         )
+        tuning_ran = True
         if cv_requested and best_params:
             cache_written = _write_xgb_cv_tuning_cache(cache_path, hyper_cfg, best_params, summary)
             print(f"[INFO] CV tuning cache saved to: {cache_written}")
@@ -1589,14 +2074,13 @@ def _train_xgb_model_cv_tuned(
     tuned_hyper["early_stopping_rounds"] = None
     tuned_config["hyperparameters"] = tuned_hyper
 
-    artifact_path = _write_xgb_cv_tuning_artifact(data_cfg, tuned_hyper, best_params, summary)
-    print(f"[INFO] CV tuning artifact saved to: {artifact_path}")
-    trials_csv = _write_xgb_cv_trials_csv(data_cfg, summary)
-    if trials_csv is not None:
-        print(f"[INFO] CV tuning trials CSV saved to: {trials_csv}")
-    trials_plot = _write_xgb_cv_trials_plot(data_cfg, summary)
-    if trials_plot is not None:
-        print(f"[INFO] CV tuning trials plot saved to: {trials_plot}")
+    if tuning_ran:
+        trials_csv = _write_xgb_cv_trials_csv(config, summary)
+        if trials_csv is not None:
+            print(f"[INFO] CV tuning trials CSV saved to: {trials_csv}")
+        trials_plot = _write_xgb_cv_trials_plot(config, summary)
+        if trials_plot is not None:
+            print(f"[INFO] CV tuning trials plot saved to: {trials_plot}")
 
     X_train, y_train, _ = _xgb_samples_to_arrays(train_samples, cast_y=cast_y)
     X_test, y_test, _ = _xgb_samples_to_arrays(test_samples, cast_y=cast_y)

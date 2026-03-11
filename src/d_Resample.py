@@ -345,7 +345,7 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
             'reg_alpha': 0,
             'learning_rate': 0.01,
             'n_jobs': -1,
-            'early_stopping_rounds': 10,
+            'early_stopping_rounds': 100,
             # Optional second stop rule (disabled unless both keys are set)
             'train_loss_plateau_rounds': 10,
             'train_loss_min_relative_improvement': 0.002,
@@ -353,14 +353,18 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
             'cv_tuning': {
                 'enabled': False,
                 'n_folds': 5,
-                'n_trials': 24,
-                'seed': 42,
+                'n_trials': 360,
+                'seed': 21,
                 'parallel_jobs': 1,
                 'metric': 'rmse',
+                'search_method': 'optuna',
+                'optuna_sampler': 'tpe',
+                'random_start_trials': 30,
                 'use_early_stopping': False,
                 'early_stopping_rounds': None,
                 'verbose': False,
                 'param_space': {
+                    'n_estimators': {'low': 100, 'high': 1300, 'type': 'int'},
                     'max_depth': {'low': 2, 'high': 9, 'type': 'int'},
                     'min_child_weight': {'low': 1, 'high': 20, 'type': 'int'},
                     'gamma': {'low': 0.0, 'high': 10.0, 'type': 'float'},
@@ -368,6 +372,7 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
                     'colsample_bytree': {'low': 0.3, 'high': 1.0, 'type': 'float'},
                     'reg_lambda': {'low': 1e-3, 'high': 10.0, 'type': 'log'},
                     'reg_alpha': {'low': 1e-4, 'high': 5.0, 'type': 'log'},
+                    'learning_rate': {'low': 0.003, 'high': 0.2, 'type': 'log'},
                 },
             },
         },
@@ -506,7 +511,7 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
         },
         'hyperparameters': {
             # Gaussian Process Regressor hyperparameters
-            'kernel': 'matern52',
+            'kernel': 'matern52+linear',
             'ard': True,
             'input_standardize': True,
             'target_standardize': True,
@@ -516,6 +521,14 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
             'uncertainty_source_mode': 'aggregate_t',
             'uncertainty_summary_dir': None,
             'uncertainty_aggregate_csv': None,
+            'early_stop_metric': 'val_rmse',
+            'early_stop_alpha': 0.5,
+            'lengthscale_min': 0.05,
+            'lengthscale_max': 10.0,
+            'noise_min': 1e-5,
+            'noise_max': 1.0,
+            'outputscale_prior': {'type': 'gamma', 'shape': 2.0, 'rate': 0.15},
+            'noise_prior': {'type': 'gamma', 'shape': 1.5, 'rate': 0.5},
             'learning_rate': 0.01,
             'num_epochs': 250,
             'patience': 20,
@@ -531,10 +544,18 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
             'split_type': "Temporal split prevents data leakage. If MC replicates detected, temporal split is auto-enforced.",
             'fault_tolerant': "False - GP requires complete data without NaN in inputs",
             'nan_tolerance': "0.0 for strict no-NaN predictor policy.",
-            'kernel': "Use 'matern52' with use_uncertain_input_kernel=True to apply uncertainty-aware Matérn-5/2 via MC kernel expectation.",
+            'kernel': "Use 'matern52+linear' (or 'rbf+linear') with use_uncertain_input_kernel=True to add a linear trend term while keeping uncertainty-aware kernels.",
             'uncertainty_source_mode': "'aggregate_t' matches MC replicate assumptions using aggregate offset fits; falls back to summary std if unavailable.",
             'uncertain_kernel_mc_samples': "MC samples used to approximate expected kernel under input uncertainty (higher = smoother but slower).",
             'uncertain_kernel_mc_seed': "Seed for deterministic uncertain-kernel sampling so train/eval remain aligned.",
+            'early_stop_metric': "Early stopping metric: 'train_nll', 'val_rmse', or 'mixed' (alpha-weighted).",
+            'early_stop_alpha': "Weight for train_nll in mixed early stopping (0-1).",
+            'lengthscale_min': "Lower bound on GP lengthscales to prevent collapse.",
+            'lengthscale_max': "Upper bound on GP lengthscales to prevent flat kernels.",
+            'noise_min': "Lower bound on likelihood noise.",
+            'noise_max': "Upper bound on likelihood noise to prevent degenerate high-noise fits.",
+            'outputscale_prior': "Gamma prior on kernel outputscale (shape, rate). Set to null to disable.",
+            'noise_prior': "Gamma prior on likelihood noise (shape, rate). Set to null to disable.",
         }
     }
 
@@ -1104,7 +1125,7 @@ if __name__ == '__main__':
     # Normalize once and reuse across all per-target dataset writes.
     df_norm, normalization_params = _normalize_once(df, to_normalize, min_val=0, max_val=1)
     shared_sensor_uncertainties = _load_and_prepare_sensor_uncertainties(
-        output_dir="../data/output/CV",
+        output_dir="../data/output/CV4",
         normalization_params=normalization_params,
         verbose=False,
     )
@@ -1119,7 +1140,7 @@ if __name__ == '__main__':
 
     for target in target_columns:
         target_slug = target.replace(" ", "_").replace("/", "_")
-        output_dir = os.path.join("../data/output/CV", f"MC_ex{target_slug}")
+        output_dir = os.path.join("../data/output/CV4", f"MC_{target_slug}")
         if eurofins_summary_df is None:
             target_length = fallback_length
         else:

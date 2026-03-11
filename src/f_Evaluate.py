@@ -59,7 +59,7 @@ from utils.config_utils import (
     _build_feature_uncertainty_variance,
     _build_feature_uncertainty_bundle,
 )
-from utils.gp_utils import build_base_kernel, ExactGPRegressor
+from utils.gp_utils import apply_gp_constraints_and_priors, build_base_kernel, ExactGPRegressor
 from utils.limits import load_limits_records
 
 
@@ -340,6 +340,7 @@ def _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device, conf
                 uncertain_kernel_mc_seed=mc_seed,
             )
         ).to(device)
+        apply_gp_constraints_and_priors(model, likelihood, hyper_cfg)
         model.load_state_dict(state["model_state_dict"])
         likelihood.load_state_dict(state["likelihood_state_dict"])
         model.eval()

@@ -115,6 +115,46 @@ class UncertainInputMatern52Kernel(gpytorch.kernels.Kernel):
         return torch.mean(k, dim=0)
 
 
+def _parse_kernel_spec(kernel_name: str) -> tuple[str | None, bool]:
+    name = str(kernel_name or "").lower().strip()
+    if not name:
+        name = "matern52"
+    parts = [part.strip() for part in name.split("+") if part.strip()]
+    has_linear = "linear" in parts
+    base_parts = [part for part in parts if part != "linear"]
+    if len(base_parts) > 1:
+        raise ValueError(
+            f"Unsupported kernel combination '{kernel_name}'. "
+            "At most one base kernel is allowed with an optional '+linear' term."
+        )
+    base = base_parts[0] if base_parts else None
+    return base, has_linear
+
+
+def describe_effective_kernel(kernel_name: str, use_uncertain_kernel: bool) -> str:
+    base, has_linear = _parse_kernel_spec(kernel_name)
+    if base is None and not has_linear:
+        base = "matern52"
+
+    if use_uncertain_kernel:
+        if base is None:
+            raise ValueError(
+                "Uncertain-input kernel requires a base kernel (rbf or matern52)."
+            )
+        if base not in {"rbf", "matern52"}:
+            raise ValueError(
+                f"Unsupported uncertain-input kernel '{base}'. "
+                "Use 'rbf' or 'matern52' when use_uncertain_input_kernel=True."
+            )
+        effective_base = f"uncertain_{base}"
+    else:
+        effective_base = base or "linear"
+
+    if has_linear and effective_base != "linear":
+        return f"{effective_base}+linear"
+    return effective_base
+
+
 def build_base_kernel(
     kernel_name,
     use_uncertain_kernel,
@@ -130,35 +170,159 @@ def build_base_kernel(
     Parameters
     ----------
     kernel_name : str
-        One of ``"rbf"``, ``"matern32"``, ``"matern52"`` (default for anything else).
+        One of ``"rbf"``, ``"matern32"``, ``"matern52"`` (default for anything else),
+        optionally suffixed with ``+linear`` (e.g., ``"matern52+linear"``).
     use_uncertain_kernel : bool
-        If True, returns an ``UncertainInputRBFKernel`` regardless of ``kernel_name``
-        (with a warning if ``kernel_name != "rbf"``).
+        If True, uses uncertain-input kernels (rbf or matern52 only).
     input_uncertainty_var : torch.Tensor or None
         Per-feature input variance tensor; required when ``use_uncertain_kernel`` is True.
     ard_dims : int or None
         Number of ARD lengthscale dimensions, or None for isotropic.
     """
+    base_name, has_linear = _parse_kernel_spec(kernel_name)
+    if base_name is None and not has_linear:
+        base_name = "matern52"
+    elif base_name is None and has_linear:
+        base_name = "linear"
+
     if use_uncertain_kernel:
-        if kernel_name == "rbf":
-            return UncertainInputRBFKernel(input_variance=input_uncertainty_var, ard_num_dims=ard_dims)
-        if kernel_name == "matern52":
-            return UncertainInputMatern52Kernel(
+        if base_name is None:
+            raise ValueError(
+                "Uncertain-input kernel requires a base kernel (rbf or matern52)."
+            )
+        if base_name == "rbf":
+            base_kernel = UncertainInputRBFKernel(input_variance=input_uncertainty_var, ard_num_dims=ard_dims)
+        elif base_name == "matern52":
+            base_kernel = UncertainInputMatern52Kernel(
                 input_variance=input_uncertainty_var,
                 noise_delta_samples=uncertainty_noise_deltas,
                 mc_samples=uncertain_kernel_mc_samples,
                 mc_seed=uncertain_kernel_mc_seed,
                 ard_num_dims=ard_dims,
             )
-        raise ValueError(
-            f"Unsupported uncertain-input kernel '{kernel_name}'. "
-            "Use 'rbf' or 'matern52' when use_uncertain_input_kernel=True."
-        )
-    if kernel_name == "rbf":
-        return gpytorch.kernels.RBFKernel(ard_num_dims=ard_dims)
-    if kernel_name == "matern32":
-        return gpytorch.kernels.MaternKernel(nu=1.5, ard_num_dims=ard_dims)
-    return gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=ard_dims)
+        else:
+            raise ValueError(
+                f"Unsupported uncertain-input kernel '{base_name}'. "
+                "Use 'rbf' or 'matern52' when use_uncertain_input_kernel=True."
+            )
+    else:
+        if base_name == "rbf":
+            base_kernel = gpytorch.kernels.RBFKernel(ard_num_dims=ard_dims)
+        elif base_name == "matern32":
+            base_kernel = gpytorch.kernels.MaternKernel(nu=1.5, ard_num_dims=ard_dims)
+        elif base_name == "matern52" or base_name is None:
+            base_kernel = gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=ard_dims)
+        elif base_name == "linear":
+            base_kernel = gpytorch.kernels.LinearKernel(ard_num_dims=ard_dims)
+        else:
+            base_kernel = gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=ard_dims)
+
+    if has_linear and base_name != "linear":
+        linear_kernel = gpytorch.kernels.LinearKernel(ard_num_dims=ard_dims)
+        return base_kernel + linear_kernel
+    return base_kernel
+
+
+def _coerce_float(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _build_constraint(min_value, max_value):
+    if min_value is None and max_value is None:
+        return None
+    if min_value is not None and max_value is not None:
+        if max_value <= min_value:
+            raise ValueError(
+                f"Constraint max ({max_value}) must be > min ({min_value})."
+            )
+        return gpytorch.constraints.Interval(min_value, max_value)
+    if min_value is not None:
+        return gpytorch.constraints.GreaterThan(min_value)
+    return gpytorch.constraints.LessThan(max_value)
+
+
+def _iter_kernels(module):
+    seen = set()
+    for child in module.modules():
+        if isinstance(child, gpytorch.kernels.Kernel):
+            if id(child) not in seen:
+                seen.add(id(child))
+                yield child
+
+
+def _parse_gamma_prior(prior_cfg):
+    if not prior_cfg:
+        return None
+    if isinstance(prior_cfg, gpytorch.priors.Prior):
+        return prior_cfg
+    if not isinstance(prior_cfg, dict):
+        return None
+    prior_type = str(prior_cfg.get("type", "gamma")).lower().strip()
+    if prior_type != "gamma":
+        raise ValueError(f"Unsupported prior type '{prior_type}'.")
+    shape = prior_cfg.get("shape", prior_cfg.get("alpha", None))
+    rate = prior_cfg.get("rate", prior_cfg.get("beta", None))
+    shape = _coerce_float(shape)
+    rate = _coerce_float(rate)
+    if shape is None or rate is None:
+        return None
+    if shape <= 0 or rate <= 0:
+        raise ValueError("GammaPrior shape and rate must be > 0.")
+    return gpytorch.priors.GammaPrior(shape, rate)
+
+
+def apply_gp_constraints_and_priors(model, likelihood, hyper_cfg: dict) -> dict:
+    """Apply optional constraints/priors from hyperparameters to GP model and likelihood."""
+    meta = {
+        "lengthscale_constraint": None,
+        "outputscale_constraint": None,
+        "noise_constraint": None,
+        "outputscale_prior": None,
+        "noise_prior": None,
+    }
+
+    ls_min = _coerce_float(hyper_cfg.get("lengthscale_min"))
+    ls_max = _coerce_float(hyper_cfg.get("lengthscale_max"))
+    ls_constraint = _build_constraint(ls_min, ls_max)
+    if ls_constraint is not None:
+        applied = 0
+        for kernel in _iter_kernels(model.covar_module.base_kernel):
+            if hasattr(kernel, "raw_lengthscale"):
+                kernel.register_constraint("raw_lengthscale", ls_constraint)
+                applied += 1
+        if applied:
+            meta["lengthscale_constraint"] = {"min": ls_min, "max": ls_max, "kernels": applied}
+
+    os_min = _coerce_float(hyper_cfg.get("outputscale_min"))
+    os_max = _coerce_float(hyper_cfg.get("outputscale_max"))
+    os_constraint = _build_constraint(os_min, os_max)
+    if os_constraint is not None and hasattr(model.covar_module, "register_constraint"):
+        model.covar_module.register_constraint("raw_outputscale", os_constraint)
+        meta["outputscale_constraint"] = {"min": os_min, "max": os_max}
+
+    noise_min = _coerce_float(hyper_cfg.get("noise_min"))
+    noise_max = _coerce_float(hyper_cfg.get("noise_max"))
+    noise_constraint = _build_constraint(noise_min, noise_max)
+    if noise_constraint is not None and hasattr(likelihood, "register_constraint"):
+        likelihood.register_constraint("raw_noise", noise_constraint)
+        meta["noise_constraint"] = {"min": noise_min, "max": noise_max}
+
+    outputscale_prior = _parse_gamma_prior(hyper_cfg.get("outputscale_prior"))
+    if outputscale_prior is not None:
+        model.covar_module.register_prior("outputscale_prior", outputscale_prior, "outputscale")
+        meta["outputscale_prior"] = "gamma"
+
+    noise_prior = _parse_gamma_prior(hyper_cfg.get("noise_prior"))
+    if noise_prior is not None:
+        likelihood.register_prior("noise_prior", noise_prior, "noise")
+        meta["noise_prior"] = "gamma"
+
+    return meta
 
 
 class ExactGPRegressor(gpytorch.models.ExactGP):
