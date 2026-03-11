@@ -667,9 +667,15 @@ def _train_single_config(
         elif model_type == "gp_regressor":
             train_module.train_gp_regressor_model(config, train_samples, test_samples)
         elif model_type == "xgb_regressor":
-            train_module.train_xgb_regressor_model(config, train_samples, test_samples)
+            if train_module._xgb_cv_tuning_enabled(config):
+                train_module.train_xgb_regressor_model_cv_tuned(config, train_samples, test_samples)
+            else:
+                train_module.train_xgb_regressor_model(config, train_samples, test_samples)
         elif model_type == "xgb_classifier":
-            train_module.train_xgb_classifier_model(config, train_samples, test_samples)
+            if train_module._xgb_cv_tuning_enabled(config):
+                train_module.train_xgb_classifier_model_cv_tuned(config, train_samples, test_samples)
+            else:
+                train_module.train_xgb_classifier_model(config, train_samples, test_samples)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
 

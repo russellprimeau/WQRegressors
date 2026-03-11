@@ -11,9 +11,12 @@ python src/e_Train.py --config data/output/regression/MC_pH/config_xgb_01.yml
 import os
 import sys
 import math
+import copy
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 import argparse
 import yaml
+import json
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -26,7 +29,7 @@ try:
     import gpytorch
 except ImportError:
     gpytorch = None
-from utils.training import write_config, splitter
+from utils.training import write_config, splitter, _base_sample_id
 from utils.transformer import (
     train_model as train_transformer,
     TimeSeriesTransformer,
@@ -101,6 +104,7 @@ DEFAULT_XGB_REGRESSOR_CONFIG = {
     # Optional second stop rule (disabled unless both keys are set in config).
     "train_loss_plateau_rounds": None,
     "train_loss_min_relative_improvement": None,
+    "cv_tuning": DEFAULT_XGB_CV_TUNING_REGRESSOR,
 }
 
 DEFAULT_XGB_CLASSIFIER_CONFIG = {
@@ -121,6 +125,32 @@ DEFAULT_XGB_CLASSIFIER_CONFIG = {
     # Optional second stop rule (disabled unless both keys are set in config).
     "train_loss_plateau_rounds": None,
     "train_loss_min_relative_improvement": None,
+    "cv_tuning": DEFAULT_XGB_CV_TUNING_CLASSIFIER,
+}
+
+DEFAULT_XGB_CV_TUNING_REGRESSOR = {
+    "enabled": False,
+    "n_folds": 5,
+    "n_trials": 24,
+    "seed": 42,
+    "parallel_jobs": 1,
+    "metric": "rmse",
+    "use_early_stopping": False,
+    "early_stopping_rounds": None,
+    "param_space": {
+        "max_depth": {"low": 2, "high": 9, "type": "int"},
+        "min_child_weight": {"low": 1, "high": 10, "type": "int"},
+        "gamma": {"low": 0.0, "high": 5.0, "type": "float"},
+        "subsample": {"low": 0.5, "high": 1.0, "type": "float"},
+        "colsample_bytree": {"low": 0.5, "high": 1.0, "type": "float"},
+        "reg_lambda": {"low": 1e-3, "high": 10.0, "type": "log"},
+        "reg_alpha": {"low": 1e-4, "high": 5.0, "type": "log"},
+    },
+}
+
+DEFAULT_XGB_CV_TUNING_CLASSIFIER = {
+    **DEFAULT_XGB_CV_TUNING_REGRESSOR,
+    "metric": "logloss",
 }
 
 
@@ -308,6 +338,29 @@ DEFAULT_EVALUATION_CONFIG = {
 }
 
 
+def _merge_cv_tuning_defaults(hyper_cfg: dict, defaults: dict) -> None:
+    """Deep-merge cv_tuning defaults into hyperparameters without mutating defaults."""
+    default_cv = defaults.get("cv_tuning")
+    if not isinstance(default_cv, dict):
+        return
+
+    if "cv_tuning" not in hyper_cfg or hyper_cfg["cv_tuning"] is None:
+        hyper_cfg["cv_tuning"] = copy.deepcopy(default_cv)
+        return
+
+    if not isinstance(hyper_cfg["cv_tuning"], dict):
+        return
+
+    merged = copy.deepcopy(default_cv)
+    merged.update(hyper_cfg["cv_tuning"])
+    if isinstance(default_cv.get("param_space"), dict) and isinstance(hyper_cfg["cv_tuning"].get("param_space"), dict):
+        merged_space = copy.deepcopy(default_cv["param_space"])
+        merged_space.update(hyper_cfg["cv_tuning"]["param_space"])
+        merged["param_space"] = merged_space
+
+    hyper_cfg["cv_tuning"] = merged
+
+
 # ===========================================================================================
 # CONFIG LOADING AND MERGING
 # ===========================================================================================
@@ -345,7 +398,13 @@ def merge_with_defaults(config, model_type):
     for key, default_value in defaults.items():
         if key not in merged_config["hyperparameters"]:
             merged_config["hyperparameters"][key] = default_value
-            print(f"  [DEFAULT] hyperparameters.{key} = {default_value}")
+            if key == "cv_tuning" and isinstance(default_value, dict):
+                print(f"  [DEFAULT] hyperparameters.{key}.enabled = {default_value.get('enabled', False)}")
+            else:
+                print(f"  [DEFAULT] hyperparameters.{key} = {default_value}")
+
+    if model_type in {"xgb_regressor", "xgb_classifier"}:
+        _merge_cv_tuning_defaults(merged_config["hyperparameters"], defaults)
     
     # Add device if not specified
     if "device" not in merged_config:
@@ -872,7 +931,319 @@ def train_gp_regressor_model(config, train_samples, test_samples):
 # XGBOOST REGRESSOR TRAINING
 # ===========================================================================================
 
-def _train_xgb_model(config, train_samples, test_samples, model_cls, metric_key, cast_y=None):
+def _xgb_cv_tuning_enabled(config: dict) -> bool:
+    hyper_cfg = config.get("hyperparameters", {}) or {}
+    cv_cfg = hyper_cfg.get("cv_tuning", {}) or {}
+    return bool(cv_cfg.get("enabled", False))
+
+
+def _xgb_samples_to_arrays(samples, cast_y=None):
+    X = np.ascontiguousarray(np.array([s[0].flatten() for s in samples], dtype=np.float32))
+    if cast_y is not None:
+        y = np.ascontiguousarray(np.array([cast_y(s[1].flatten()[0]) for s in samples]))
+    else:
+        y = np.ascontiguousarray(np.array([s[1].flatten()[0] for s in samples], dtype=np.float32))
+    names = [str(s[2]) for s in samples]
+    return X, y, names
+
+
+def _build_group_folds(file_names: list[str], n_folds: int, seed: int) -> list[list[int]]:
+    group_to_indices: dict[str, list[int]] = {}
+    for idx, name in enumerate(file_names):
+        gid = _base_sample_id(name)
+        group_to_indices.setdefault(gid, []).append(idx)
+
+    groups = list(group_to_indices.items())
+    rng = np.random.default_rng(int(seed))
+    rng.shuffle(groups)
+
+    n_folds = max(2, min(int(n_folds), len(groups)))
+    fold_bins: list[list[int]] = [[] for _ in range(n_folds)]
+    fold_sizes = [0 for _ in range(n_folds)]
+
+    for _gid, indices in sorted(groups, key=lambda item: len(item[1]), reverse=True):
+        target_fold = int(np.argmin(fold_sizes))
+        fold_bins[target_fold].extend(indices)
+        fold_sizes[target_fold] += len(indices)
+
+    return [sorted(indices) for indices in fold_bins if indices]
+
+
+def _sample_cv_param(rng: np.random.Generator, spec, param_name: str):
+    if isinstance(spec, dict):
+        low = spec.get("low")
+        high = spec.get("high")
+        mode = str(spec.get("type", "float")).lower()
+        if spec.get("log", False):
+            mode = "log"
+        if low is None or high is None:
+            return spec.get("value")
+        if mode == "int":
+            return int(rng.integers(int(low), int(high) + 1))
+        if mode == "log":
+            low = max(float(low), 1e-12)
+            high = max(float(high), low * 1.000001)
+            return float(np.exp(rng.uniform(np.log(low), np.log(high))))
+        return float(rng.uniform(float(low), float(high)))
+
+    if isinstance(spec, (list, tuple)):
+        if len(spec) == 2 and all(isinstance(v, (int, float, np.integer, np.floating)) for v in spec):
+            low, high = spec
+            if param_name in {"max_depth", "min_child_weight"}:
+                return int(rng.integers(int(low), int(high) + 1))
+            return float(rng.uniform(float(low), float(high)))
+        return spec[int(rng.integers(0, len(spec)))]
+
+    return spec
+
+
+def _sanitize_xgb_params(params: dict) -> dict:
+    out = dict(params)
+    for key in ("subsample", "colsample_bytree"):
+        if key in out and out[key] is not None:
+            out[key] = float(min(1.0, max(0.05, float(out[key]))))
+    for key in ("reg_lambda", "reg_alpha", "gamma"):
+        if key in out and out[key] is not None:
+            out[key] = float(max(0.0, float(out[key])))
+    if "max_depth" in out and out["max_depth"] is not None:
+        out["max_depth"] = int(max(1, int(out["max_depth"])))
+    if "min_child_weight" in out and out["min_child_weight"] is not None:
+        out["min_child_weight"] = float(max(0.0, float(out["min_child_weight"])))
+    return out
+
+
+def _binary_logloss(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    eps = 1e-15
+    probs = np.clip(y_prob.astype(float), eps, 1 - eps)
+    y = y_true.astype(float)
+    return float(-np.mean(y * np.log(probs) + (1 - y) * np.log(1 - probs)))
+
+
+def _xgb_cv_fold_score(
+    model_kind: str,
+    model_kwargs: dict,
+    X: np.ndarray,
+    y: np.ndarray,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    metric: str,
+    use_early_stopping: bool,
+    early_stopping_rounds: int | None,
+) -> float:
+    X_train = X[train_idx]
+    y_train = y[train_idx]
+    X_val = X[val_idx]
+    y_val = y[val_idx]
+
+    if model_kind == "classifier":
+        model = xgb.XGBClassifier(**model_kwargs)
+    else:
+        model = xgb.XGBRegressor(**model_kwargs)
+
+    fit_kwargs = {"verbose": False}
+    if use_early_stopping:
+        fit_kwargs["eval_set"] = [(X_train, y_train), (X_val, y_val)]
+        if early_stopping_rounds is not None:
+            model.set_params(early_stopping_rounds=int(early_stopping_rounds))
+
+    model.fit(X_train, y_train, **fit_kwargs)
+
+    if model_kind == "classifier":
+        probs = model.predict_proba(X_val)[:, 1]
+        score = _binary_logloss(y_val, probs)
+    else:
+        preds = model.predict(X_val)
+        score = float(np.sqrt(np.mean(np.square(preds - y_val))))
+
+    return score
+
+
+def _xgb_tune_hyperparameters_cv(
+    config: dict,
+    train_samples,
+    model_kind: str,
+    metric_key: str,
+    cast_y=None,
+) -> tuple[dict, dict]:
+    hyper_cfg = _resolve_xgb_runtime_hyperparameters(config["hyperparameters"], config.get("device", "cpu"))
+    cv_cfg = hyper_cfg.get("cv_tuning", {}) or {}
+    if not cv_cfg.get("enabled", False):
+        return {}, {"enabled": False}
+
+    X, y, names = _xgb_samples_to_arrays(train_samples, cast_y=cast_y)
+    if len(names) < 2:
+        print("[WARN] CV tuning skipped: not enough training samples.")
+        return {}, {"enabled": False, "reason": "insufficient_samples"}
+
+    folds = _build_group_folds(names, int(cv_cfg.get("n_folds", 5)), int(cv_cfg.get("seed", 42)))
+    if len(folds) < 2:
+        print("[WARN] CV tuning skipped: not enough independent groups for folds.")
+        return {}, {"enabled": False, "reason": "insufficient_groups"}
+
+    param_space = cv_cfg.get("param_space") or {}
+    rng = np.random.default_rng(int(cv_cfg.get("seed", 42)))
+    n_trials = int(max(1, cv_cfg.get("n_trials", 10)))
+
+    base_kwargs = {
+        "tree_method": hyper_cfg["tree_method"],
+        "objective": hyper_cfg["objective"],
+        "n_estimators": hyper_cfg["n_estimators"],
+        "max_depth": hyper_cfg["max_depth"],
+        "subsample": hyper_cfg["subsample"],
+        "colsample_bytree": hyper_cfg["colsample_bytree"],
+        "min_child_weight": hyper_cfg["min_child_weight"],
+        "gamma": hyper_cfg["gamma"],
+        "reg_lambda": hyper_cfg["reg_lambda"],
+        "reg_alpha": hyper_cfg["reg_alpha"],
+        "learning_rate": hyper_cfg["learning_rate"],
+        "n_jobs": int(hyper_cfg.get("n_jobs", -1)),
+    }
+    if metric_key == "eval_metric":
+        base_kwargs["eval_metric"] = hyper_cfg[metric_key]
+    if "device" in hyper_cfg:
+        base_kwargs["device"] = hyper_cfg["device"]
+    if "predictor" in hyper_cfg:
+        base_kwargs["predictor"] = hyper_cfg["predictor"]
+
+    is_gpu_mode = (
+        str(hyper_cfg.get("device", "")).lower().startswith("cuda")
+        or str(hyper_cfg.get("tree_method", "")).lower() == "gpu_hist"
+    )
+    parallel_jobs = int(cv_cfg.get("parallel_jobs", 1))
+    if is_gpu_mode and parallel_jobs > 1:
+        print("[WARN] CV tuning parallel_jobs > 1 is not supported in GPU mode; forcing to 1.")
+        parallel_jobs = 1
+
+    use_early_stopping = bool(cv_cfg.get("use_early_stopping", False))
+    early_stop_rounds = cv_cfg.get("early_stopping_rounds")
+
+    if not use_early_stopping:
+        base_kwargs["early_stopping_rounds"] = None
+
+    metric = str(cv_cfg.get("metric", "rmse")).lower()
+    trial_results: list[dict] = []
+    best_score = float("inf")
+    best_params: dict = {}
+
+    executor = None
+    try:
+        if parallel_jobs > 1:
+            executor = ProcessPoolExecutor(max_workers=parallel_jobs)
+
+        for trial_idx in range(n_trials):
+            sampled = {}
+            for param_name, spec in param_space.items():
+                sampled[param_name] = _sample_cv_param(rng, spec, param_name)
+            sampled = _sanitize_xgb_params(sampled)
+
+            trial_kwargs = dict(base_kwargs)
+            trial_kwargs.update(sampled)
+            if parallel_jobs > 1:
+                trial_kwargs["n_jobs"] = 1
+
+            fold_scores: list[float] = []
+            if executor is not None:
+                futures = []
+                for fold_idx in range(len(folds)):
+                    val_idx = np.array(folds[fold_idx], dtype=int)
+                    train_idx = np.array(
+                        [i for f_idx, f in enumerate(folds) if f_idx != fold_idx for i in f],
+                        dtype=int,
+                    )
+                    futures.append(
+                        executor.submit(
+                            _xgb_cv_fold_score,
+                            model_kind,
+                            trial_kwargs,
+                            X,
+                            y,
+                            train_idx,
+                            val_idx,
+                            metric,
+                            use_early_stopping,
+                            early_stop_rounds,
+                        )
+                    )
+                for future in as_completed(futures):
+                    fold_scores.append(float(future.result()))
+            else:
+                for fold_idx in range(len(folds)):
+                    val_idx = np.array(folds[fold_idx], dtype=int)
+                    train_idx = np.array(
+                        [i for f_idx, f in enumerate(folds) if f_idx != fold_idx for i in f],
+                        dtype=int,
+                    )
+                    score = _xgb_cv_fold_score(
+                        model_kind,
+                        trial_kwargs,
+                        X,
+                        y,
+                        train_idx,
+                        val_idx,
+                        metric,
+                        use_early_stopping,
+                        early_stop_rounds,
+                    )
+                    fold_scores.append(float(score))
+
+            mean_score = float(np.mean(fold_scores)) if fold_scores else float("inf")
+            std_score = float(np.std(fold_scores)) if fold_scores else float("nan")
+            trial_results.append(
+                {
+                    "trial": int(trial_idx + 1),
+                    "mean_score": mean_score,
+                    "std_score": std_score,
+                    "params": dict(sampled),
+                }
+            )
+            if mean_score < best_score:
+                best_score = mean_score
+                best_params = dict(sampled)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    summary = {
+        "enabled": True,
+        "metric": metric,
+        "n_folds": int(len(folds)),
+        "n_trials": int(n_trials),
+        "seed": int(cv_cfg.get("seed", 42)),
+        "use_early_stopping": bool(use_early_stopping),
+        "early_stopping_rounds": None if early_stop_rounds is None else int(early_stop_rounds),
+        "best_score": float(best_score),
+        "trials": trial_results,
+        "param_space": param_space,
+    }
+    return best_params, summary
+
+
+def _write_xgb_cv_tuning_artifact(data_cfg: dict, hyper_cfg: dict, best_params: dict, summary: dict) -> Path:
+    forecast_dir = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
+    forecast_dir.mkdir(parents=True, exist_ok=True)
+    tuned_hyper = dict(hyper_cfg)
+    tuned_hyper.update(best_params)
+    payload = {
+        "artifact_version": 1,
+        "tuned_hyperparameters": tuned_hyper,
+        "best_params": best_params,
+        "cv_summary": summary,
+    }
+    out_path = forecast_dir / "xgb_cv_tuning.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return out_path
+
+def _train_xgb_model(
+    config,
+    train_samples,
+    test_samples,
+    model_cls,
+    metric_key,
+    cast_y=None,
+    eval_set_override=None,
+    disable_early_stopping: bool = False,
+):
     """Shared XGBoost training implementation for regressor and classifier."""
     print("\n" + "="*80)
     print(f"TRAINING {model_cls.__name__.upper()}")
@@ -923,6 +1294,8 @@ def _train_xgb_model(config, train_samples, test_samples, model_cls, metric_key,
         "early_stopping_rounds": hyper_cfg["early_stopping_rounds"],
         "n_jobs": int(hyper_cfg.get("n_jobs", -1)),
     }
+    if disable_early_stopping:
+        model_kwargs.pop("early_stopping_rounds", None)
     if metric_key == "eval_metric":
         model_kwargs["eval_metric"] = metric
     if "device" in hyper_cfg:
@@ -947,9 +1320,12 @@ def _train_xgb_model(config, train_samples, test_samples, model_cls, metric_key,
 
     print(f"Training {model_cls.__name__}...")
     fit_kwargs = {
-        "eval_set": [(X_train, y_train), (X_test, y_test)],
         "verbose": True,
     }
+    if eval_set_override is not None:
+        fit_kwargs["eval_set"] = eval_set_override
+    else:
+        fit_kwargs["eval_set"] = [(X_train, y_train), (X_test, y_test)]
 
     supports_callbacks = "callbacks" in inspect.signature(model.fit).parameters
 
@@ -978,35 +1354,93 @@ def _train_xgb_model(config, train_samples, test_samples, model_cls, metric_key,
 
     if config.get("save_training_plots", True):
         results = model.evals_result()
-        epochs = len(results['validation_0'][metric])
-        plt.figure(figsize=(8, 5))
-        plt.loglog(range(epochs), results['validation_0'][metric], label='Training Loss')
-        plt.loglog(range(epochs), results['validation_1'][metric], label='Validation Loss')
-        if hasattr(model, "best_iteration") and getattr(model, "best_iteration") is not None:
-            plt.axvline(
-                float(model.best_iteration),
-                color="#d62728",
-                linestyle="--",
-                linewidth=1.0,
-                label=f"Validation stop/best iter ({model.best_iteration})",
-            )
-        if plateau_state and plateau_state.get("triggered") and plateau_state.get("trigger_iteration") is not None:
-            plt.axvline(
-                float(plateau_state["trigger_iteration"]),
-                color="#ff7f0e",
-                linestyle="--",
-                linewidth=1.0,
-                label=f"Train plateau stop ({plateau_state['trigger_iteration']})",
-            )
-        plt.xlabel('Boosting Rounds')
-        plt.ylabel(metric)
-        plt.grid(True, which="both", ls="--")
-        plt.title('Training vs Validation Loss')
-        plt.legend()
-        plt.savefig(save_path / "loss_plot.png")
-        plt.close()
-        print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")
+        train_series = results.get("validation_0", {}).get(metric)
+        val_series = results.get("validation_1", {}).get(metric)
+        if train_series:
+            epochs = len(train_series)
+            plt.figure(figsize=(8, 5))
+            plt.loglog(range(epochs), train_series, label='Training Loss')
+            if val_series:
+                plt.loglog(range(len(val_series)), val_series, label='Validation Loss')
+            if hasattr(model, "best_iteration") and getattr(model, "best_iteration") is not None:
+                plt.axvline(
+                    float(model.best_iteration),
+                    color="#d62728",
+                    linestyle="--",
+                    linewidth=1.0,
+                    label=f"Validation stop/best iter ({model.best_iteration})",
+                )
+            if plateau_state and plateau_state.get("triggered") and plateau_state.get("trigger_iteration") is not None:
+                plt.axvline(
+                    float(plateau_state["trigger_iteration"]),
+                    color="#ff7f0e",
+                    linestyle="--",
+                    linewidth=1.0,
+                    label=f"Train plateau stop ({plateau_state['trigger_iteration']})",
+                )
+            plt.xlabel('Boosting Rounds')
+            plt.ylabel(metric)
+            plt.grid(True, which="both", ls="--")
+            plt.title('Training vs Validation Loss' if val_series else 'Training Loss')
+            plt.legend()
+            plt.savefig(save_path / "loss_plot.png")
+            plt.close()
+            print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")
+        else:
+            print("[WARN] Training plot skipped: no evaluation history found.")
     write_evaluation_config(config)
+
+
+def _train_xgb_model_cv_tuned(
+    config,
+    train_samples,
+    test_samples,
+    model_cls,
+    metric_key,
+    model_kind: str,
+    cast_y=None,
+):
+    hyper_cfg = _resolve_xgb_runtime_hyperparameters(config["hyperparameters"], config.get("device", "cpu"))
+    cv_cfg = hyper_cfg.get("cv_tuning", {}) or {}
+    cv_requested = bool(cv_cfg.get("enabled", False))
+
+    best_params, summary = _xgb_tune_hyperparameters_cv(
+        config=config,
+        train_samples=train_samples,
+        model_kind=model_kind,
+        metric_key=metric_key,
+        cast_y=cast_y,
+    )
+
+    tuned_config = copy.deepcopy(config)
+    tuned_hyper = _resolve_xgb_runtime_hyperparameters(
+        tuned_config["hyperparameters"], tuned_config.get("device", "cpu")
+    )
+    if best_params:
+        tuned_hyper.update(best_params)
+    elif cv_requested:
+        print("[WARN] CV tuning requested but skipped; using base hyperparameters.")
+
+    tuned_hyper["early_stopping_rounds"] = None
+    tuned_config["hyperparameters"] = tuned_hyper
+
+    data_cfg = tuned_config["data"]
+    artifact_path = _write_xgb_cv_tuning_artifact(data_cfg, tuned_hyper, best_params, summary)
+    print(f"[INFO] CV tuning artifact saved to: {artifact_path}")
+
+    X_train, y_train, _ = _xgb_samples_to_arrays(train_samples, cast_y=cast_y)
+    eval_set_override = [(X_train, y_train)]
+
+    _train_xgb_model(
+        tuned_config,
+        train_samples,
+        test_samples,
+        model_cls,
+        metric_key,
+        cast_y=cast_y,
+        eval_set_override=eval_set_override,
+        disable_early_stopping=True,
+    )
 
 
 # ===========================================================================================
@@ -1023,6 +1457,31 @@ def train_xgb_classifier_model(config, train_samples, test_samples):
     _train_xgb_model(
         config, train_samples, test_samples,
         xgb.XGBClassifier, "eval_metric", cast_y=lambda v: int(round(v))
+    )
+
+
+def train_xgb_regressor_model_cv_tuned(config, train_samples, test_samples):
+    """Train XGBoost Regressor with CV-tuned regularization (no test exposure)."""
+    _train_xgb_model_cv_tuned(
+        config,
+        train_samples,
+        test_samples,
+        xgb.XGBRegressor,
+        "metric",
+        model_kind="regressor",
+    )
+
+
+def train_xgb_classifier_model_cv_tuned(config, train_samples, test_samples):
+    """Train XGBoost Classifier with CV-tuned regularization (no test exposure)."""
+    _train_xgb_model_cv_tuned(
+        config,
+        train_samples,
+        test_samples,
+        xgb.XGBClassifier,
+        "eval_metric",
+        model_kind="classifier",
+        cast_y=lambda v: int(round(v)),
     )
 
 
@@ -1081,9 +1540,15 @@ def main():
     elif model_type == "gp_regressor":
         train_gp_regressor_model(config, train_samples, test_samples)
     elif model_type == "xgb_regressor":
-        train_xgb_regressor_model(config, train_samples, test_samples)
+        if _xgb_cv_tuning_enabled(config):
+            train_xgb_regressor_model_cv_tuned(config, train_samples, test_samples)
+        else:
+            train_xgb_regressor_model(config, train_samples, test_samples)
     elif model_type == "xgb_classifier":
-        train_xgb_classifier_model(config, train_samples, test_samples)
+        if _xgb_cv_tuning_enabled(config):
+            train_xgb_classifier_model_cv_tuned(config, train_samples, test_samples)
+        else:
+            train_xgb_classifier_model(config, train_samples, test_samples)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
     

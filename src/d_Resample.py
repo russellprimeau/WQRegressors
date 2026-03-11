@@ -334,7 +334,7 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
             'max_depth': 7,
             'subsample': 0.2,
             'colsample_bytree': 0.8,
-            'min_child_weight': 3,
+            'min_child_weight': 8,
             'gamma': 0,
             'reg_lambda': 1,
             'reg_alpha': 0,
@@ -1077,7 +1077,7 @@ if __name__ == '__main__':
     # Normalize once and reuse across all per-target dataset writes.
     df_norm, normalization_params = _normalize_once(df, to_normalize, min_val=0, max_val=1)
     shared_sensor_uncertainties = _load_and_prepare_sensor_uncertainties(
-        output_dir="../data/output/side3",
+        output_dir="../data/output/min_child8",
         normalization_params=normalization_params,
         verbose=False,
     )
@@ -1092,7 +1092,7 @@ if __name__ == '__main__':
 
     for target in target_columns:
         target_slug = target.replace(" ", "_").replace("/", "_")
-        output_dir = os.path.join("../data/output/side3", f"MC_ex{target_slug}")
+        output_dir = os.path.join("../data/output/min_child8", f"MC_ex{target_slug}")
         if eurofins_summary_df is None:
             target_length = fallback_length
         else:
