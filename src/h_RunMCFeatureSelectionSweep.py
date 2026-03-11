@@ -1062,6 +1062,27 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         ),
     )
 
+    # For each subset cluster, order model bars by descending local R2.
+    base_model_order = list(FINAL_METRICS_MODEL_ORDER)
+    model_order_index = {model: idx for idx, model in enumerate(base_model_order)}
+
+    def _r2_for_rank_model(rank: int, model: str) -> float:
+        if rank in r2_pivot.index and model in r2_pivot.columns:
+            val = pd.to_numeric(r2_pivot.loc[rank, model], errors="coerce")
+            return float(val) if np.isfinite(val) else float("nan")
+        return float("nan")
+
+    models_by_rank: dict[int, list[str]] = {}
+    for rank in subset_order:
+        models_by_rank[int(rank)] = sorted(
+            base_model_order,
+            key=lambda model: (
+                1 if not np.isfinite(_r2_for_rank_model(int(rank), model)) else 0,
+                -_r2_for_rank_model(int(rank), model) if np.isfinite(_r2_for_rank_model(int(rank), model)) else 0.0,
+                model_order_index[model],
+            ),
+        )
+
     x = np.arange(len(subset_order), dtype=float)
     n_models = len(FINAL_METRICS_MODEL_ORDER)
     cluster_width = 0.86
@@ -1075,39 +1096,40 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         ("r2", "R\N{SUPERSCRIPT TWO}"),
     ]
 
-    legend_handles = []
-    legend_labels = []
+    legend_handles_by_model: dict[str, object] = {}
+    legend_labels_by_model: dict[str, str] = {}
     for ax, (metric, ylabel) in zip(axes, metric_specs):
         metric_pivot = grouped.pivot(index="subset_rank", columns="model_norm", values=metric)
         axis_vals: list[float] = []
-        axis_bar_groups = []
+        axis_bars_and_vals: list[tuple[object, float]] = []
 
-        for i, model in enumerate(FINAL_METRICS_MODEL_ORDER):
-            style = FINAL_METRICS_MODEL_STYLE[model]
-            vals = []
-            for rank in subset_order:
+        for j, rank in enumerate(subset_order):
+            ordered_models = models_by_rank.get(int(rank), base_model_order)
+            for i, model in enumerate(ordered_models):
+                style = FINAL_METRICS_MODEL_STYLE[model]
                 if rank in metric_pivot.index and model in metric_pivot.columns:
-                    val = metric_pivot.loc[rank, model]
-                    vals.append(float(val) if np.isfinite(val) else np.nan)
+                    raw_val = metric_pivot.loc[rank, model]
+                    val = float(raw_val) if np.isfinite(raw_val) else float("nan")
                 else:
-                    vals.append(np.nan)
+                    val = float("nan")
 
-            xpos = x - (cluster_width / 2.0) + (i + 0.5) * bar_w
-            bars = ax.bar(
-                xpos,
-                vals,
-                width=bar_w,
-                color=style["color"],
-                hatch=style["hatch"],
-                edgecolor="black" if style["hatch"] else "none",
-                linewidth=0.8 if style["hatch"] else 0.0,
-                label=style["label"],
-            )
-            axis_bar_groups.append((bars, vals))
-            axis_vals.extend([float(v) for v in vals if np.isfinite(v)])
-            if len(legend_handles) < n_models:
-                legend_handles.append(bars[0])
-                legend_labels.append(style["label"])
+                xpos = float(x[j]) - (cluster_width / 2.0) + (i + 0.5) * bar_w
+                bars = ax.bar(
+                    [xpos],
+                    [val],
+                    width=bar_w,
+                    color=style["color"],
+                    hatch=style["hatch"],
+                    edgecolor="black" if style["hatch"] else "none",
+                    linewidth=0.8 if style["hatch"] else 0.0,
+                )
+                bar = bars[0]
+                axis_bars_and_vals.append((bar, val))
+                if np.isfinite(val):
+                    axis_vals.append(float(val))
+                if model not in legend_handles_by_model:
+                    legend_handles_by_model[model] = bar
+                    legend_labels_by_model[model] = style["label"]
 
         ax.set_ylabel(ylabel)
         ax.grid(axis="y", alpha=0.3)
@@ -1136,29 +1158,28 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         text_pad = 0.02 * y_span
         edge_band = 0.03 * y_span
 
-        for bars, vals in axis_bar_groups:
-            for bar, val in zip(bars, vals):
-                if not np.isfinite(val):
-                    continue
-                f_val = float(val)
-                y_pref = f_val + text_pad if f_val >= 0 else f_val - text_pad
-                y = min(max(y_pref, y_low + text_pad), y_high - text_pad)
-                va = "bottom" if f_val >= 0 else "top"
-                # Keep clamped edge labels inside the panel while preserving readability.
-                if y >= (y_high - edge_band):
-                    va = "top"
-                elif y <= (y_low + edge_band):
-                    va = "bottom"
-                ax.text(
-                    bar.get_x() + (bar.get_width() / 2.0),
-                    y,
-                    _format_bar_label(f_val),
-                    ha="center",
-                    va=va,
-                    fontsize=7,
-                    rotation=90,
-                    clip_on=False,
-                )
+        for bar, val in axis_bars_and_vals:
+            if not np.isfinite(val):
+                continue
+            f_val = float(val)
+            y_pref = f_val + text_pad if f_val >= 0 else f_val - text_pad
+            y = min(max(y_pref, y_low + text_pad), y_high - text_pad)
+            va = "bottom" if f_val >= 0 else "top"
+            # Keep clamped edge labels inside the panel while preserving readability.
+            if y >= (y_high - edge_band):
+                va = "top"
+            elif y <= (y_low + edge_band):
+                va = "bottom"
+            ax.text(
+                bar.get_x() + (bar.get_width() / 2.0),
+                y,
+                _format_bar_label(f_val),
+                ha="center",
+                va=va,
+                fontsize=7,
+                rotation=90,
+                clip_on=False,
+            )
 
     axes[-1].set_xticks(x)
     axes[-1].set_xticklabels([rank_to_label[r] for r in subset_order], rotation=0)
@@ -1168,6 +1189,8 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         ax.tick_params(axis="x", labelbottom=False)
 
     fig.subplots_adjust(top=0.89, hspace=0.16)
+    legend_handles = [legend_handles_by_model[m] for m in FINAL_METRICS_MODEL_ORDER if m in legend_handles_by_model]
+    legend_labels = [legend_labels_by_model[m] for m in FINAL_METRICS_MODEL_ORDER if m in legend_labels_by_model]
     fig.legend(
         legend_handles,
         legend_labels,

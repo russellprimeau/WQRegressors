@@ -2393,13 +2393,51 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 print("[INFO] Skipped MC uncertainty impact figure: all panels were constant or non-finite.")
 
             # --- Single model quality matrix (accuracy, precision, reliability, support) ---
-            matrix_index = labels.astype(str).tolist()
-            n_rows_mat = len(perf_df)
+            # Matrix-specific ordering: evidence tier, then p-value, then q-value.
+            matrix_perf_df = perf_df.copy()
+            _raw_labels = [
+                _derive_target_name(name, args.dataset_prefix)
+                for name in matrix_perf_df["dataset"].astype(str).tolist()
+            ]
+            if len(_raw_labels) > 1:
+                # Strip longest common prefix, trimmed to last separator boundary.
+                _cp_len = 0
+                for _chars in zip(*_raw_labels):
+                    if len(set(_chars)) == 1:
+                        _cp_len += 1
+                    else:
+                        break
+                if _cp_len > 0:
+                    _cp_str = _raw_labels[0][:_cp_len]
+                    for _sep in ('_', '-', ' ', '.'):
+                        _last = _cp_str.rfind(_sep)
+                        if _last >= 0:
+                            _cp_len = _last + 1
+                            break
+                _stripped_labels = [n[_cp_len:] for n in _raw_labels]
+                # Strip longest common suffix, trimmed to last separator boundary from tail.
+                _cs_len = 0
+                for _chars in zip(*[s[::-1] for s in _stripped_labels]):
+                    if len(set(_chars)) == 1:
+                        _cs_len += 1
+                    else:
+                        break
+                if _cs_len > 0:
+                    _cs_str = _stripped_labels[0][-_cs_len:]
+                    for _sep in ('_', '-', ' ', '.'):
+                        _first_sep = _cs_str.find(_sep)
+                        if _first_sep >= 0:
+                            _cs_len = len(_cs_str) - _first_sep
+                            break
+                _final_labels = [
+                    (s[:-_cs_len] if _cs_len else s) or n
+                    for s, n in zip(_stripped_labels, _raw_labels)
+                ]
+            else:
+                _final_labels = _raw_labels
+            matrix_perf_df["_target_label"] = _final_labels
 
-            def _col_values(name: str) -> np.ndarray:
-                if name in perf_df.columns:
-                    return pd.to_numeric(perf_df[name], errors="coerce").to_numpy(dtype=float)
-                return np.full(n_rows_mat, np.nan, dtype=float)
+            n_rows_mat = len(matrix_perf_df)
 
             q_cols = [
                 "dm_q_vs_naive", "dm_q_vs_seasonal", "dm_q_vs_linear",
@@ -2411,18 +2449,49 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 "wilcoxon_p_vs_naive", "wilcoxon_p_vs_seasonal", "wilcoxon_p_vs_linear",
                 "sign_p_vs_naive", "sign_p_vs_seasonal", "sign_p_vs_linear",
             ]
-            present_q_cols = [c for c in q_cols if c in perf_df.columns]
-            present_p_cols = [c for c in p_cols if c in perf_df.columns]
+            present_q_cols = [c for c in q_cols if c in matrix_perf_df.columns]
+            present_p_cols = [c for c in p_cols if c in matrix_perf_df.columns]
 
-            q_min = pd.to_numeric(perf_df[present_q_cols].min(axis=1, skipna=True), errors="coerce").to_numpy(dtype=float) if present_q_cols else np.full(n_rows_mat, np.nan, dtype=float)
-            p_min = pd.to_numeric(perf_df[present_p_cols].min(axis=1, skipna=True), errors="coerce").to_numpy(dtype=float) if present_p_cols else np.full(n_rows_mat, np.nan, dtype=float)
-            tier_vals = np.array(
-                [tier_map.get(str(v), np.nan) for v in perf_df.get("evidence_tier_overall", pd.Series(["very_low"] * n_rows_mat))],
+            # Compute sort-key arrays from the pre-sort DataFrame.
+            _sort_q_min = pd.to_numeric(matrix_perf_df[present_q_cols].min(axis=1, skipna=True), errors="coerce").to_numpy(dtype=float) if present_q_cols else np.full(n_rows_mat, np.nan, dtype=float)
+            _sort_p_min = pd.to_numeric(matrix_perf_df[present_p_cols].min(axis=1, skipna=True), errors="coerce").to_numpy(dtype=float) if present_p_cols else np.full(n_rows_mat, np.nan, dtype=float)
+            _sort_q_tie = np.where(np.isfinite(_sort_q_min), _sort_q_min, _sort_p_min)
+            _sort_tier = np.array(
+                [tier_map.get(str(v), np.nan) for v in matrix_perf_df.get("evidence_tier_overall", pd.Series(["very_low"] * n_rows_mat))],
                 dtype=float,
             )
 
+            matrix_perf_df["_tier_sort"] = np.where(np.isfinite(_sort_tier), _sort_tier, np.inf)
+            matrix_perf_df["_p_sort"] = np.where(np.isfinite(_sort_p_min), _sort_p_min, np.inf)
+            matrix_perf_df["_q_sort"] = np.where(np.isfinite(_sort_q_tie), _sort_q_tie, np.inf)
+            matrix_perf_df = matrix_perf_df.sort_values(
+                by=["_tier_sort", "_p_sort", "_q_sort", "_target_label"],
+                ascending=[True, False, False, True],
+                kind="mergesort",
+            )
+            matrix_perf_df = matrix_perf_df.drop(columns=["_tier_sort", "_p_sort", "_q_sort"])
+
+            matrix_index = matrix_perf_df["_target_label"].astype(str).tolist()
+            n_rows_mat = len(matrix_perf_df)
+
+            # Recompute metric arrays from the sorted DataFrame so quality_df rows align.
+            present_q_cols = [c for c in q_cols if c in matrix_perf_df.columns]
+            present_p_cols = [c for c in p_cols if c in matrix_perf_df.columns]
+            q_min = pd.to_numeric(matrix_perf_df[present_q_cols].min(axis=1, skipna=True), errors="coerce").to_numpy(dtype=float) if present_q_cols else np.full(n_rows_mat, np.nan, dtype=float)
+            p_min = pd.to_numeric(matrix_perf_df[present_p_cols].min(axis=1, skipna=True), errors="coerce").to_numpy(dtype=float) if present_p_cols else np.full(n_rows_mat, np.nan, dtype=float)
+            tier_vals = np.array(
+                [tier_map.get(str(v), np.nan) for v in matrix_perf_df.get("evidence_tier_overall", pd.Series(["very_low"] * n_rows_mat))],
+                dtype=float,
+            )
+
+            def _col_values(name: str) -> np.ndarray:
+                if name in matrix_perf_df.columns:
+                    return pd.to_numeric(matrix_perf_df[name], errors="coerce").to_numpy(dtype=float)
+                return np.full(n_rows_mat, np.nan, dtype=float)
+
             quality_df = pd.DataFrame({
-                "Coefficient of Determination": _col_values("r2"),
+                "Test Sample Count": _col_values("n_eval_raw_segments"),
+                "R²": _col_values("r2"),
                 "nRMSE": _col_values("nrmse"),
                 "Prediction Interval Coverage Probability": _col_values("model_picp"),
                 "Normalized Mean Prediction Interval Width": _col_values("model_nmpiw"),
@@ -2439,7 +2508,6 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 "Best False Discovery Rate Adjusted q-value": q_min,
                 "Best p-value": p_min,
                 "Overall Evidence Tier": tier_vals,
-                "Independent Raw Segment Count": _col_values("n_eval_raw_segments"),
             }, index=matrix_index)
 
             # Fallback to p-values if q-values are unavailable.
@@ -2448,7 +2516,8 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             # Column-wise directional scaling for heatmap coloring only.
             higher_better = {
-                "Coefficient of Determination": True,
+                "Test Sample Count": True,
+                "R²": True,
                 "nRMSE": False,
                 "Prediction Interval Coverage Probability": True,
                 "Normalized Mean Prediction Interval Width": False,
@@ -2456,25 +2525,37 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 "Minimum 95% Lower Confidence Bound of Skill": True,
                 "Best False Discovery Rate Adjusted q-value": False,
                 "Overall Evidence Tier": True,
-                "Independent Raw Segment Count": True,
             }
             if "Best p-value" in quality_df.columns:
                 higher_better["Best p-value"] = False
 
-            heat_cols = [
-                "Coefficient of Determination",
+            non_gate_cols = [
+                "Test Sample Count",
+                "R²",
                 "nRMSE",
                 "Prediction Interval Coverage Probability",
                 "Normalized Mean Prediction Interval Width",
+            ]
+            gate_cols = [
                 "Minimum Probability of Positive Skill",
                 "Minimum 95% Lower Confidence Bound of Skill",
                 "Best False Discovery Rate Adjusted q-value",
-                "Independent Raw Segment Count",
                 "Overall Evidence Tier",
             ]
             if np.isfinite(quality_df["Best p-value"].to_numpy(dtype=float)).any():
-                heat_cols.insert(7, "Best p-value")
-            display_df = quality_df[heat_cols].copy()
+                gate_cols.insert(2, "Best p-value")
+
+            # Visual separator between descriptive metrics and gate-evaluated metrics.
+            quality_df[""] = np.nan
+            heat_cols = non_gate_cols + [""] + gate_cols
+            display_df = pd.concat(
+                [
+                    quality_df[non_gate_cols],
+                    quality_df[[""]],
+                    quality_df[gate_cols],
+                ],
+                axis=1,
+            ).copy()
 
             norm = display_df.copy()
             for c in norm.columns:
@@ -2495,7 +2576,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             annot = display_df.copy()
             for c in annot.columns:
-                if c in {"Tier", "RawN"}:
+                if c in {"Overall Evidence Tier", "Test Sample Count"}:
                     annot[c] = annot[c].map(lambda v: "" if not np.isfinite(v) else f"{int(round(v))}")
                 elif c in {"Best False Discovery Rate Adjusted q-value", "Best p-value"}:
                     annot[c] = annot[c].map(lambda v: "" if not np.isfinite(v) else f"{v:.3f}")
@@ -2509,13 +2590,25 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 cmap="RdYlGn",
                 vmin=0.0,
                 vmax=1.0,
-                cbar=True,
+                cbar=False,
                 linewidths=0.5,
                 linecolor="white",
                 annot=annot.values,
                 fmt="",
                 annot_kws={"fontsize": 8},
             )
+            if "" in display_df.columns:
+                sep_col = int(display_df.columns.get_loc(""))
+                ax_mat.add_patch(
+                    plt.Rectangle(
+                        (sep_col, 0),
+                        1,
+                        int(display_df.shape[0]),
+                        facecolor=ax_mat.get_facecolor(),
+                        edgecolor="none",
+                        zorder=3,
+                    )
+                )
             ax_mat.set_title("")
             ax_mat.set_xlabel("Metrics")
             ax_mat.set_ylabel("Dataset")
