@@ -83,6 +83,11 @@ _SHAPLEY_NAMESPACE = "Shapley_sweeps"
 _OPTIMIZER_DEFAULT_NAMESPACE = "feature_sweeps"
 _CONSENSUS_VERSION = 2
 _CONSENSUS_METHOD = "elite_trial_observed_candidate"
+_ELITE_REL_MARGIN = 0.03
+_ELITE_ABS_MARGIN = 0.0
+_ELITE_INCLUDE_ONE_SE = True
+_STAGE2_CVTUNE_DEFAULT_N_TRIALS = 50
+_STAGE2_CVTUNE_DEFAULT_RANDOM_START_TRIALS = 10
 
 
 class _TeeTextIO:
@@ -256,15 +261,52 @@ def _run_full_feature_cv_tuning(plan: optimizer_module.DatasetPlan) -> None:
     cast_y = (lambda v: int(round(v))) if model_kind == "classifier" else None
 
     print(f"[PIPELINE] Stage A CV tuning (full features): {base_cfg_path}")
-    train_module.run_xgb_cv_tuning_only(
+    best_params, summary = train_module.run_xgb_cv_tuning_only(
         config=cfg,
         train_samples=train_samples,
         model_kind=model_kind,
         metric_key=metric_key,
         cast_y=cast_y,
-        use_cache=True,
-        write_cache=True,
+        use_cache=False,
+        write_cache=False,
     )
+
+    stage_a_candidates = _extract_elite_trials(
+        summary or {},
+        rel_margin=_ELITE_REL_MARGIN,
+        abs_margin=_ELITE_ABS_MARGIN,
+        include_one_se=_ELITE_INCLUDE_ONE_SE,
+    )
+    stage_a_selected, stage_a_meta = _select_consensus_from_candidates(stage_a_candidates)
+
+    if stage_a_selected:
+        selected_params = stage_a_selected
+    else:
+        selected_params = best_params or {}
+        if selected_params:
+            stage_a_meta = {
+                "method": "fallback_run_xgb_cv_tuning_only_best",
+                "version": _CONSENSUS_VERSION,
+                "reason": "no_elite_candidates",
+            }
+
+    if selected_params:
+        summary = dict(summary or {})
+        summary["selection_method"] = stage_a_meta.get("method")
+        summary["selection_version"] = stage_a_meta.get("version")
+        summary["elite_rel_margin"] = float(_ELITE_REL_MARGIN)
+        summary["elite_abs_margin"] = float(_ELITE_ABS_MARGIN)
+        summary["elite_include_one_se"] = bool(_ELITE_INCLUDE_ONE_SE)
+        summary["elite_candidate_count"] = int(len(stage_a_candidates))
+        summary["parsed_trial_count"] = int(len((summary.get("trials") or [])))
+        summary["selected_params_source"] = "stability_consensus" if stage_a_selected else "best_params_fallback"
+
+        train_module._write_xgb_cv_tuning_cache(cache_path, hyper_cfg, selected_params, summary)
+        print(
+            "[PIPELINE] Stage A selected params via "
+            f"{summary['selected_params_source']} "
+            f"(elite={summary['elite_candidate_count']}, rel_margin={_ELITE_REL_MARGIN:.2%})."
+        )
 
 
 def _load_topk_shapley_subsets(plan: optimizer_module.DatasetPlan, row_count: int, top_k: int) -> list[tuple[str, ...]]:
@@ -352,9 +394,9 @@ def _compute_consensus_params(records: list[dict]) -> dict:
 def _extract_elite_trials(
     summary: dict,
     *,
-    rel_margin: float = 0.01,
+    rel_margin: float = _ELITE_REL_MARGIN,
     abs_margin: float = 0.0,
-    include_one_se: bool = True,
+    include_one_se: bool = _ELITE_INCLUDE_ONE_SE,
 ) -> list[dict]:
     """Return near-optimal trials from one CV run using run-local tolerance."""
     trials = summary.get("trials") if isinstance(summary, dict) else None
@@ -581,7 +623,12 @@ def _run_topk_subset_cv_tuning(
 
     if stage_a_payload is not None:
         stage_a_summary = stage_a_payload.get("cv_summary") if isinstance(stage_a_payload, dict) else None
-        stage_a_candidates = _extract_elite_trials(stage_a_summary or {})
+        stage_a_candidates = _extract_elite_trials(
+            stage_a_summary or {},
+            rel_margin=_ELITE_REL_MARGIN,
+            abs_margin=_ELITE_ABS_MARGIN,
+            include_one_se=_ELITE_INCLUDE_ONE_SE,
+        )
         if stage_a_candidates:
             norm = sum(max(0.0, c.get("candidate_weight_raw", 0.0)) for c in stage_a_candidates)
             norm = norm if norm > 0 else float(len(stage_a_candidates))
@@ -627,6 +674,23 @@ def _run_topk_subset_cv_tuning(
                 tmp_dir=tmp_dir,
                 forced_data_dir=plan.dataset_dir,
             )
+            # Stage 2-only CVtune defaults: keep subset tuning lightweight.
+            raw_cfg = _load_raw_config(cfg_path)
+            raw_hyper = raw_cfg.setdefault("hyperparameters", {})
+            raw_cv_cfg = raw_hyper.get("cv_tuning")
+            if isinstance(raw_cv_cfg, dict):
+                raw_cv_cfg.setdefault("n_trials", int(_STAGE2_CVTUNE_DEFAULT_N_TRIALS))
+                raw_cv_cfg.setdefault(
+                    "random_start_trials",
+                    int(_STAGE2_CVTUNE_DEFAULT_RANDOM_START_TRIALS),
+                )
+            else:
+                raw_hyper["cv_tuning"] = {
+                    "n_trials": int(_STAGE2_CVTUNE_DEFAULT_N_TRIALS),
+                    "random_start_trials": int(_STAGE2_CVTUNE_DEFAULT_RANDOM_START_TRIALS),
+                }
+            _write_raw_config(cfg_path, raw_cfg)
+
             cfg = train_module.load_config(str(cfg_path))
             cfg = train_module.merge_with_defaults(cfg, cfg.get("model_type", "xgb_regressor"))
             hyper_cfg = cfg.setdefault("hyperparameters", {})
@@ -634,12 +698,19 @@ def _run_topk_subset_cv_tuning(
             if isinstance(cv_cfg, dict):
                 cv_cfg["enabled"] = True
                 cv_cfg["artifact_dir"] = str(out_dir / f"subset_{feature_tag}")
+                cv_cfg.setdefault("n_trials", int(_STAGE2_CVTUNE_DEFAULT_N_TRIALS))
+                cv_cfg.setdefault(
+                    "random_start_trials",
+                    int(_STAGE2_CVTUNE_DEFAULT_RANDOM_START_TRIALS),
+                )
                 # Vary seed per subset to avoid identical trial sequences.
                 cv_cfg["seed"] = int(abs(hash(feature_tag)) % 10_000_000)
             else:
                 hyper_cfg["cv_tuning"] = {
                     "enabled": True,
                     "artifact_dir": str(out_dir / f"subset_{feature_tag}"),
+                    "n_trials": int(_STAGE2_CVTUNE_DEFAULT_N_TRIALS),
+                    "random_start_trials": int(_STAGE2_CVTUNE_DEFAULT_RANDOM_START_TRIALS),
                     "seed": int(abs(hash(feature_tag)) % 10_000_000),
                 }
 
@@ -658,7 +729,12 @@ def _run_topk_subset_cv_tuning(
                 write_cache=False,
             )
 
-            run_candidates = _extract_elite_trials(summary or {})
+            run_candidates = _extract_elite_trials(
+                summary or {},
+                rel_margin=_ELITE_REL_MARGIN,
+                abs_margin=_ELITE_ABS_MARGIN,
+                include_one_se=_ELITE_INCLUDE_ONE_SE,
+            )
             if run_candidates:
                 norm = sum(max(0.0, c.get("candidate_weight_raw", 0.0)) for c in run_candidates)
                 norm = norm if norm > 0 else float(len(run_candidates))
@@ -712,6 +788,9 @@ def _run_topk_subset_cv_tuning(
             "source": "stage_b_consensus",
             "consensus_method": consensus_meta.get("method"),
             "consensus_version": consensus_meta.get("version"),
+            "elite_rel_margin": float(_ELITE_REL_MARGIN),
+            "elite_abs_margin": float(_ELITE_ABS_MARGIN),
+            "elite_include_one_se": bool(_ELITE_INCLUDE_ONE_SE),
             "consensus_derivation_path": str(cvtune_dir / "xgb_cv_consensus_derivation.json"),
             "consensus_metadata_path": str(cvtune_dir / "xgb_cv_stage_b_metadata.json"),
         })

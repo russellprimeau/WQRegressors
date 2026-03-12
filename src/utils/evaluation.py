@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import torch
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score, accuracy_score, precision_score,
@@ -532,6 +533,22 @@ def visualizer(
     """
     sns.set_style("whitegrid")
 
+    n_sets = len(pred_target_pairs)
+    if labels is None:
+        labels = [f"Set {i+1}" for i in range(n_sets)]
+    elif len(labels) != n_sets:
+        raise ValueError("Length of labels must match number of result sets.")
+
+    if split_files_by_pair is None:
+        split_files_by_pair = [None] * n_sets
+    elif len(split_files_by_pair) != n_sets:
+        raise ValueError("Length of split_files_by_pair must match number of result sets.")
+
+    if collapse_error_points_by_pair is None:
+        collapse_error_points_by_pair = [False] * n_sets
+    elif len(collapse_error_points_by_pair) != n_sets:
+        raise ValueError("Length of collapse_error_points_by_pair must match number of result sets.")
+
     def _aligned_flat(preds, targets, limit=None):
         preds_flat = np.asarray(preds).reshape(-1)
         targets_flat = np.asarray(targets).reshape(-1)
@@ -603,6 +620,137 @@ def visualizer(
 
         return np.asarray(collapsed_errors, dtype=float)
 
+    def _marker_for_series(index):
+        # Keep marker assignment deterministic so model shapes stay stable across runs.
+        marker_cycle = ["o", "s", "^", "D", "v", "P", "X", "<", ">", "*"]
+        return marker_cycle[index % len(marker_cycle)]
+
+    def _scalarize_row_mean_finite(row_values):
+        arr = np.asarray(row_values, dtype=float).reshape(-1)
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return np.nan
+        return float(np.mean(finite))
+
+    def _strip_base_sample_id(sample_id):
+        name = Path(str(sample_id)).name if sample_id is not None else ""
+        if not name:
+            return ""
+        no_mc = re.sub(r"_mc_\d+(?=\.csv$)", "", name)
+        no_mc = re.sub(r"_mc_\d+$", "", Path(no_mc).stem)
+        return no_mc
+
+    def _resolve_sample_csv_path(split_entry):
+        if split_entry is None:
+            return None
+
+        entry = Path(str(split_entry))
+        candidates = []
+        if entry.is_absolute():
+            candidates.append(entry)
+
+        if directory is not None:
+            data_root = Path(directory)
+            candidates.append(data_root / entry)
+            candidates.append(data_root / "samples" / entry.name)
+            candidates.append(data_root / "mc_replicates" / entry.name)
+
+        for candidate in candidates:
+            try:
+                if candidate.exists() and candidate.is_file():
+                    return candidate
+            except Exception:
+                continue
+        return None
+
+    _series_label_cache = {}
+
+    def _extract_date_label_from_final_timestamp(base_id, split_entry):
+        key = str(split_entry) if split_entry is not None else ""
+        if key in _series_label_cache:
+            return _series_label_cache[key]
+
+        fallback = base_id if base_id else "unknown"
+        sample_csv = _resolve_sample_csv_path(split_entry)
+        if sample_csv is None:
+            _series_label_cache[key] = fallback
+            return fallback
+
+        try:
+            sample_df = pd.read_csv(sample_csv, usecols=["TIMESTAMP"])
+            if sample_df.empty:
+                _series_label_cache[key] = fallback
+                return fallback
+            ts = pd.to_datetime(sample_df["TIMESTAMP"], errors="coerce")
+            ts = ts.dropna()
+            if ts.empty:
+                _series_label_cache[key] = fallback
+                return fallback
+            label = str(ts.iloc[-1].date())
+            _series_label_cache[key] = label
+            return label
+        except Exception:
+            _series_label_cache[key] = fallback
+            return fallback
+
+    def _collect_prediction_values_by_series(preds, targets, split_files, row_limit=None, collapse_replicates=False):
+        pred_arr, target_arr, n_rows, n_cols = _aligned_matrix(preds, targets, row_limit=row_limit)
+        if n_rows <= 0 or n_cols <= 0:
+            return [], {}, {}, {}
+
+        sample_entries = list(split_files) if split_files else []
+        row_count = min(n_rows, len(sample_entries)) if sample_entries else n_rows
+        if row_count <= 0:
+            return [], {}, {}, {}
+
+        ordered_ids = []
+        seen_ids = set()
+        point_values = {}
+        target_values = {}
+        target_counts = {}
+        series_labels = {}
+
+        for row_idx in range(row_count):
+            split_entry = sample_entries[row_idx] if row_idx < len(sample_entries) else None
+            if split_entry is None:
+                base_id = f"row_{row_idx + 1}"
+            else:
+                base_id = _strip_base_sample_id(split_entry)
+                if not base_id:
+                    base_id = f"row_{row_idx + 1}"
+
+            pred_scalar = _scalarize_row_mean_finite(pred_arr[row_idx, :])
+            target_scalar = _scalarize_row_mean_finite(target_arr[row_idx, :])
+            if not np.isfinite(pred_scalar) or not np.isfinite(target_scalar):
+                continue
+
+            if base_id not in seen_ids:
+                seen_ids.add(base_id)
+                ordered_ids.append(base_id)
+                point_values[base_id] = []
+                target_values[base_id] = 0.0
+                target_counts[base_id] = 0
+                series_labels[base_id] = _extract_date_label_from_final_timestamp(base_id, split_entry)
+
+            point_values[base_id].append(float(pred_scalar))
+            target_values[base_id] += float(target_scalar)
+            target_counts[base_id] += 1
+
+        filtered_ids = []
+        for base_id in ordered_ids:
+            count = target_counts.get(base_id, 0)
+            if count <= 0:
+                continue
+            values = point_values.get(base_id, [])
+            if not values:
+                continue
+            if collapse_replicates:
+                point_values[base_id] = [float(np.mean(values))]
+            target_values[base_id] = float(target_values[base_id] / count)
+            filtered_ids.append(base_id)
+
+        return filtered_ids, point_values, target_values, series_labels
+
     # === Scatter plot of predictions vs actuals ===
     fig, ax = plt.subplots(figsize=(8, 8))
     colors = sns.color_palette("husl", len(pred_target_pairs))
@@ -619,17 +767,25 @@ def visualizer(
             continue
 
         mask = np.isfinite(preds) & np.isfinite(targets)
+        model_marker = _marker_for_series(i)
         # If sample_labels is provided, plot train/test with different symbology
         if sample_labels is not None and len(sample_labels) == len(preds):
-            for group, marker, color in [("train", "o", "#1f77b4"), ("test", "s", "#ff7f0e")]:
+            for group, color in [("train", "#1f77b4"), ("test", "#ff7f0e")]:
                 group_mask = (np.array(sample_labels) == group) & mask
                 if np.any(group_mask):
-                    ax.scatter(targets[group_mask], preds[group_mask], label=f"{label} ({group})", alpha=0.7, marker=marker, color=color)
+                    ax.scatter(
+                        targets[group_mask],
+                        preds[group_mask],
+                        label=f"{label} ({group})",
+                        alpha=0.7,
+                        marker=model_marker,
+                        color=color,
+                    )
                     min_val = min(min_val, np.nanmin(targets[group_mask]), np.nanmin(preds[group_mask]))
                     max_val = max(max_val, np.nanmax(targets[group_mask]), np.nanmax(preds[group_mask]))
         else:
             if mask.any():
-                ax.scatter(targets[mask], preds[mask], label=label, alpha=0.7, color=colors[i])
+                ax.scatter(targets[mask], preds[mask], label=label, alpha=0.7, color=colors[i], marker=model_marker)
                 min_val = min(min_val, np.nanmin(targets[mask]), np.nanmin(preds[mask]))
                 max_val = max(max_val, np.nanmax(targets[mask]), np.nanmax(preds[mask]))
         if mask.any():
@@ -673,6 +829,106 @@ def visualizer(
     plt.savefig(Path(directory, "forecasts", forecast_name, "predictions.png"))
     plt.close(fig)
 
+    # Prediction series by sample, preserving sample order and optional baseline replicate collapse.
+    series_order = []
+    series_index = {}
+    target_by_sample = {}
+    sample_label_map = {}
+    model_points = {}
+    plottable = False
+
+    for idx, ((preds, targets), label) in enumerate(zip(pred_target_pairs, labels)):
+        split_files = split_files_by_pair[idx]
+        collapse_replicates = bool(collapse_error_points_by_pair[idx])
+        ids, pred_points, target_points, sample_labels_map = _collect_prediction_values_by_series(
+            preds,
+            targets,
+            split_files,
+            row_limit=num_samples,
+            collapse_replicates=collapse_replicates,
+        )
+        if not ids:
+            continue
+
+        model_points[label] = pred_points
+        plottable = True
+
+        for base_id in ids:
+            if base_id not in series_index:
+                series_index[base_id] = len(series_order)
+                series_order.append(base_id)
+            if base_id not in target_by_sample:
+                target_by_sample[base_id] = float(target_points[base_id])
+            if base_id not in sample_label_map:
+                sample_label_map[base_id] = sample_labels_map.get(base_id, base_id)
+
+    if plottable and series_order:
+        fig_w = max(10.0, 0.5 * len(series_order) + 6.0)
+        fig, ax = plt.subplots(figsize=(fig_w, 6.5))
+
+        x_positions = np.arange(len(series_order), dtype=float)
+        for x, base_id in zip(x_positions, series_order):
+            target_val = target_by_sample.get(base_id)
+            if target_val is None or not np.isfinite(target_val):
+                continue
+            ax.hlines(
+                y=target_val,
+                xmin=x - 0.36,
+                xmax=x + 0.36,
+                color="red",
+                linewidth=4,
+                alpha=0.85,
+                zorder=1,
+            )
+
+        legend_handles = [Line2D([0], [0], color="red", linewidth=4, label="Target")]
+        for idx, label in enumerate(labels):
+            if label not in model_points:
+                continue
+            marker = _marker_for_series(idx)
+            color = colors[idx]
+            legend_handles.append(
+                Line2D([0], [0], marker=marker, linestyle="", markersize=7, color=color, label=label)
+            )
+
+            pred_points = model_points[label]
+            for base_id in series_order:
+                values = pred_points.get(base_id, [])
+                if not values:
+                    continue
+                x_center = float(series_index[base_id])
+                if len(values) > 1:
+                    jitter = np.linspace(-0.18, 0.18, num=len(values))
+                else:
+                    jitter = np.array([0.0])
+                x_vals = x_center + jitter
+                y_vals = np.asarray(values, dtype=float)
+                finite_mask = np.isfinite(y_vals)
+                if not finite_mask.any():
+                    continue
+                ax.scatter(
+                    x_vals[finite_mask],
+                    y_vals[finite_mask],
+                    marker=marker,
+                    color=color,
+                    alpha=0.85,
+                    s=40,
+                    zorder=2,
+                )
+
+        xtick_labels = [sample_label_map.get(base_id, base_id) for base_id in series_order]
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(xtick_labels, rotation=45, ha="right")
+        ax.set_xlabel("Sample")
+        ax.set_ylabel("Predicted Value")
+        ax.legend(handles=legend_handles)
+        ax.grid(True, axis="y", linestyle="--", alpha=0.5)
+        plt.tight_layout()
+        plt.savefig(Path(directory, "forecasts", forecast_name, "prediction_series.png"))
+        plt.close(fig)
+    else:
+        print("[WARN] Skipping prediction series plot: no finite per-sample values available.")
+
     # === Metrics summary figure ===
     if metrics:
         labels_m = [m[0] for m in metrics]
@@ -699,22 +955,6 @@ def visualizer(
         plt.tight_layout()
         plt.savefig(Path(directory, "forecasts", forecast_name, "metrics_summary.png"))
         plt.close(fig)
-
-    n_sets = len(pred_target_pairs)
-    if labels is None:
-        labels = [f"Set {i+1}" for i in range(n_sets)]
-    elif len(labels) != n_sets:
-        raise ValueError("Length of labels must match number of result sets.")
-
-    if split_files_by_pair is None:
-        split_files_by_pair = [None] * n_sets
-    elif len(split_files_by_pair) != n_sets:
-        raise ValueError("Length of split_files_by_pair must match number of result sets.")
-
-    if collapse_error_points_by_pair is None:
-        collapse_error_points_by_pair = [False] * n_sets
-    elif len(collapse_error_points_by_pair) != n_sets:
-        raise ValueError("Length of collapse_error_points_by_pair must match number of result sets.")
 
     # Prepare combined error data (supports different lengths per model)
     combined_frames = []

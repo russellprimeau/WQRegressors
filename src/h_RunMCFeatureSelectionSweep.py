@@ -285,6 +285,24 @@ class CandidateResult:
     target_dim: float
     source: str = "search"
     seeded_input_rank: int | None = None
+    training_stop_reason: str | None = None
+
+
+def _load_training_stop_reason(forecast_dir: Path) -> str | None:
+    """Load concise training stop reason from forecast-level summary artifact."""
+    summary_path = Path(forecast_dir) / "training_stop_summary.json"
+    if not summary_path.is_file():
+        return None
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        reason = payload.get("stop_reason_text")
+        if reason is not None:
+            reason = str(reason).strip()
+            return reason or None
+    except Exception as exc:
+        print(f"[WARN] Could not read training stop summary at {summary_path}: {exc}")
+    return None
 
 
 _MODEL_ID_ALIASES: dict[str, str] = {
@@ -915,6 +933,7 @@ def _evaluate_candidate(
         input_dim = float(model_row.get("input_dim", np.nan))
         target_dim = float(model_row.get("target_dim", np.nan))
         objective = _objective_from_metrics(r2=r2, drop_rate=drop_rate, lambda_drop=lambda_drop)
+        training_stop_reason = _load_training_stop_reason(eval_cfg.parent)
 
         return CandidateResult(
             dataset=dataset_dir.name,
@@ -934,6 +953,7 @@ def _evaluate_candidate(
             n_test_samples=n_test_samples,
             input_dim=input_dim,
             target_dim=target_dim,
+            training_stop_reason=training_stop_reason,
         )
     except Exception as exc:
         print(f"[ERROR] Exception in _evaluate_candidate for config: {surrogate_config_path}")
@@ -2570,6 +2590,7 @@ def _write_search_outputs(
                 "target_dim": item.target_dim,
                 "source": item.source,
                 "seeded_input_rank": item.seeded_input_rank,
+                "training_stop_reason": item.training_stop_reason,
                 "features": "|".join(item.features),
             }
         )

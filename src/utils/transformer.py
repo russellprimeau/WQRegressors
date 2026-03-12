@@ -40,7 +40,11 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
     val_corr_terms = []
     val_combined_losses = []
     best_val_combined = float('inf')
+    best_val_epoch = None
     patience_counter = 0
+    stop_reason_code = None
+    stop_reason_text = None
+    stop_epoch = None
 
     for epoch in range(num_epochs):
         model.train()
@@ -101,6 +105,13 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
 
         # Early stopping condition
         if loss_threshold is not None and avg_train_combined <= loss_threshold:
+            stop_reason_code = "train_combined_threshold_reached"
+            stop_epoch = int(epoch + 1)
+            stop_reason_text = (
+                "Early stopping: train_combined <= loss_threshold "
+                f"({avg_train_combined:.6g} <= {float(loss_threshold):.6g}) "
+                f"at epoch {stop_epoch}/{int(num_epochs)}."
+            )
             print(
                 f"Stopping early at epoch {epoch + 1} because combined loss reached "
                 f"{avg_train_combined:.6f}"
@@ -109,12 +120,29 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
 
         if avg_val_combined < best_val_combined:
             best_val_combined = avg_val_combined
+            best_val_epoch = int(epoch + 1)
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= patience:
+                stop_reason_code = "validation_combined_patience_exhausted"
+                stop_epoch = int(epoch + 1)
+                stop_reason_text = (
+                    "Early stopping: no decrease in best validation combined loss "
+                    f"for {int(patience)} consecutive epoch(s) "
+                    f"(best={best_val_combined:.6g} at epoch {int(best_val_epoch or 1)}) "
+                    f"at epoch {stop_epoch}/{int(num_epochs)}."
+                )
                 print("Stopping early due to validation combined-loss plateau.")
                 break
+
+    if stop_reason_code is None:
+        stop_reason_code = "max_epochs_exhausted"
+        stop_epoch = int(len(train_combined_losses))
+        stop_reason_text = (
+            "Scheduled stop: all configured epochs exhausted "
+            f"({int(num_epochs)}/{int(num_epochs)} epochs)."
+        )
 
     # Plot all objective terms for train/validation to inspect optimization behavior.
     filepath = Path(directory, "forecasts", forecast_name, model_subdir)
@@ -132,9 +160,38 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
     plt.title("Transformer MSE/Corr/Combined Terms vs. Epoch")
     plt.grid(True, ls="--")
     plt.legend()
+    plt.gcf().text(
+        0.01,
+        0.01,
+        stop_reason_text,
+        fontsize=8,
+        ha="left",
+        va="bottom",
+        bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "#666666", "boxstyle": "round,pad=0.2"},
+    )
     plt.tight_layout()
     plt.savefig(filepath / "loss_plot.png")
     plt.close()
+
+    return {
+        "model_type": "transformer",
+        "stop_reason_code": str(stop_reason_code),
+        "stop_reason_text": str(stop_reason_text),
+        "stop_epoch": int(stop_epoch),
+        "stopped_early": bool(str(stop_reason_code) != "max_epochs_exhausted"),
+        "configured": {
+            "num_epochs": int(num_epochs),
+            "loss_threshold": None if loss_threshold is None else float(loss_threshold),
+            "patience": int(patience),
+        },
+        "observed": {
+            "best_val_combined": None if not val_combined_losses else float(min(val_combined_losses)),
+            "best_val_epoch": None if best_val_epoch is None else int(best_val_epoch),
+            "final_train_combined": None if not train_combined_losses else float(train_combined_losses[-1]),
+            "final_val_combined": None if not val_combined_losses else float(val_combined_losses[-1]),
+            "epochs_executed": int(len(train_combined_losses)),
+        },
+    }
 
 
 class TimeSeriesLSTM(nn.Module):

@@ -188,7 +188,7 @@ DEFAULT_XGB_CLASSIFIER_CONFIG = {
 
 
 class _TrainLossPlateauCallback(xgb.callback.TrainingCallback):
-    """Stop training when train metric relative improvement plateaus."""
+    """Stop training when rolling-window net train metric improvement plateaus."""
 
     def __init__(self, metric_name: str, patience_rounds: int, min_relative_improvement: float, state: dict):
         self.metric_name = str(metric_name)
@@ -197,7 +197,7 @@ class _TrainLossPlateauCallback(xgb.callback.TrainingCallback):
         self.state = state
         self.best_metric = None
         self.best_iteration = None
-        self.no_improve_count = 0
+        self.metric_window = []
 
     def after_iteration(self, model, epoch: int, evals_log: dict) -> bool:
         eval0 = evals_log.get("validation_0", {})
@@ -215,6 +215,11 @@ class _TrainLossPlateauCallback(xgb.callback.TrainingCallback):
         if not math.isfinite(current):
             return False
 
+        self.metric_window.append(current)
+        max_window_len = self.patience_rounds + 1
+        if len(self.metric_window) > max_window_len:
+            self.metric_window.pop(0)
+
         if self.best_metric is None:
             self.best_metric = current
             self.best_iteration = int(epoch)
@@ -222,20 +227,27 @@ class _TrainLossPlateauCallback(xgb.callback.TrainingCallback):
             self.state["best_iteration"] = self.best_iteration
             return False
 
-        denom = max(abs(self.best_metric), 1e-12)
-        rel_improvement = (self.best_metric - current) / denom
-        improved = rel_improvement >= self.min_relative_improvement
-
-        if improved:
+        # Keep global best stats for diagnostics, independent of stop-rule semantics.
+        if current < self.best_metric:
             self.best_metric = current
             self.best_iteration = int(epoch)
-            self.no_improve_count = 0
             self.state["best_metric"] = self.best_metric
             self.state["best_iteration"] = self.best_iteration
+
+        # Need one full N-round window to evaluate net improvement from t-N to t.
+        if len(self.metric_window) < max_window_len:
             return False
 
-        self.no_improve_count += 1
-        if self.no_improve_count >= self.patience_rounds:
+        reference_metric = float(self.metric_window[0])
+        denom = max(abs(reference_metric), 1e-12)
+        rel_net_improvement = (reference_metric - current) / denom
+
+        self.state["rolling_reference_metric"] = reference_metric
+        self.state["rolling_current_metric"] = float(current)
+        self.state["rolling_relative_net_improvement"] = float(rel_net_improvement)
+
+        # Trigger when net improvement across the last N rounds is not greater than the threshold.
+        if rel_net_improvement <= self.min_relative_improvement:
             self.state["triggered"] = True
             self.state["trigger_iteration"] = int(epoch)
             self.state["stop_reason"] = "train_loss_plateau"
@@ -269,6 +281,10 @@ def _build_train_loss_plateau_callback(hyper_cfg: dict, metric_name: str):
         "trigger_iteration": None,
         "best_metric": None,
         "best_iteration": None,
+        "rolling_window_size": patience,
+        "rolling_reference_metric": None,
+        "rolling_current_metric": None,
+        "rolling_relative_net_improvement": None,
         "metric_name": str(metric_name),
         "patience_rounds": patience,
         "min_relative_improvement": min_rel,
@@ -615,6 +631,43 @@ def write_evaluation_config(config):
     print(f"Evaluation config saved to: {eval_config_path}")
 
 
+def _to_json_safe(value):
+    """Convert nested values to JSON-serializable primitives."""
+    if isinstance(value, dict):
+        return {str(k): _to_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating, float)):
+        fv = float(value)
+        return fv if math.isfinite(fv) else None
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    return value
+
+
+def _write_training_stop_summary(config: dict, summary: dict) -> Path:
+    """Persist a standardized training stop-reason artifact next to model files."""
+    data_cfg = config["data"]
+    save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
+    save_path.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "artifact_version": 1,
+        "model_type": str(config.get("model_type", "unknown")),
+        "model_name": str(config.get("model_name", "")),
+        "forecast_name": str(data_cfg.get("forecast_name", "")),
+    }
+    payload.update(_to_json_safe(summary or {}))
+    out_path = save_path / "training_stop_summary.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    print(f"Training stop summary saved to: {out_path}")
+    return out_path
+
+
 # ===========================================================================================
 # TRANSFORMER TRAINING
 # ===========================================================================================
@@ -668,7 +721,7 @@ def train_transformer_model(config, train_samples, test_samples):
     # Create and train model
     model = TimeSeriesTransformer(model_config).to(device)
     
-    train_transformer(
+    stop_summary = train_transformer(
         data_cfg["data_dir"],
         model,
         data_cfg["forecast_name"],
@@ -690,6 +743,8 @@ def train_transformer_model(config, train_samples, test_samples):
     os.makedirs(save_path, exist_ok=True)
     torch.save(model.state_dict(), save_path / "transformer_model.pt")
     print(f"\nModel saved to: {save_path / 'transformer_model.pt'}")
+    if isinstance(stop_summary, dict):
+        _write_training_stop_summary(config, stop_summary)
     write_evaluation_config(config)
 
 
@@ -795,6 +850,7 @@ def train_gp_regressor_model(config, train_samples, test_samples):
     output_val_rmse_history = []
     output_rmse = []
     models_state = []
+    output_stop_summaries = []
 
     save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
     os.makedirs(save_path, exist_ok=True)
@@ -850,6 +906,7 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         best_likelihood_state = None
         baseline_train_nll = None
         baseline_val_rmse = None
+        best_epoch = None
         early_stop_metric = str(hyper_cfg.get("early_stop_metric", "train_nll")).lower()
         early_stop_alpha = float(hyper_cfg.get("early_stop_alpha", 0.5))
         if early_stop_metric not in {"train_nll", "val_rmse", "mixed"}:
@@ -859,6 +916,13 @@ def train_gp_regressor_model(config, train_samples, test_samples):
             )
         if early_stop_metric == "mixed" and not (0.0 <= early_stop_alpha <= 1.0):
             raise ValueError("hyperparameters.early_stop_alpha must be in [0, 1]")
+
+        stop_reason_code = "max_epochs_exhausted"
+        stop_epoch = int(hyper_cfg["num_epochs"])
+        stop_reason_text = (
+            "Scheduled stop: all configured epochs exhausted "
+            f"({int(hyper_cfg['num_epochs'])}/{int(hyper_cfg['num_epochs'])} epochs)."
+        )
 
         for epoch in range(hyper_cfg["num_epochs"]):
             optimizer.zero_grad()
@@ -902,12 +966,28 @@ def train_gp_regressor_model(config, train_samples, test_samples):
                 best_loss = loss_value
                 best_val_rmse = val_rmse
                 patience_counter = 0
+                best_epoch = int(epoch + 1)
                 best_model_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
                 best_likelihood_state = {k: v.detach().cpu() for k, v in likelihood.state_dict().items()}
             else:
                 patience_counter += 1
                 if patience_counter >= hyper_cfg["patience"]:
+                    stop_reason_code = "patience_exhausted"
+                    stop_epoch = int(epoch + 1)
+                    stop_reason_text = (
+                        f"Early stopping: no improvement in early_stop_metric='{early_stop_metric}' "
+                        f"for {int(hyper_cfg['patience'])} epoch(s); "
+                        f"best_score={float(best_score):.6g} at epoch {int(best_epoch or 1)}, "
+                        f"stopped at epoch {stop_epoch}/{int(hyper_cfg['num_epochs'])}."
+                    )
                     break
+
+        if stop_reason_code == "max_epochs_exhausted":
+            stop_epoch = int(len(losses))
+            stop_reason_text = (
+                "Scheduled stop: all configured epochs exhausted "
+                f"({stop_epoch}/{int(hyper_cfg['num_epochs'])} epochs)."
+            )
 
         model.load_state_dict(best_model_state)
         likelihood.load_state_dict(best_likelihood_state)
@@ -934,7 +1014,24 @@ def train_gp_regressor_model(config, train_samples, test_samples):
             "train_nll": best_loss,
             "val_rmse_at_best": best_val_rmse,
             "test_rmse": rmse,
+            "stop_reason_code": stop_reason_code,
+            "stop_reason_text": stop_reason_text,
+            "stop_epoch": int(stop_epoch),
+            "best_epoch": None if best_epoch is None else int(best_epoch),
         })
+
+        output_stop_summaries.append(
+            {
+                "output_index": int(output_idx),
+                "stop_reason_code": stop_reason_code,
+                "stop_reason_text": stop_reason_text,
+                "stop_epoch": int(stop_epoch),
+                "best_epoch": None if best_epoch is None else int(best_epoch),
+                "early_stop_metric": early_stop_metric,
+                "patience": int(hyper_cfg["patience"]),
+                "num_epochs": int(hyper_cfg["num_epochs"]),
+            }
+        )
 
         print(f"Output {output_idx + 1}/{output_dim} - best train NLL: {best_loss:.6f}, test RMSE: {rmse:.6f}")
 
@@ -1015,10 +1112,59 @@ def train_gp_regressor_model(config, train_samples, test_samples):
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8)
     plt.title("GP Training Loss and Validation RMSE by Output")
+    if output_stop_summaries:
+        annotation_lines = []
+        for stop_item in output_stop_summaries[:4]:
+            annotation_lines.append(f"out{int(stop_item['output_index']) + 1}: {stop_item['stop_reason_text']}")
+        if len(output_stop_summaries) > 4:
+            annotation_lines.append(f"... and {len(output_stop_summaries) - 4} more output(s)")
+        fig.text(
+            0.01,
+            0.01,
+            "\n".join(annotation_lines),
+            fontsize=7,
+            ha="left",
+            va="bottom",
+            bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "#666666", "boxstyle": "round,pad=0.2"},
+        )
     plt.tight_layout()
     plt.savefig(save_path / "loss_plot.png")
     plt.close()
     print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")
+
+    unique_codes = {item["stop_reason_code"] for item in output_stop_summaries}
+    if len(unique_codes) == 1 and output_stop_summaries:
+        overall_code = next(iter(unique_codes))
+        if len(output_stop_summaries) == 1:
+            overall_text = output_stop_summaries[0]["stop_reason_text"]
+        else:
+            overall_text = (
+                f"Per-output stop condition identical ({overall_code}) "
+                f"for {len(output_stop_summaries)} output(s)."
+            )
+    else:
+        overall_code = "per_output_mixed"
+        overall_text = (
+            f"Per-output mixed stop conditions across {len(output_stop_summaries)} output(s)."
+            if output_stop_summaries
+            else "No output stop summaries captured."
+        )
+
+    _write_training_stop_summary(
+        config,
+        {
+            "stop_reason_code": overall_code,
+            "stop_reason_text": overall_text,
+            "stopped_early": bool(any(item["stop_reason_code"] != "max_epochs_exhausted" for item in output_stop_summaries)),
+            "per_output": output_stop_summaries,
+            "configured": {
+                "num_epochs": int(hyper_cfg["num_epochs"]),
+                "patience": int(hyper_cfg["patience"]),
+                "early_stop_metric": str(hyper_cfg.get("early_stop_metric", "train_nll")),
+                "early_stop_alpha": float(hyper_cfg.get("early_stop_alpha", 0.5)),
+            },
+        },
+    )
     write_evaluation_config(config)
 
 
@@ -1984,6 +2130,49 @@ def _train_xgb_model(
     results = model.evals_result()
     train_series = results.get("validation_0", {}).get(metric)
     val_series = results.get("validation_1", {}).get(metric)
+    executed_rounds = int(len(train_series)) if train_series else 0
+    best_iteration = getattr(model, "best_iteration", None)
+    configured_early_stopping_rounds = model_kwargs.get("early_stopping_rounds")
+    if (
+        configured_early_stopping_rounds is not None
+        and best_iteration is not None
+        and executed_rounds <= 0
+    ):
+        executed_rounds = int(best_iteration) + 1
+
+    if plateau_state and plateau_state.get("triggered"):
+        trigger_round = int(plateau_state.get("trigger_iteration", -1)) + 1
+        observed_rel_net = plateau_state.get("rolling_relative_net_improvement")
+        if observed_rel_net is None:
+            observed_rel_net = float("nan")
+        stop_reason_code = "train_loss_plateau"
+        stop_reason_text = (
+            "Early stopping: rolling-window net relative improvement in training "
+            f"{metric} over the last {int(plateau_state.get('patience_rounds', 0))} round(s) "
+            f"was {float(observed_rel_net):.6g}, which is not greater than "
+            f"{float(plateau_state.get('min_relative_improvement', 0.0)):.6g}; "
+            f"triggered at round {trigger_round}."
+        )
+    elif (
+        configured_early_stopping_rounds is not None
+        and best_iteration is not None
+        and executed_rounds > 0
+        and executed_rounds < int(hyper_cfg["n_estimators"])
+    ):
+        stop_reason_code = "validation_early_stopping"
+        stop_reason_text = (
+            f"Early stopping: no decrease in best validation {metric} for "
+            f"{int(configured_early_stopping_rounds)} round(s); "
+            f"best_iteration={int(best_iteration) + 1}, rounds_executed={executed_rounds}/{int(hyper_cfg['n_estimators'])}."
+        )
+    else:
+        stop_reason_code = "n_estimators_exhausted"
+        rounds_value = executed_rounds if executed_rounds > 0 else int(hyper_cfg["n_estimators"])
+        stop_reason_text = (
+            "Scheduled stop: all configured boosting rounds exhausted "
+            f"({rounds_value}/{int(hyper_cfg['n_estimators'])} rounds)."
+        )
+
     if train_series:
         epochs = len(train_series)
         plt.figure(figsize=(8, 5))
@@ -2011,12 +2200,46 @@ def _train_xgb_model(
         plt.grid(True, which="both", ls="--")
         plt.title('Training vs Validation Loss' if val_series else 'Training Loss')
         plt.legend()
+        plt.gcf().text(
+            0.01,
+            0.01,
+            stop_reason_text,
+            fontsize=8,
+            ha="left",
+            va="bottom",
+            bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "#666666", "boxstyle": "round,pad=0.2"},
+        )
         plt.savefig(save_path / "loss_plot.png")
         plt.close()
         print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")
     else:
         print("[WARN] Training plot skipped: no evaluation history found.")
+
+    _write_training_stop_summary(
+        config,
+        {
+            "stop_reason_code": stop_reason_code,
+            "stop_reason_text": stop_reason_text,
+            "stopped_early": bool(stop_reason_code != "n_estimators_exhausted"),
+            "configured": {
+                "n_estimators": int(hyper_cfg["n_estimators"]),
+                "early_stopping_rounds": (
+                    None if configured_early_stopping_rounds is None else int(configured_early_stopping_rounds)
+                ),
+                "metric": str(metric),
+            },
+            "observed": {
+                "best_iteration": None if best_iteration is None else int(best_iteration) + 1,
+                "executed_rounds": int(executed_rounds),
+                "plateau_state": plateau_state,
+            },
+        },
+    )
     write_evaluation_config(config)
+    return {
+        "stop_reason_code": stop_reason_code,
+        "stop_reason_text": stop_reason_text,
+    }
 
 
 def _train_xgb_model_cv_tuned(
@@ -2036,6 +2259,7 @@ def _train_xgb_model_cv_tuned(
     cache_path = _resolve_cv_cache_path(config)
     best_params = {}
     summary = {"enabled": False}
+    tuning_ran = False
     if cache_path.exists():
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
