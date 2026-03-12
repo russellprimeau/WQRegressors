@@ -881,6 +881,14 @@ def _safe_series_colors(n: int) -> list:
     return (base * repeats)[:n]
 
 
+def _norm_surface_sensor_key(s: str) -> str:
+    """Normalize a surface sensor name to a canonical key for matching.
+    Handles µ/micro variants, unicode punctuation, and whitespace.
+    """
+    s = str(s).lower().replace("\u00b5", "micro").replace("\u03bc", "micro")
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
 def _load_surface_offset_uncertainty_specs(repo_root: Path) -> dict:
     """
     Build per-sensor uncertainty specs for Surface plotting from offset distributions.
@@ -964,6 +972,34 @@ def _load_surface_offset_uncertainty_specs(repo_root: Path) -> dict:
     return specs
 
 
+def _load_surface_calibration_times(repo_root: Path) -> dict:
+    """
+    Load per-sensor calibration end times from per-sensor summary CSVs under
+    data/output/calibration/summaries/*.csv.
+    Returns mapping: normalized_sensor_name -> sorted list of pd.Timestamp.
+    """
+    summaries_root = repo_root / "data" / "output" / "calibration" / "summaries"
+    if not summaries_root.exists():
+        return {}
+    result = {}
+    for csv_path in summaries_root.glob("*.csv"):
+        sensor_key = _norm_surface_sensor_key(csv_path.stem)
+        if not sensor_key:
+            continue
+        try:
+            cal_df = pd.read_csv(csv_path, low_memory=False)
+            if "Calibration End Time" not in cal_df.columns:
+                continue
+            times = pd.to_datetime(cal_df["Calibration End Time"], errors="coerce").dropna()
+            if times.empty:
+                continue
+            result[sensor_key] = sorted(times.tolist())
+        except Exception:
+            continue
+    print(f"[CALIBRATION] Loaded calibration times for {len(result)} sensors.")
+    return result
+
+
 def write_category_timeseries_columns(repo_root: Path) -> None:
     """
     Write one figure per category with a single column of subplots (one subplot per feature).
@@ -1000,6 +1036,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
 
     all_cols_by_norm = {_norm_col(c): c for c in all_cols}
     surface_uncertainty_specs = _load_surface_offset_uncertainty_specs(repo_root)
+    surface_calibration_times = _load_surface_calibration_times(repo_root)
     limits_records = load_limits_records(limits_csv)
     all_limit_specs = map_limits_to_columns(all_cols, limits_records)
 
@@ -1320,6 +1357,16 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
             palette = _safe_series_colors(n_rows)
             overlay_spans = []
 
+            # --- Legend presence tracking ---
+            legend_presence = {"inside": False, "beyond": False, "train": False, "test": False}
+            overlay_spans = []
+            # Determine overlay status for this variant
+            with_overlay = False
+            if figure_name in {"Target", "Target_diff"} and variant_suffix == "timeseries_overlay":
+                with_overlay = True
+            # For Target_diff overlay normalization variant
+            if figure_name == "Target_diff" and variant_suffix == "timeseries_overlay_norm01":
+                with_overlay = True
             for i, (ax, col, label) in enumerate(zip(axes, cols, wrapped_labels)):
                 series = pd.to_numeric(df[col], errors="coerce")
                 series_color = palette[i]
@@ -1343,11 +1390,13 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                                 limit_exceedance_mask(target_series, upper=upper_limit, lower=lower_limit),
                                 index=series.index,
                             )
-
                         valid_mask = series.notna()
                         normal_mask = valid_mask & (~exceed_mask.reindex(series.index, fill_value=False))
                         exceed_plot_mask = valid_mask & exceed_mask.reindex(series.index, fill_value=False)
-
+                        if normal_mask.sum() > 0:
+                            legend_presence["inside"] = True
+                        if exceed_plot_mask.sum() > 0:
+                            legend_presence["beyond"] = True
                         ax.plot(
                             series.index[normal_mask],
                             series.values[normal_mask],
@@ -1369,6 +1418,9 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                             color="#ff0000",
                         )
                     else:
+                        valid_mask = series.notna()
+                        if valid_mask.sum() > 0:
+                            legend_presence["inside"] = True
                         ax.plot(
                             series.index,
                             series.values,
@@ -1410,8 +1462,6 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                             else:
                                 y_low = min(y_low, lower_limit)
                                 y_high = max(y_high, lower_limit)
-
-                    # Ensure threshold (if present) is always in-frame and add clear margin.
                     if y_low is not None and y_high is not None:
                         y_span = y_high - y_low
                         if y_span <= 0:
@@ -1437,23 +1487,41 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                                 f"[UNCERTAINTY] Surface '{base_surface_name}': mu={mu:.6g}, sigma={sigma:.6g}, "
                                 f"2sigma={2.0 * sigma:.6g}, center_span={center_span:.6g}, rel_2sigma={rel_2sigma:.6g}"
                             )
-                            ax.fill_between(
-                                broken.index,
-                                center - (2.0 * sigma),
-                                center + (2.0 * sigma),
-                                color=series_color,
-                                alpha=0.24,
-                                linewidth=0.0,
-                                zorder=0.6,
-                            )
-                            ax.fill_between(
+                            ax.plot(
                                 broken.index,
                                 center - sigma,
-                                center + sigma,
+                                linestyle="--",
                                 color=series_color,
-                                alpha=0.34,
-                                linewidth=0.0,
-                                zorder=0.7,
+                                linewidth=0.8,
+                                alpha=0.7,
+                                zorder=1.5,
+                            )
+                            ax.plot(
+                                broken.index,
+                                center + sigma,
+                                linestyle="--",
+                                color=series_color,
+                                linewidth=0.8,
+                                alpha=0.7,
+                                zorder=1.5,
+                            )
+                            ax.plot(
+                                broken.index,
+                                center - 2.0 * sigma,
+                                linestyle=":",
+                                color=series_color,
+                                linewidth=0.6,
+                                alpha=0.55,
+                                zorder=1.4,
+                            )
+                            ax.plot(
+                                broken.index,
+                                center + 2.0 * sigma,
+                                linestyle=":",
+                                color=series_color,
+                                linewidth=0.6,
+                                alpha=0.55,
+                                zorder=1.4,
                             )
                         else:
                             print(f"[UNCERTAINTY] Surface '{base_surface_name}': no matching uncertainty spec found.")
@@ -1466,7 +1534,18 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                         alpha=0.85,
                         zorder=1.4,
                     )
-
+                    if figure_name == "Surface":
+                        base_surface_name = col[len("Pfl - "):] if col.startswith("Pfl - ") else col
+                        cal_key = _norm_surface_sensor_key(base_surface_name)
+                        for cal_ts in surface_calibration_times.get(cal_key, []):
+                            if start_date <= cal_ts <= end_date:
+                                ax.axvline(
+                                    x=cal_ts,
+                                    color="#e31a1c",
+                                    linewidth=0.9,
+                                    linestyle="--",
+                                    zorder=2.5,
+                                )
                 span_info = None
                 if figure_name in {"Target", "Target_diff"}:
                     valid_idx = np.where(series.notna().to_numpy() & (np.arange(len(series)) >= first_valid_idx))[0]
@@ -1484,8 +1563,11 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                             second_start = series.index[valid_idx[split_cut]] - pd.Timedelta(minutes=30)
                             second_end = series.index[valid_idx[-1]] + pd.Timedelta(minutes=30)
                         span_info = (first_start, first_end, second_start, second_end)
+                        if with_overlay:
+                            legend_presence["train"] = True
+                            if second_start is not None and second_end is not None:
+                                legend_presence["test"] = True
                 overlay_spans.append(span_info)
-
                 ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=y_label_font_size, labelpad=y_label_pad)
                 ax.grid(axis="y", linestyle="--", alpha=0.25, linewidth=0.4)
                 ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=3))
@@ -1501,11 +1583,8 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                 ax.tick_params(axis="y", labelsize=y_value_font_size)
                 ax.tick_params(axis="x", labelsize=x_label_font_size)
 
-            # Use absolute-inch margins so short figures get enough label room
-            # while taller figures avoid excessive whitespace.
-            shared_top_margin = max(0.86, min(0.995, 1.0 - (top_margin_in / fig_h)))
-            shared_bottom_margin = max(0.08, min(0.30, bottom_margin_in / fig_h))
-
+            shared_top_margin = max(0.86, min(0.995, 1.0 - (top_margin_in / fig_h)));
+            shared_bottom_margin = max(0.08, min(0.30, bottom_margin_in / fig_h));
             fig.subplots_adjust(
                 left=shared_left_margin,
                 right=shared_right_margin,
@@ -1513,6 +1592,73 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                 bottom=shared_bottom_margin,
                 hspace=shared_hspace,
             )
+            # --- Legend logic for overlays ---
+            # Remove legend from Target_timeseries_overlay.png
+            if figure_name == "Target" and variant_suffix == "timeseries_overlay":
+                pass  # No legend
+            # Always show overlay legend for Target_diff overlay variants
+            elif figure_name == "Target_diff" and variant_suffix in {"timeseries_overlay", "timeseries_overlay_norm01"}:
+                legend_handles = [
+                    plt.Line2D([0], [0], marker="o", color="black", markerfacecolor="black", markeredgecolor="black", markersize=7, linestyle="", label="Measurement inside limits"),
+                    plt.Line2D([0], [0], marker="x", color="red", markeredgecolor="red", markersize=8, linestyle="", label="Measurement beyond limits"),
+                    plt.Rectangle((0,0),1,1, color="#66bb66", alpha=0.24, label="Training set"),
+                    plt.Rectangle((0,0),1,1, color="#f4a3c2", alpha=0.24, label="Test set"),
+                ]
+                legend_labels = [
+                    "Measurement inside limits",
+                    "Measurement beyond limits",
+                    "Training set",
+                    "Test set",
+                ]
+                fig.legend(
+                    handles=legend_handles,
+                    labels=legend_labels,
+                    loc="upper center",
+                    bbox_to_anchor=(0.5, 1.04),
+                    ncol=len(legend_handles),
+                    framealpha=0.85,
+                    fontsize=font_size+1,
+                    borderaxespad=0.18,
+                )
+            # Conditional legend for other Target/Target_diff variants
+            elif figure_name in {"Target", "Target_diff"}:
+                legend_handles = []
+                legend_labels = []
+                if legend_presence["inside"]:
+                    legend_handles.append(plt.Line2D([0], [0], marker="o", color="black", markerfacecolor="black", markeredgecolor="black", markersize=7, linestyle="", label="Measurement inside limits"))
+                    legend_labels.append("Measurement inside limits")
+                if legend_presence["beyond"]:
+                    legend_handles.append(plt.Line2D([0], [0], marker="x", color="red", markeredgecolor="red", markersize=8, linestyle="", label="Measurement beyond limits"))
+                    legend_labels.append("Measurement beyond limits")
+                if legend_handles:
+                    fig.legend(
+                        handles=legend_handles,
+                        labels=legend_labels,
+                        loc="upper center",
+                        bbox_to_anchor=(0.5, 1.04),
+                        ncol=len(legend_handles),
+                        framealpha=0.85,
+                        fontsize=font_size+1,
+                        borderaxespad=0.18,
+                    )
+            elif figure_name == "Surface":
+                calib_handle = plt.Line2D([0], [0], color="#e31a1c", linewidth=1.0, linestyle="--", label="Calibration")
+                if "uncertainty" in variant_suffix:
+                    measured_handle = plt.Line2D([0], [0], color="black", linewidth=1.4, linestyle="-", label="Measured value")
+                    sigma1_handle = plt.Line2D([0], [0], color="black", linewidth=0.8, linestyle="--", label="±1σ boundary")
+                    sigma2_handle = plt.Line2D([0], [0], color="black", linewidth=0.6, linestyle=":", label="±2σ boundary")
+                    legend_handles = [measured_handle, sigma1_handle, sigma2_handle, calib_handle]
+                else:
+                    legend_handles = [calib_handle]
+                fig.legend(
+                    handles=legend_handles,
+                    loc="upper center",
+                    bbox_to_anchor=(0.5, 1.03),
+                    ncol=len(legend_handles),
+                    framealpha=0.85,
+                    fontsize=font_size,
+                    borderaxespad=0.12,
+                )
             out_path = out_dir / f"{figure_name}_{variant_suffix}.png"
             fig.savefig(out_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
             if figure_name in {"Target", "Target_diff"} and variant_suffix == "timeseries":
@@ -1547,6 +1693,94 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                         )
                 overlay_out_path = out_dir / f"{figure_name}_timeseries_overlay.png"
                 fig.savefig(overlay_out_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
+                # --- Add normalized overlay for Target_diff ---
+                if figure_name == "Target_diff":
+                    # Min-max normalize each Target_diff column to [0,1]
+                    norm_df = df.copy()
+                    for col in cols:
+                        series = pd.to_numeric(df[col], errors="coerce")
+                        col_min = series.min()
+                        col_max = series.max()
+                        if pd.isna(col_min) or pd.isna(col_max) or col_max == col_min:
+                            norm_df[col] = 0.5
+                        else:
+                            norm_df[col] = (series - col_min) / (col_max - col_min)
+                    fig_norm, axes_norm = plt.subplots(
+                        len(cols), 1, sharex=True, figsize=(fig_width, fig_h), gridspec_kw={"hspace": shared_hspace}
+                    )
+                    if len(cols) == 1:
+                        axes_norm = [axes_norm]
+                    palette_norm = _safe_series_colors(len(cols))
+                    for i, (ax, col, label) in enumerate(zip(axes_norm, cols, wrapped_labels)):
+                        # Compute normalization
+                        series_raw = pd.to_numeric(df[col], errors="coerce")
+                        col_min = series_raw.min()
+                        col_max = series_raw.max()
+                        if pd.isna(col_min) or pd.isna(col_max) or col_max == col_min:
+                            series_norm = pd.Series(0.5, index=series_raw.index)
+                        else:
+                            series_norm = ((series_raw - col_min) / (col_max - col_min))
+                        series_color = palette_norm[i]
+                        valid_mask = series_norm.notna()
+                        # Limit checking
+                        base_target_col = col[:-4] if col.endswith("_res") else col
+                        target_col_match = all_cols_by_norm.get(_norm_col(base_target_col))
+                        exceed_mask = pd.Series(False, index=series_norm.index)
+                        if target_col_match in all_limit_specs:
+                            target_series = pd.to_numeric(df[target_col_match], errors="coerce")
+                            limit_spec = all_limit_specs.get(target_col_match)
+                            upper_limit, lower_limit = _limit_bounds(limit_spec)
+                            exceed_mask = pd.Series(
+                                limit_exceedance_mask(target_series, upper=upper_limit, lower=lower_limit),
+                                index=series_norm.index,
+                            )
+                        normal_mask = valid_mask & (~exceed_mask.reindex(series_norm.index, fill_value=False))
+                        exceed_plot_mask = valid_mask & exceed_mask.reindex(series_norm.index, fill_value=False)
+                        # Plot normal values
+                        ax.plot(
+                            series_norm.index[normal_mask],
+                            series_norm.values[normal_mask],
+                            linestyle="", marker="o", markersize=4.5, color=series_color,
+                            markeredgecolor="black", markeredgewidth=0.35, alpha=0.95,
+                        )
+                        # Plot out-of-limit values as red 'x'
+                        ax.plot(
+                            series_norm.index[exceed_plot_mask],
+                            series_norm.values[exceed_plot_mask],
+                            linestyle="", marker="x", markersize=4.0, markeredgewidth=0.9, color="#ff0000",
+                        )
+                        ax.set_ylim(-0.05, 1.05)
+                        ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=y_label_font_size, labelpad=y_label_pad)
+                        ax.yaxis.set_major_locator(mticker.FixedLocator([0, 0.5, 1]))
+                        ax.grid(axis="y", linestyle="--", alpha=0.25, linewidth=0.4)
+                        if i < len(cols) - 1:
+                            ax.tick_params(axis="x", which="both", labelbottom=False)
+                    axes_norm[-1].set_xticks(quarter_ticks)
+                    axes_norm[-1].set_xticklabels([dt.strftime("%Y-%m-%d") for dt in quarter_ticks], rotation=25, ha="right", fontsize=x_label_font_size)
+                    axes_norm[-1].set_xlim(start_date, end_date)
+                    for ax in axes_norm:
+                        ax.tick_params(axis="y", labelsize=y_value_font_size)
+                        ax.tick_params(axis="x", labelsize=x_label_font_size)
+                    fig_norm.subplots_adjust(
+                        left=shared_left_margin, right=shared_right_margin, top=shared_top_margin,
+                        bottom=shared_bottom_margin, hspace=shared_hspace
+                    )
+                    # Overlay spans (same as original)
+                    for ax, span_info in zip(axes_norm, overlay_spans):
+                        if span_info is None:
+                            continue
+                        first_start, first_end, second_start, second_end = span_info
+                        ax.axvspan(
+                            first_start, first_end, ymin=0.03, ymax=0.97, color="#66bb66", alpha=0.24, zorder=0.3
+                        )
+                        if second_start is not None and second_end is not None:
+                            ax.axvspan(
+                                second_start, second_end, ymin=0.03, ymax=0.97, color="#f4a3c2", alpha=0.24, zorder=0.3
+                            )
+                    overlay_norm_out_path = out_dir / "Target_diff_timeseries_overlay_norm01.png"
+                    fig_norm.savefig(overlay_norm_out_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
+                    plt.close(fig_norm)
+                    print(f"Wrote chart to: {overlay_norm_out_path}")
             plt.close(fig)
             print(f"Wrote chart to: {out_path}")
             if figure_name in {"Target", "Target_diff"} and variant_suffix == "timeseries":

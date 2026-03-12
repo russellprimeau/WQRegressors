@@ -7,6 +7,21 @@ import torch.optim as optim
 from torch.utils.data import Dataset
 
 
+def _compact_stop_reason_for_plot(stop_reason_text: str) -> str:
+    """Shorten stop annotations for plotting without dropping numeric details."""
+    compact_text = " ".join(str(stop_reason_text).split())
+    replacements = (
+        ("Early stopping:", "Early stop:"),
+        ("Scheduled stop:", "Scheduled:"),
+        ("all configured epochs exhausted", "epochs exhausted"),
+        ("round(s)", "rounds"),
+        ("epoch(s)", "epochs"),
+    )
+    for old, new in replacements:
+        compact_text = compact_text.replace(old, new)
+    return compact_text
+
+
 def _batch_pearson_corr(y_pred, y_true, eps=1e-8, clip=True):
     """Compute mean Pearson correlation across flattened output dimensions."""
     pred = y_pred.reshape(y_pred.shape[0], -1)
@@ -157,19 +172,18 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
     plt.plot(x_vals, val_corr_terms, marker='s', linestyle=':', label='Val Corr')
     plt.xlabel("Epoch")
     plt.ylabel("Value")
-    plt.title("Transformer MSE/Corr/Combined Terms vs. Epoch")
     plt.grid(True, ls="--")
     plt.legend()
     plt.gcf().text(
         0.01,
-        0.01,
-        stop_reason_text,
+        0.99,
+        _compact_stop_reason_for_plot(stop_reason_text),
         fontsize=8,
         ha="left",
-        va="bottom",
-        bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "#666666", "boxstyle": "round,pad=0.2"},
+        va="top",
+        bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "#666666", "boxstyle": "round,pad=0.15"},
     )
-    plt.tight_layout()
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.9))
     plt.savefig(filepath / "loss_plot.png")
     plt.close()
 

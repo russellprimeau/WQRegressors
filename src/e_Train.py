@@ -84,6 +84,22 @@ NORMALIZATION_OUTPUT_PATH = (
 _XGB_GPU_CPU_INPUT_WARNING_EMITTED = False
 
 
+def _compact_stop_reason_for_plot(stop_reason_text: str) -> str:
+    """Shorten stop annotations for plotting without dropping numeric details."""
+    compact_text = " ".join(str(stop_reason_text).split())
+    replacements = (
+        ("Early stopping:", "Early stop:"),
+        ("Scheduled stop:", "Scheduled:"),
+        ("all configured epochs exhausted", "epochs exhausted"),
+        ("all configured boosting rounds exhausted", "rounds exhausted"),
+        ("round(s)", "rounds"),
+        ("epoch(s)", "epochs"),
+    )
+    for old, new in replacements:
+        compact_text = compact_text.replace(old, new)
+    return compact_text
+
+
 # ===========================================================================================
 # DEFAULT CONFIGURATIONS
 # ===========================================================================================
@@ -126,6 +142,14 @@ DEFAULT_XGB_CV_TUNING_REGRESSOR = {
     "use_early_stopping": False,
     "early_stopping_rounds": None,
     "verbose": False,
+    # Optional scalarized objective for regressors.
+    # Preferred: set metric to "rmse_r2" (or "rmse-r2") to enable score = rmse * (1 - r2).
+    # Legacy: scalarize_rmse_r2=True with metric=rmse.
+    "scalarize_rmse_r2": False,
+    # Optional guardrail to avoid degenerate underfit trials.
+    # When set, mean CV score is penalized if mean_r2 < min_r2.
+    "min_r2": None,
+    "r2_penalty": 10.0,
     "param_space": {
         "n_estimators": {"low": 200, "high": 1600, "type": "int"},
         "max_depth": {"low": 2, "high": 9, "type": "int"},
@@ -1111,23 +1135,25 @@ def train_gp_regressor_model(config, train_samples, test_samples):
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8)
-    plt.title("GP Training Loss and Validation RMSE by Output")
     if output_stop_summaries:
         annotation_lines = []
         for stop_item in output_stop_summaries[:4]:
-            annotation_lines.append(f"out{int(stop_item['output_index']) + 1}: {stop_item['stop_reason_text']}")
+            compact_reason = _compact_stop_reason_for_plot(stop_item["stop_reason_text"])
+            annotation_lines.append(
+                f"out{int(stop_item['output_index']) + 1} [{stop_item['stop_reason_code']}]: {compact_reason}"
+            )
         if len(output_stop_summaries) > 4:
             annotation_lines.append(f"... and {len(output_stop_summaries) - 4} more output(s)")
         fig.text(
             0.01,
-            0.01,
+            0.99,
             "\n".join(annotation_lines),
-            fontsize=7,
+            fontsize=6.5,
             ha="left",
-            va="bottom",
-            bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "#666666", "boxstyle": "round,pad=0.2"},
+            va="top",
+            bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "#666666", "boxstyle": "round,pad=0.15"},
         )
-    plt.tight_layout()
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.9))
     plt.savefig(save_path / "loss_plot.png")
     plt.close()
     print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")
@@ -1417,6 +1443,19 @@ def _binary_logloss(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     return float(-np.mean(y * np.log(probs) + (1 - y) * np.log(1 - probs)))
 
 
+def _r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y = np.asarray(y_true, dtype=float)
+    pred = np.asarray(y_pred, dtype=float)
+    if y.size == 0:
+        return float("nan")
+    y_mean = float(np.mean(y))
+    ss_tot = float(np.sum((y - y_mean) ** 2))
+    ss_res = float(np.sum((y - pred) ** 2))
+    if not np.isfinite(ss_tot) or ss_tot <= 0:
+        return float("nan")
+    return float(1.0 - (ss_res / ss_tot))
+
+
 def _xgb_cv_fold_score(
     model_kind: str,
     model_kwargs: dict,
@@ -1427,7 +1466,7 @@ def _xgb_cv_fold_score(
     metric: str,
     use_early_stopping: bool,
     early_stopping_rounds: int | None,
-) -> float:
+) -> tuple[float, float | None]:
     global _XGB_GPU_CPU_INPUT_WARNING_EMITTED
 
     X_train = X[train_idx]
@@ -1478,6 +1517,7 @@ def _xgb_cv_fold_score(
                 _XGB_GPU_CPU_INPUT_WARNING_EMITTED = True
             probs = model.predict_proba(X_val)[:, 1]
         score = _binary_logloss(y_val, probs)
+        r2 = None
     else:
         if use_gpu_arrays:
             raw_preds = model.get_booster().inplace_predict(X_val_fit, validate_features=False)
@@ -1491,8 +1531,9 @@ def _xgb_cv_fold_score(
                 _XGB_GPU_CPU_INPUT_WARNING_EMITTED = True
             preds = model.predict(X_val)
         score = float(np.sqrt(np.mean(np.square(preds - y_val))))
+        r2 = _r2_score(y_val, preds)
 
-    return score
+    return score, r2
 
 
 def _xgb_tune_hyperparameters_cv(
@@ -1587,9 +1628,22 @@ def _xgb_tune_hyperparameters_cv(
     if not use_early_stopping:
         base_kwargs["early_stopping_rounds"] = None
 
-    metric = str(cv_cfg.get("metric", "rmse")).lower()
+    metric_raw = str(cv_cfg.get("metric", "rmse")).lower()
+    scalarized_metric_aliases = {"rmse_r2", "rmse-r2", "rmse*r2", "rmse_r2_scalar"}
+    use_scalarized_rmse_r2 = bool(
+        model_kind == "regressor"
+        and (
+            metric_raw in scalarized_metric_aliases
+            or (metric_raw == "rmse" and cv_cfg.get("scalarize_rmse_r2", False))
+        )
+    )
+    metric = "rmse" if metric_raw in scalarized_metric_aliases else metric_raw
     verbose = bool(cv_cfg.get("verbose", False))
     search_method = str(cv_cfg.get("search_method", "random")).lower()
+    r2_min = cv_cfg.get("min_r2", cv_cfg.get("r2_guardrail_min"))
+    r2_penalty = cv_cfg.get("r2_penalty")
+    if r2_penalty is None:
+        r2_penalty = 10.0 if r2_min is not None else 0.0
     trial_results: list[dict] = []
     best_score = float("inf")
     best_params: dict = {}
@@ -1624,6 +1678,7 @@ def _xgb_tune_hyperparameters_cv(
                     trial_kwargs["n_jobs"] = 1
 
                 fold_scores: list[float] = []
+                fold_r2: list[float] = []
                 if executor is not None:
                     futures = []
                     for fold_idx in range(len(folds)):
@@ -1647,7 +1702,10 @@ def _xgb_tune_hyperparameters_cv(
                             )
                         )
                     for future in as_completed(futures):
-                        fold_scores.append(float(future.result()))
+                        score, r2 = future.result()
+                        fold_scores.append(float(score))
+                        if r2 is not None and np.isfinite(r2):
+                            fold_r2.append(float(r2))
                 else:
                     for fold_idx in range(len(folds)):
                         val_idx = np.array(folds[fold_idx], dtype=int)
@@ -1655,7 +1713,7 @@ def _xgb_tune_hyperparameters_cv(
                             [i for f_idx, f in enumerate(folds) if f_idx != fold_idx for i in f],
                             dtype=int,
                         )
-                        score = _xgb_cv_fold_score(
+                        score, r2 = _xgb_cv_fold_score(
                             model_kind,
                             trial_kwargs,
                             X,
@@ -1667,15 +1725,32 @@ def _xgb_tune_hyperparameters_cv(
                             early_stop_rounds,
                         )
                         fold_scores.append(float(score))
+                        if r2 is not None and np.isfinite(r2):
+                            fold_r2.append(float(r2))
 
-                mean_score = float(np.mean(fold_scores)) if fold_scores else float("inf")
+                mean_rmse = float(np.mean(fold_scores)) if fold_scores else float("inf")
                 std_score = float(np.std(fold_scores)) if fold_scores else float("nan")
+                mean_r2 = float(np.mean(fold_r2)) if fold_r2 else float("nan")
+                std_r2 = float(np.std(fold_r2)) if fold_r2 else float("nan")
+                if use_scalarized_rmse_r2 and np.isfinite(mean_r2):
+                    mean_score = mean_rmse * (1.0 - mean_r2)
+                else:
+                    mean_score = mean_rmse
+                if r2_min is not None and np.isfinite(mean_r2):
+                    deficit = float(r2_min) - mean_r2
+                    if deficit > 0:
+                        mean_score += float(r2_penalty) * deficit
                 trial.set_user_attr("std_score", std_score)
+                trial.set_user_attr("mean_r2", mean_r2)
+                trial.set_user_attr("std_r2", std_r2)
+                trial.set_user_attr("mean_rmse", mean_rmse)
                 trial.set_user_attr("params", sampled)
                 if verbose:
                     print(
                         f"[CV] Trial {trial.number + 1}/{n_trials} "
-                        f"mean={mean_score:.6f} std={std_score:.6f} params={sampled}"
+                        f"mean={mean_score:.6f} std={std_score:.6f} "
+                        f"mean_rmse={mean_rmse:.6f} "
+                        f"mean_r2={mean_r2:.6f} params={sampled}"
                     )
                 return mean_score
 
@@ -1689,6 +1764,9 @@ def _xgb_tune_hyperparameters_cv(
                         "trial": int(t.number + 1),
                         "mean_score": float(t.value) if t.value is not None else float("nan"),
                         "std_score": float(t.user_attrs.get("std_score", float("nan"))),
+                        "mean_r2": float(t.user_attrs.get("mean_r2", float("nan"))),
+                        "std_r2": float(t.user_attrs.get("std_r2", float("nan"))),
+                        "mean_rmse": float(t.user_attrs.get("mean_rmse", float("nan"))),
                         "params": dict(t.user_attrs.get("params", {})),
                     }
                 )
@@ -1705,6 +1783,7 @@ def _xgb_tune_hyperparameters_cv(
                     trial_kwargs["n_jobs"] = 1
 
                 fold_scores: list[float] = []
+                fold_r2: list[float] = []
                 if executor is not None:
                     futures = []
                     for fold_idx in range(len(folds)):
@@ -1728,7 +1807,10 @@ def _xgb_tune_hyperparameters_cv(
                             )
                         )
                     for future in as_completed(futures):
-                        fold_scores.append(float(future.result()))
+                        score, r2 = future.result()
+                        fold_scores.append(float(score))
+                        if r2 is not None and np.isfinite(r2):
+                            fold_r2.append(float(r2))
                 else:
                     for fold_idx in range(len(folds)):
                         val_idx = np.array(folds[fold_idx], dtype=int)
@@ -1736,7 +1818,7 @@ def _xgb_tune_hyperparameters_cv(
                             [i for f_idx, f in enumerate(folds) if f_idx != fold_idx for i in f],
                             dtype=int,
                         )
-                        score = _xgb_cv_fold_score(
+                        score, r2 = _xgb_cv_fold_score(
                             model_kind,
                             trial_kwargs,
                             X,
@@ -1748,14 +1830,29 @@ def _xgb_tune_hyperparameters_cv(
                             early_stop_rounds,
                         )
                         fold_scores.append(float(score))
+                        if r2 is not None and np.isfinite(r2):
+                            fold_r2.append(float(r2))
 
-                mean_score = float(np.mean(fold_scores)) if fold_scores else float("inf")
+                mean_rmse = float(np.mean(fold_scores)) if fold_scores else float("inf")
                 std_score = float(np.std(fold_scores)) if fold_scores else float("nan")
+                mean_r2 = float(np.mean(fold_r2)) if fold_r2 else float("nan")
+                std_r2 = float(np.std(fold_r2)) if fold_r2 else float("nan")
+                if use_scalarized_rmse_r2 and np.isfinite(mean_r2):
+                    mean_score = mean_rmse * (1.0 - mean_r2)
+                else:
+                    mean_score = mean_rmse
+                if r2_min is not None and np.isfinite(mean_r2):
+                    deficit = float(r2_min) - mean_r2
+                    if deficit > 0:
+                        mean_score += float(r2_penalty) * deficit
                 trial_results.append(
                     {
                         "trial": int(trial_idx + 1),
                         "mean_score": mean_score,
                         "std_score": std_score,
+                        "mean_r2": mean_r2,
+                        "std_r2": std_r2,
+                        "mean_rmse": mean_rmse,
                         "params": dict(sampled),
                     }
                 )
@@ -1765,7 +1862,8 @@ def _xgb_tune_hyperparameters_cv(
                 if verbose:
                     print(
                         f"[CV] Trial {trial_idx + 1}/{n_trials} "
-                        f"mean={mean_score:.6f} std={std_score:.6f} params={sampled}"
+                        f"mean={mean_score:.6f} std={std_score:.6f} "
+                        f"mean_r2={mean_r2:.6f} params={sampled}"
                     )
     finally:
         if executor is not None:
@@ -1783,6 +1881,9 @@ def _xgb_tune_hyperparameters_cv(
         "best_score": float(best_score),
         "trials": trial_results,
         "param_space": param_space,
+        "score_definition": "rmse*(1-r2)" if use_scalarized_rmse_r2 else metric_raw,
+        "r2_guardrail_min": None if r2_min is None else float(r2_min),
+        "r2_penalty": float(r2_penalty),
         "cv_dataset_source": raw_diagnostics.get("cv_dataset_source", "unknown"),
         "name_source": raw_diagnostics.get("name_source", "unknown"),
         "raw_unique_base_count": raw_diagnostics.get("raw_unique_base_count", 0),
@@ -2198,17 +2299,17 @@ def _train_xgb_model(
         plt.xlabel('Boosting Rounds')
         plt.ylabel(metric)
         plt.grid(True, which="both", ls="--")
-        plt.title('Training vs Validation Loss' if val_series else 'Training Loss')
         plt.legend()
         plt.gcf().text(
             0.01,
-            0.01,
-            stop_reason_text,
+            0.99,
+            _compact_stop_reason_for_plot(stop_reason_text),
             fontsize=8,
             ha="left",
-            va="bottom",
-            bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "#666666", "boxstyle": "round,pad=0.2"},
+            va="top",
+            bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "#666666", "boxstyle": "round,pad=0.15"},
         )
+        plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.9))
         plt.savefig(save_path / "loss_plot.png")
         plt.close()
         print(f"Loss plot saved to: {save_path / 'loss_plot.png'}")

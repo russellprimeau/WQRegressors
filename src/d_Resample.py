@@ -355,18 +355,20 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
                 'n_trials': 250,
                 'seed': 21,
                 'parallel_jobs': 1,
-                'metric': 'rmse',
+                'metric': 'rmse_r2',
                 'search_method': 'optuna',
                 'optuna_sampler': 'tpe',
                 'random_start_trials': 30,
                 'use_early_stopping': False,
                 'early_stopping_rounds': None,
                 'verbose': False,
+                'min_r2': 0.0,        # or 0.05, 0.1 depending on how strict you want to be
+                'r2_penalty': 10.0,   # larger => harsher penalty
                 'param_space': {
                     'n_estimators': {'low': 100, 'high': 1300, 'type': 'int'},
                     'max_depth': {'low': 2, 'high': 9, 'type': 'int'},
                     'min_child_weight': {'low': 1, 'high': 20, 'type': 'int'},
-                    'gamma': {'low': 0.0, 'high': 10.0, 'type': 'float'},
+                    'gamma': {'low': 0.0, 'high': 2.0, 'type': 'float'},
                     'subsample': {'low': 0.5, 'high': 0.9, 'type': 'float'},
                     'colsample_bytree': {'low': 0.3, 'high': 1.0, 'type': 'float'},
                     'reg_lambda': {'low': 1e-3, 'high': 10.0, 'type': 'log'},
@@ -1124,7 +1126,7 @@ if __name__ == '__main__':
     # Normalize once and reuse across all per-target dataset writes.
     df_norm, normalization_params = _normalize_once(df, to_normalize, min_val=0, max_val=1)
     shared_sensor_uncertainties = _load_and_prepare_sensor_uncertainties(
-        output_dir="../data/output/CV5",
+        output_dir="../data/output/CV6",
         normalization_params=normalization_params,
         verbose=False,
     )
@@ -1139,7 +1141,7 @@ if __name__ == '__main__':
 
     for target in target_columns:
         target_slug = target.replace(" ", "_").replace("/", "_")
-        output_dir = os.path.join("../data/output/CV5", f"MC_{target_slug}")
+        output_dir = os.path.join("../data/output/CV6", f"MC_{target_slug}")
         if eurofins_summary_df is None:
             target_length = fallback_length
         else:

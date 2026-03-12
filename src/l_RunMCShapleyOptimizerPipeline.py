@@ -22,9 +22,9 @@ Stage behavior:
       `forecasts/xgb_cv_tuning_cache.json`.
     * Subsequent runs reuse cached hyperparameters for consistent regularization
       across feature subsets and to reduce compute.
-    * Stage A (pre-Shapley): run CV tuning on the full feature set.
-    * Stage B (post-Shapley): run CV tuning on top-k Shapley subsets and write
-      comparison artifacts (`xgb_cv_topk_params_r###.csv/.png`) under
+        * Stage A (pre-Shapley): run CV tuning on the full feature set.
+        * Stage B (post-Shapley): run CV tuning on top-k Shapley subsets and write
+            comparison artifacts (`xgb_cv_consensus_candidates_r###.csv`) under
       `forecasts/Shapley_sweeps`.
 - Search phases keep standard temporal-by-coverage split behavior
     (target 70/30 by default).
@@ -72,7 +72,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import h_RunMCFeatureSelectionSweep as optimizer_module
 import i_RunMCFeatureSelectionShapleySweep as shapley_module
 import e_Train as train_module
@@ -83,7 +82,7 @@ _SHAPLEY_NAMESPACE = "Shapley_sweeps"
 _OPTIMIZER_DEFAULT_NAMESPACE = "feature_sweeps"
 _CONSENSUS_VERSION = 2
 _CONSENSUS_METHOD = "elite_trial_observed_candidate"
-_ELITE_REL_MARGIN = 0.03
+_ELITE_REL_MARGIN = 0.01
 _ELITE_ABS_MARGIN = 0.0
 _ELITE_INCLUDE_ONE_SE = True
 _STAGE2_CVTUNE_DEFAULT_N_TRIALS = 50
@@ -337,40 +336,50 @@ def _load_topk_shapley_subsets(plan: optimizer_module.DatasetPlan, row_count: in
     return subsets
 
 
-def _write_topk_param_reports(
+def _write_candidate_comparison_report(
     out_dir: Path,
     row_count: int,
-    records: list[dict],
+    candidates: list[dict],
 ) -> None:
-    if not records:
+    if not candidates:
         return
-    out_dir.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame(records)
-    csv_path = out_dir / f"xgb_cv_topk_params_r{row_count:03d}.csv"
-    df.to_csv(csv_path, index=False)
 
-    param_cols = [c for c in df.columns if c.startswith("param__")]
-    if not param_cols:
-        return
-    data = []
-    labels = []
-    for col in param_cols:
-        series = pd.to_numeric(df[col], errors="coerce").dropna()
-        if series.empty:
+    rows: list[dict] = []
+    for cand in candidates:
+        params = cand.get("params")
+        if not isinstance(params, dict) or not params:
             continue
-        data.append(series.to_numpy(dtype=float))
-        labels.append(col.replace("param__", ""))
-    if not data:
+
+        row = {
+            "report_row_count": int(row_count),
+            "candidate_row_count": cand.get("row_count"),
+            "feature_tag": cand.get("feature_tag"),
+            "trial": cand.get("trial"),
+            "mean_score": cand.get("mean_score"),
+            "std_score": cand.get("std_score"),
+            "best_mean": cand.get("best_mean"),
+            "tolerance": cand.get("tolerance"),
+            "delta_from_best": cand.get("delta_from_best"),
+            "candidate_weight_raw": cand.get("candidate_weight_raw"),
+            "candidate_weight": cand.get("candidate_weight"),
+        }
+        for k, v in params.items():
+            row[f"param__{k}"] = v
+        rows.append(row)
+
+    if not rows:
         return
-    plt.figure(figsize=(max(8, 1.2 * len(labels)), 4.8))
-    plt.boxplot(data, labels=labels, showfliers=False)
-    plt.title("Stage B: CV-tuned parameter distribution (top-k subsets)")
-    plt.ylabel("Value")
-    plt.grid(axis="y", alpha=0.35)
-    plot_path = out_dir / f"xgb_cv_topk_params_r{row_count:03d}.png"
-    plt.tight_layout()
-    plt.savefig(plot_path, dpi=180)
-    plt.close()
+
+    df = pd.DataFrame(rows)
+    df.sort_values(
+        by=["candidate_weight", "delta_from_best", "std_score", "feature_tag", "trial"],
+        ascending=[False, True, True, True, True],
+        na_position="last",
+        inplace=True,
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / f"xgb_cv_consensus_candidates_r{row_count:03d}.csv"
+    df.to_csv(csv_path, index=False)
 
 
 def _compute_consensus_params(records: list[dict]) -> dict:
@@ -623,6 +632,7 @@ def _run_topk_subset_cv_tuning(
 
     all_records: list[dict] = []
     elite_candidates: list[dict] = []
+    stage_a_candidates_weighted: list[dict] = []
 
     if stage_a_payload is not None:
         stage_a_summary = stage_a_payload.get("cv_summary") if isinstance(stage_a_payload, dict) else None
@@ -636,10 +646,12 @@ def _run_topk_subset_cv_tuning(
             norm = sum(max(0.0, c.get("candidate_weight_raw", 0.0)) for c in stage_a_candidates)
             norm = norm if norm > 0 else float(len(stage_a_candidates))
             for c in stage_a_candidates:
+                c = dict(c)
                 weight = max(0.0, c.get("candidate_weight_raw", 0.0))
                 c["candidate_weight"] = float((weight if norm > 0 else 1.0) / norm)
                 c["row_count"] = "stage_a"
                 c["feature_tag"] = "stage_a_full"
+                stage_a_candidates_weighted.append(c)
                 elite_candidates.append(c)
 
     for row_count in row_counts:
@@ -648,8 +660,12 @@ def _run_topk_subset_cv_tuning(
             continue
         out_dir = plan.dataset_dir / "forecasts" / _SHAPLEY_NAMESPACE / "CVtune"
         records: list[dict] = []
+        row_candidates: list[dict] = []
         tmp_dir = out_dir / "_cv_tuning_tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        if stage_a_candidates_weighted:
+            row_candidates.extend([dict(c) for c in stage_a_candidates_weighted])
 
         if stage_a_payload is not None:
             stage_a_params = stage_a_payload.get("tuned_hyperparameters") or stage_a_payload.get("best_params") or {}
@@ -742,10 +758,12 @@ def _run_topk_subset_cv_tuning(
                 norm = sum(max(0.0, c.get("candidate_weight_raw", 0.0)) for c in run_candidates)
                 norm = norm if norm > 0 else float(len(run_candidates))
                 for c in run_candidates:
+                    c = dict(c)
                     weight = max(0.0, c.get("candidate_weight_raw", 0.0))
                     c["candidate_weight"] = float((weight if norm > 0 else 1.0) / norm)
                     c["row_count"] = int(row_count)
                     c["feature_tag"] = feature_tag
+                    row_candidates.append(c)
                     elite_candidates.append(c)
 
             input_dim = int(len(cfg.get("data", {}).get("input_columns", [])))
@@ -764,8 +782,7 @@ def _run_topk_subset_cv_tuning(
             records.append(record)
 
         all_records.extend(records)
-
-        _write_topk_param_reports(out_dir, row_count, records)
+        _write_candidate_comparison_report(out_dir, row_count, row_candidates)
 
     # Build consensus across all records and write feature_sweeps cache + summary
     cvtune_dir = plan.dataset_dir / "forecasts" / _SHAPLEY_NAMESPACE / "CVtune"
