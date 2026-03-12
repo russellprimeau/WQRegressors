@@ -35,14 +35,10 @@ CLI arguments:
 
 Examples:
     python src/k_RunHorizonSweep.py --resample-config data/output/sampling/resample_config.yml
-    python src/k_RunHorizonSweep.py \\
-        --data-root data/output/regression \\
-        --dataset-prefix MC \\
-        --resample-config data/output/sampling/resample_config.yml \\
-        --horizons 0 6 12 24 48
+    python src/k_RunHorizonSweep.py --data-root data/output/CV4 --dataset-prefix MC --resample-config data/output/sampling/resample_config.yml --horizons 0 6 12 24 48
+
 """
 
-import os
 import sys
 import json
 import argparse
@@ -86,7 +82,7 @@ def _base_window_rows_from_config(config_path: Path) -> int:
     data_cfg = cfg.get('data', {})
     base_start = int(data_cfg['input_row_1'])
     base_stop = int(data_cfg['input_row_2'])
-    return int(base_stop - base_start)
+    return int(base_stop - base_start + 1)  # indices are inclusive: rows input_row_1..input_row_2
 
 
 def _build_lookahead_schedule(base_rows: int, preferred: list | None = None) -> list[int]:
@@ -285,13 +281,19 @@ def run_horizon_sweep(data_root, dataset_prefix, resample_config_path, preferred
             horizon_label = f'horizon_{horizon:03d}hr'
             horizon_dir = dataset_dir / 'horizons' / horizon_label
 
-            # Per-horizon training_config_defaults: inject forecast_name
+            # Per-horizon training_config_defaults: inject forecast_name and forecast_dir.
+            # forecast_dir (absolute) is included so f_Evaluate.py resolves test_files.txt
+            # correctly even when falling back to the training config instead of the eval config.
+            forecast_dir_abs = str((horizon_dir / 'forecasts' / horizon_label).resolve())
             training_cfg_defaults = {}
             for k, v in base_overrides.items():
                 training_cfg_defaults[k] = dict(v)
-                training_cfg_defaults[k]['data'] = {'forecast_name': horizon_label}
+                training_cfg_defaults[k]['data'] = {
+                    'forecast_name': horizon_label,
+                    'forecast_dir': forecast_dir_abs,
+                }
 
-            print(f"  [RESAMPLE] Horizon {horizon}hr → {horizon_dir.name}")
+            print(f"  [RESAMPLE] Horizon {horizon}hr -> {horizon_dir.name}")
             try:
                 result = resample_split(
                     df_norm,
@@ -325,17 +327,39 @@ def run_horizon_sweep(data_root, dataset_prefix, resample_config_path, preferred
                 print(f"  [SKIP] Horizon {horizon}hr: could not find config for model_key={model_key}.")
                 continue
 
+            # Patch forecast_name and forecast_dir directly in the config file.
+            # d_RunResample.split() hardcodes 'xgb_01' as the forecast_name arg; the
+            # training_config_defaults override is not reliable when the horizon dir already
+            # contains a config from a prior run. Writing here guarantees the correct values.
+            with open(horizon_cfg, 'r', encoding='utf-8') as _f:
+                _cfg = yaml.safe_load(_f)
+            _cfg.setdefault('data', {})['forecast_name'] = horizon_label
+            _cfg['data']['forecast_dir'] = forecast_dir_abs
+            with open(horizon_cfg, 'w', encoding='utf-8') as _f:
+                yaml.dump(_cfg, _f, sort_keys=False)
+
             # Train
             train_cmd = [sys.executable, 'src/e_Train.py', '--config', str(horizon_cfg)]
             print(f"  [TRAIN] Horizon {horizon}hr")
-            with open(os.devnull, 'w') as devnull:
-                subprocess.run(train_cmd, check=True, stdout=devnull, stderr=devnull)
+            try:
+                subprocess.run(train_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            except subprocess.CalledProcessError as exc:
+                print(f"  [ERROR] Training failed for horizon {horizon}hr:")
+                print(exc.stderr.decode(errors='replace'))
+                continue
 
-            # Evaluate
-            eval_cmd = [sys.executable, 'src/f_Evaluate.py', '--config', str(horizon_cfg), '--no-plots']
+            # Evaluate — prefer the eval config written by e_Train.py (paths resolved correctly).
+            # e_Train.py names it config_evaluate_<forecast_name>.yml (line 651 of e_Train.py).
+            eval_cfg_path = horizon_dir / 'forecasts' / horizon_label / f'config_evaluate_{horizon_label}.yml'
+            eval_config_arg = str(eval_cfg_path) if eval_cfg_path.exists() else str(horizon_cfg)
+            eval_cmd = [sys.executable, 'src/f_Evaluate.py', '--config', eval_config_arg]
             print(f"  [EVAL] Horizon {horizon}hr")
-            with open(os.devnull, 'w') as devnull:
-                subprocess.run(eval_cmd, check=True, stdout=devnull, stderr=devnull)
+            try:
+                subprocess.run(eval_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            except subprocess.CalledProcessError as exc:
+                print(f"  [ERROR] Evaluation failed for horizon {horizon}hr:")
+                print(exc.stderr.decode(errors='replace'))
+                continue
 
             eval_csv = horizon_dir / 'forecasts' / horizon_label / 'evaluation_summary.csv'
             if eval_csv.exists():

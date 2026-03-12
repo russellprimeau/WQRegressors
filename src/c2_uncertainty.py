@@ -1030,7 +1030,7 @@ def save_sensor_uncertainty_summary(og_df, sensor_name, n_calibration_points, ou
     
     summary_df = pd.DataFrame([summary])
     summary_df.to_csv(output_path, index=False)
-    print(f"  ✓ Saved uncertainty summary: {output_path}")
+    print(f"  OK Saved uncertainty summary: {output_path}")
     
     return summary
 
@@ -2228,9 +2228,9 @@ def compare_decomposed_vs_simple_model(results_df, raw_df, sensor_name):
         pred_stds = [p[2] for p in decomposed_predictions]
         pred_errors = [abs(p[0] - p[1]) for p in decomposed_predictions]
         print(f"\n      Decomposed Model Diagnostics:")
-        print(f"        Prediction std (σ): mean={np.mean(pred_stds):.6f}, min={np.min(pred_stds):.6f}, max={np.max(pred_stds):.6f}")
+        print(f"        Prediction std (sigma): mean={np.mean(pred_stds):.6f}, min={np.min(pred_stds):.6f}, max={np.max(pred_stds):.6f}")
         print(f"        Prediction error: mean={np.mean(pred_errors):.6f}, median={np.median(pred_errors):.6f}")
-        print(f"        Ratio (error/σ): {np.mean(pred_errors)/np.mean(pred_stds):.3f}")
+        print(f"        Ratio (error/sigma): {np.mean(pred_errors)/np.mean(pred_stds):.3f}")
         
         # Component variance statistics across folds
         if decomposed_component_variances:
@@ -2242,44 +2242,44 @@ def compare_decomposed_vs_simple_model(results_df, raw_df, sensor_name):
                     cases[case] = []
                 cases[case].append(d)
             
-            print(f"        Component σ statistics by calibration type:")
+            print(f"        Component sigma statistics by calibration type:")
             for case, fold_list in sorted(cases.items()):
                 print(f"          {case}:")
                 if case == '1-point':
                     sigmas = [d['sigma_total'] for d in fold_list if not np.isnan(d['sigma_total'])]
                     if sigmas:
-                        print(f"            σ_total: mean={np.mean(sigmas):.6f}, range=[{np.min(sigmas):.6f}, {np.max(sigmas):.6f}]")
+                        print(f"            sigma_total: mean={np.mean(sigmas):.6f}, range=[{np.min(sigmas):.6f}, {np.max(sigmas):.6f}]")
                 elif case == '2-point':
                     sigma_gains = [d['sigma_gain'] for d in fold_list if not np.isnan(d['sigma_gain'])]
                     sigma_residuals = [d['sigma_residual'] for d in fold_list if not np.isnan(d['sigma_residual'])]
                     if sigma_gains:
-                        print(f"            σ_gain: mean={np.mean(sigma_gains):.6f}, range=[{np.min(sigma_gains):.6f}, {np.max(sigma_gains):.6f}]")
+                        print(f"            sigma_gain: mean={np.mean(sigma_gains):.6f}, range=[{np.min(sigma_gains):.6f}, {np.max(sigma_gains):.6f}]")
                     if sigma_residuals:
-                        print(f"            σ_residual: mean={np.mean(sigma_residuals):.6f}, range=[{np.min(sigma_residuals):.6f}, {np.max(sigma_residuals):.6f}]")
+                        print(f"            sigma_residual: mean={np.mean(sigma_residuals):.6f}, range=[{np.min(sigma_residuals):.6f}, {np.max(sigma_residuals):.6f}]")
                 elif case == '3+ point':
                     sigma_offsets = [d['sigma_offset'] for d in fold_list if not np.isnan(d['sigma_offset'])]
                     sigma_gains = [d['sigma_gain'] for d in fold_list if not np.isnan(d['sigma_gain'])]
                     sigma_noises = [d['sigma_noise'] for d in fold_list if not np.isnan(d['sigma_noise'])]
                     if sigma_offsets:
-                        print(f"            σ_offset: mean={np.mean(sigma_offsets):.6f}, range=[{np.min(sigma_offsets):.6f}, {np.max(sigma_offsets):.6f}]")
+                        print(f"            sigma_offset: mean={np.mean(sigma_offsets):.6f}, range=[{np.min(sigma_offsets):.6f}, {np.max(sigma_offsets):.6f}]")
                     if sigma_gains:
-                        print(f"            σ_gain: mean={np.mean(sigma_gains):.6f}, range=[{np.min(sigma_gains):.6f}, {np.max(sigma_gains):.6f}]")
+                        print(f"            sigma_gain: mean={np.mean(sigma_gains):.6f}, range=[{np.min(sigma_gains):.6f}, {np.max(sigma_gains):.6f}]")
                     if sigma_noises:
-                        print(f"            σ_noise: mean={np.mean(sigma_noises):.6f}, range=[{np.min(sigma_noises):.6f}, {np.max(sigma_noises):.6f}]")
+                        print(f"            sigma_noise: mean={np.mean(sigma_noises):.6f}, range=[{np.min(sigma_noises):.6f}, {np.max(sigma_noises):.6f}]")
     
     if simple_predictions:
         pred_stds_simple = [p[2] for p in simple_predictions]
         pred_errors_simple = [abs(p[0] - p[1]) for p in simple_predictions]
         print(f"\n      Simple Model Diagnostics:")
-        print(f"        Prediction std (σ): mean={np.mean(pred_stds_simple):.6f}, min={np.min(pred_stds_simple):.6f}, max={np.max(pred_stds_simple):.6f}")
+        print(f"        Prediction std (sigma): mean={np.mean(pred_stds_simple):.6f}, min={np.min(pred_stds_simple):.6f}, max={np.max(pred_stds_simple):.6f}")
         print(f"        Prediction error: mean={np.mean(pred_errors_simple):.6f}, median={np.median(pred_errors_simple):.6f}")
-        print(f"        Ratio (error/σ): {np.mean(pred_errors_simple)/np.mean(pred_stds_simple):.3f}")
+        print(f"        Ratio (error/sigma): {np.mean(pred_errors_simple)/np.mean(pred_stds_simple):.3f}")
     
     # Warn about positive log-likelihoods (now less likely with hierarchical evaluation)
     if simple_cv_loglik > 0:
-        print(f"\n      ⚠ WARNING: Simple model has positive CV LogLik ({simple_cv_loglik:.2f})")
+        print(f"\n      [WARN] WARNING: Simple model has positive CV LogLik ({simple_cv_loglik:.2f})")
     if decomposed_cv_loglik > 0:
-        print(f"\n      ⚠ WARNING: Decomposed model has positive CV LogLik ({decomposed_cv_loglik:.2f})")
+        print(f"\n      [WARN] WARNING: Decomposed model has positive CV LogLik ({decomposed_cv_loglik:.2f})")
     
     # ===== FIT FULL MODELS FOR PARAMETER COUNTING =====
     print(f"\n    - Fitting full models for parameter counting...")
@@ -2308,7 +2308,7 @@ def compare_decomposed_vs_simple_model(results_df, raw_df, sensor_name):
         simple_loglik += ll
         simple_k += 2
         
-        print(f"      Point {point_idx}: μ={mu:.4f}, σ={sigma:.4f}, LogLik={ll:.2f}")
+        print(f"      Point {point_idx}: mu={mu:.4f}, sigma={sigma:.4f}, LogLik={ll:.2f}")
 
     
     comparison['Simple_LogLik'] = simple_loglik
@@ -2322,7 +2322,7 @@ def compare_decomposed_vs_simple_model(results_df, raw_df, sensor_name):
     
     # ===== DECOMPOSED MODEL =====
     print(f"    - Decomposed Model (hierarchical with point-count-dependent parameterization):")
-    print(f"      1-point: σ_total | 2-point: σ_gain + σ_residual | 3+ point: σ_offset + σ_gain + σ_noise")
+    print(f"      1-point: sigma_total | 2-point: sigma_gain + sigma_residual | 3+ point: sigma_offset + sigma_gain + sigma_noise")
     
     # Separate events by calibration point count
     events_1pt = results_df[results_df['N_Points'] == 1]
@@ -2334,7 +2334,7 @@ def compare_decomposed_vs_simple_model(results_df, raw_df, sensor_name):
     # Check if we have enough events
     total_events = len(results_df)
     if total_events < 10:
-        print(f"    - WARNING: Not enough events to fit decomposed model (n={total_events}, require n≥10)")
+        print(f"    - WARNING: Not enough events to fit decomposed model (n={total_events}, require n>=10)")
         comparison['Recommendation'] = 'Simple'
         comparison['Reasons'] = f'Insufficient events for decomposed model (n={total_events} < 10)'
         return comparison
@@ -2351,7 +2351,7 @@ def compare_decomposed_vs_simple_model(results_df, raw_df, sensor_name):
             sigma_total = np.std(corrections_1pt, ddof=1)
             if sigma_total == 0.0:
                 sigma_total = 1e-10
-            print(f"      1-point: μ_total={mu_total:.4f}, σ_total={sigma_total:.4f} (n={len(corrections_1pt)} corrections)")
+            print(f"      1-point: mu_total={mu_total:.4f}, sigma_total={sigma_total:.4f} (n={len(corrections_1pt)} corrections)")
         else:
             mu_total = np.nan
             sigma_total = np.nan
@@ -2385,7 +2385,7 @@ def compare_decomposed_vs_simple_model(results_df, raw_df, sensor_name):
         else:
             sigma_residual_2pt = 1e-10
         
-        print(f"      2-point: μ_gain={mu_gain_2pt:.4f}, σ_gain={sigma_gain_2pt:.4f}, σ_residual={sigma_residual_2pt:.4f} (n={len(gains_2pt)} events, {len(residuals_2pt)} residuals)")
+        print(f"      2-point: mu_gain={mu_gain_2pt:.4f}, sigma_gain={sigma_gain_2pt:.4f}, sigma_residual={sigma_residual_2pt:.4f} (n={len(gains_2pt)} events, {len(residuals_2pt)} residuals)")
     else:
         mu_gain_2pt = np.nan
         sigma_gain_2pt = np.nan
@@ -2420,7 +2420,7 @@ def compare_decomposed_vs_simple_model(results_df, raw_df, sensor_name):
         else:
             sigma_noise = 1e-10
         
-        print(f"      3+ point: μ_offset={mu_offset:.4f}, σ_offset={sigma_offset:.4f}, μ_gain={mu_gain_3plus:.4f}, σ_gain={sigma_gain_3plus:.4f}, σ_noise={sigma_noise:.4f}")
+        print(f"      3+ point: mu_offset={mu_offset:.4f}, sigma_offset={sigma_offset:.4f}, mu_gain={mu_gain_3plus:.4f}, sigma_gain={sigma_gain_3plus:.4f}, sigma_noise={sigma_noise:.4f}")
         print(f"               (n={len(offsets)} events, {len(residuals_3plus)} residuals)")
     else:
         mu_offset = np.nan
@@ -2527,9 +2527,9 @@ def compare_decomposed_vs_simple_model(results_df, raw_df, sensor_name):
         comparison['Reasons'] = f'ΔCV_LogLik={comparison["Delta_CV_LogLik"]:.1f} (models equivalent by CV)'
     
     # Print comparison summary
-    print(f"\n  → COMPARISON SUMMARY:")
-    print(f"      ΔCV LogLik = {comparison['Delta_CV_LogLik']:.2f} (Decomposed - Simple)")
-    print(f"      ΔAIC = {comparison['Delta_AIC']:.2f} (Decomposed - Simple)")
+    print(f"\n  -> COMPARISON SUMMARY:")
+    print(f"      DeltaCV LogLik = {comparison['Delta_CV_LogLik']:.2f} (Decomposed - Simple)")
+    print(f"      DeltaAIC = {comparison['Delta_AIC']:.2f} (Decomposed - Simple)")
     print(f"      CV Recommendation: {cv_conclusion}")
     print(f"      AIC Recommendation: {aic_conclusion}")
     print(f"      Final: {comparison['Recommendation']} - {comparison['Reasons']}")
@@ -3006,7 +3006,7 @@ def main():
                 print(f"    - Levene: F={kw_result['Levene_F']:.4f}, p={kw_result['Levene_p']:.4f}, " +
                       f"Equal Variances={not kw_result['Levene_Significant']}")
             else:
-                print(f"    - {kw_result['Test_Status']} (need ≥2 points with ≥5 observations each)")
+                print(f"    - {kw_result['Test_Status']} (need >=2 points with >=5 observations each)")
             
             # Create visualization of corrections comparison
             create_corrections_comparison_visualization(raw_df, sensor_name, output_dir=sensor_output_dir)

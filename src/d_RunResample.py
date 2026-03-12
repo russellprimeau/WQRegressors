@@ -4,7 +4,7 @@ different horizons.
 Then, split the dataset into files for each equivalent sample.
 
 Example:
-python src/d_RunResample.py --config data/output/sampling/resample_config_example.yml
+python src/d_RunResample.py --config data/output/sampling/resample_config.yml
 '''
 
 import os

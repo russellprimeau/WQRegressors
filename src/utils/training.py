@@ -338,7 +338,7 @@ def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns,
         # Detect Monte Carlo replicates and adjust split strategy if needed
         is_mc_dataset, segment_groups = detect_mc_replicates(samples)
         if is_mc_dataset:
-            print("\n⚠️  Monte Carlo replicates detected!")
+            print("\n[WARN] Monte Carlo replicates detected!")
             print("   Enforcing temporal split to prevent data leakage.")
             print("   All replicates of each segment will stay together in train/test.\n")
             split_type = 'temporal'  # Force temporal split for MC datasets
