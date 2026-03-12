@@ -1357,16 +1357,6 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
             palette = _safe_series_colors(n_rows)
             overlay_spans = []
 
-            # --- Legend presence tracking ---
-            legend_presence = {"inside": False, "beyond": False, "train": False, "test": False}
-            overlay_spans = []
-            # Determine overlay status for this variant
-            with_overlay = False
-            if figure_name in {"Target", "Target_diff"} and variant_suffix == "timeseries_overlay":
-                with_overlay = True
-            # For Target_diff overlay normalization variant
-            if figure_name == "Target_diff" and variant_suffix == "timeseries_overlay_norm01":
-                with_overlay = True
             for i, (ax, col, label) in enumerate(zip(axes, cols, wrapped_labels)):
                 series = pd.to_numeric(df[col], errors="coerce")
                 series_color = palette[i]
@@ -1390,13 +1380,11 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                                 limit_exceedance_mask(target_series, upper=upper_limit, lower=lower_limit),
                                 index=series.index,
                             )
+
                         valid_mask = series.notna()
                         normal_mask = valid_mask & (~exceed_mask.reindex(series.index, fill_value=False))
                         exceed_plot_mask = valid_mask & exceed_mask.reindex(series.index, fill_value=False)
-                        if normal_mask.sum() > 0:
-                            legend_presence["inside"] = True
-                        if exceed_plot_mask.sum() > 0:
-                            legend_presence["beyond"] = True
+
                         ax.plot(
                             series.index[normal_mask],
                             series.values[normal_mask],
@@ -1418,9 +1406,6 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                             color="#ff0000",
                         )
                     else:
-                        valid_mask = series.notna()
-                        if valid_mask.sum() > 0:
-                            legend_presence["inside"] = True
                         ax.plot(
                             series.index,
                             series.values,
@@ -1462,6 +1447,8 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                             else:
                                 y_low = min(y_low, lower_limit)
                                 y_high = max(y_high, lower_limit)
+
+                    # Ensure threshold (if present) is always in-frame and add clear margin.
                     if y_low is not None and y_high is not None:
                         y_span = y_high - y_low
                         if y_span <= 0:
@@ -1487,6 +1474,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                                 f"[UNCERTAINTY] Surface '{base_surface_name}': mu={mu:.6g}, sigma={sigma:.6g}, "
                                 f"2sigma={2.0 * sigma:.6g}, center_span={center_span:.6g}, rel_2sigma={rel_2sigma:.6g}"
                             )
+                            # Draw ±1σ boundary lines (dashed)
                             ax.plot(
                                 broken.index,
                                 center - sigma,
@@ -1505,6 +1493,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                                 alpha=0.7,
                                 zorder=1.5,
                             )
+                            # Draw ±2σ boundary lines (dotted)
                             ax.plot(
                                 broken.index,
                                 center - 2.0 * sigma,
@@ -1534,6 +1523,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                         alpha=0.85,
                         zorder=1.4,
                     )
+
                     if figure_name == "Surface":
                         base_surface_name = col[len("Pfl - "):] if col.startswith("Pfl - ") else col
                         cal_key = _norm_surface_sensor_key(base_surface_name)
@@ -1546,6 +1536,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                                     linestyle="--",
                                     zorder=2.5,
                                 )
+
                 span_info = None
                 if figure_name in {"Target", "Target_diff"}:
                     valid_idx = np.where(series.notna().to_numpy() & (np.arange(len(series)) >= first_valid_idx))[0]
@@ -1563,11 +1554,8 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                             second_start = series.index[valid_idx[split_cut]] - pd.Timedelta(minutes=30)
                             second_end = series.index[valid_idx[-1]] + pd.Timedelta(minutes=30)
                         span_info = (first_start, first_end, second_start, second_end)
-                        if with_overlay:
-                            legend_presence["train"] = True
-                            if second_start is not None and second_end is not None:
-                                legend_presence["test"] = True
                 overlay_spans.append(span_info)
+
                 ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=y_label_font_size, labelpad=y_label_pad)
                 ax.grid(axis="y", linestyle="--", alpha=0.25, linewidth=0.4)
                 ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=3))
@@ -1583,8 +1571,11 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                 ax.tick_params(axis="y", labelsize=y_value_font_size)
                 ax.tick_params(axis="x", labelsize=x_label_font_size)
 
-            shared_top_margin = max(0.86, min(0.995, 1.0 - (top_margin_in / fig_h)));
-            shared_bottom_margin = max(0.08, min(0.30, bottom_margin_in / fig_h));
+            # Use absolute-inch margins so short figures get enough label room
+            # while taller figures avoid excessive whitespace.
+            shared_top_margin = max(0.86, min(0.995, 1.0 - (top_margin_in / fig_h)))
+            shared_bottom_margin = max(0.08, min(0.30, bottom_margin_in / fig_h))
+
             fig.subplots_adjust(
                 left=shared_left_margin,
                 right=shared_right_margin,
@@ -1592,56 +1583,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                 bottom=shared_bottom_margin,
                 hspace=shared_hspace,
             )
-            # --- Legend logic for overlays ---
-            # Remove legend from Target_timeseries_overlay.png
-            if figure_name == "Target" and variant_suffix == "timeseries_overlay":
-                pass  # No legend
-            # Always show overlay legend for Target_diff overlay variants
-            elif figure_name == "Target_diff" and variant_suffix in {"timeseries_overlay", "timeseries_overlay_norm01"}:
-                legend_handles = [
-                    plt.Line2D([0], [0], marker="o", color="black", markerfacecolor="black", markeredgecolor="black", markersize=7, linestyle="", label="Measurement inside limits"),
-                    plt.Line2D([0], [0], marker="x", color="red", markeredgecolor="red", markersize=8, linestyle="", label="Measurement beyond limits"),
-                    plt.Rectangle((0,0),1,1, color="#66bb66", alpha=0.24, label="Training set"),
-                    plt.Rectangle((0,0),1,1, color="#f4a3c2", alpha=0.24, label="Test set"),
-                ]
-                legend_labels = [
-                    "Measurement inside limits",
-                    "Measurement beyond limits",
-                    "Training set",
-                    "Test set",
-                ]
-                fig.legend(
-                    handles=legend_handles,
-                    labels=legend_labels,
-                    loc="upper center",
-                    bbox_to_anchor=(0.5, 1.04),
-                    ncol=len(legend_handles),
-                    framealpha=0.85,
-                    fontsize=font_size+1,
-                    borderaxespad=0.18,
-                )
-            # Conditional legend for other Target/Target_diff variants
-            elif figure_name in {"Target", "Target_diff"}:
-                legend_handles = []
-                legend_labels = []
-                if legend_presence["inside"]:
-                    legend_handles.append(plt.Line2D([0], [0], marker="o", color="black", markerfacecolor="black", markeredgecolor="black", markersize=7, linestyle="", label="Measurement inside limits"))
-                    legend_labels.append("Measurement inside limits")
-                if legend_presence["beyond"]:
-                    legend_handles.append(plt.Line2D([0], [0], marker="x", color="red", markeredgecolor="red", markersize=8, linestyle="", label="Measurement beyond limits"))
-                    legend_labels.append("Measurement beyond limits")
-                if legend_handles:
-                    fig.legend(
-                        handles=legend_handles,
-                        labels=legend_labels,
-                        loc="upper center",
-                        bbox_to_anchor=(0.5, 1.04),
-                        ncol=len(legend_handles),
-                        framealpha=0.85,
-                        fontsize=font_size+1,
-                        borderaxespad=0.18,
-                    )
-            elif figure_name == "Surface":
+            if figure_name == "Surface":
                 calib_handle = plt.Line2D([0], [0], color="#e31a1c", linewidth=1.0, linestyle="--", label="Calibration")
                 if "uncertainty" in variant_suffix:
                     measured_handle = plt.Line2D([0], [0], color="black", linewidth=1.4, linestyle="-", label="Measured value")

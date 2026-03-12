@@ -345,9 +345,9 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
             'reg_alpha': 0,
             'learning_rate': 0.01,
             'n_jobs': -1,
-            'early_stopping_rounds': 100,
+            'early_stopping_rounds': 20,
             'train_loss_plateau_rounds': 10,
-            'train_loss_min_relative_improvement': 0.005,
+            'train_loss_min_relative_improvement': 0.01,
             # Optional CV tuning for regularization (train-set only).
             'cv_tuning': {
                 'enabled': False,
