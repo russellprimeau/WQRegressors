@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/b_ExploreData.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -c \":*)"
+    ]
+  }
+}
