@@ -93,12 +93,15 @@ _STAGE2_CVTUNE_DEFAULT_RANDOM_START_TRIALS = 10
 class _TeeTextIO:
     """Write-through stream that mirrors output to multiple text streams."""
 
-    def __init__(self, *streams) -> None:
+    def __init__(self, *streams, auto_flush: bool = True) -> None:
         self._streams = streams
+        self._auto_flush = bool(auto_flush)
 
     def write(self, data: str) -> int:
         for stream in self._streams:
             stream.write(data)
+            if self._auto_flush:
+                stream.flush()
         return len(data)
 
     def flush(self) -> None:
@@ -976,7 +979,7 @@ def main() -> int:
     log_path = _build_pipeline_log_path(data_root_resolved)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(log_path, mode="w", encoding="utf-8") as log_file:
+    with open(log_path, mode="w", encoding="utf-8", buffering=1) as log_file:
         tee_stdout = _TeeTextIO(sys.stdout, log_file)
         tee_stderr = _TeeTextIO(sys.stderr, log_file)
         with contextlib.redirect_stdout(tee_stdout), contextlib.redirect_stderr(tee_stderr):

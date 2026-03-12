@@ -292,7 +292,7 @@ def apply_gp_constraints_and_priors(model, likelihood, hyper_cfg: dict) -> dict:
     if ls_constraint is not None:
         applied = 0
         for kernel in _iter_kernels(model.covar_module.base_kernel):
-            if hasattr(kernel, "raw_lengthscale"):
+            if hasattr(kernel, "raw_lengthscale") and "raw_lengthscale" in kernel._parameters:
                 kernel.register_constraint("raw_lengthscale", ls_constraint)
                 applied += 1
         if applied:
@@ -301,25 +301,40 @@ def apply_gp_constraints_and_priors(model, likelihood, hyper_cfg: dict) -> dict:
     os_min = _coerce_float(hyper_cfg.get("outputscale_min"))
     os_max = _coerce_float(hyper_cfg.get("outputscale_max"))
     os_constraint = _build_constraint(os_min, os_max)
-    if os_constraint is not None and hasattr(model.covar_module, "register_constraint"):
+    if (
+        os_constraint is not None
+        and hasattr(model.covar_module, "register_constraint")
+        and "raw_outputscale" in model.covar_module._parameters
+    ):
         model.covar_module.register_constraint("raw_outputscale", os_constraint)
         meta["outputscale_constraint"] = {"min": os_min, "max": os_max}
 
     noise_min = _coerce_float(hyper_cfg.get("noise_min"))
     noise_max = _coerce_float(hyper_cfg.get("noise_max"))
     noise_constraint = _build_constraint(noise_min, noise_max)
-    if noise_constraint is not None and hasattr(likelihood, "register_constraint"):
-        likelihood.register_constraint("raw_noise", noise_constraint)
+    if (
+        noise_constraint is not None
+        and hasattr(likelihood, "noise_covar")
+        and "raw_noise" in likelihood.noise_covar._parameters
+    ):
+        likelihood.noise_covar.register_constraint("raw_noise", noise_constraint)
         meta["noise_constraint"] = {"min": noise_min, "max": noise_max}
 
     outputscale_prior = _parse_gamma_prior(hyper_cfg.get("outputscale_prior"))
-    if outputscale_prior is not None:
+    if (
+        outputscale_prior is not None
+        and "raw_outputscale" in model.covar_module._parameters
+    ):
         model.covar_module.register_prior("outputscale_prior", outputscale_prior, "outputscale")
         meta["outputscale_prior"] = "gamma"
 
     noise_prior = _parse_gamma_prior(hyper_cfg.get("noise_prior"))
-    if noise_prior is not None:
-        likelihood.register_prior("noise_prior", noise_prior, "noise")
+    if (
+        noise_prior is not None
+        and hasattr(likelihood, "noise_covar")
+        and "raw_noise" in likelihood.noise_covar._parameters
+    ):
+        likelihood.noise_covar.register_prior("noise_prior", noise_prior, "noise")
         meta["noise_prior"] = "gamma"
 
     return meta
