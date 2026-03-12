@@ -2,11 +2,16 @@
 Analyze the combined dataset to identify commonly-sized chunks of data which can be used for forecasting over
 different horizons.
 Then, split the dataset into files for each equivalent sample.
+
+Example:
+python src/d_RunResample.py --config data/output/sampling/resample_config_example.yml
 '''
 
 import os
+import sys
 import json
 import re
+import argparse
 import pandas as pd
 import numpy as np
 import yaml
@@ -16,6 +21,7 @@ import plotly.express as px
 from scipy import stats
 from pathlib import Path
 from utils.preprocessing import normalize_columns
+from utils.config_utils import load_config
 
 
 DEFAULT_SAMPLE_LENGTH_ROWS = 168
@@ -288,7 +294,7 @@ def clean_directory(directory_path):
         print(f"Error deleting files in {directory_path}: {e}")
 
 
-def generate_training_config_template(output_dir, forecast_name, input_columns, output_columns, sample_length, model_type='xgb'):
+def generate_training_config_template(output_dir, forecast_name, input_columns, output_columns, sample_length, model_type='xgb', overrides=None):
     """
     Generate a template configuration file for e_Train.py.
     
@@ -394,15 +400,25 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
         }
     }
     
+    if overrides:
+        config['hyperparameters'].update(overrides.get('hyperparameters', {}))
+        for key in ('model_type', 'model_name', 'device', 'matplotlib_backend'):
+            if key in overrides:
+                config[key] = overrides[key]
+        if 'data' in overrides:
+            config['data'].update(overrides['data'])
+        if 'data_split' in overrides:
+            config['data_split'].update(overrides['data_split'])
+
     # Save as YAML
     config_path = Path(output_dir) / f'config_{model_type}_01.yml'
     with open(config_path, 'w') as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-    
+
     return str(config_path)
 
 
-def generate_transformer_config_template(output_dir, forecast_name, input_columns, output_columns, sample_length):
+def generate_transformer_config_template(output_dir, forecast_name, input_columns, output_columns, sample_length, overrides=None):
     """
     Generate a template configuration file for Transformer models.
     
@@ -467,15 +483,25 @@ def generate_transformer_config_template(output_dir, forecast_name, input_column
         }
     }
     
+    if overrides:
+        config['hyperparameters'].update(overrides.get('hyperparameters', {}))
+        for key in ('model_type', 'model_name', 'device', 'matplotlib_backend'):
+            if key in overrides:
+                config[key] = overrides[key]
+        if 'data' in overrides:
+            config['data'].update(overrides['data'])
+        if 'data_split' in overrides:
+            config['data_split'].update(overrides['data_split'])
+
     # Save as YAML
     config_path = Path(output_dir) / f'config_transformer_01.yml'
     with open(config_path, 'w') as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-    
+
     return str(config_path)
 
 
-def generate_gp_config_template(output_dir, forecast_name, input_columns, output_columns, sample_length):
+def generate_gp_config_template(output_dir, forecast_name, input_columns, output_columns, sample_length, overrides=None):
     """
     Generate a template configuration file for Gaussian Process Regressor models.
 
@@ -559,6 +585,16 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
             'noise_prior': "Gamma prior on likelihood noise (shape, rate). Set to null to disable.",
         }
     }
+
+    if overrides:
+        config['hyperparameters'].update(overrides.get('hyperparameters', {}))
+        for key in ('model_type', 'model_name', 'device', 'matplotlib_backend'):
+            if key in overrides:
+                config[key] = overrides[key]
+        if 'data' in overrides:
+            config['data'].update(overrides['data'])
+        if 'data_split' in overrides:
+            config['data_split'].update(overrides['data_split'])
 
     config_path = Path(output_dir) / 'config_gp_01.yml'
     with open(config_path, 'w') as f:
@@ -824,19 +860,30 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
                         '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)'],
           use_uncertainty_perturbation=False, n_mc_replicates=10, random_seed=21,
           pre_normalized=False, normalization_params=None, sensor_uncertainties=None,
-          verbose=False):
+          verbose=False, gap_rows=0, training_config_defaults=None):
     """
-    Break up a dataset which contains gaps into many files of standard size, which do not contain gaps
+    Break up a dataset which contains gaps into many files of standard size, which do not contain gaps.
+
     :param df: dataframe of consolidated dataset to be broken up
     :param output_dir: where to save the output files
-    :param length: chunk size (threshold for consecutive rows to include in each sample)
+    :param length: number of predictor rows per sample
+    :param gap_rows: rows between the last predictor row and the target row (default 0).
+        Each segment CSV always contains exactly `length` rows. When gap_rows > 0, the
+        predictor window is shifted `gap_rows` rows earlier; the last row of each segment
+        has its TIMESTAMP and target-column values replaced with those from the target row
+        (gap_rows later), while predictor column values come from the earlier row.
+        The contiguity of the predictor window is checked via the Segment column when present.
     :param use_uncertainty_perturbation: if True, generate K Monte Carlo replicates with uncertainty
     :param n_mc_replicates: number of Monte Carlo replicates to generate (K)
     :param random_seed: seed for reproducibility
+    :param training_config_defaults: optional dict with keys 'xgb', 'transformer', 'gp'; values
+        are merged into the corresponding generated template configs.
     :param nan_tol: deprecated here; NaN filtering is handled in e_Train.py
     :param fault_tolerant: deprecated here; NaN filtering is handled in e_Train.py
     :return:
     """
+    if training_config_defaults is None:
+        training_config_defaults = {}
     if pre_normalized:
         df = df.copy()
         if normalization_params is not None:
@@ -905,7 +952,9 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
         )
 
     n_rows = len(df)
-    if n_rows < length:
+    has_segment_col = "Segment" in df.columns
+    min_rows_needed = length + gap_rows
+    if n_rows < min_rows_needed:
         sample_count = 0
         xgb_config_path = generate_training_config_template(
             output_dir,
@@ -913,21 +962,24 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
             predictor_cols,
             target_columns,
             length,
-            model_type='xgb'
+            model_type='xgb',
+            overrides=training_config_defaults.get('xgb', {}),
         )
         transformer_config_path = generate_transformer_config_template(
             output_dir,
             'transformer_01',
             predictor_cols,
             target_columns,
-            length
+            length,
+            overrides=training_config_defaults.get('transformer', {}),
         )
         gp_config_path = generate_gp_config_template(
             output_dir,
             'gp_01',
             predictor_cols,
             target_columns,
-            length
+            length,
+            overrides=training_config_defaults.get('gp', {}),
         )
         return {
             "sample_set_name": Path(output_dir).name,
@@ -937,15 +989,40 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
             "config_paths": [xgb_config_path, transformer_config_path, gp_config_path],
         }
 
-    end_indices = np.arange(length - 1, n_rows)
+    # Target rows: every row from index (min_rows_needed - 1) onward is a candidate.
+    # With gap_rows=0 this is identical to the previous behaviour.
     target_valid = df[target_columns].notnull().all(axis=1).to_numpy()
-    valid_end_mask = target_valid[end_indices]
+    candidate_target_indices = np.arange(min_rows_needed - 1, n_rows)
+    valid_target_indices = candidate_target_indices[target_valid[candidate_target_indices]]
 
-    valid_end_indices = end_indices[valid_end_mask]
+    for target_idx in valid_target_indices:
+        # Predictor window: length rows ending gap_rows before the target
+        pred_end_idx = int(target_idx - gap_rows)
+        pred_start_idx = int(pred_end_idx - length + 1)
 
-    for end_idx in valid_end_indices:
-        start_idx = int(end_idx - length + 1)
-        segment = df.iloc[start_idx:end_idx + 1]
+        predictor_window = df.iloc[pred_start_idx:pred_end_idx + 1]
+
+        # Check predictor-window contiguity when Segment column is present
+        if has_segment_col and predictor_window["Segment"].nunique() > 1:
+            continue
+
+        # Build the segment: predictor_window rows, then compose the last row
+        if gap_rows > 0:
+            # Compose the last row: predictor values from pred_end row, but
+            # TIMESTAMP and target-column values from the actual target row.
+            segment_rows = predictor_window.copy()
+            target_row = df.iloc[target_idx]
+            last_row = segment_rows.iloc[-1].copy()
+            if "TIMESTAMP" in df.columns:
+                last_row["TIMESTAMP"] = target_row["TIMESTAMP"]
+            for col in target_write_cols:
+                if col in last_row.index:
+                    last_row[col] = target_row[col]
+            segment_rows.iloc[-1] = last_row
+            segment = segment_rows
+        else:
+            segment = predictor_window
+
         segment_out = segment.loc[:, sample_columns]
 
         output_file = os.path.join(samples_dir, f"segment_{segment_counter:04d}.csv")
@@ -965,43 +1042,102 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
 
         segment_counter += 1
 
-    # Generate template configuration files for e_Train.py
-    # Use model type with index for forecast naming (not sample set directory name)
+    n_samples = segment_counter - 1
 
-    # Generate XGBoost template
+    # Generate template configuration files for e_Train.py
     xgb_config_path = generate_training_config_template(
-        output_dir, 
+        output_dir,
         'xgb_01',
         predictor_cols,
         target_columns,
         length,
-        model_type='xgb'
+        model_type='xgb',
+        overrides=training_config_defaults.get('xgb', {}),
     )
-
-    # Generate Transformer template
     transformer_config_path = generate_transformer_config_template(
-        output_dir, 
+        output_dir,
         'transformer_01',
         predictor_cols,
         target_columns,
-        length
+        length,
+        overrides=training_config_defaults.get('transformer', {}),
     )
-
-    # Generate GP template
     gp_config_path = generate_gp_config_template(
         output_dir,
         'gp_01',
         predictor_cols,
         target_columns,
-        length
+        length,
+        overrides=training_config_defaults.get('gp', {}),
     )
     return {
         "sample_set_name": Path(output_dir).name,
         "target_columns": list(target_columns),
         "predictor_columns": list(predictor_cols),
-        "n_samples": int(len(valid_end_indices)),
+        "n_samples": n_samples,
         "config_paths": [xgb_config_path, transformer_config_path, gp_config_path],
     }
+
+
+def _build_auto_normalize_list(predictor_cols, target_base_names, df_columns):
+    """
+    Build the to_normalize list automatically from predictors + target base/state/res variants.
+    """
+    candidates = list(predictor_cols)
+    for name in target_base_names:
+        for suffix in ["", "_state", "_res"]:
+            col = name + suffix
+            if col in df_columns:
+                candidates.append(col)
+    return list(dict.fromkeys(candidates))  # dedup, preserve order
+
+
+def _resolve_columns_from_config(config, df_columns):
+    """
+    Resolve final target_columns, predictor_columns, and to_normalize list from config dict.
+
+    Handles auto_target_suffixes.res and auto_target_suffixes.state:
+      - res=True  -> each name in target_columns becomes <name>_res (if present in df)
+      - state=True -> <name>_state is appended to predictors (if present in df)
+
+    Returns (target_columns, predictor_columns, to_normalize)
+    """
+    df_col_set = set(df_columns)
+    raw_target_names = list(config.get("target_columns", []))
+    suffix_opts = config.get("auto_target_suffixes", {})
+    use_res = suffix_opts.get("res", True)
+    use_state = suffix_opts.get("state", True)
+
+    target_columns = []
+    for name in raw_target_names:
+        if use_res:
+            candidate = f"{name}_res"
+            if candidate in df_col_set:
+                target_columns.append(candidate)
+            elif name in df_col_set:
+                target_columns.append(name)
+            else:
+                print(f"[WARN] Target '{name}' not found as '{candidate}' or '{name}' in data. Skipping.")
+        else:
+            if name in df_col_set:
+                target_columns.append(name)
+            else:
+                print(f"[WARN] Target column '{name}' not found in data. Skipping.")
+
+    predictor_columns = list(config.get("predictor_columns", []))
+    if use_state:
+        for name in raw_target_names:
+            state_col = f"{name}_state"
+            if state_col in df_col_set and state_col not in predictor_columns:
+                predictor_columns.append(state_col)
+
+    normalize_cfg = config.get("to_normalize", "auto")
+    if normalize_cfg == "auto":
+        to_normalize = _build_auto_normalize_list(predictor_columns, raw_target_names, df_col_set)
+    else:
+        to_normalize = list(normalize_cfg)
+
+    return target_columns, predictor_columns, to_normalize
 
 
 def _resolve_state_predictor_column(target_name, available_columns):
@@ -1025,149 +1161,112 @@ def _resolve_state_predictor_column(target_name, available_columns):
     return None
 
 
-if __name__ == '__main__':
-    matplotlib.use('Agg')  # Non-interactive backend for file output to handle remote machine installation errors
-    ## Load sensor data
-    ## For binary classification (of Eurofins parameters):
-    # df = pd.read_csv("../data/output/classification/Consolidated_binarized.csv",
-    #                  parse_dates=["TIMESTAMP"])
-    ## For regression (of any parameters:
-    df = pd.read_csv("../data/output/regression/Consolidated_sparse.csv",parse_dates=["TIMESTAMP"])
-    df = df.sort_values("TIMESTAMP")
-
-    ## Identify prediction target columns. Output will only include samples with valid value in last row.
-    predictor_cols  = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
-                        'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
-                        'Pfl - fDOM (QSU)', "Wind speed x (m/s)", "Wind speed y (m/s)",
-                        "Atmospheric pressure (mBar)", 'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
-                        '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
-        'SCADA - pH', 'SCADA - Temperature (°C)']
-
-    # target_columns = ['Cadmium (µg/L)_res', 'pH_res', 'Total coliforms 37°C (CFU/100mL)_res']  # alternative 1: name-based selection
-    
-    target_columns = ['Color_res',
-        'Turbidity (FNU)_res', 'pH_res', 'E.coli (CFU/100mL)_res', 'Intestinal enterococci (CFU/100mL)_res', 
-        'Colony Count 22°C (CFU/mL)_res', 'Total coliforms 37°C (CFU/100mL)_res', 'Arsenic (µg/L)_res',
-        'Lead (µg/L)_res', 'Cadmium (µg/L)_res', 'Copper filtered (mg/L)_res', 'Chromium (µg/L)_res', 'Nickel (µg/L)_res', 
-        'Zinc (µg/L)_res']  # alternative 1: name-based selection
-    
-    # target_columns = df.columns[-9:]  # alternative: index-based selection
-
-    ## Alternative with better coverage
-    # predictor_cols_max = ["Wind speed x (m/s)", "Wind speed y (m/s)",
-    #                   'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
-    #                   'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
-    #                   '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
-    #                   'SCADA - Temperature (°C)']
-    # target_columns_max = ['06-E.coli', '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C']
-
-
-    ## To analyze the impact of sample dimensions on the # of available samples:
-    # gapless(df, target_columns, name="Sparse_Eurofins_availability")  # Analysis function #1
-    # seg_length = 24  # fixed segment length for evaluating range of lengths of gap betweeen input and output
-    # gapped(df, target_columns, seg_length)  # Analysis function #2
-    # analyze_valid(df, target_columns, predictor_cols, 96, 0.1, name="Max_Input_96hr_Set")
-    # analyze_valid(df, target_columns_max, predictor_cols_max, 96, 0.1, name="Max_Coverage_96hr_Set")
-    # analyze_valid(df, ['09-Koliforme bakterier 37°C'], predictor_cols, 96, 0.1, name="Koli_96hr_Set")
-
-    ## Name the dataset and select the size of each sample (# of timesteps/rows)
-    set_name  = "MC_all"  # Name of subdirectory where samples will be organized
-    fallback_length = DEFAULT_SAMPLE_LENGTH_ROWS  # Fallback rows if target lookup fails
-
-    ## Select columns where values in samples will be normalized, which helps with calculating loss accurately
-    # to_normalize = df.columns[3:]
-    to_normalize = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
-                        'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
-                        'Pfl - fDOM (QSU)', "Wind speed x (m/s)", "Wind speed y (m/s)",
-                        'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
-                        'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
-                        '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
-        'SCADA - pH', 'SCADA - Temperature (°C)', 'Color', 'Turbidity (FNU)', 'pH', 'E.coli (CFU/100mL)',
-        'Intestinal enterococci (CFU/100mL)', 'Colony Count 22°C (CFU/mL)', 'Total coliforms 37°C (CFU/100mL)', 'Arsenic (µg/L)',
-        'Lead (µg/L)', 'Cadmium (µg/L)', 'Copper filtered (mg/L)', 'Chromium (µg/L)', 'Nickel (µg/L)', 'Zinc (µg/L)', 'Color_state',
-        'Turbidity (FNU)_state', 'pH_state', 'E.coli (CFU/100mL)_state', 'Intestinal enterococci (CFU/100mL)_state', 
-        'Colony Count 22°C (CFU/mL)_state', 'Total coliforms 37°C (CFU/100mL)_state', 'Arsenic (µg/L)_state',
-        'Lead (µg/L)_state', 'Cadmium (µg/L)_state', 'Copper filtered (mg/L)_state', 'Chromium (µg/L)_state', 'Nickel (µg/L)_state', 
-        'Zinc (µg/L)_state', 'Color_res',
-        'Turbidity (FNU)_res', 'pH_res', 'E.coli (CFU/100mL)_res', 'Intestinal enterococci (CFU/100mL)_res', 
-        'Colony Count 22°C (CFU/mL)_res', 'Total coliforms 37°C (CFU/100mL)_res', 'Arsenic (µg/L)_res',
-        'Lead (µg/L)_res', 'Cadmium (µg/L)_res', 'Copper filtered (mg/L)_res', 'Chromium (µg/L)_res', 'Nickel (µg/L)_res', 
-        'Zinc (µg/L)_res']
-
-    # to_normalize = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
-    #                     'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
-    #                     'Pfl - fDOM (QSU)', "Wind speed x (m/s)", "Wind speed y (m/s)",
-    #                     'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
-    #                     'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
-    #                     '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
-    #     'SCADA - pH', 'SCADA - Temperature (°C)', '01-Farge', '04-Turbiditet', '44-pH', '06-E.coli',
-    #     '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
-    #     '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)', '01-Farge_state',
-    #                 '04-Turbiditet_state', '06-E.coli_state',
-    # '07-Intestinale enterokokker_state', '08-Kimtall 22°C_state', '09-Koliforme bakterier 37°C_state', '21-Arsen_state',
-    #          '24-Bly_state', '32-Kadmium_state', '36-Kopper filtrert_state', '37-Krom_state', '41-Nikkel_state',
-    #                 'Sink (Zn)_state', '01-Farge', '04-Turbiditet', '06-E.coli',
-    # '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen',
-    #          '24-Bly', '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
-
-    # to_normalize = ['Pfl - Water temperature (°C)', 'Pfl - Sp Cond (microS_cm)',
-    #                     'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)',
-    #                     'Pfl - fDOM (QSU)', "Wind speed x (m/s)", "Wind speed y (m/s)",
-    #                     'Maximum 3s wind gust (m/s)', "Atmospheric pressure (mBar)",
-    #                     'Longwave (IR) radiation (W/m2)', 'Shortwave (solar) radiation (W/m2)',
-    #                     '24hr precipitation total (mm)', 'Air temperature (°C)', 'Humidity (%)',
-    #     'SCADA - pH', 'SCADA - Temperature (°C)']
-    # split(df, output_dir, target_columns, length, to_normalize, 0)
-
-    # split(df, output_dir, target_columns, length, 0.8, to_normalize,
-    #       True, predictor_cols=predictor_cols,
-    #       use_uncertainty_perturbation=True, n_mc_replicates=10, random_seed=1)
-    
-    # Normalize once and reuse across all per-target dataset writes.
-    df_norm, normalization_params = _normalize_once(df, to_normalize, min_val=0, max_val=1)
-    shared_sensor_uncertainties = _load_and_prepare_sensor_uncertainties(
-        output_dir="../data/output/CV6",
-        normalization_params=normalization_params,
-        verbose=False,
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate resampled training datasets from a consolidated sensor CSV."
     )
-    try:
-        eurofins_summary_df = _load_eurofins_summary_df()
-    except Exception as exc:
-        eurofins_summary_df = None
-        print(
-            "[WARN] Could not load Eurofins summary table for per-target lengths: "
-            f"{exc}. Using fallback sample length={fallback_length} for all targets."
+    parser.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="Path to resampling configuration YAML file.",
+    )
+    args = parser.parse_args()
+
+    matplotlib.use('Agg')
+
+    config = load_config(args.config)
+    config_dir = Path(config["__config_dir"])
+
+    # --- Resolve paths ---
+    input_csv = Path(config["input_csv"])
+    if not input_csv.is_absolute():
+        input_csv = (config_dir / input_csv).resolve()
+
+    base_output_dir = Path(config["output_dir"])
+    if not base_output_dir.is_absolute():
+        base_output_dir = (config_dir / base_output_dir).resolve()
+
+    set_name_template = config.get("set_name_template", "MC_{target_slug}")
+    sample_length_cfg = config.get("sample_length", "auto")
+    fallback_length = int(config.get("sample_length_fallback", DEFAULT_SAMPLE_LENGTH_ROWS))
+    gap_rows = int(config.get("gap_rows", 0))
+    use_uncertainty_perturbation = bool(config.get("use_uncertainty_perturbation", True))
+    n_mc_replicates = int(config.get("n_mc_replicates", 10))
+    random_seed = int(config.get("random_seed", 1))
+    verbose = bool(config.get("verbose", False))
+    training_config_defaults = config.get("training_config_defaults", {})
+
+    eurofins_path_cfg = config.get("eurofins_summary_path", None)
+    eurofins_summary_path = (
+        Path(eurofins_path_cfg) if eurofins_path_cfg else EUROFINS_SUMMARY_DEFAULT_PATH
+    )
+    if eurofins_path_cfg and not Path(eurofins_path_cfg).is_absolute():
+        eurofins_summary_path = (config_dir / eurofins_path_cfg).resolve()
+
+    # --- Load data ---
+    print(f"[INFO] Loading data from {input_csv}")
+    df = pd.read_csv(input_csv, parse_dates=["TIMESTAMP"])
+    df = df.sort_values("TIMESTAMP").reset_index(drop=True)
+
+    # --- Resolve columns ---
+    target_columns, predictor_cols, to_normalize = _resolve_columns_from_config(config, df.columns)
+    if not target_columns:
+        print("[ERROR] No valid target columns found. Exiting.")
+        sys.exit(1)
+
+    # --- Normalize once ---
+    df_norm, normalization_params = _normalize_once(df, to_normalize, min_val=0, max_val=1)
+
+    # --- Load shared sensor uncertainties ---
+    shared_sensor_uncertainties = None
+    if use_uncertainty_perturbation:
+        shared_sensor_uncertainties = _load_and_prepare_sensor_uncertainties(
+            output_dir=str(base_output_dir),
+            normalization_params=normalization_params,
+            verbose=verbose,
         )
 
-    for target in target_columns:
-        target_slug = target.replace(" ", "_").replace("/", "_")
-        output_dir = os.path.join("../data/output/CV6", f"MC_{target_slug}")
-        if eurofins_summary_df is None:
-            target_length = fallback_length
-        else:
-            target_length = _get_target_sample_length_rows(
-                target,
-                eurofins_summary_df,
-                default_rows=fallback_length,
-                verbose=True,
+    # --- Eurofins lookup for per-target sample lengths ---
+    eurofins_summary_df = None
+    if sample_length_cfg == "auto":
+        try:
+            eurofins_summary_df = _load_eurofins_summary_df(eurofins_summary_path)
+        except Exception as exc:
+            print(
+                f"[WARN] Could not load Eurofins summary table: {exc}. "
+                f"Using fallback sample length={fallback_length} for all targets."
             )
-        available_cols = set(df_norm.columns)
-        target_state_col = _resolve_state_predictor_column(target, available_cols)
-        per_target_predictors = list(predictor_cols)
-        if target_state_col is not None and target_state_col not in per_target_predictors:
-            per_target_predictors.append(target_state_col)
 
-        missing_predictors = [col for col in per_target_predictors if col not in available_cols]
+    # --- Per-target loop ---
+    for target in target_columns:
+        target_slug = re.sub(r"[^\w]", "_", target)
+        output_dir = str(base_output_dir / set_name_template.format(target_slug=target_slug))
+
+        if sample_length_cfg == "auto":
+            if eurofins_summary_df is None:
+                target_length = fallback_length
+            else:
+                target_length = _get_target_sample_length_rows(
+                    target,
+                    eurofins_summary_df,
+                    default_rows=fallback_length,
+                    verbose=True,
+                )
+        else:
+            target_length = int(sample_length_cfg)
+
+        available_cols = set(df_norm.columns)
+        per_target_predictors = [c for c in predictor_cols if c in available_cols]
+
+        missing_predictors = [c for c in predictor_cols if c not in available_cols]
         if missing_predictors:
             print(
                 f"[WARN] Dropping missing predictors for target '{target}': "
                 + ", ".join(missing_predictors)
             )
-            per_target_predictors = [col for col in per_target_predictors if col in available_cols]
 
-        if target_state_col is None:
-            print(f"[WARN] No matching state predictor column found for target '{target}'.")
-        print(f"[INFO] Target '{target}' sample length (rows): {target_length}")
+        print(f"[INFO] Target '{target}': sample_length={target_length}, gap_rows={gap_rows}")
         result = split(
             df_norm,
             output_dir,
@@ -1177,48 +1276,24 @@ if __name__ == '__main__':
             to_normalize,
             True,
             predictor_cols=per_target_predictors,
-            use_uncertainty_perturbation=True,
-            n_mc_replicates=10,
-            random_seed=1,
+            use_uncertainty_perturbation=use_uncertainty_perturbation,
+            n_mc_replicates=n_mc_replicates,
+            random_seed=random_seed,
             pre_normalized=True,
             normalization_params=normalization_params,
             sensor_uncertainties=shared_sensor_uncertainties,
-            verbose=False,
+            verbose=verbose,
+            gap_rows=gap_rows,
+            training_config_defaults=training_config_defaults,
         )
 
-        print(f"Sample set: {result['sample_set_name']}")
-        print(f"Target columns: {result['target_columns']}")
-        print(f"Predictor columns: {result['predictor_columns']}")
-        print(f"Number of samples included: {result['n_samples']}")
-        for cfg in result['config_paths']:
-            print(f"Config file generated: {cfg}")
+        print(f"  Sample set : {result['sample_set_name']}")
+        print(f"  Targets    : {result['target_columns']}")
+        print(f"  Predictors : {len(result['predictor_columns'])} columns")
+        print(f"  N samples  : {result['n_samples']}")
+        for cfg_path in result['config_paths']:
+            print(f"  Config     : {cfg_path}")
 
-    # for target in target_columns:
-    #     target_slug = target.replace(" ", "_").replace("/", "_")
-    #     output_dir = os.path.join("../data/output/regression", f"MC_ex{target_slug}")
-    #     target_state_col = target.replace('', '_state') if target.endswith('') else f"{target}_state"
-    #     per_target_predictors = predictor_cols + [target_state_col] if target_state_col not in predictor_cols else predictor_cols
-    #     result = split(
-    #         df_norm,
-    #         output_dir,
-    #         [target],
-    #         length,
-    #         0.8,
-    #         to_normalize,
-    #         True,
-    #         predictor_cols=per_target_predictors,
-    #         use_uncertainty_perturbation=True,
-    #         n_mc_replicates=10,
-    #         random_seed=1,
-    #         pre_normalized=True,
-    #         normalization_params=normalization_params,
-    #         sensor_uncertainties=shared_sensor_uncertainties,
-    #         verbose=False,
-    #     )
 
-    #     print(f"Sample set: {result['sample_set_name']}")
-    #     print(f"Target columns: {result['target_columns']}")
-    #     print(f"Predictor columns: {result['predictor_columns']}")
-    #     print(f"Number of samples included: {result['n_samples']}")
-    #     for cfg in result['config_paths']:
-    #         print(f"Config file generated: {cfg}")
+if __name__ == '__main__':
+    main()
