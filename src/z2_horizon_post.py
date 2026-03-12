@@ -1,23 +1,34 @@
 """
-Generates lookahead-sweep comparison figures across all MC datasets.
+Generates horizon-sweep comparison figures across all MC datasets.
 
 Reads ``lookahead_metrics.csv`` from each dataset's ``forecasts/lookahead_sweeps/``
-directory and produces two summary figures:
+directory (written by ``k_RunHorizonSweep.py``) and produces two summary figures:
 
-  1. ``lookahead_r2_comparison.png``    – R² vs lookahead distance (hours)
-  2. ``lookahead_nrmse_comparison.png`` – nRMSE vs lookahead distance (hours)
+  1. ``lookahead_r2_comparison.png``    – R² vs forecast horizon (hours)
+  2. ``lookahead_nrmse_comparison.png`` – nRMSE vs forecast horizon (hours)
 
 nRMSE (= RMSE / std_target) is used instead of raw RMSE so that datasets with
 very different target magnitudes can be compared on the same axis.  The
 ``std_target`` value is read from each dataset's
 ``forecasts/feature_sweeps/feature_sweep_final_metrics.csv`` (populated by
-``z1_PostProcess.py`` / ``z1_PostProcess.py``).
+``z1_PostProcess.py``).
 
 Both figures are written to the ``summaries/`` subdirectory of the data root,
 the same location used by ``z1_PostProcess.py``.
 
+The script supports metrics CSVs produced by both ``k_RunHorizonSweep.py``
+(column ``horizon``) and the legacy ``k_lookahead_sweep.py`` (column
+``lookahead``); both are handled transparently.
+
+CLI arguments:
+    --data-root PATH        Root directory containing MC_* dataset subdirectories.
+                            Default: data/output/regression
+    --dataset-prefix STR    Only include datasets whose name starts with this
+                            prefix.  Default: MC
+
 Examples:
     python src/z2_horizon_post.py
+    python src/z2_horizon_post.py --data-root data/output/regression
     python src/z2_horizon_post.py --data-root data/output/regression --dataset-prefix MC
 """
 from __future__ import annotations
@@ -96,7 +107,12 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path) -> int:
     records: list[tuple[str, pd.DataFrame]] = []
     for name, dataset_dir, csv_path in datasets:
         try:
-            df = pd.read_csv(csv_path).sort_values("lookahead").reset_index(drop=True)
+            df = pd.read_csv(csv_path)
+            # Normalise column name: k_RunHorizonSweep uses "horizon",
+            # legacy k_lookahead_sweep used "lookahead".
+            if "horizon" in df.columns and "lookahead" not in df.columns:
+                df = df.rename(columns={"horizon": "lookahead"})
+            df = df.sort_values("lookahead").reset_index(drop=True)
             std_target = _load_std_target(dataset_dir)
             if std_target is not None:
                 df["nrmse"] = df["rmse"] / std_target
@@ -106,7 +122,7 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path) -> int:
                 std_note = "std_target not found – nRMSE will be NaN"
             label = _clean_label(name, prefix)
             records.append((label, df))
-            print(f"[INFO]  {name}: {len(df)} lookahead rows, {std_note}")
+            print(f"[INFO]  {name}: {len(df)} horizon rows, {std_note}")
         except Exception:
             print(f"[WARN] Could not load {csv_path}:")
             traceback.print_exc()
@@ -132,7 +148,7 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path) -> int:
                 linewidth=1.5,
                 label=label,
             )
-        ax.set_xlabel("Lookahead (hours)")
+        ax.set_xlabel("Forecast horizon (hours)")
         ax.set_ylabel(ylabel)
         ax.set_xticks(all_x)
         ax.set_xticklabels([])  # labels drawn manually below to allow vertical staggering

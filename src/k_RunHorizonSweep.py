@@ -1,17 +1,45 @@
 """
-Horizon sweep script: For each dataset, take the best-performing model/config (from feature_sweeps),
-then for each horizon N generate a fresh set of samples via d_RunResample.split(gap_rows=N),
-retrain and evaluate the model, and save metrics/plots to forecasts/lookahead_sweeps/.
+Horizon sweep script: For each dataset, take the best-performing model/config (from
+feature_sweeps), then for each horizon N call d_RunResample.split(gap_rows=N) to generate
+a fresh set of samples where the predictor window ends N hours before the target, retrain
+and evaluate the model, and save metrics/plots to forecasts/lookahead_sweeps/.
 
-Each horizon's samples and model outputs live under:
+Each horizon's samples and model outputs are written to an isolated subdirectory:
+
     <dataset_dir>/horizons/horizon_NNNhr/
+        samples/                        – raw sample CSVs (gap_rows=N)
+        mc_replicates/                  – uncertainty-perturbed replicates
+        config_<model>_01.yml           – training config for this horizon
+        forecasts/horizon_NNNhr/
+            evaluation_summary.csv      – per-set metrics for this horizon
 
-# Expect:
-# - data/output/regression/MC_<TARGET>/horizons/horizon_000hr/ created with samples/ and mc_replicates/
-# - data/output/regression/MC_<TARGET>/horizons/horizon_024hr/ etc.
-# - evaluation_summary.csv under each horizons/horizon_NNNhr/forecasts/horizon_NNNhr/
-# - data/output/regression/MC_<TARGET>/forecasts/lookahead_sweeps/lookahead_metrics.csv updated
-# - rmse_vs_lookahead.png and r2_vs_lookahead.png updated
+Aggregate metrics and per-dataset plots are written to:
+
+    <dataset_dir>/forecasts/lookahead_sweeps/
+        lookahead_metrics.csv           – one row per horizon (test-set metrics)
+        rmse_vs_lookahead.png
+        r2_vs_lookahead.png
+
+Use z2_horizon_post.py to produce cross-dataset comparison figures.
+
+CLI arguments:
+    --data-root PATH        Root directory containing MC_* dataset subdirectories.
+                            Default: data/output/regression
+    --dataset-prefix STR    Only process datasets whose name starts with this prefix.
+                            Default: MC
+    --resample-config PATH  Path to the d_RunResample YAML config that was used to
+                            generate the original samples.  Provides input_csv, column
+                            lists, and Monte Carlo settings.  Required.
+    --horizons INT [INT …]  Space-separated list of horizon values (hours) to sweep.
+                            Default: 0 1 2 6 12 24 48 96 120 167
+
+Examples:
+    python src/k_RunHorizonSweep.py --resample-config data/output/sampling/resample_config.yml
+    python src/k_RunHorizonSweep.py \\
+        --data-root data/output/regression \\
+        --dataset-prefix MC \\
+        --resample-config data/output/sampling/resample_config.yml \\
+        --horizons 0 6 12 24 48
 """
 
 import os
@@ -179,7 +207,7 @@ def _select_horizon_config(config_paths: list, model_key: str) -> Path | None:
     return Path(config_paths[0]) if config_paths else None
 
 
-def run_horizon_sweep(data_root, dataset_prefix, resample_config_path):
+def run_horizon_sweep(data_root, dataset_prefix, resample_config_path, preferred_lookaheads=None):
     # --- Load resample config ---
     resample_cfg = load_config(resample_config_path)
     config_dir = Path(resample_cfg['__config_dir'])
@@ -242,7 +270,7 @@ def run_horizon_sweep(data_root, dataset_prefix, resample_config_path):
 
         # --- Build lookahead schedule ---
         sample_length = _base_window_rows_from_config(base_config)
-        lookaheads = _build_lookahead_schedule(base_rows=sample_length)
+        lookaheads = _build_lookahead_schedule(base_rows=sample_length, preferred=preferred_lookaheads)
         if not lookaheads:
             print(f"  [WARN] No valid lookahead schedule for sample_length={sample_length}. Skipping.")
             continue
@@ -374,5 +402,13 @@ if __name__ == '__main__':
         required=True,
         help='Path to the original d_RunResample YAML config (provides input_csv, columns, MC settings).',
     )
+    parser.add_argument(
+        '--horizons',
+        type=int,
+        nargs='+',
+        default=None,
+        metavar='INT',
+        help='Horizon values (hours) to sweep. Default: 0 1 2 6 12 24 48 96 120 167',
+    )
     args = parser.parse_args()
-    run_horizon_sweep(args.data_root, args.dataset_prefix, args.resample_config)
+    run_horizon_sweep(args.data_root, args.dataset_prefix, args.resample_config, args.horizons)
