@@ -28,14 +28,14 @@ Postprocess behavior highlights:
     prefix filtering and process every dataset folder.
 
 Examples:
-python src/z1_PostProcess.py --keep-search-plots
-python src/z1_PostProcess.py --sweep-namespace feature_sweeps
-python src/z1_PostProcess.py --sweep-namespace Shapley_sweeps
-python src/z1_PostProcess.py --path data/output/regression_alt --sweep-namespace Shapley_sweeps
-python src/z1_PostProcess.py --sweep-namespace feature_sweeps --run-rolling-cv
-python src/z1_PostProcess.py --path data/output/regression --sweep-namespace feature_sweeps --bootstrap-mode moving_block --bootstrap-block-len 5
-python src/z1_PostProcess.py --all-datasets
-python src/z1_PostProcess.py --limit-datasets 1
+python src/z1_FeaturePostProcess.py --keep-search-plots
+python src/z1_FeaturePostProcess.py --sweep-namespace feature_sweeps
+python src/z1_FeaturePostProcess.py --sweep-namespace Shapley_sweeps
+python src/z1_FeaturePostProcess.py --path data/output/regression_alt --sweep-namespace Shapley_sweeps
+python src/z1_FeaturePostProcess.py --sweep-namespace feature_sweeps --run-rolling-cv
+python src/z1_FeaturePostProcess.py --path data/output/regression --sweep-namespace feature_sweeps --bootstrap-mode moving_block --bootstrap-block-len 5
+python src/z1_FeaturePostProcess.py --all-datasets
+python src/z1_FeaturePostProcess.py --limit-datasets 1
 """
 from __future__ import annotations
 import contextlib

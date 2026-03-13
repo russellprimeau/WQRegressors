@@ -39,9 +39,9 @@ CLI arguments:
                             prefix.  Default: MC
 
 Examples:
-    python src/z2_horizon_post.py
-    python src/z2_horizon_post.py --data-root data/output/regression
-    python src/z2_horizon_post.py --data-root data/output/CV4 --dataset-prefix MC
+    python src/z2_HorizonPostProcess.py
+    python src/z2_HorizonPostProcess.py --data-root data/output/regression
+    python src/z2_HorizonPostProcess.py --data-root data/output/CV4 --dataset-prefix MC
 """
 from __future__ import annotations
 import argparse
@@ -257,7 +257,7 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path) -> int:
         axes[-1].set_xticklabels([])
         trans = axes[-1].get_xaxis_transform()
         for j, val in enumerate(all_x):
-            y_offset = -0.05 if j % 2 == 0 else -0.12
+            y_offset = -0.1 if j % 2 == 0 else -0.12
             axes[-1].text(val, y_offset, str(int(val)), transform=trans,
                           ha="center", va="top", fontsize=10)
 
@@ -314,7 +314,12 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path) -> int:
         [df["nrmse"] for _, df in records if "nrmse" in df.columns],
         ignore_index=True,
     ).dropna()
-    nrmse_ylim = (float(_nrmse_all.min()), float(_nrmse_all.max())) if not _nrmse_all.empty else None
+    if not _nrmse_all.empty:
+        _nrmse_min, _nrmse_max = float(_nrmse_all.min()), float(_nrmse_all.max())
+        _nrmse_margin = 0.1 * (_nrmse_max - _nrmse_min)
+        nrmse_ylim = (_nrmse_min - _nrmse_margin, _nrmse_max + _nrmse_margin)
+    else:
+        nrmse_ylim = None
 
     nrmse_path = _make_figure("nrmse", "nRMSE (RMSE / σ_target)", "lookahead_nrmse_comparison.png",
                               any_replicates=any_replicates, ylim=nrmse_ylim)
