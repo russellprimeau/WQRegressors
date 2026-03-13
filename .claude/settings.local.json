@@ -9,7 +9,11 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/e_Train.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/z2_horizon_post.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/k_RunHorizonSweep.py''\\).read\\(\\)\\); ast.parse\\(open\\(''src/z2_horizon_post.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/k_RunHorizonSweep.py''\\).read\\(\\)\\); print\\(''OK''\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/k_RunHorizonSweep.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''pipeline OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/m_RunParallelPipeline.py''\\).read\\(\\)\\); print\\(''orchestrator OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/m_RunParallelPipeline.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''OK''\\)\")"
     ]
   }
 }

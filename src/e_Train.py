@@ -21,6 +21,19 @@ Notes:
     CUDA QuantileDMatrix memory) and CuPy fold arrays (returning them to the pool
     for reuse). No full pool flush is performed — pool reuse is intentional and
     necessary for GPU throughput.
+- CV tuning pre-computes fold index arrays once before the trial loop and
+    pre-transfers the full feature matrix X to the GPU once (as a CuPy array).
+    This eliminates n_trials × n_folds redundant host-to-device copies and
+    list-comprehension rebuilds. y stays as numpy since it is used in scalar
+    metric computations alongside numpy prediction outputs.
+- In GPU mode, n_jobs is not overridden by the runtime resolver. Users control
+    parallelism via hyperparameters.n_jobs (default -1, all cores). CV tuning
+    overrides n_jobs per-trial only when parallel_jobs > 1 to prevent contention
+    across concurrent fold processes.
+- Final model training pre-transfers X_train, X_test, y_train, y_test to GPU
+    (CuPy) before model.fit() so that XGBoost builds its internal QuantileDMatrix
+    directly from device memory. eval_set_override is not converted since its
+    format is controlled by the caller.
 """
 
 import os
@@ -364,8 +377,8 @@ def _resolve_xgb_runtime_hyperparameters(hyper_cfg: dict, preferred_device: str)
             effective.setdefault("tree_method", "gpu_hist")
             effective.setdefault("predictor", "gpu_predictor")
             effective.pop("device", None)
-        # In GPU mode, avoid high host CPU contention from n_jobs=-1.
-        effective["n_jobs"] = int(effective.get("n_jobs", 1)) if int(effective.get("n_jobs", 1)) > 0 else 1
+        # n_jobs is left as configured. CV tuning overrides it explicitly per-trial
+        # when parallel_jobs > 1; final model training benefits from full parallelism.
     else:
         effective.setdefault("tree_method", "hist")
         effective.setdefault("n_jobs", -1)
@@ -1671,6 +1684,23 @@ def _xgb_tune_hyperparameters_cv(
     best_score = float("inf")
     best_params: dict = {}
 
+    # Pre-compute fold index arrays once; they are constant across all trials.
+    # This avoids rebuilding them via list comprehension for every trial × fold.
+    precomputed_folds: list[tuple[np.ndarray, np.ndarray]] = []
+    for _fi in range(len(folds)):
+        _val_idx = np.array(folds[_fi], dtype=int)
+        _train_idx = np.array(
+            [i for _fj, _f in enumerate(folds) if _fj != _fi for i in _f],
+            dtype=int,
+        )
+        precomputed_folds.append((_train_idx, _val_idx))
+
+    # Pre-transfer X to GPU once if in GPU mode. cp.asarray() on a CuPy slice
+    # inside _xgb_cv_fold_score is then a no-op, eliminating n_trials × n_folds
+    # host-to-device copies of the full feature matrix. y stays as numpy because it
+    # is used in scalar metric computations alongside numpy prediction outputs.
+    X_cv = cp.asarray(X) if (is_gpu_mode and cp is not None) else X
+
     executor = None
     try:
         if parallel_jobs > 1:
@@ -1704,18 +1734,13 @@ def _xgb_tune_hyperparameters_cv(
                 fold_r2: list[float] = []
                 if executor is not None:
                     futures = []
-                    for fold_idx in range(len(folds)):
-                        val_idx = np.array(folds[fold_idx], dtype=int)
-                        train_idx = np.array(
-                            [i for f_idx, f in enumerate(folds) if f_idx != fold_idx for i in f],
-                            dtype=int,
-                        )
+                    for train_idx, val_idx in precomputed_folds:
                         futures.append(
                             executor.submit(
                                 _xgb_cv_fold_score,
                                 model_kind,
                                 trial_kwargs,
-                                X,
+                                X_cv,
                                 y,
                                 train_idx,
                                 val_idx,
@@ -1730,16 +1755,11 @@ def _xgb_tune_hyperparameters_cv(
                         if r2 is not None and np.isfinite(r2):
                             fold_r2.append(float(r2))
                 else:
-                    for fold_idx in range(len(folds)):
-                        val_idx = np.array(folds[fold_idx], dtype=int)
-                        train_idx = np.array(
-                            [i for f_idx, f in enumerate(folds) if f_idx != fold_idx for i in f],
-                            dtype=int,
-                        )
+                    for train_idx, val_idx in precomputed_folds:
                         score, r2 = _xgb_cv_fold_score(
                             model_kind,
                             trial_kwargs,
-                            X,
+                            X_cv,
                             y,
                             train_idx,
                             val_idx,
@@ -1809,18 +1829,13 @@ def _xgb_tune_hyperparameters_cv(
                 fold_r2: list[float] = []
                 if executor is not None:
                     futures = []
-                    for fold_idx in range(len(folds)):
-                        val_idx = np.array(folds[fold_idx], dtype=int)
-                        train_idx = np.array(
-                            [i for f_idx, f in enumerate(folds) if f_idx != fold_idx for i in f],
-                            dtype=int,
-                        )
+                    for train_idx, val_idx in precomputed_folds:
                         futures.append(
                             executor.submit(
                                 _xgb_cv_fold_score,
                                 model_kind,
                                 trial_kwargs,
-                                X,
+                                X_cv,
                                 y,
                                 train_idx,
                                 val_idx,
@@ -1835,16 +1850,11 @@ def _xgb_tune_hyperparameters_cv(
                         if r2 is not None and np.isfinite(r2):
                             fold_r2.append(float(r2))
                 else:
-                    for fold_idx in range(len(folds)):
-                        val_idx = np.array(folds[fold_idx], dtype=int)
-                        train_idx = np.array(
-                            [i for f_idx, f in enumerate(folds) if f_idx != fold_idx for i in f],
-                            dtype=int,
-                        )
+                    for train_idx, val_idx in precomputed_folds:
                         score, r2 = _xgb_cv_fold_score(
                             model_kind,
                             trial_kwargs,
-                            X,
+                            X_cv,
                             y,
                             train_idx,
                             val_idx,
@@ -2217,6 +2227,18 @@ def _train_xgb_model(
         f"xgboost_version={getattr(xgb, '__version__', 'unknown')})"
     )
 
+    # Pre-transfer training data to GPU once so that XGBoost builds its internal
+    # QuantileDMatrix directly from device memory instead of copying from host.
+    # eval_set_override is not converted since its format is caller-controlled.
+    if is_gpu_mode and cp is not None:
+        X_train_fit = cp.asarray(X_train)
+        y_train_fit = cp.asarray(y_train)
+        X_test_fit = cp.asarray(X_test)
+        y_test_fit = cp.asarray(y_test)
+    else:
+        X_train_fit, y_train_fit = X_train, y_train
+        X_test_fit, y_test_fit = X_test, y_test
+
     print(f"Training {model_cls.__name__}...")
     fit_kwargs = {
         "verbose": True,
@@ -2224,7 +2246,7 @@ def _train_xgb_model(
     if eval_set_override is not None:
         fit_kwargs["eval_set"] = eval_set_override
     else:
-        fit_kwargs["eval_set"] = [(X_train, y_train), (X_test, y_test)]
+        fit_kwargs["eval_set"] = [(X_train_fit, y_train_fit), (X_test_fit, y_test_fit)]
 
     supports_callbacks = "callbacks" in inspect.signature(model.fit).parameters
 
@@ -2236,7 +2258,7 @@ def _train_xgb_model(
                 "[WARN] train-loss plateau stop requested but this xgboost sklearn "
                 "version does not support fit(callbacks=...). Skipping plateau rule."
             )
-    model.fit(X_train, y_train, **fit_kwargs)
+    model.fit(X_train_fit, y_train_fit, **fit_kwargs)
 
     if plateau_state and plateau_state.get("triggered"):
         print(

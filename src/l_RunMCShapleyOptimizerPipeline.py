@@ -34,28 +34,61 @@ Stage behavior:
 - Supports stage skipping for iterative workflows:
     `--skip-shapley-stage` or `--skip-optimizer-stage`.
 
+Parallel execution (multi-dataset):
+- The companion script `m_RunParallelPipeline.py` partitions datasets across N
+    concurrent worker processes using stride assignment (worker i processes
+    plans[i::N]). All arguments to this script are passed through unchanged.
+- Datasets are independent: each has its own cache, Shapley artifacts, optimizer
+    outputs, and config files. Workers never share or modify each other's files.
+- Output: the orchestrator merges all workers' stdout/stderr into a single
+    master log file (parallel_pipeline_TIMESTAMP.log), with each line prefixed
+    [W{i}] to identify the source worker. Each worker also writes its own
+    individual log file as usual. Monitor the master log live with:
+        Get-Content "<master_log_path>" -Wait     (PowerShell)
+        tail -f "<master_log_path>"               (bash/WSL)
+    The master log path is printed to the terminal at startup. Do not monitor
+    individual worker logs during a parallel run; use the master log instead.
+- WARNING — GPU memory: each worker process creates its own CUDA context and
+    CuPy memory pool. Peak VRAM usage scales approximately as N × single-worker
+    peak. Monitor VRAM on the first parallel run and reduce --num-workers (or
+    set device: cpu in configs) if GPU OOM errors occur.
+- WARNING — RAM: each worker independently loads data and holds model state.
+    Observed steady-state RAM usage scales with --num-workers. With ~40% RAM at
+    steady state for one worker, two workers may approach 80% before the OS can
+    page. Add swap space or reduce --num-workers if memory pressure is too high.
+- Worker-partition arguments (--num-workers, --worker-index) are passed by
+    the orchestrator and are hidden from --help. Do not use them directly.
+
 Common usage:
 1) Dry-run full pipeline:
         python src/l_RunMCShapleyOptimizerPipeline.py --dry-run
 
-2) Full pipeline with explicit budgets:
+2) Full pipeline with explicit budgets (sequential):
+python src/l_RunMCShapleyOptimizerPipeline.py \\
+            --dataset-prefix MC --limit-datasets 14 \\
+            --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4
 
-python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4
-python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 3 --shapley-eval-budget 3 --optimizer-eval-budget 3 --final-top-k 1 --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 --beam-width 16 --max-rounds 30 --max-swap-attempts 200 --keep-shapley-plots --keep-search-plots
-python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 --beam-width 16 --max-rounds 30 --max-swap-attempts 200 --keep-shapley-plots --keep-search-plots --parallel-evaluators 1
+python src/l_RunMCShapleyOptimizerPipeline.py \\
+            --dataset-prefix MC --limit-datasets 14 \\
+            --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 \\
+            --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 \\
+            --beam-width 16 --max-rounds 30 --max-swap-attempts 200 \\
+            --keep-shapley-plots --keep-search-plots
 
+3) Full pipeline with parallel dataset processing (see GPU/RAM warnings above):
+python src/m_RunParallelPipeline.py --num-workers 2 --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 --keep-shapley-plots --keep-search-plots --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 --beam-width 16 --max-rounds 30 --max-swap-attempts 200 --parallel-evaluators 1 --data-root C:\Users\Master\Documents\GitHub\WQRegressors\data\output\CV7
 
-3) Multi-seed optimizer stage in one run:
-        python src/l_RunMCShapleyOptimizerPipeline.py \
+4) Multi-seed optimizer stage in one run:
+python src/l_RunMCShapleyOptimizerPipeline.py \\
             --dataset-prefix MC --optimizer-seeds 7,11,19
 
-4) Reuse existing Shapley artifacts and skip Stage 1:
-        python src/l_RunMCShapleyOptimizerPipeline.py \
+5) Reuse existing Shapley artifacts and skip Stage 1:
+python src/l_RunMCShapleyOptimizerPipeline.py \\
             --skip-shapley-stage --optimizer-seeds 7,11,19
 
-5) Override seed subset source with explicit CSV:
-        python src/l_RunMCShapleyOptimizerPipeline.py \
-            --seed-subsets-csv data/output/regression/MC_exColor_res/forecasts/Shapley_sweeps/feature_seed_subsets_r671.csv \
+6) Override seed subset source with explicit CSV:
+python src/l_RunMCShapleyOptimizerPipeline.py \\
+            --seed-subsets-csv data/output/regression/MC_exColor_res/forecasts/Shapley_sweeps/feature_seed_subsets_r671.csv \\
             --skip-shapley-stage
 """
 
@@ -985,6 +1018,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--stop-on-error", action="store_true")
+
+    # Worker-partition arguments used by m_RunParallelPipeline.py.
+    # --worker-index selects every Nth plan starting at index i (stride assignment).
+    # Not intended for direct use; suppressed from --help.
+    parser.add_argument("--num-workers", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-index", type=int, default=0, help=argparse.SUPPRESS)
+
     return parser
 
 
@@ -1017,6 +1057,18 @@ def _run_pipeline(args: argparse.Namespace, data_root_resolved: Path) -> int:
         print("No matching datasets/configs found.")
         return 1
 
+    # Stride-partition plans when running as a worker under m_RunParallelPipeline.py.
+    # Worker i processes plans[i::num_workers]: datasets are interleaved so that
+    # work is distributed evenly if dataset processing times vary.
+    num_workers = int(args.num_workers)
+    worker_index = int(args.worker_index)
+    if num_workers > 1:
+        plans = plans[worker_index::num_workers]
+        if not plans:
+            print(f"[WORKER {worker_index}/{num_workers}] No datasets assigned to this worker.")
+            return 0
+        print(f"[WORKER {worker_index}/{num_workers}] Assigned {len(plans)} dataset(s): "
+              f"{[p.dataset_dir.name for p in plans]}")
 
     print("\nPipeline plan")
     print("-" * 100)
