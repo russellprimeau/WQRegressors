@@ -93,6 +93,7 @@ import io
 import json
 import re
 import sys
+import textwrap
 import time
 from concurrent.futures import ProcessPoolExecutor
 import pandas as pd
@@ -197,6 +198,37 @@ def _normalize_baseline_label(value: object) -> "str | None":
 def _is_baseline_model_value(value: object) -> bool:
     text = str(value).strip().lower()
     return text in BASELINE_MODEL_IDS
+
+
+def _select_best_model_by_min_skill_rmse(
+    df_rank: "pd.DataFrame",
+) -> "pd.Series | None":
+    """Select the best non-baseline model row by RMSE-based minimum skill.
+
+    min_skill = (rmse_best_baseline - rmse_model) / rmse_best_baseline
+
+    Returns the best-skill model row, or None if baseline rows are absent,
+    no ML model rows exist, or the best baseline RMSE is non-positive.
+    """
+    if df_rank.empty or "rmse" not in df_rank.columns or "model" not in df_rank.columns:
+        return None
+    is_baseline = df_rank["model"].apply(_is_baseline_model_value)
+    baseline_rows = df_rank[is_baseline]
+    ml_rows = df_rank[~is_baseline].copy()
+    if baseline_rows.empty or ml_rows.empty:
+        return None
+    baseline_rmse = pd.to_numeric(baseline_rows["rmse"], errors="coerce").dropna()
+    if baseline_rmse.empty:
+        return None
+    best_baseline_rmse = float(baseline_rmse.min())
+    if not np.isfinite(best_baseline_rmse) or best_baseline_rmse <= 0:
+        return None
+    ml_rmse = pd.to_numeric(ml_rows["rmse"], errors="coerce")
+    ml_rows["_min_skill"] = (best_baseline_rmse - ml_rmse) / best_baseline_rmse
+    valid = ml_rows[ml_rows["_min_skill"].notna() & np.isfinite(ml_rows["_min_skill"])]
+    if valid.empty:
+        return None
+    return valid.loc[valid["_min_skill"].idxmax()]
 
 
 def _sweep_namespace() -> str:
@@ -1072,19 +1104,53 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     if not finite_max_r2:
         raise ValueError("Cannot plot final metrics summary: R2 values are all non-finite.")
 
-    best_model = max(finite_max_r2.items(), key=lambda item: item[1])[0]
+    # Build RMSE-based minimum skill pivot for cross-model ordering decisions.
+    # min_skill = (rmse_best_baseline - rmse_model) / rmse_best_baseline
+    _baseline_mask = grouped["model_norm"].apply(_is_baseline_model_value)
+    _baseline_rmse_by_rank = (
+        grouped[_baseline_mask]
+        .groupby("subset_rank")["rmse"]
+        .min()
+        .rename("_best_baseline_rmse")
+    )
+    _grouped_skill = grouped.join(_baseline_rmse_by_rank, on="subset_rank")
+    _skill_vals = np.where(
+        (~_baseline_mask) & (_grouped_skill["_best_baseline_rmse"] > 0),
+        (_grouped_skill["_best_baseline_rmse"] - _grouped_skill["rmse"]) / _grouped_skill["_best_baseline_rmse"],
+        np.nan,
+    )
+    _grouped_skill = _grouped_skill.copy()
+    _grouped_skill["_min_skill"] = _skill_vals
+    skill_pivot = _grouped_skill.pivot(index="subset_rank", columns="model_norm", values="_min_skill")
+    grouped["min_skill_rmse"] = _grouped_skill["_min_skill"].values
+
+    def _skill_for_rank_model(rank: int, model: str) -> float:
+        if rank in skill_pivot.index and model in skill_pivot.columns:
+            val = pd.to_numeric(skill_pivot.loc[rank, model], errors="coerce")
+            return float(val) if np.isfinite(val) else float("-inf")
+        return float("-inf")
+
+    # Select best model by highest max skill across subsets; fall back to r2 if skill unavailable.
+    finite_max_skill = {}
+    for model in FINAL_METRICS_MODEL_ORDER:
+        if model not in skill_pivot.columns or _is_baseline_model_value(model):
+            continue
+        vals = pd.to_numeric(skill_pivot[model], errors="coerce").to_numpy(dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size > 0:
+            finite_max_skill[model] = float(np.max(vals))
+
+    if finite_max_skill:
+        best_model = max(finite_max_skill.items(), key=lambda item: item[1])[0]
+    else:
+        best_model = max(finite_max_r2.items(), key=lambda item: item[1])[0]
 
     subset_order = sorted(
         rank_to_label.keys(),
-        key=lambda rank: (
-            -float(r2_pivot.loc[rank, best_model])
-            if (rank in r2_pivot.index and best_model in r2_pivot.columns and np.isfinite(r2_pivot.loc[rank, best_model]))
-            else float("inf"),
-            int(rank),
-        ),
+        key=lambda rank: (-_skill_for_rank_model(rank, best_model), int(rank)),
     )
 
-    # For each subset cluster, order model bars by descending local R2.
+    # For each subset cluster, order model bars by descending local min-skill.
     base_model_order = list(FINAL_METRICS_MODEL_ORDER)
     model_order_index = {model: idx for idx, model in enumerate(base_model_order)}
 
@@ -1098,9 +1164,9 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     for rank in subset_order:
         models_by_rank[int(rank)] = sorted(
             base_model_order,
-            key=lambda model: (
-                1 if not np.isfinite(_r2_for_rank_model(int(rank), model)) else 0,
-                -_r2_for_rank_model(int(rank), model) if np.isfinite(_r2_for_rank_model(int(rank), model)) else 0.0,
+            key=lambda model, _rank=rank: (
+                1 if not np.isfinite(_skill_for_rank_model(int(_rank), model)) else 0,
+                -_skill_for_rank_model(int(_rank), model),
                 model_order_index[model],
             ),
         )
@@ -1110,12 +1176,13 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     cluster_width = 0.86
     bar_w = cluster_width / max(1, n_models)
 
-    fig, axes = plt.subplots(4, 1, figsize=(max(10, 0.85 * len(subset_order) + 6), 14), sharex=True, constrained_layout=False)
+    fig, axes = plt.subplots(5, 1, figsize=(max(10, 0.85 * len(subset_order) + 6), 17), sharex=True, constrained_layout=False)
     metric_specs = [
         ("mae", "MAE"),
         ("rmse", "RMSE"),
         ("pearson_r", "Pearson's r"),
         ("r2", "R\N{SUPERSCRIPT TWO}"),
+        ("min_skill_rmse", "Min Skill (RMSE)"),
     ]
 
     legend_handles_by_model: dict[str, object] = {}
@@ -1167,6 +1234,13 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         elif metric in ("pearson_r", "r2"):
             # Keep correlation-style panels on a fixed bounded scale.
             ax.set_ylim(-1.0, 1.0)
+        elif metric == "min_skill_rmse":
+            # Skill is centred on 0 (= matches best baseline); expand to include 0.
+            ymin_s = float(np.min(finite_vals)) if finite_vals.size > 0 else -0.2
+            ymax_s = float(np.max(finite_vals)) if finite_vals.size > 0 else 1.0
+            pad = max(abs(ymax_s - ymin_s) * 0.08, 0.02)
+            ax.set_ylim(min(ymin_s - pad, -pad), max(ymax_s + pad, pad))
+            ax.axhline(0.0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
         else:
             ymin_base = float(np.min(finite_vals)) if finite_vals.size > 0 else -1.0
             ymax_base = float(np.max(finite_vals)) if finite_vals.size > 0 else 1.0
@@ -2287,22 +2361,11 @@ def _compile_multi_target_comparison(
     max_group_len = max(len(multi_target_features), len(single_target_features), 1)
     n_total_features = max(len(all_features), 1)
 
-    # Density-aware typography keeps dense plots readable without changing plot semantics.
-    heat_xtick_font = max(5, min(8, int(200 / max_group_len)))
-    heat_ytick_font = max(6, min(9, int(140 / max(len(targets), 1))))
-    heat_axis_label_font = max(8, min(10, int(170 / max_group_len)))
-    # Bar typography is tuned for document embedding where figures are often resized down.
-    bar_tick_font = max(8, min(13, int(340 / max_group_len)))
-    bar_title_font = max(12, min(16, int(420 / max_group_len)))
-    bar_value_font = max(7, min(11, int(320 / max_group_len)))
-    bar_axis_label_font = max(11, min(15, int(360 / max_group_len)))
-    max_group_len = max(len(multi_target_features), len(single_target_features), 1)
-    n_total_features = max(len(all_features), 1)
-
-    # Density-aware typography keeps dense plots readable without changing plot semantics.
-    heat_xtick_font = max(5, min(8, int(200 / max_group_len)))
-    heat_ytick_font = max(6, min(9, int(140 / max(len(targets), 1))))
-    heat_axis_label_font = max(8, min(10, int(170 / max_group_len)))
+    # Single uniform font size used for all heatmap text (annotations, tick labels, axis labels).
+    heat_font = 8
+    heat_xtick_font = heat_font
+    heat_ytick_font = heat_font
+    heat_axis_label_font = heat_font
     # Bar typography is tuned for document embedding where figures are often resized down.
     bar_tick_font = max(8, min(13, int(340 / max_group_len)))
     bar_title_font = max(12, min(16, int(420 / max_group_len)))
@@ -2322,15 +2385,14 @@ def _compile_multi_target_comparison(
         if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
             vmax = float(vmin + 1.0)
 
-    # Dynamically set font size based on grid density
-    annot_fontsize = max(3, min(8, int(120 / max(len(all_features), len(targets), 1))))
-    # Dynamically set font size based on grid density
-    annot_fontsize = max(3, min(8, int(120 / max(len(all_features), len(targets), 1))))
+    annot_fontsize = heat_font
 
     def _annotate_heat_cells(ax_obj, values: np.ndarray, fontsize: int) -> None:
         for row_i in range(values.shape[0]):
             for col_j in range(values.shape[1]):
                 value = values[row_i, col_j]
+                if not np.isfinite(value):
+                    continue
                 ax_obj.text(
                     col_j + 0.5,
                     row_i + 0.5,
@@ -2339,107 +2401,91 @@ def _compile_multi_target_comparison(
                     va="center",
                     color="black",
                     fontsize=fontsize,
-                    rotation=90,
+                    rotation=0,
                     clip_on=True,
                 )
 
+    summed_sensitivity = matrix.sum(axis=0)
+    top_features = list(all_features)
+    summed_scores = [float(v) for v in summed_sensitivity]
+
+    heat_h = max(4, (len(targets) + 1) * 0.38)
+    # Wrap the colorbar label so it doesn't extend beyond the colorbar height.
+    # At heat_font pt, each character occupies ~0.65*heat_font points; colorbar height ~ heat_h*72 pts.
+    cbar_label_wrap = max(20, int(heat_h * 72 / (heat_font * 0.65)))
+    wrapped_importance_label = textwrap.fill(str(importance_label), cbar_label_wrap)
+
     if multi_idx and single_idx:
-        heat_w = max(14, n_total_features * 0.55)
-        heat_h = max(8, len(targets) * 0.58)
-        n_left = max(1, len(multi_target_features))
-        n_right = max(1, len(single_target_features))
-        # Convert desired one-column gap into gridspec wspace units.
-        # Approximation: one column gap in width-ratio units -> wspace ~= 2/(left+right).
-        dynamic_wspace = 2.0 / float(max(1, n_left + n_right))
-        dynamic_wspace = float(min(0.20, max(0.01, dynamic_wspace)))
-        fig, (ax_left, ax_right) = plt.subplots(
-            1,
-            2,
-            figsize=(heat_w, heat_h),
-            gridspec_kw={
-                "width_ratios": [n_left, n_right],
-                "wspace": dynamic_wspace,
-            },
-            constrained_layout=True,
-        )
+        yticklabels_with_total = yticklabels + ["Total"]
+        left_block = np.vstack([matrix[:, multi_idx],
+                                 np.array([summed_scores[i] for i in multi_idx])[None, :]])
+        right_block = np.vstack([matrix[:, single_idx],
+                                  np.array([summed_scores[i] for i in single_idx])[None, :]])
+        sep_col = np.full((left_block.shape[0], 1), np.nan)
+        combined_matrix = np.hstack([left_block, sep_col, right_block])
+        sep_pos = left_block.shape[1]
+        xticklabels_with_sep = multi_target_features + [""] + single_target_features
 
-        left_matrix = matrix[:, multi_idx]
-        right_matrix = matrix[:, single_idx]
+        n_total_cols = combined_matrix.shape[1]
+        heat_w = max(14, n_total_cols * 0.85)
+        fig, ax = plt.subplots(figsize=(heat_w, heat_h), constrained_layout=True)
 
         sns.heatmap(
-            left_matrix,
-            ax=ax_left,
-            cmap="RdYlGn",
-            vmin=vmin,
-            vmax=vmax,
-            annot=False,
-            cbar=False,
-            xticklabels=multi_target_features,
-            yticklabels=yticklabels,
-            linewidths=0.5,
-            linecolor="#eeeeee",
-            square=False,
-        )
-        sns.heatmap(
-            right_matrix,
-            ax=ax_right,
-            cmap="RdYlGn",
-            vmin=vmin,
-            vmax=vmax,
-            annot=False,
-            cbar=False,
-            xticklabels=single_target_features,
-            yticklabels=False,
-            linewidths=0.5,
-            linecolor="#eeeeee",
-            square=False,
-        )
-
-        _annotate_heat_cells(ax_left, left_matrix, annot_fontsize)
-        _annotate_heat_cells(ax_right, right_matrix, annot_fontsize)
-
-        ax_left.set_xticklabels(multi_target_features, rotation=45, ha='right', fontsize=heat_xtick_font)
-        ax_right.set_xticklabels(single_target_features, rotation=45, ha='right', fontsize=heat_xtick_font)
-        ax_left.set_yticklabels(yticklabels, fontsize=heat_ytick_font)
-        ax_left.set_xlabel(
-            f"Multi-target Features (n={len(multi_target_features)})",
-            fontsize=heat_axis_label_font,
-        )
-        ax_right.set_xlabel(
-            f"Single-target Features (n={len(single_target_features)})",
-            fontsize=heat_axis_label_font,
-        )
-        ax_left.set_ylabel("Target", fontsize=heat_axis_label_font)
-        ax_right.set_ylabel("")
-
-        sm = matplotlib.cm.ScalarMappable(norm=matplotlib.colors.Normalize(vmin=vmin, vmax=vmax), cmap="RdYlGn")
-        sm.set_array([])
-        cbar = fig.colorbar(sm, ax=[ax_left, ax_right], fraction=0.025, pad=0.02)
-        cbar.set_label(str(importance_label), fontsize=heat_axis_label_font)
-        cbar.ax.tick_params(labelsize=max(6, heat_xtick_font))
-    else:
-        fig, ax = plt.subplots(
-            figsize=(max(13, n_total_features * 0.5), max(8, len(targets) * 0.58)),
-            constrained_layout=True,
-        )
-        sns.heatmap(
-            matrix,
+            combined_matrix,
             ax=ax,
             cmap="RdYlGn",
             vmin=vmin,
             vmax=vmax,
             annot=False,
-            cbar_kws={"label": str(importance_label)},
-            xticklabels=all_features,
-            yticklabels=yticklabels,
+            cbar_kws={"label": wrapped_importance_label, "pad": 0.01},
+            xticklabels=xticklabels_with_sep,
+            yticklabels=yticklabels_with_total,
             linewidths=0.5,
             linecolor="#eeeeee",
             square=False,
         )
-        _annotate_heat_cells(ax, matrix, annot_fontsize)
+        _annotate_heat_cells(ax, combined_matrix, annot_fontsize)
+
+        # Cover separator column with background color to conceal grid lines.
+        ax.add_patch(plt.Rectangle(
+            (sep_pos, 0),
+            1,
+            combined_matrix.shape[0],
+            facecolor=ax.get_facecolor(),
+            edgecolor="none",
+            zorder=3,
+        ))
+
+        ax.set_xticklabels(xticklabels_with_sep, rotation=45, ha='right', fontsize=heat_xtick_font)
+        ax.set_yticklabels([textwrap.fill(lbl, 20) for lbl in yticklabels_with_total], rotation=0, fontsize=heat_ytick_font)
+        ax.set_xlabel("Predictor", fontsize=heat_axis_label_font)
+        ax.set_ylabel("Target", fontsize=heat_axis_label_font)
+    else:
+        # Add 'Total' row to matrix and yticklabels
+        matrix_with_total = np.vstack([matrix, np.array(summed_scores)[None, :]])
+        yticklabels_with_total = yticklabels + ["Total"]
+        fig, ax = plt.subplots(
+            figsize=(max(13, n_total_features * 0.85), heat_h),
+            constrained_layout=True,
+        )
+        sns.heatmap(
+            matrix_with_total,
+            ax=ax,
+            cmap="RdYlGn",
+            vmin=vmin,
+            vmax=vmax,
+            annot=False,
+            cbar_kws={"label": wrapped_importance_label, "pad": 0.01},
+            xticklabels=all_features,
+            yticklabels=yticklabels_with_total,
+            linewidths=0.5,
+            linecolor="#eeeeee",
+            square=False,
+        )
+        _annotate_heat_cells(ax, matrix_with_total, annot_fontsize)
         ax.set_xticklabels(all_features, rotation=45, ha='right', fontsize=heat_xtick_font)
-        ax.set_yticklabels(yticklabels, fontsize=heat_ytick_font)
-        ax.set_xlabel("Feature", fontsize=heat_axis_label_font)
+        ax.set_yticklabels([textwrap.fill(lbl, 20) for lbl in yticklabels_with_total], rotation=0, fontsize=heat_ytick_font)
+        ax.set_xlabel("Predictor", fontsize=heat_axis_label_font)
         ax.set_ylabel("Target", fontsize=heat_axis_label_font)
 
     # Save to root output directory (namespace-specific for non-default sweeps)
@@ -2453,10 +2499,6 @@ def _compile_multi_target_comparison(
     plt.close(fig)
     
     # Create grouped bar charts: multi-target features and single-target features.
-    summed_sensitivity = matrix.sum(axis=0)
-    top_features = list(all_features)
-    summed_scores = [float(v) for v in summed_sensitivity]
-
     score_map = {feat: float(score) for feat, score in zip(top_features, summed_scores)}
     multi_scores = [score_map[feat] for feat in multi_target_features if feat in score_map]
     single_scores = [score_map[feat] for feat in single_target_features if feat in score_map]
@@ -3007,6 +3049,25 @@ def _evaluate_selected_subsets_all_models(
                 rows.append(payload)
 
     final_df = pd.DataFrame(rows)
+
+    # Compute RMSE-based minimum skill for each ML model row.
+    if not final_df.empty and {"subset_rank", "rmse", "model"}.issubset(final_df.columns):
+        _is_bl = final_df["model"].apply(_is_baseline_model_value)
+        _bl_rmse = (
+            final_df[_is_bl]
+            .groupby("subset_rank")["rmse"]
+            .min()
+            .rename("_best_bl_rmse")
+        )
+        final_df = final_df.join(_bl_rmse, on="subset_rank")
+        _ml_rmse = pd.to_numeric(final_df["rmse"], errors="coerce")
+        final_df["min_skill_rmse"] = np.where(
+            ~_is_bl & (final_df["_best_bl_rmse"] > 0),
+            (final_df["_best_bl_rmse"] - _ml_rmse) / final_df["_best_bl_rmse"],
+            np.nan,
+        )
+        final_df.drop(columns=["_best_bl_rmse"], inplace=True)
+
     out_csv = output_dir / "feature_sweep_final_metrics.csv"
     final_df.to_csv(out_csv, index=False)
     try:
@@ -3037,15 +3098,12 @@ def _run_rolling_origin_cv(
         print(f"[WARN] Rolling origin CV: could not read final metrics: {e}")
         return
 
-    k01_rows = df_final[df_final["subset_rank"] == 1].copy()
-    if "model" in k01_rows.columns:
-        k01_rows = k01_rows[~k01_rows["model"].apply(_is_baseline_model_value)]
-    if k01_rows.empty or k01_rows["r2"].isna().all():
-        print("[WARN] Rolling origin CV: no valid k01 rows in final metrics. Skipping.")
+    k01_all = df_final[df_final["subset_rank"] == 1].copy()
+    best_row = _select_best_model_by_min_skill_rmse(k01_all)
+    if best_row is None:
+        print("[WARN] Rolling origin CV: no baseline rows at subset_rank 1; cannot compute skill score. Skipping.")
         return
 
-    best_r2_idx = k01_rows["r2"].idxmax()
-    best_row = k01_rows.loc[best_r2_idx]
     best_model_str = str(best_row.get("model", ""))
     best_row_count = int(best_row["row_count"])
     best_feature_tag = str(best_row["feature_tag"])
@@ -3314,15 +3372,12 @@ def _ensure_k01_baselines(plan: DatasetPlan, final_metrics_csv: Path) -> None:
         print(f"[WARN] _ensure_k01_baselines: could not read {final_metrics_csv}: {e}")
         return
 
-    k01_rows = df_final[df_final["subset_rank"] == 1].copy()
-    if "model" in k01_rows.columns:
-        k01_rows = k01_rows[~k01_rows["model"].apply(_is_baseline_model_value)]
-    valid_k01 = k01_rows[k01_rows["r2"].notnull() & np.isfinite(k01_rows["r2"].astype(float))] if not k01_rows.empty else k01_rows
-    if valid_k01.empty:
-        print(f"[WARN] _ensure_k01_baselines: no valid k01 rows for {plan.dataset_dir.name}; skipping.")
+    k01_all = df_final[df_final["subset_rank"] == 1].copy()
+    best_row = _select_best_model_by_min_skill_rmse(k01_all)
+    if best_row is None:
+        print(f"[WARN] _ensure_k01_baselines: no baseline rows at subset_rank 1 for {plan.dataset_dir.name}; skipping.")
         return
 
-    best_row = valid_k01.loc[valid_k01["r2"].idxmax()]
     best_model_str = str(best_row.get("model", ""))
     best_row_count = int(best_row["row_count"])
     best_feature_tag = str(best_row["feature_tag"])
@@ -3385,20 +3440,12 @@ def _write_dataset_evaluation_summary(plan: DatasetPlan, final_metrics_csv: Path
         print(f"[WARN] _write_dataset_evaluation_summary: could not read {final_metrics_csv}: {e}")
         return None
 
-    k01_rows = df_final[df_final["subset_rank"] == 1].copy()
-    if "model" in k01_rows.columns:
-        k01_rows = k01_rows[~k01_rows["model"].apply(_is_baseline_model_value)]
-    if k01_rows.empty or k01_rows["r2"].isna().all():
-        print(f"[WARN] _write_dataset_evaluation_summary: no valid k01 rows with r2 in {final_metrics_csv}")
+    k01_all = df_final[df_final["subset_rank"] == 1].copy()
+    best_row = _select_best_model_by_min_skill_rmse(k01_all)
+    if best_row is None:
+        print(f"[WARN] _write_dataset_evaluation_summary: no baseline rows at subset_rank 1 for {plan.dataset_dir.name}; skipping.")
         return None
 
-    valid_k01 = k01_rows[k01_rows["r2"].notnull() & np.isfinite(k01_rows["r2"].astype(float))]
-    if valid_k01.empty:
-        print(f"[WARN] _write_dataset_evaluation_summary: no finite r2 values in k01 rows for {plan.dataset_dir.name}")
-        return None
-
-    best_idx = valid_k01["r2"].idxmax()
-    best_row = valid_k01.loc[best_idx]
     best_model_type = str(best_row.get("model", ""))
     best_row_count = int(best_row["row_count"])
     best_feature_tag = str(best_row["feature_tag"])

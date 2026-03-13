@@ -143,18 +143,19 @@ def _seasonal_window_mean(days, hours, values, target_day, target_hour, diurnal_
     day_diff = np.minimum(day_diff, 365 - day_diff)
     hour_diff = np.abs(hours - target_hour)
 
-    mask = (day_diff <= day_windows[0]) & (hour_diff <= diurnal_window)
-    if not np.any(mask):
-        mask = day_diff <= day_windows[0]
-    if not np.any(mask):
-        mask = day_diff <= day_windows[1]
-    if not np.any(mask):
-        mask = np.ones_like(day_diff, dtype=bool)
+    masks = [
+        (day_diff <= day_windows[0]) & (hour_diff <= diurnal_window),
+        day_diff <= day_windows[0],
+        day_diff <= day_windows[1],
+    ]
+    for mask in masks:
+        finite_vals = values[mask]
+        finite_vals = finite_vals[np.isfinite(finite_vals)]
+        if finite_vals.size >= 3:
+            return float(np.mean(finite_vals))
 
-    candidate_vals = values[mask]
-    if candidate_vals.size == 0:
-        return np.nan
-    finite_vals = candidate_vals[np.isfinite(candidate_vals)]
+    # Last fallback: all rows not of the current year — no minimum sample size requirement
+    finite_vals = values[np.isfinite(values)]
     if finite_vals.size == 0:
         return np.nan
     return float(np.mean(finite_vals))

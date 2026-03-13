@@ -928,13 +928,16 @@ def _bootstrap_grouped_skill(
         yb = y_b[sel_idx, :]
         m_model = _compute_point_metrics(ym, yt)
         m_base = _compute_point_metrics(yb, yt)
-        if not (np.isfinite(m_model["rmse"]) and np.isfinite(m_base["rmse"]) and m_base["rmse"] > 0):
+        if not (np.isfinite(m_model["rmse"]) and np.isfinite(m_base["rmse"])):
             continue
         rmse_diff.append(m_model["rmse"] - m_base["rmse"])
         if np.isfinite(m_model["mae"]) and np.isfinite(m_base["mae"]):
             mae_diff.append(m_model["mae"] - m_base["mae"])
         if np.isfinite(m_model["r2"]) and np.isfinite(m_base["r2"]):
             r2_diff.append(m_model["r2"] - m_base["r2"])
+        if m_base["rmse"] == 0:
+            beats.append(0.0)
+            continue
         skill = float(1.0 - m_model["rmse"] / m_base["rmse"])
         skill_vals.append(skill)
         beats.append(1.0 if skill > 0 else 0.0)
@@ -2456,12 +2459,11 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             _sort_q_min = pd.to_numeric(matrix_perf_df[present_q_cols].min(axis=1, skipna=True), errors="coerce").to_numpy(dtype=float) if present_q_cols else np.full(n_rows_mat, np.nan, dtype=float)
             _sort_p_min = pd.to_numeric(matrix_perf_df[present_p_cols].min(axis=1, skipna=True), errors="coerce").to_numpy(dtype=float) if present_p_cols else np.full(n_rows_mat, np.nan, dtype=float)
             _sort_q_tie = np.where(np.isfinite(_sort_q_min), _sort_q_min, _sort_p_min)
-            _sort_tier = np.array(
-                [tier_map.get(str(v), np.nan) for v in matrix_perf_df.get("evidence_tier_overall", pd.Series(["very_low"] * n_rows_mat))],
-                dtype=float,
-            )
-
-            matrix_perf_df["_tier_sort"] = np.where(np.isfinite(_sort_tier), _sort_tier, np.inf)
+            _sort_score = pd.to_numeric(
+                matrix_perf_df.get("evidence_score_overall_min", pd.Series([0] * n_rows_mat)),
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            matrix_perf_df["_tier_sort"] = np.where(np.isfinite(_sort_score), _sort_score, np.inf)
             matrix_perf_df["_p_sort"] = np.where(np.isfinite(_sort_p_min), _sort_p_min, np.inf)
             matrix_perf_df["_q_sort"] = np.where(np.isfinite(_sort_q_tie), _sort_q_tie, np.inf)
             matrix_perf_df = matrix_perf_df.sort_values(
@@ -2479,10 +2481,10 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             present_p_cols = [c for c in p_cols if c in matrix_perf_df.columns]
             q_min = pd.to_numeric(matrix_perf_df[present_q_cols].min(axis=1, skipna=True), errors="coerce").to_numpy(dtype=float) if present_q_cols else np.full(n_rows_mat, np.nan, dtype=float)
             p_min = pd.to_numeric(matrix_perf_df[present_p_cols].min(axis=1, skipna=True), errors="coerce").to_numpy(dtype=float) if present_p_cols else np.full(n_rows_mat, np.nan, dtype=float)
-            tier_vals = np.array(
-                [tier_map.get(str(v), np.nan) for v in matrix_perf_df.get("evidence_tier_overall", pd.Series(["very_low"] * n_rows_mat))],
-                dtype=float,
-            )
+            tier_vals = pd.to_numeric(
+                matrix_perf_df.get("evidence_score_overall_min", pd.Series([0] * n_rows_mat)),
+                errors="coerce",
+            ).to_numpy(dtype=float)
 
             def _col_values(name: str) -> np.ndarray:
                 if name in matrix_perf_df.columns:
@@ -2507,7 +2509,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 ], axis=1).min(axis=1, skipna=True).to_numpy(dtype=float),
                 "Best False Discovery Rate Adjusted q-value": q_min,
                 "Best p-value": p_min,
-                "Overall Evidence Tier": tier_vals,
+                "Evidence Score": tier_vals,
             }, index=matrix_index)
 
             # Fallback to p-values if q-values are unavailable.
@@ -2524,13 +2526,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 "Minimum Probability of Positive Skill": True,
                 "Minimum 95% Lower Confidence Bound of Skill": True,
                 "Best False Discovery Rate Adjusted q-value": False,
-                "Overall Evidence Tier": True,
+                "Evidence Score": True,
             }
             if "Best p-value" in quality_df.columns:
                 higher_better["Best p-value"] = False
 
             non_gate_cols = [
                 "Test Sample Count",
+                "Best Model",
                 "R²",
                 "nRMSE",
                 "Prediction Interval Coverage Probability",
@@ -2540,14 +2543,35 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 "Minimum Probability of Positive Skill",
                 "Minimum 95% Lower Confidence Bound of Skill",
                 "Best False Discovery Rate Adjusted q-value",
-                "Overall Evidence Tier",
+                "Evidence Score",
             ]
             if np.isfinite(quality_df["Best p-value"].to_numpy(dtype=float)).any():
                 gate_cols.insert(2, "Best p-value")
 
             # Visual separator between descriptive metrics and gate-evaluated metrics.
+            # Insert 'Best Model' column after 'Test Sample Count'
+            if 'model' in matrix_perf_df.columns:
+                # Normalize model type for display (XGB, Transformer, GP)
+                def _display_model_type(val):
+                    key = str(val).strip().lower()
+                    if 'xgb' in key:
+                        return 'XGB'
+                    elif 'transformer' in key:
+                        return 'Trans.'
+                    elif 'gp' in key:
+                        return 'GP'
+                    else:
+                        return key.title()
+                quality_df['Best Model'] = matrix_perf_df['model'].map(_display_model_type).values
+            else:
+                quality_df['Best Model'] = 'Unknown'
+            # Place as second column (after Test Sample Count)
+            col_order = list(quality_df.columns)
+            if 'Best Model' in col_order:
+                col_order.insert(1, col_order.pop(col_order.index('Best Model')))
+            quality_df = quality_df[col_order]
             quality_df[""] = np.nan
-            heat_cols = non_gate_cols + [""] + gate_cols
+            heat_cols = col_order[:len(non_gate_cols)+2] + [""] + col_order[len(non_gate_cols)+2:]
             display_df = pd.concat(
                 [
                     quality_df[non_gate_cols],
@@ -2559,31 +2583,53 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             norm = display_df.copy()
             for c in norm.columns:
-                vals = pd.to_numeric(norm[c], errors="coerce")
-                finite = vals[np.isfinite(vals)]
-                if finite.empty:
-                    norm[c] = np.nan
-                    continue
-                vmin = float(finite.min())
-                vmax = float(finite.max())
-                if np.isclose(vmin, vmax):
-                    scaled = pd.Series([0.5] * len(vals), index=vals.index, dtype=float)
+                if c == 'Best Model':
+                    # Categorical column: fill with 0.5 (no heatmap)
+                    norm[c] = 0.5
                 else:
-                    scaled = (vals - vmin) / (vmax - vmin)
-                if not higher_better.get(c, True):
-                    scaled = 1.0 - scaled
-                norm[c] = scaled
+                    vals = pd.to_numeric(norm[c], errors="coerce")
+                    finite = vals[np.isfinite(vals)]
+                    if finite.empty:
+                        norm[c] = np.nan
+                        continue
+                    vmin = float(finite.min())
+                    vmax = float(finite.max())
+                    if np.isclose(vmin, vmax):
+                        scaled = pd.Series([0.5] * len(vals), index=vals.index, dtype=float)
+                    else:
+                        scaled = (vals - vmin) / (vmax - vmin)
+                    if not higher_better.get(c, True):
+                        scaled = 1.0 - scaled
+                    norm[c] = scaled
 
             annot = display_df.copy()
             for c in annot.columns:
-                if c in {"Overall Evidence Tier", "Test Sample Count"}:
+                if c == 'Best Model':
+                    annot[c] = ""  # drawn manually after rectangles
+                elif c in {"Evidence Score", "Test Sample Count"}:
                     annot[c] = annot[c].map(lambda v: "" if not np.isfinite(v) else f"{int(round(v))}")
                 elif c in {"Best False Discovery Rate Adjusted q-value", "Best p-value"}:
                     annot[c] = annot[c].map(lambda v: "" if not np.isfinite(v) else f"{v:.3f}")
                 else:
                     annot[c] = annot[c].map(lambda v: "" if not np.isfinite(v) else f"{v:.2f}")
 
-            fig_mat, ax_mat = plt.subplots(figsize=(max(12, 1.2 * len(heat_cols)), max(6, 0.5 * len(display_df))))
+            fig_mat, ax_mat = plt.subplots(figsize=(max(8, 0.75 * len(heat_cols)), max(4, 0.32 * len(display_df))))
+            # Custom coloring for 'Best Model' column
+            from matplotlib.colors import ListedColormap
+            model_color_map = {'XGB': 'tab:blue', 'Trans.': 'tab:purple', 'GP': 'tab:olive'}
+            # Build color matrix
+            color_matrix = np.full(norm.shape, np.nan, dtype=object)
+            for i, col in enumerate(norm.columns):
+                if col == 'Best Model':
+                    for j, val in enumerate(display_df['Best Model']):
+                        color_matrix[j, i] = model_color_map.get(val, 'tab:gray')
+                else:
+                    color_matrix[:, i] = None
+            def _cell_color_func(val, row, col):
+                if norm.columns[col] == 'Best Model':
+                    return model_color_map.get(display_df['Best Model'].iloc[row], 'tab:gray')
+                return None
+            # Draw heatmap
             sns.heatmap(
                 norm,
                 ax=ax_mat,
@@ -2595,8 +2641,15 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 linecolor="white",
                 annot=annot.values,
                 fmt="",
-                annot_kws={"fontsize": 8},
+                annot_kws={"fontsize": 8, "rotation": 0},
             )
+            # Overlay colored rectangles for 'Best Model' column, then draw labels on top
+            for i, col in enumerate(norm.columns):
+                if col == 'Best Model':
+                    for j, val in enumerate(display_df['Best Model']):
+                        rect = plt.Rectangle((i, j), 1, 1, facecolor=model_color_map.get(val, 'tab:gray'), edgecolor='white', linewidth=0.5, zorder=4)
+                        ax_mat.add_patch(rect)
+                        ax_mat.text(i + 0.5, j + 0.5, str(val), ha='center', va='center', fontsize=8, zorder=5)
             if "" in display_df.columns:
                 sep_col = int(display_df.columns.get_loc(""))
                 ax_mat.add_patch(
@@ -2610,10 +2663,10 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     )
                 )
             ax_mat.set_title("")
-            ax_mat.set_xlabel("Metrics")
-            ax_mat.set_ylabel("Dataset")
-            ax_mat.set_yticklabels(ax_mat.get_yticklabels(), rotation=0)
-            ax_mat.set_xticklabels(ax_mat.get_xticklabels(), rotation=35, ha="right")
+            # ax_mat.set_xlabel("Metrics")
+            # ax_mat.set_ylabel("Dataset")
+            ax_mat.set_yticklabels(ax_mat.get_yticklabels(), rotation=0, fontsize=8)
+            ax_mat.set_xticklabels(ax_mat.get_xticklabels(), rotation=35, ha="right", fontsize=8)
             plt.tight_layout()
             matrix_path = evaluation_dir / "summary_model_quality_matrix.png"
             fig_mat.savefig(matrix_path, dpi=300, bbox_inches='tight')

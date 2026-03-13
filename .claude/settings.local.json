@@ -13,7 +13,12 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''pipeline OK''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/m_RunParallelPipeline.py''\\).read\\(\\)\\); print\\(''orchestrator OK''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/m_RunParallelPipeline.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''OK''\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''c:/Users/Master/Documents/GitHub/WQRegressors/src/h_RunMCFeatureSelectionSweep.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''''c:/Users/Master/Documents/GitHub/WQRegressors/src/z1_FeaturePostProcess.py''''\\).read\\(\\)\\); print\\(''''OK''''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/z1_FeaturePostProcess.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/utils/evaluation.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/h_RunMCFeatureSelectionSweep.py''\\).read\\(\\)\\); print\\(''OK''\\)\")"
     ]
   }
 }
