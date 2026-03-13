@@ -17,6 +17,10 @@ Notes:
     default) to limit per-fold QuantileDMatrix GPU memory. Override via
     hyperparameters.cv_tuning.cv_max_bin. This setting is CV-tuning-only and
     does not affect final model training.
+- In GPU mode, each CV fold explicitly deletes the XGBoost booster (freeing its
+    CUDA QuantileDMatrix memory) and CuPy fold arrays (returning them to the pool
+    for reuse). No full pool flush is performed — pool reuse is intentional and
+    necessary for GPU throughput.
 """
 
 import os
@@ -1540,13 +1544,12 @@ def _xgb_cv_fold_score(
         score = float(np.sqrt(np.mean(np.square(preds - y_val))))
         r2 = _r2_score(y_val, preds)
 
-    # Free GPU resources immediately to prevent CuPy pool accumulation across folds.
+    # Free GPU resources immediately: del model releases XGBoost's booster and its
+    # CUDA-side QuantileDMatrix memory. del on CuPy arrays returns blocks to the pool
+    # for reuse by the next fold without going back to the CUDA allocator.
     del model
     if use_gpu_arrays:
         del X_train_fit, y_train_fit, X_val_fit, y_val_fit
-        if cp is not None:
-            cp.get_default_memory_pool().free_all_blocks()
-            cp.get_default_pinned_memory_pool().free_all_blocks()
 
     return score, r2
 

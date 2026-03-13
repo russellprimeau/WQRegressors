@@ -410,26 +410,38 @@ def run_horizon_sweep(
             sweep_dir.mkdir(parents=True, exist_ok=True)
             all_metrics.to_csv(sweep_dir / 'lookahead_metrics.csv', index=False)
 
-            # Simple per-dataset summary plots (mean across replicates)
+            # Per-dataset summary plots: individual replicates as scatter + mean line
+            has_reps = 'replicate' in all_metrics.columns and all_metrics['replicate'].nunique() > 1
             mean_metrics = all_metrics.groupby('horizon')[['rmse', 'r2']].mean().reset_index()
 
-            plt.figure(figsize=(8, 5))
-            plt.plot(mean_metrics['horizon'], mean_metrics['rmse'], marker='o', label='RMSE (mean)')
-            plt.xlabel('Horizon (hours)')
-            plt.ylabel('RMSE')
-            plt.title(f'{dataset_dir.name} - RMSE vs Horizon')
-            plt.grid(True)
-            plt.savefig(sweep_dir / 'rmse_vs_lookahead.png')
-            plt.close()
-
-            plt.figure(figsize=(8, 5))
-            plt.plot(mean_metrics['horizon'], mean_metrics['r2'], marker='o', label='R2 (mean)')
-            plt.xlabel('Horizon (hours)')
-            plt.ylabel('R2')
-            plt.title(f'{dataset_dir.name} - R2 vs Horizon')
-            plt.grid(True)
-            plt.savefig(sweep_dir / 'r2_vs_lookahead.png')
-            plt.close()
+            for metric, ylabel, filename in [
+                ('rmse', 'RMSE', 'rmse_vs_lookahead.png'),
+                ('r2',   'R²',   'r2_vs_lookahead.png'),
+            ]:
+                fig, ax = plt.subplots(figsize=(8, 5))
+                if has_reps:
+                    for rep_id, rep_df in all_metrics.groupby('replicate'):
+                        ax.scatter(rep_df['horizon'], rep_df[metric],
+                                   s=18, alpha=0.45, color='steelblue', zorder=2)
+                ax.plot(mean_metrics['horizon'], mean_metrics[metric],
+                        marker='o', markersize=5, linewidth=1.8,
+                        color='steelblue', label='Mean', zorder=3)
+                ax.set_xlabel('Horizon (hours)')
+                ax.set_ylabel(ylabel)
+                ax.set_title(f'{dataset_dir.name} – {ylabel} vs Horizon')
+                ax.grid(True, alpha=0.3)
+                if has_reps:
+                    from matplotlib.lines import Line2D
+                    handles = [
+                        Line2D([0], [0], color='steelblue', linewidth=1.8,
+                               marker='o', markersize=5, label='Mean'),
+                        Line2D([0], [0], color='steelblue', linewidth=0,
+                               marker='o', markersize=5, alpha=0.45, label='Replicates'),
+                    ]
+                    ax.legend(handles=handles, fontsize=9)
+                fig.tight_layout()
+                fig.savefig(sweep_dir / filename, dpi=150)
+                plt.close(fig)
 
 
 if __name__ == '__main__':
