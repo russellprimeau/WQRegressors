@@ -13,6 +13,10 @@ Notes:
     reused via dataset-level cache `forecasts/xgb_cv_tuning_cache.json`.
 - Trial-level diagnostics are written to `xgb_cv_trials.csv` under the CV
     artifact directory.
+- In GPU mode, CV tuning uses a reduced histogram bin count (max_bin=64 by
+    default) to limit per-fold QuantileDMatrix GPU memory. Override via
+    hyperparameters.cv_tuning.cv_max_bin. This setting is CV-tuning-only and
+    does not affect final model training.
 """
 
 import os
@@ -150,6 +154,9 @@ DEFAULT_XGB_CV_TUNING_REGRESSOR = {
     # When set, mean CV score is penalized if mean_r2 < min_r2.
     "min_r2": None,
     "r2_penalty": 10.0,
+    # GPU-only: reduced histogram bin count for CV tuning to limit QuantileDMatrix GPU
+    # memory per fold. Default 64 (vs XGBoost default 256). Does not affect final training.
+    "cv_max_bin": 64,
     "param_space": {
         "n_estimators": {"low": 200, "high": 1600, "type": "int"},
         "max_depth": {"low": 2, "high": 9, "type": "int"},
@@ -1533,6 +1540,14 @@ def _xgb_cv_fold_score(
         score = float(np.sqrt(np.mean(np.square(preds - y_val))))
         r2 = _r2_score(y_val, preds)
 
+    # Free GPU resources immediately to prevent CuPy pool accumulation across folds.
+    del model
+    if use_gpu_arrays:
+        del X_train_fit, y_train_fit, X_val_fit, y_val_fit
+        if cp is not None:
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+
     return score, r2
 
 
@@ -1617,6 +1632,11 @@ def _xgb_tune_hyperparameters_cv(
         str(hyper_cfg.get("device", "")).lower().startswith("cuda")
         or str(hyper_cfg.get("tree_method", "")).lower() == "gpu_hist"
     )
+    # Reduce histogram bin count for CV tuning in GPU mode to lower QuantileDMatrix
+    # memory footprint. cv_max_bin defaults to 64 (vs XGBoost default of 256).
+    # Only applies to CV tuning; final training uses the config's max_bin unchanged.
+    if is_gpu_mode:
+        base_kwargs["max_bin"] = int(cv_cfg.get("cv_max_bin", 64))
     parallel_jobs = int(cv_cfg.get("parallel_jobs", 1))
     if is_gpu_mode and parallel_jobs > 1:
         print("[WARN] CV tuning parallel_jobs > 1 is not supported in GPU mode; forcing to 1.")

@@ -1,7 +1,7 @@
 """
 Generates horizon-sweep comparison figures across all MC datasets.
 
-Reads ``lookahead_metrics.csv`` from each dataset's ``forecasts/lookahead_sweeps/``
+Reads ``lookahead_metrics.csv`` from each dataset's ``horizons/lookahead_sweeps/``
 directory (written by ``k_RunHorizonSweep.py``) and produces two summary figures:
 
   1. ``lookahead_r2_comparison.png``    – R² vs forecast horizon (hours)
@@ -16,9 +16,21 @@ very different target magnitudes can be compared on the same axis.  The
 Both figures are written to the ``summaries/`` subdirectory of the data root,
 the same location used by ``z1_PostProcess.py``.
 
-The script supports metrics CSVs produced by both ``k_RunHorizonSweep.py``
-(column ``horizon``) and the legacy ``k_lookahead_sweep.py`` (column
-``lookahead``); both are handled transparently.
+Uncertainty bands (replicates > 1):
+    When ``k_RunHorizonSweep.py`` is run with ``--replicates M > 1``,
+    ``lookahead_metrics.csv`` contains a ``replicate`` column with M rows per
+    horizon.  This script detects that and plots each dataset as:
+      - Solid mean line with markers
+      - Dashed ±1σ boundary lines (linewidth=0.8, alpha=0.7)
+      - Dotted ±2σ boundary lines (linewidth=0.6, alpha=0.55)
+    This matches the styling of ``Surface_timeseries_uncertainty.png`` produced
+    by ``b_ExploreData.py``.  When only one replicate is present the standard
+    single-line plot is drawn.
+
+CSV column compatibility:
+    Supports CSVs produced by both ``k_RunHorizonSweep.py`` (column ``horizon``,
+    optional ``replicate``) and the legacy ``k_lookahead_sweep.py`` (column
+    ``lookahead``, no ``replicate``); both are handled transparently.
 
 CLI arguments:
     --data-root PATH        Root directory containing MC_* dataset subdirectories.
@@ -29,17 +41,36 @@ CLI arguments:
 Examples:
     python src/z2_horizon_post.py
     python src/z2_horizon_post.py --data-root data/output/regression
-    python src/z2_horizon_post.py --data-root data/output/regression --dataset-prefix MC
+    python src/z2_horizon_post.py --data-root data/output/CV4 --dataset-prefix MC
 """
 from __future__ import annotations
 import argparse
 import sys
+import textwrap
 import traceback
 from pathlib import Path
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 matplotlib.use("Agg")
+
+# Color palette matching b_ExploreData.py _safe_series_colors — avoids red/orange hues
+# so uncertainty bands (same color, lower alpha) stay visually distinct from alarm states.
+_SERIES_COLORS = [
+    "#1f77b4",  # blue
+    "#2ca02c",  # green
+    "#17becf",  # cyan
+    "#9467bd",  # purple
+    "#7f7f7f",  # gray
+    "#bcbd22",  # olive
+    "#aec7e8",  # light blue
+    "#98df8a",  # light green
+    "#c5b0d5",  # light purple
+    "#9edae5",  # pale cyan
+    "#8c564b",  # brown
+    "#c7c7c7",  # light gray
+]
 
 
 def _clean_label(dataset_name: str, prefix: str) -> str:
@@ -86,7 +117,7 @@ def _discover_datasets(data_root: Path, prefix: str) -> list[tuple[str, Path, Pa
     for child in sorted(data_root.iterdir()):
         if not child.is_dir() or not child.name.startswith(prefix):
             continue
-        metrics_csv = child / "forecasts" / "lookahead_sweeps" / "lookahead_metrics.csv"
+        metrics_csv = child / "horizons" / "lookahead_sweeps" / "lookahead_metrics.csv"
         if metrics_csv.exists():
             hits.append((child.name, child, metrics_csv))
         else:
@@ -122,7 +153,9 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path) -> int:
                 std_note = "std_target not found – nRMSE will be NaN"
             label = _clean_label(name, prefix)
             records.append((label, df))
-            print(f"[INFO]  {name}: {len(df)} horizon rows, {std_note}")
+            n_horizons = df["lookahead"].nunique()
+            n_reps = df["replicate"].nunique() if "replicate" in df.columns else 1
+            print(f"[INFO]  {name}: {n_horizons} horizons × {n_reps} replicate(s), {std_note}")
         except Exception:
             print(f"[WARN] Could not load {csv_path}:")
             traceback.print_exc()
@@ -134,51 +167,157 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path) -> int:
     # Collect all x-values across datasets for consistent tick marks
     all_x = sorted({v for _, df in records for v in df["lookahead"].dropna().tolist()})
 
-    def _make_figure(metric: str, ylabel: str, filename: str, hline_zero: bool = False) -> Path:
-        fig_w = max(10, len(records) * 0.6)
-        fig, ax = plt.subplots(figsize=(fig_w, 5), constrained_layout=True)
-        for label, df in records:
-            if metric not in df.columns or df[metric].isnull().all():
-                continue
-            ax.plot(
-                df["lookahead"],
-                df[metric],
-                marker="o",
-                markersize=4,
-                linewidth=1.5,
-                label=label,
-            )
-        ax.set_xlabel("Forecast horizon (hours)")
-        ax.set_ylabel(ylabel)
-        ax.set_xticks(all_x)
-        ax.set_xticklabels([])  # labels drawn manually below to allow vertical staggering
-        # Stagger tick labels at two depths so closely-spaced values don't overlap.
-        # get_xaxis_transform(): x in data coords, y in axes fraction (0=bottom, negative=below).
-        trans = ax.get_xaxis_transform()
-        for i, val in enumerate(all_x):
-            y_offset = -0.05 if i % 2 == 0 else -0.12
-            ax.text(val, y_offset, str(int(val)), transform=trans,
-                    ha="center", va="top", fontsize=9)
-        ax.grid(axis="both", alpha=0.3)
-        if hline_zero:
-            ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
-        # Place legend outside the plot area so it never overlaps the lines
-        ax.legend(
-            loc="upper left",
-            bbox_to_anchor=(1.01, 1),
-            borderaxespad=0,
-            fontsize=7,
-            framealpha=0.8,
+    # Detect whether any dataset has multiple replicates (drives legend content)
+    any_replicates = any(
+        "replicate" in df.columns and df["replicate"].nunique() > 1
+        for _, df in records
+    )
+
+    # Layout constants matching b_ExploreData.py Target_timeseries style
+    _FIG_WIDTH  = 13.0
+    _ROW_HEIGHT = 0.88
+    _MIN_FIG_H  = 2.8
+    _HSPACE     = 0.08
+    _TOP_IN     = 0.45   # inches reserved at top — must exceed legend height (~0.35 in) + gap
+    _BOTTOM_IN  = 0.90   # inches reserved at bottom (staggered tick labels + supxlabel)
+
+    def _make_figure(
+        metric: str,
+        ylabel: str,
+        filename: str,
+        hline_zero: bool = False,
+        any_replicates: bool = False,
+        ylim: tuple | None = None,
+        yticks: list | None = None,
+    ) -> Path:
+        n_rows = len(records)
+        fig_h = max(_MIN_FIG_H, _ROW_HEIGHT * n_rows)
+        fig, axes = plt.subplots(
+            n_rows, 1, sharex=True,
+            figsize=(_FIG_WIDTH, fig_h),
+            gridspec_kw={"hspace": _HSPACE},
         )
+        if n_rows == 1:
+            axes = [axes]
+
+        for i, (label, df) in enumerate(records):
+            ax = axes[i]
+            color = _SERIES_COLORS[i % len(_SERIES_COLORS)]
+
+            if metric not in df.columns or df[metric].isnull().all():
+                ax.set_visible(False)
+                continue
+
+            has_replicates = "replicate" in df.columns and df["replicate"].nunique() > 1
+            if has_replicates:
+                grp = df.groupby("lookahead")[metric].agg(["mean", "std"]).reset_index()
+                x = grp["lookahead"]
+                mu = grp["mean"]
+                sigma = grp["std"].fillna(0)
+                # Mean line (solid with markers)
+                ax.plot(x, mu, marker="o", markersize=4, linewidth=1.5,
+                        color=color, zorder=3)
+                # ±1σ — dashed, matching b_ExploreData.py Surface_timeseries_uncertainty style
+                ax.plot(x, mu + sigma,     linestyle="--", linewidth=0.8, alpha=0.7,
+                        color=color, zorder=2)
+                ax.plot(x, mu - sigma,     linestyle="--", linewidth=0.8, alpha=0.7,
+                        color=color, zorder=2)
+                # ±2σ — dotted
+                ax.plot(x, mu + 2 * sigma, linestyle=":",  linewidth=0.6, alpha=0.55,
+                        color=color, zorder=1)
+                ax.plot(x, mu - 2 * sigma, linestyle=":",  linewidth=0.6, alpha=0.55,
+                        color=color, zorder=1)
+            else:
+                # Single replicate or legacy CSV without replicate column
+                plot_df = (
+                    df.groupby("lookahead")[metric].mean().reset_index()
+                    if "replicate" in df.columns else df
+                )
+                ax.plot(plot_df["lookahead"], plot_df[metric],
+                        marker="o", markersize=4, linewidth=1.5, color=color)
+
+            wrapped = "\n".join(textwrap.wrap(label, width=15))
+            ax.set_ylabel(wrapped, rotation=0, ha="right", va="center",
+                          fontsize=15, labelpad=8)
+            ax.grid(axis="both", alpha=0.3)
+            if yticks is not None:
+                ax.set_yticks(yticks)
+            else:
+                ax.yaxis.set_major_locator(MaxNLocator(nbins=3))
+            if ylim is not None:
+                ax.set_ylim(*ylim)
+            if hline_zero:
+                ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+            if i < n_rows - 1:
+                ax.tick_params(axis="x", which="both", labelbottom=False)
+
+        # X-axis: staggered tick labels on bottom subplot only.
+        # get_xaxis_transform(): x in data coords, y in axes fraction (negative = below axis).
+        axes[-1].set_xticks(all_x)
+        axes[-1].set_xticklabels([])
+        trans = axes[-1].get_xaxis_transform()
+        for j, val in enumerate(all_x):
+            y_offset = -0.05 if j % 2 == 0 else -0.12
+            axes[-1].text(val, y_offset, str(int(val)), transform=trans,
+                          ha="center", va="top", fontsize=10)
+
+        # Margins — computed here so axes height is known for xlabel labelpad.
+        top_frac    = max(0.86, min(0.995, 1.0 - (_TOP_IN    / fig_h)))
+        bottom_frac = max(0.08, min(0.30,          _BOTTOM_IN / fig_h))
+        fig.subplots_adjust(
+            left=0.18, right=0.995,
+            top=top_frac, bottom=bottom_frac,
+            hspace=_HSPACE,
+        )
+
+        # X-axis label — positioned below the deepest stagger text.
+        # The stagger sits at -0.12 axes fraction; convert to points to derive labelpad.
+        _axes_h_frac = (top_frac - bottom_frac) / (n_rows + max(n_rows - 1, 0) * _HSPACE)
+        _axes_h_pts  = _axes_h_frac * fig_h * 72
+        _xlabel_pad  = max(18, int(0.12 * _axes_h_pts + 15))
+        axes[-1].set_xlabel("Forecast horizon (hours)", fontsize=15, labelpad=_xlabel_pad)
+
+        # Single figure-level legend above top subplot with generic black lines
+        legend_handles = [
+            plt.Line2D([0], [0], color="black", linewidth=1.5,
+                       marker="o", markersize=4, label="Mean"),
+        ]
+        if any_replicates:
+            legend_handles += [
+                plt.Line2D([0], [0], color="black", linestyle="--",
+                           linewidth=0.8, alpha=0.7,  label="±1σ"),
+                plt.Line2D([0], [0], color="black", linestyle=":",
+                           linewidth=0.6, alpha=0.55, label="±2σ"),
+            ]
+        fig.legend(
+            handles=legend_handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 1.03),
+            ncol=len(legend_handles),
+            framealpha=0.85,
+            fontsize=15,
+            borderaxespad=0.12,
+        )
+
         out = summaries_dir / filename
-        fig.savefig(out, dpi=300, bbox_inches="tight")
+        fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.02)
         plt.close(fig)
         return out
 
-    r2_path = _make_figure("r2", "R²", "lookahead_r2_comparison.png", hline_zero=True)
+    r2_path = _make_figure("r2", "R²", "lookahead_r2_comparison.png",
+                           hline_zero=True, any_replicates=any_replicates,
+                           ylim=(-1.2, 1.2), yticks=[-1, 0, 1])
     print(f"[INFO] Wrote R² figure:    {r2_path}")
 
-    nrmse_path = _make_figure("nrmse", "nRMSE (RMSE / σ_target)", "lookahead_nrmse_comparison.png")
+    # Shared nRMSE y-axis limits: global min/max across all datasets and replicates.
+    _nrmse_all = pd.concat(
+        [df["nrmse"] for _, df in records if "nrmse" in df.columns],
+        ignore_index=True,
+    ).dropna()
+    nrmse_ylim = (float(_nrmse_all.min()), float(_nrmse_all.max())) if not _nrmse_all.empty else None
+
+    nrmse_path = _make_figure("nrmse", "nRMSE (RMSE / σ_target)", "lookahead_nrmse_comparison.png",
+                              any_replicates=any_replicates, ylim=nrmse_ylim)
     print(f"[INFO] Wrote nRMSE figure: {nrmse_path}")
 
     return 0

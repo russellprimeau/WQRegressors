@@ -4,23 +4,29 @@ feature_sweeps), then for each horizon N call d_RunResample.split(gap_rows=N) to
 a fresh set of samples where the predictor window ends N hours before the target, retrain
 and evaluate the model, and save metrics/plots to forecasts/lookahead_sweeps/.
 
-Each horizon's samples and model outputs are written to an isolated subdirectory:
+Each horizon's samples and model outputs are written to isolated replicate subdirectories:
 
     <dataset_dir>/horizons/horizon_NNNhr/
-        samples/                        – raw sample CSVs (gap_rows=N)
-        mc_replicates/                  – uncertainty-perturbed replicates
-        config_<model>_01.yml           – training config for this horizon
-        forecasts/horizon_NNNhr/
-            evaluation_summary.csv      – per-set metrics for this horizon
+        rep_000/
+            samples/                        – raw sample CSVs (gap_rows=N, seed+0)
+            mc_replicates/                  – uncertainty-perturbed replicates
+            config_<model>_01.yml           – training config for this replicate
+            forecasts/horizon_NNNhr_rep_000/
+                evaluation_summary.csv      – per-set metrics for this replicate
+        rep_001/
+            ...
 
-Aggregate metrics and per-dataset plots are written to:
+With --replicates M each horizon is run M times using seeds random_seed+0 … random_seed+M-1,
+producing a distribution of forecasts that captures model and MC-perturbation variability.
 
-    <dataset_dir>/forecasts/lookahead_sweeps/
-        lookahead_metrics.csv           – one row per horizon (test-set metrics)
+Aggregate metrics (all replicates, all horizons) are written to:
+
+    <dataset_dir>/horizons/lookahead_sweeps/
+        lookahead_metrics.csv           – one row per (horizon, replicate)
         rmse_vs_lookahead.png
         r2_vs_lookahead.png
 
-Use z2_horizon_post.py to produce cross-dataset comparison figures.
+Use z2_horizon_post.py to produce cross-dataset comparison figures with uncertainty bands.
 
 CLI arguments:
     --data-root PATH        Root directory containing MC_* dataset subdirectories.
@@ -32,10 +38,15 @@ CLI arguments:
                             lists, and Monte Carlo settings.  Required.
     --horizons INT [INT …]  Space-separated list of horizon values (hours) to sweep.
                             Default: 0 1 2 6 12 24 48 96 120 167
+    --replicates M          Number of times to resample, train, and evaluate each horizon.
+                            Each replicate uses a different random seed (random_seed + idx).
+                            Default: 1
 
 Examples:
     python src/k_RunHorizonSweep.py --resample-config data/output/sampling/resample_config.yml
-    python src/k_RunHorizonSweep.py --data-root data/output/CV4 --dataset-prefix MC --resample-config data/output/sampling/resample_config.yml --horizons 0 6 12 24 48
+    python src/k_RunHorizonSweep.py --data-root data/output/CV4 --dataset-prefix MC \
+        --resample-config data/output/sampling/resample_config.yml \
+        --horizons 0 6 12 24 48 --replicates 5
 
 """
 
@@ -85,22 +96,10 @@ def _base_window_rows_from_config(config_path: Path) -> int:
     return int(base_stop - base_start + 1)  # indices are inclusive: rows input_row_1..input_row_2
 
 
-def _build_lookahead_schedule(base_rows: int, preferred: list | None = None) -> list[int]:
-    """Build a valid lookahead schedule bounded by the available base window.
-
-    For a base window of N rows, max valid lookahead is N-1 (must leave >=1 row).
-    The schedule keeps preferred milestones that fit and also includes the max
-    endpoint to ensure full-range coverage for long-window targets.
-    """
-    if base_rows <= 0:
-        return []
-
-    max_lookahead = int(base_rows - 1)
+def _build_lookahead_schedule(preferred: list | None = None) -> list[int]:
+    """Return the lookahead schedule as non-negative integers, sorted and deduplicated."""
     candidates = preferred if preferred is not None else PREFERRED_LOOKAHEADS
-    schedule = [int(v) for v in candidates if 0 <= int(v) <= max_lookahead]
-    if max_lookahead not in schedule:
-        schedule.append(max_lookahead)
-    return sorted(set(schedule))
+    return sorted(set(int(v) for v in candidates if int(v) >= 0))
 
 
 def find_best_configs(data_root, dataset_prefix):
@@ -203,7 +202,13 @@ def _select_horizon_config(config_paths: list, model_key: str) -> Path | None:
     return Path(config_paths[0]) if config_paths else None
 
 
-def run_horizon_sweep(data_root, dataset_prefix, resample_config_path, preferred_lookaheads=None):
+def run_horizon_sweep(
+    data_root,
+    dataset_prefix,
+    resample_config_path,
+    preferred_lookaheads=None,
+    n_replicates=1,
+):
     # --- Load resample config ---
     resample_cfg = load_config(resample_config_path)
     config_dir = Path(resample_cfg['__config_dir'])
@@ -266,110 +271,117 @@ def run_horizon_sweep(data_root, dataset_prefix, resample_config_path, preferred
 
         # --- Build lookahead schedule ---
         sample_length = _base_window_rows_from_config(base_config)
-        lookaheads = _build_lookahead_schedule(base_rows=sample_length, preferred=preferred_lookaheads)
+        lookaheads = _build_lookahead_schedule(preferred=preferred_lookaheads)
         if not lookaheads:
-            print(f"  [WARN] No valid lookahead schedule for sample_length={sample_length}. Skipping.")
+            print(f"  [WARN] No horizons to sweep. Skipping.")
             continue
-        print(f"  [INFO] sample_length={sample_length}; horizon schedule={lookaheads}")
+        print(f"  [INFO] sample_length={sample_length}; horizon schedule={lookaheads}; replicates={n_replicates}")
 
         # --- Base hyperparameter overrides from best model ---
         base_overrides = _extract_model_overrides(base_config)
 
-        # --- Sweep horizons ---
+        # --- Sweep horizons × replicates ---
         metrics = []
         for horizon in lookaheads:
             horizon_label = f'horizon_{horizon:03d}hr'
             horizon_dir = dataset_dir / 'horizons' / horizon_label
 
-            # Per-horizon training_config_defaults: inject forecast_name and forecast_dir.
-            # forecast_dir (absolute) is included so f_Evaluate.py resolves test_files.txt
-            # correctly even when falling back to the training config instead of the eval config.
-            forecast_dir_abs = str((horizon_dir / 'forecasts' / horizon_label).resolve())
-            training_cfg_defaults = {}
-            for k, v in base_overrides.items():
-                training_cfg_defaults[k] = dict(v)
-                training_cfg_defaults[k]['data'] = {
-                    'forecast_name': horizon_label,
-                    'forecast_dir': forecast_dir_abs,
-                }
+            for rep_idx in range(n_replicates):
+                rep_label = f'rep_{rep_idx:03d}'
+                rep_dir = horizon_dir / rep_label
+                rep_name = f'{horizon_label}_{rep_label}'
+                rep_seed = random_seed + rep_idx
+                forecast_dir_abs = str((rep_dir / 'forecasts' / rep_name).resolve())
 
-            print(f"  [RESAMPLE] Horizon {horizon}hr -> {horizon_dir.name}")
-            try:
-                result = resample_split(
-                    df_norm,
-                    str(horizon_dir),
-                    [target],
-                    sample_length,
-                    nan_tol=0.8,
-                    to_normalize=[],
-                    fault_tolerant=True,
-                    predictor_cols=predictor_cols,
-                    use_uncertainty_perturbation=use_uncertainty_perturbation,
-                    n_mc_replicates=n_mc_replicates,
-                    random_seed=random_seed,
-                    pre_normalized=True,
-                    normalization_params=normalization_params,
-                    sensor_uncertainties=shared_sensor_uncertainties,
-                    verbose=False,
-                    gap_rows=horizon,
-                    training_config_defaults=training_cfg_defaults,
-                )
-            except Exception as exc:
-                print(f"  [ERROR] Resampling failed for horizon {horizon}hr: {exc}")
-                continue
+                # Per-replicate training_config_defaults: inject forecast_name and forecast_dir.
+                # forecast_dir (absolute) is included so f_Evaluate.py resolves test_files.txt
+                # correctly even when falling back to the training config instead of the eval config.
+                training_cfg_defaults = {}
+                for k, v in base_overrides.items():
+                    training_cfg_defaults[k] = dict(v)
+                    training_cfg_defaults[k]['data'] = {
+                        'forecast_name': rep_name,
+                        'forecast_dir': forecast_dir_abs,
+                    }
 
-            if result['n_samples'] == 0:
-                print(f"  [SKIP] Horizon {horizon}hr: no samples generated.")
-                continue
+                print(f"  [RESAMPLE] Horizon {horizon}hr rep {rep_idx} (seed={rep_seed})")
+                try:
+                    result = resample_split(
+                        df_norm,
+                        str(rep_dir),
+                        [target],
+                        sample_length,
+                        nan_tol=0.8,
+                        to_normalize=[],
+                        fault_tolerant=True,
+                        predictor_cols=predictor_cols,
+                        use_uncertainty_perturbation=use_uncertainty_perturbation,
+                        n_mc_replicates=n_mc_replicates,
+                        random_seed=rep_seed,
+                        pre_normalized=True,
+                        normalization_params=normalization_params,
+                        sensor_uncertainties=shared_sensor_uncertainties,
+                        verbose=False,
+                        gap_rows=horizon,
+                        training_config_defaults=training_cfg_defaults,
+                    )
+                except Exception as exc:
+                    print(f"  [ERROR] Resampling failed for horizon {horizon}hr rep {rep_idx}: {exc}")
+                    continue
 
-            horizon_cfg = _select_horizon_config(result['config_paths'], model_key)
-            if horizon_cfg is None:
-                print(f"  [SKIP] Horizon {horizon}hr: could not find config for model_key={model_key}.")
-                continue
+                if result['n_samples'] == 0:
+                    print(f"  [SKIP] Horizon {horizon}hr rep {rep_idx}: no samples generated.")
+                    continue
 
-            # Patch forecast_name and forecast_dir directly in the config file.
-            # d_RunResample.split() hardcodes 'xgb_01' as the forecast_name arg; the
-            # training_config_defaults override is not reliable when the horizon dir already
-            # contains a config from a prior run. Writing here guarantees the correct values.
-            with open(horizon_cfg, 'r', encoding='utf-8') as _f:
-                _cfg = yaml.safe_load(_f)
-            _cfg.setdefault('data', {})['forecast_name'] = horizon_label
-            _cfg['data']['forecast_dir'] = forecast_dir_abs
-            with open(horizon_cfg, 'w', encoding='utf-8') as _f:
-                yaml.dump(_cfg, _f, sort_keys=False)
+                horizon_cfg = _select_horizon_config(result['config_paths'], model_key)
+                if horizon_cfg is None:
+                    print(f"  [SKIP] Horizon {horizon}hr rep {rep_idx}: could not find config for model_key={model_key}.")
+                    continue
 
-            # Train
-            train_cmd = [sys.executable, 'src/e_Train.py', '--config', str(horizon_cfg)]
-            print(f"  [TRAIN] Horizon {horizon}hr")
-            try:
-                subprocess.run(train_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            except subprocess.CalledProcessError as exc:
-                print(f"  [ERROR] Training failed for horizon {horizon}hr:")
-                print(exc.stderr.decode(errors='replace'))
-                continue
+                # Patch forecast_name and forecast_dir directly in the config file.
+                # d_RunResample.split() hardcodes 'xgb_01' as the forecast_name arg; the
+                # training_config_defaults override is not reliable when the rep dir already
+                # contains a config from a prior run. Writing here guarantees the correct values.
+                with open(horizon_cfg, 'r', encoding='utf-8') as _f:
+                    _cfg = yaml.safe_load(_f)
+                _cfg.setdefault('data', {})['forecast_name'] = rep_name
+                _cfg['data']['forecast_dir'] = forecast_dir_abs
+                with open(horizon_cfg, 'w', encoding='utf-8') as _f:
+                    yaml.dump(_cfg, _f, sort_keys=False)
 
-            # Evaluate — prefer the eval config written by e_Train.py (paths resolved correctly).
-            # e_Train.py names it config_evaluate_<forecast_name>.yml (line 651 of e_Train.py).
-            eval_cfg_path = horizon_dir / 'forecasts' / horizon_label / f'config_evaluate_{horizon_label}.yml'
-            eval_config_arg = str(eval_cfg_path) if eval_cfg_path.exists() else str(horizon_cfg)
-            eval_cmd = [sys.executable, 'src/f_Evaluate.py', '--config', eval_config_arg]
-            print(f"  [EVAL] Horizon {horizon}hr")
-            try:
-                subprocess.run(eval_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            except subprocess.CalledProcessError as exc:
-                print(f"  [ERROR] Evaluation failed for horizon {horizon}hr:")
-                print(exc.stderr.decode(errors='replace'))
-                continue
+                # Train
+                train_cmd = [sys.executable, 'src/e_Train.py', '--config', str(horizon_cfg)]
+                print(f"  [TRAIN] Horizon {horizon}hr rep {rep_idx}")
+                try:
+                    subprocess.run(train_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                except subprocess.CalledProcessError as exc:
+                    print(f"  [ERROR] Training failed for horizon {horizon}hr rep {rep_idx}:")
+                    print(exc.stderr.decode(errors='replace'))
+                    continue
 
-            eval_csv = horizon_dir / 'forecasts' / horizon_label / 'evaluation_summary.csv'
-            if eval_csv.exists():
-                df_eval = pd.read_csv(eval_csv)
-                df_eval['horizon'] = horizon
-                df_eval['input_rows_included'] = sample_length
-                df_eval['input_rows_excluded'] = horizon
-                metrics.append(df_eval)
-            else:
-                print(f"  [WARN] evaluation_summary.csv not found: {eval_csv}")
+                # Evaluate — prefer the eval config written by e_Train.py (paths resolved correctly).
+                # e_Train.py names it config_evaluate_<forecast_name>.yml (line 651 of e_Train.py).
+                eval_cfg_path = rep_dir / 'forecasts' / rep_name / f'config_evaluate_{rep_name}.yml'
+                eval_config_arg = str(eval_cfg_path) if eval_cfg_path.exists() else str(horizon_cfg)
+                eval_cmd = [sys.executable, 'src/f_Evaluate.py', '--config', eval_config_arg]
+                print(f"  [EVAL] Horizon {horizon}hr rep {rep_idx}")
+                try:
+                    subprocess.run(eval_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                except subprocess.CalledProcessError as exc:
+                    print(f"  [ERROR] Evaluation failed for horizon {horizon}hr rep {rep_idx}:")
+                    print(exc.stderr.decode(errors='replace'))
+                    continue
+
+                eval_csv = rep_dir / 'forecasts' / rep_name / 'evaluation_summary.csv'
+                if eval_csv.exists():
+                    df_eval = pd.read_csv(eval_csv)
+                    df_eval['horizon'] = horizon
+                    df_eval['replicate'] = rep_idx
+                    df_eval['input_rows_included'] = sample_length
+                    df_eval['input_rows_excluded'] = horizon
+                    metrics.append(df_eval)
+                else:
+                    print(f"  [WARN] evaluation_summary.csv not found: {eval_csv}")
 
         # --- Save metrics and plots ---
         if metrics:
@@ -388,17 +400,21 @@ def run_horizon_sweep(data_root, dataset_prefix, resample_config_path, preferred
             drop_cols = [col for col in ['label', 'kind'] if col in all_metrics.columns]
             all_metrics = all_metrics.drop(columns=drop_cols, errors='ignore')
 
+            # Put horizon and replicate first
             cols = list(all_metrics.columns)
-            if 'horizon' in cols:
-                cols.insert(0, cols.pop(cols.index('horizon')))
-                all_metrics = all_metrics[cols]
+            front = [c for c in ['horizon', 'replicate'] if c in cols]
+            rest = [c for c in cols if c not in front]
+            all_metrics = all_metrics[front + rest]
 
-            sweep_dir = dataset_dir / 'forecasts' / 'lookahead_sweeps'
+            sweep_dir = dataset_dir / 'horizons' / 'lookahead_sweeps'
             sweep_dir.mkdir(parents=True, exist_ok=True)
             all_metrics.to_csv(sweep_dir / 'lookahead_metrics.csv', index=False)
 
+            # Simple per-dataset summary plots (mean across replicates)
+            mean_metrics = all_metrics.groupby('horizon')[['rmse', 'r2']].mean().reset_index()
+
             plt.figure(figsize=(8, 5))
-            plt.plot(all_metrics['horizon'], all_metrics['rmse'], marker='o', label='RMSE')
+            plt.plot(mean_metrics['horizon'], mean_metrics['rmse'], marker='o', label='RMSE (mean)')
             plt.xlabel('Horizon (hours)')
             plt.ylabel('RMSE')
             plt.title(f'{dataset_dir.name} - RMSE vs Horizon')
@@ -407,7 +423,7 @@ def run_horizon_sweep(data_root, dataset_prefix, resample_config_path, preferred
             plt.close()
 
             plt.figure(figsize=(8, 5))
-            plt.plot(all_metrics['horizon'], all_metrics['r2'], marker='o', label='R2')
+            plt.plot(mean_metrics['horizon'], mean_metrics['r2'], marker='o', label='R2 (mean)')
             plt.xlabel('Horizon (hours)')
             plt.ylabel('R2')
             plt.title(f'{dataset_dir.name} - R2 vs Horizon')
@@ -434,5 +450,18 @@ if __name__ == '__main__':
         metavar='INT',
         help='Horizon values (hours) to sweep. Default: 0 1 2 6 12 24 48 96 120 167',
     )
+    parser.add_argument(
+        '--replicates',
+        type=int,
+        default=1,
+        metavar='M',
+        help='Number of times to resample, train, and evaluate each horizon (default: 1).',
+    )
     args = parser.parse_args()
-    run_horizon_sweep(args.data_root, args.dataset_prefix, args.resample_config, args.horizons)
+    run_horizon_sweep(
+        args.data_root,
+        args.dataset_prefix,
+        args.resample_config,
+        args.horizons,
+        n_replicates=args.replicates,
+    )
