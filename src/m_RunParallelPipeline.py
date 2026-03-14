@@ -27,8 +27,14 @@ Output routing design:
 Usage:
     python src/m_RunParallelPipeline.py --num-workers 2 [all pipeline args]
 
+    Optional: --max-worker-memory-gb <GB>
+        Hard-kills any worker whose RSS exceeds <GB> gigabytes and logs a clear
+        message. Requires psutil (pip install psutil). Useful for diagnosing or
+        preventing silent OOM failures when running multiple workers.
+
 Example:
     python src/m_RunParallelPipeline.py --num-workers 2 \\
+        --max-worker-memory-gb 20 \\
         --dataset-prefix MC --limit-datasets 14 \\
         --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4
 
@@ -51,6 +57,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -117,6 +124,53 @@ def _write_output(
         master_log.flush()
 
 
+def _memory_watchdog(
+    procs: list[tuple[int, subprocess.Popen]],
+    limit_bytes: int,
+    out_queue: queue.SimpleQueue,
+    poll_interval: float = 5.0,
+) -> None:
+    """Terminate any worker whose RSS exceeds limit_bytes.
+
+    Runs in a daemon thread. Polls every poll_interval seconds and hard-kills
+    (SIGKILL / TerminateProcess) any worker whose resident set size exceeds the
+    per-worker limit, enqueuing a clear message so the failure is distinguishable
+    from a silent OS-level OOM kill in the master log.
+
+    Requires psutil. If psutil is not installed the watchdog logs a warning and
+    exits immediately — it does not raise.
+    """
+    try:
+        import psutil
+    except ImportError:
+        out_queue.put(
+            "[PARALLEL] WARNING: psutil not installed — memory watchdog disabled. "
+            "Install with: pip install psutil\n"
+        )
+        return
+
+    limit_gb = limit_bytes / (1024 ** 3)
+    active = {i: proc for i, proc in procs}
+    while active:
+        time.sleep(poll_interval)
+        for i, proc in list(active.items()):
+            if proc.poll() is not None:
+                del active[i]
+                continue
+            try:
+                rss = psutil.Process(proc.pid).memory_info().rss
+                if rss > limit_bytes:
+                    proc.kill()  # hard kill; terminate() may be ignored on Windows
+                    rss_gb = rss / (1024 ** 3)
+                    out_queue.put(
+                        f"[PARALLEL] Worker {i} KILLED by memory watchdog: "
+                        f"RSS {rss_gb:.2f} GB exceeded per-worker limit {limit_gb:.2f} GB\n"
+                    )
+                    del active[i]
+            except Exception:  # process gone, access denied, etc.
+                del active[i]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -132,8 +186,25 @@ def main() -> int:
         default=2,
         help="Number of parallel worker processes (default: 2).",
     )
+    parser.add_argument(
+        "--max-worker-memory-gb",
+        type=float,
+        default=None,
+        metavar="GB",
+        help=(
+            "Per-worker RAM limit in GB. If a worker's resident set size exceeds "
+            "this value it is hard-killed and a clear message is written to the "
+            "master log. Requires psutil (pip install psutil). "
+            "No limit by default."
+        ),
+    )
     args, passthrough = parser.parse_known_args()
     num_workers = max(1, int(args.num_workers))
+    max_worker_memory_bytes: int | None = (
+        int(args.max_worker_memory_gb * (1024 ** 3))
+        if args.max_worker_memory_gb is not None
+        else None
+    )
 
     if num_workers == 1:
         # Single worker: run the pipeline directly without subprocess overhead.
@@ -160,6 +231,10 @@ def main() -> int:
         _log(f"[PARALLEL] Workers    : {num_workers}")
         _log(f"[PARALLEL] Partition  : stride 1/{num_workers} — worker i runs plans[i::{num_workers}]")
         _log(f"[PARALLEL] GPU note   : peak VRAM scales with number of workers using GPU simultaneously")
+        if max_worker_memory_bytes is not None:
+            _log(f"[PARALLEL] RAM limit  : {args.max_worker_memory_gb:.2f} GB per worker (watchdog active)")
+        else:
+            _log(f"[PARALLEL] RAM limit  : none (pass --max-worker-memory-gb to enable watchdog)")
         _log("")
 
         out_queue: queue.SimpleQueue = queue.SimpleQueue()
@@ -188,6 +263,15 @@ def main() -> int:
             _log(f"[PARALLEL] Worker {i} started (pid={proc.pid})")
 
         _log("")
+
+        # Start memory watchdog if a per-worker limit was requested.
+        if max_worker_memory_bytes is not None:
+            watchdog = threading.Thread(
+                target=_memory_watchdog,
+                args=(procs, max_worker_memory_bytes, out_queue),
+                daemon=True,  # daemon: exits automatically when all workers are done
+            )
+            watchdog.start()
 
         # Writer thread drains the queue; runs until all collectors send sentinels.
         writer = threading.Thread(

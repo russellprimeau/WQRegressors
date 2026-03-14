@@ -1106,7 +1106,6 @@ def _resolve_columns_from_config(config, df_columns):
     raw_target_names = list(config.get("target_columns", []))
     suffix_opts = config.get("auto_target_suffixes", {})
     use_res = suffix_opts.get("res", True)
-    use_state = suffix_opts.get("state", True)
 
     target_columns = []
     for name in raw_target_names:
@@ -1125,11 +1124,6 @@ def _resolve_columns_from_config(config, df_columns):
                 print(f"[WARN] Target column '{name}' not found in data. Skipping.")
 
     predictor_columns = list(config.get("predictor_columns", []))
-    if use_state:
-        for name in raw_target_names:
-            state_col = f"{name}_state"
-            if state_col in df_col_set and state_col not in predictor_columns:
-                predictor_columns.append(state_col)
 
     normalize_cfg = config.get("to_normalize", "auto")
     if normalize_cfg == "auto":
@@ -1211,6 +1205,7 @@ def main():
 
     # --- Resolve columns ---
     target_columns, predictor_cols, to_normalize = _resolve_columns_from_config(config, df.columns)
+    use_state = config.get("auto_target_suffixes", {}).get("state", True)
     if not target_columns:
         print("[ERROR] No valid target columns found. Exiting.")
         sys.exit(1)
@@ -1258,6 +1253,10 @@ def main():
 
         available_cols = set(df_norm.columns)
         per_target_predictors = [c for c in predictor_cols if c in available_cols]
+        if use_state:
+            state_col = _resolve_state_predictor_column(target, available_cols)
+            if state_col and state_col not in per_target_predictors:
+                per_target_predictors.append(state_col)
 
         missing_predictors = [c for c in predictor_cols if c not in available_cols]
         if missing_predictors:

@@ -75,6 +75,9 @@ python src/l_RunMCShapleyOptimizerPipeline.py \\
             --beam-width 16 --max-rounds 30 --max-swap-attempts 200 \\
             --keep-shapley-plots --keep-search-plots
 
+python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 --keep-shapley-plots --keep-search-plots --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 --beam-width 16 --max-rounds 30 --max-swap-attempts 200 --parallel-evaluators 1 --data-root C:\\Users\\Master\\Documents\\GitHub\\WQRegressors\\data\\output\\CV8
+
+
 3) Full pipeline with parallel dataset processing (see GPU/RAM warnings above):
 python src/m_RunParallelPipeline.py --num-workers 2 --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 --keep-shapley-plots --keep-search-plots --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 --beam-width 16 --max-rounds 30 --max-swap-attempts 200 --parallel-evaluators 1 --data-root C:\\Users\\Master\\Documents\\GitHub\\WQRegressors\\data\\output\\CV7
 
