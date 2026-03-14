@@ -38,11 +38,21 @@ Example:
         --dataset-prefix MC --limit-datasets 14 \\
         --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4
 
-GPU memory warning:
-    Each worker process runs its own CUDA context and CuPy memory pool. Peak
-    VRAM usage scales approximately as N × single-worker peak. Monitor VRAM
-    during the first parallel run and reduce --num-workers (or set device: cpu
-    in config files) if GPU OOM errors occur.
+GPU / CPU device assignment:
+    By default worker 0 is assigned CUDA_VISIBLE_DEVICES=0 (GPU) and all
+    additional workers are assigned CUDA_VISIBLE_DEVICES="" (CPU only). This
+    eliminates VRAM contention between workers on a single-GPU machine.
+
+    Use --gpu-workers N to give the first N workers GPU access and the rest
+    CPU. Use --gpu-ids to specify which physical GPU IDs are assigned:
+        --gpu-workers 2 --gpu-ids 0,1   → W0 gets GPU 0, W1 gets GPU 1
+        --gpu-workers 0                 → all workers use CPU
+
+    IMPORTANT: CUDA_VISIBLE_DEVICES controls what the process can see, but it
+    does not rewrite config files. Worker config files must specify a matching
+    device (device: cuda for GPU workers, device: cpu / tree_method: hist for
+    CPU workers). A mismatch will cause a runtime error that the per-fold CPU
+    fallback will catch, but it is better to configure configs correctly.
 
 CPU / RAM warning:
     Observed steady-state RAM usage scales with --num-workers. With ~40% RAM
@@ -53,6 +63,7 @@ CPU / RAM warning:
 from __future__ import annotations
 
 import argparse
+import os
 import queue
 import subprocess
 import sys
@@ -120,8 +131,13 @@ def _write_output(
             continue
         sys.stdout.write(item)
         sys.stdout.flush()
-        master_log.write(item)
-        master_log.flush()
+        try:
+            master_log.write(item)
+            master_log.flush()
+        except OSError:
+            # Disk full or log file error — continue writing to stdout only so
+            # the writer thread keeps draining the queue and does not hang.
+            pass
 
 
 def _memory_watchdog(
@@ -198,6 +214,42 @@ def main() -> int:
             "No limit by default."
         ),
     )
+    parser.add_argument(
+        "--worker-timeout-hours",
+        type=float,
+        default=None,
+        metavar="H",
+        help=(
+            "Per-worker wall-clock timeout in hours. Any worker still running "
+            "after this deadline is hard-killed and its exit code recorded as -1. "
+            "Useful when a CUDA context hang leaves a worker alive but permanently "
+            "blocked. No timeout by default."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Number of workers that receive GPU access via CUDA_VISIBLE_DEVICES "
+            "(default: 1). Workers 0..N-1 are assigned the IDs from --gpu-ids; "
+            "workers N..num-workers-1 get CUDA_VISIBLE_DEVICES='' (CPU only). "
+            "Pass 0 to force all workers to CPU."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-ids",
+        type=str,
+        default="0",
+        metavar="IDS",
+        help=(
+            "Comma-separated CUDA device IDs to assign to GPU workers "
+            "(default: '0'). Worker i (i < --gpu-workers) receives "
+            "gpu_ids[i %% len(gpu_ids)], so IDs are cycled if there are fewer "
+            "IDs than GPU workers. Example: --gpu-workers 2 --gpu-ids 0,1"
+        ),
+    )
     args, passthrough = parser.parse_known_args()
     num_workers = max(1, int(args.num_workers))
     max_worker_memory_bytes: int | None = (
@@ -205,11 +257,23 @@ def main() -> int:
         if args.max_worker_memory_gb is not None
         else None
     )
+    worker_timeout_seconds: float | None = (
+        args.worker_timeout_hours * 3600.0
+        if args.worker_timeout_hours is not None
+        else None
+    )
+    num_gpu_workers: int = max(0, min(int(args.gpu_workers), num_workers))
+    gpu_ids: list[str] = [s.strip() for s in args.gpu_ids.split(",") if s.strip()] or ["0"]
+
+    def _worker_cvd(i: int) -> str:
+        """Return the CUDA_VISIBLE_DEVICES value for worker i."""
+        return gpu_ids[i % len(gpu_ids)] if i < num_gpu_workers else ""
 
     if num_workers == 1:
         # Single worker: run the pipeline directly without subprocess overhead.
         cmd = [sys.executable, str(_PIPELINE_SCRIPT)] + passthrough
-        return subprocess.run(cmd).returncode
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": _worker_cvd(0)}
+        return subprocess.run(cmd, env=env).returncode
 
     log_dir = _resolve_log_dir(passthrough)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -230,11 +294,19 @@ def main() -> int:
         _log(f"[PARALLEL] Monitor    : Get-Content \"{master_log_path}\" -Wait")
         _log(f"[PARALLEL] Workers    : {num_workers}")
         _log(f"[PARALLEL] Partition  : stride 1/{num_workers} — worker i runs plans[i::{num_workers}]")
-        _log(f"[PARALLEL] GPU note   : peak VRAM scales with number of workers using GPU simultaneously")
+        device_summary = "  ".join(
+            f"W{i}→{'CUDA:' + _worker_cvd(i) if i < num_gpu_workers else 'CPU'}"
+            for i in range(num_workers)
+        )
+        _log(f"[PARALLEL] Devices    : {num_gpu_workers}/{num_workers} GPU — {device_summary}")
         if max_worker_memory_bytes is not None:
             _log(f"[PARALLEL] RAM limit  : {args.max_worker_memory_gb:.2f} GB per worker (watchdog active)")
         else:
             _log(f"[PARALLEL] RAM limit  : none (pass --max-worker-memory-gb to enable watchdog)")
+        if worker_timeout_seconds is not None:
+            _log(f"[PARALLEL] Timeout    : {args.worker_timeout_hours:.2f} h per worker")
+        else:
+            _log(f"[PARALLEL] Timeout    : none (pass --worker-timeout-hours to enable)")
         _log("")
 
         out_queue: queue.SimpleQueue = queue.SimpleQueue()
@@ -246,10 +318,13 @@ def main() -> int:
                 "--num-workers", str(num_workers),
                 "--worker-index", str(i),
             ]
+            cvd = _worker_cvd(i)
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": cvd}
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,  # merge stderr into stdout pipe
+                env=env,
             )
             done = threading.Event()
             t = threading.Thread(
@@ -260,7 +335,8 @@ def main() -> int:
             t.start()
             procs.append((i, proc))
             collector_threads.append((t, done))
-            _log(f"[PARALLEL] Worker {i} started (pid={proc.pid})")
+            device_label = f"CUDA:{cvd}" if cvd else "CPU"
+            _log(f"[PARALLEL] Worker {i} started (pid={proc.pid}, device={device_label})")
 
         _log("")
 
@@ -285,7 +361,15 @@ def main() -> int:
         results: dict[int, int] = {}
 
         def _wait_for_worker(i: int, proc: subprocess.Popen) -> None:
-            results[i] = proc.wait()
+            try:
+                results[i] = proc.wait(timeout=worker_timeout_seconds)
+            except subprocess.TimeoutExpired:
+                out_queue.put(
+                    f"[PARALLEL] Worker {i} KILLED: exceeded timeout of "
+                    f"{worker_timeout_seconds / 3600:.1f} h\n"
+                )
+                proc.kill()
+                results[i] = -1
 
         wait_threads = [
             threading.Thread(target=_wait_for_worker, args=(i, proc), daemon=True)

@@ -1720,7 +1720,21 @@ def _xgb_tune_hyperparameters_cv(
     # inside _xgb_cv_fold_score is then a no-op, eliminating n_trials × n_folds
     # host-to-device copies of the full feature matrix. y stays as numpy because it
     # is used in scalar metric computations alongside numpy prediction outputs.
-    X_cv = cp.asarray(X) if (is_gpu_mode and cp is not None) else X
+    if is_gpu_mode and cp is not None:
+        try:
+            X_cv = cp.asarray(X)
+        except Exception as _cp_err:
+            print(
+                f"[WARN] GPU pre-transfer of feature matrix failed "
+                f"({type(_cp_err).__name__}); falling back to CPU for all CV folds."
+            )
+            X_cv = X
+            is_gpu_mode = False
+            base_kwargs["device"] = "cpu"
+            base_kwargs["tree_method"] = "hist"
+            base_kwargs.pop("predictor", None)
+    else:
+        X_cv = X
 
     executor = None
     try:
@@ -1771,7 +1785,11 @@ def _xgb_tune_hyperparameters_cv(
                             )
                         )
                     for future in as_completed(futures):
-                        score, r2 = future.result()
+                        try:
+                            score, r2 = future.result()
+                        except Exception as _fold_err:
+                            print(f"[WARN] Parallel CV fold worker failed: {_fold_err}")
+                            continue
                         fold_scores.append(float(score))
                         if r2 is not None and np.isfinite(r2):
                             fold_r2.append(float(r2))
@@ -1820,8 +1838,16 @@ def _xgb_tune_hyperparameters_cv(
 
             study = optuna.create_study(direction="minimize", sampler=sampler)
             study.optimize(_objective, n_trials=n_trials, catch=(xgb.core.XGBoostError,))
-            best_params = dict(study.best_trial.user_attrs.get("params", {}))
-            best_score = float(study.best_value)
+            try:
+                best_params = dict(study.best_trial.user_attrs.get("params", {}))
+                best_score = float(study.best_value)
+            except ValueError:
+                print(
+                    "[WARN] All Optuna trials failed (e.g. all GPU OOM); "
+                    "no best trial available — returning empty hyperparameters."
+                )
+                best_params = {}
+                best_score = float("inf")
             for t in study.trials:
                 trial_results.append(
                     {
@@ -1866,7 +1892,11 @@ def _xgb_tune_hyperparameters_cv(
                             )
                         )
                     for future in as_completed(futures):
-                        score, r2 = future.result()
+                        try:
+                            score, r2 = future.result()
+                        except Exception as _fold_err:
+                            print(f"[WARN] Parallel CV fold worker failed: {_fold_err}")
+                            continue
                         fold_scores.append(float(score))
                         if r2 is not None and np.isfinite(r2):
                             fold_r2.append(float(r2))

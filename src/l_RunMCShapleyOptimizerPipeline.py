@@ -130,6 +130,37 @@ _ELITE_INCLUDE_ONE_SE = True
 _STAGE2_CVTUNE_DEFAULT_N_TRIALS = 50
 _STAGE2_CVTUNE_DEFAULT_RANDOM_START_TRIALS = 10
 
+# ---------------------------------------------------------------------------
+# Worker device override
+# ---------------------------------------------------------------------------
+# When launched by m_RunParallelPipeline.py the orchestrator sets
+# CUDA_VISIBLE_DEVICES per worker before spawning the subprocess.  We read it
+# once at import time and apply it to every config that passes through this
+# script, so the YAML device field always matches the hardware the worker can
+# actually see — regardless of what the config file says.
+#
+#   CUDA_VISIBLE_DEVICES not in env  →  None  (solo run; no override applied)
+#   CUDA_VISIBLE_DEVICES = ""        →  "cpu"
+#   CUDA_VISIBLE_DEVICES = "0" etc.  →  "cuda"
+#
+# _resolve_xgb_runtime_hyperparameters in e_Train.py still checks
+# torch.cuda.is_available() as a secondary guard, so a stale or wrong
+# CUDA_VISIBLE_DEVICES value cannot silently force GPU training.
+def _detect_worker_device() -> str | None:
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    if cvd is None:
+        return None
+    return "cpu" if cvd.strip() == "" else "cuda"
+
+
+_WORKER_DEVICE: str | None = _detect_worker_device()
+
+
+def _apply_device_override(cfg: dict) -> None:
+    """Patch cfg['device'] in-place when a worker device override is active."""
+    if _WORKER_DEVICE is not None:
+        cfg["device"] = _WORKER_DEVICE
+
 
 class _TeeTextIO:
     """Write-through stream that mirrors output to multiple text streams."""
@@ -286,6 +317,7 @@ def _run_full_feature_cv_tuning(plan: optimizer_module.DatasetPlan) -> None:
 
     cfg = train_module.load_config(str(base_cfg_path))
     cfg = train_module.merge_with_defaults(cfg, cfg.get("model_type", "xgb_regressor"))
+    _apply_device_override(cfg)
     hyper_cfg = cfg.setdefault("hyperparameters", {})
     cv_cfg = hyper_cfg.get("cv_tuning")
     if isinstance(cv_cfg, dict):
@@ -664,6 +696,7 @@ def _run_topk_subset_cv_tuning(
         return
     base_cfg = train_module.load_config(str(base_cfg_path))
     base_cfg = train_module.merge_with_defaults(base_cfg, base_cfg.get("model_type", "xgb_regressor"))
+    _apply_device_override(base_cfg)
 
     stage_a_cache = _shapley_cache_path(plan.dataset_dir)
     stage_a_payload = None
@@ -752,6 +785,7 @@ def _run_topk_subset_cv_tuning(
 
             cfg = train_module.load_config(str(cfg_path))
             cfg = train_module.merge_with_defaults(cfg, cfg.get("model_type", "xgb_regressor"))
+            _apply_device_override(cfg)
             hyper_cfg = cfg.setdefault("hyperparameters", {})
             cv_cfg = hyper_cfg.get("cv_tuning")
             if isinstance(cv_cfg, dict):
@@ -1090,6 +1124,9 @@ def _run_pipeline(args: argparse.Namespace, data_root_resolved: Path) -> int:
             return 0
         print(f"[WORKER {worker_index}/{num_workers}] Assigned {len(plans)} dataset(s): "
               f"{[p.dataset_dir.name for p in plans]}")
+    if _WORKER_DEVICE is not None:
+        print(f"[PIPELINE] Device override : {_WORKER_DEVICE} "
+              f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')!r})")
 
     print("\nPipeline plan")
     print("-" * 100)
@@ -1148,13 +1185,17 @@ def _run_pipeline(args: argparse.Namespace, data_root_resolved: Path) -> int:
                         return shapley_rc
                     continue
 
-                _run_topk_subset_cv_tuning(
-                    plan,
-                    row_counts=row_counts,
-                    top_k=int(args.final_top_k),
-                    n_trials=int(args.stage2_cv_n_trials),
-                    random_start_trials=int(args.stage2_cv_random_start_trials),
-                )
+                try:
+                    _run_topk_subset_cv_tuning(
+                        plan,
+                        row_counts=row_counts,
+                        top_k=int(args.final_top_k),
+                        n_trials=int(args.stage2_cv_n_trials),
+                        random_start_trials=int(args.stage2_cv_random_start_trials),
+                    )
+                except Exception as _cv_exc:
+                    print(f"[PIPELINE][WARN] Stage B CV tuning failed for {plan.dataset_dir.name}: {_cv_exc}")
+                    print("[PIPELINE][WARN] Proceeding without Stage B cached hyperparameters.")
 
             if not args.skip_optimizer_stage:
                 # Critical isolation: optimizer outputs must not inherit Shapley namespace.

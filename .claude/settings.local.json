@@ -26,7 +26,11 @@
       "Bash(head -20 \"data/output/CV4/MC_Total_coliforms_37°C_\\(CFU_100mL\\)_res/horizons/lookahead_sweeps/lookahead_metrics.csv\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/z2_HorizonPostProcess.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/e_Train.py''\\).read\\(\\)\\); print\\(''e_Train OK''\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''l_RunMCShapleyOptimizerPipeline OK''\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''l_RunMCShapleyOptimizerPipeline OK''\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\(''src/e_Train.py''\\).read\\(\\)\\); print\\(''e_Train OK''\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''Pipeline OK''\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\(''src/m_RunParallelPipeline.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''OK''\\)\")"
     ]
   }
 }
