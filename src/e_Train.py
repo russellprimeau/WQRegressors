@@ -1526,7 +1526,28 @@ def _xgb_cv_fold_score(
         if early_stopping_rounds is not None:
             model.set_params(early_stopping_rounds=int(early_stopping_rounds))
 
-    model.fit(X_train_fit, y_train_fit, **fit_kwargs)
+    try:
+        model.fit(X_train_fit, y_train_fit, **fit_kwargs)
+    except xgb.core.XGBoostError as _gpu_err:
+        if not use_gpu_arrays:
+            raise
+        # GPU OOM fallback: free GPU memory and retry this fold on CPU.
+        print(f"[WARN] GPU OOM in CV fold — retrying on CPU: {_gpu_err}")
+        del model
+        del X_train_fit, y_train_fit, X_val_fit, y_val_fit
+        cpu_kwargs = {k: v for k, v in model_kwargs.items()}
+        cpu_kwargs["device"] = "cpu"
+        cpu_kwargs.pop("tree_method", None)
+        if model_kind == "classifier":
+            model = xgb.XGBClassifier(**cpu_kwargs)
+        else:
+            model = xgb.XGBRegressor(**cpu_kwargs)
+        X_train_fit, y_train_fit = X_train, y_train
+        X_val_fit, y_val_fit = X_val, y_val
+        if use_early_stopping:
+            fit_kwargs["eval_set"] = [(X_train_fit, y_train_fit), (X_val_fit, y_val_fit)]
+        model.fit(X_train_fit, y_train_fit, **fit_kwargs)
+        use_gpu_arrays = False
 
     if model_kind == "classifier":
         if use_gpu_arrays:
@@ -1798,7 +1819,7 @@ def _xgb_tune_hyperparameters_cv(
                 return mean_score
 
             study = optuna.create_study(direction="minimize", sampler=sampler)
-            study.optimize(_objective, n_trials=n_trials)
+            study.optimize(_objective, n_trials=n_trials, catch=(xgb.core.XGBoostError,))
             best_params = dict(study.best_trial.user_attrs.get("params", {}))
             best_score = float(study.best_value)
             for t in study.trials:

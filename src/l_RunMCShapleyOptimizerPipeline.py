@@ -1127,7 +1127,11 @@ def _run_pipeline(args: argparse.Namespace, data_root_resolved: Path) -> int:
             base_span = int(surrogate_data["input_row_2"]) - int(surrogate_data["input_row_1"])
             row_counts = optimizer_module._parse_row_counts(args.row_counts, default_span=base_span)
 
-            _run_full_feature_cv_tuning(plan)
+            try:
+                _run_full_feature_cv_tuning(plan)
+            except Exception as _cv_exc:
+                print(f"[PIPELINE][WARN] Stage A CV tuning failed for {plan.dataset_dir.name}: {_cv_exc}")
+                print("[PIPELINE][WARN] Proceeding without Stage A cached hyperparameters.")
 
             if not args.skip_shapley_stage:
                 _set_pipeline_stage_namespace(_SHAPLEY_NAMESPACE)
