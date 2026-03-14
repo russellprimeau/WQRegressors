@@ -22,10 +22,16 @@ Stage behavior:
       `forecasts/xgb_cv_tuning_cache.json`.
     * Subsequent runs reuse cached hyperparameters for consistent regularization
       across feature subsets and to reduce compute.
-        * Stage A (pre-Shapley): run CV tuning on the full feature set.
+        * Stage A (pre-Shapley): run CV tuning on the full feature set using
+            `cv_tuning.n_trials` / `cv_tuning.random_start_trials` from the
+            config YAML.
         * Stage B (post-Shapley): run CV tuning on top-k Shapley subsets and write
             comparison artifacts (`xgb_cv_consensus_candidates_r###.csv`) under
-      `forecasts/Shapley_sweeps`.
+            `forecasts/Shapley_sweeps`. Stage B always overrides n_trials and
+            random_start_trials with its own (smaller) budget so that subset
+            sweeps remain lightweight regardless of the Stage A config values.
+            Controlled via `--stage2-cv-n-trials` (default: 50) and
+            `--stage2-cv-random-start-trials` (default: 10).
 - Search phases keep standard temporal-by-coverage split behavior
     (target 70/30 by default).
 - Final top-K phases enforce minimum test coverage (>=5 test samples):
@@ -650,6 +656,8 @@ def _run_topk_subset_cv_tuning(
     plan: optimizer_module.DatasetPlan,
     row_counts: list[int],
     top_k: int,
+    n_trials: int = _STAGE2_CVTUNE_DEFAULT_N_TRIALS,
+    random_start_trials: int = _STAGE2_CVTUNE_DEFAULT_RANDOM_START_TRIALS,
 ) -> None:
     base_cfg_path = _find_first_xgb_config(plan)
     if base_cfg_path is None:
@@ -679,12 +687,9 @@ def _run_topk_subset_cv_tuning(
             include_one_se=_ELITE_INCLUDE_ONE_SE,
         )
         if stage_a_candidates:
-            norm = sum(max(0.0, c.get("candidate_weight_raw", 0.0)) for c in stage_a_candidates)
-            norm = norm if norm > 0 else float(len(stage_a_candidates))
             for c in stage_a_candidates:
                 c = dict(c)
-                weight = max(0.0, c.get("candidate_weight_raw", 0.0))
-                c["candidate_weight"] = float((weight if norm > 0 else 1.0) / norm)
+                c["candidate_weight"] = float(max(0.0, c.get("candidate_weight_raw", 0.0)))
                 c["row_count"] = "stage_a"
                 c["feature_tag"] = "stage_a_full"
                 stage_a_candidates_weighted.append(c)
@@ -729,20 +734,19 @@ def _run_topk_subset_cv_tuning(
                 tmp_dir=tmp_dir,
                 forced_data_dir=plan.dataset_dir,
             )
-            # Stage 2-only CVtune defaults: keep subset tuning lightweight.
+            # Stage 2-only CVtune: force override n_trials/random_start_trials so that
+            # subset runs always use the (smaller) Stage B budget, regardless of what
+            # Stage A's config has set.
             raw_cfg = _load_raw_config(cfg_path)
             raw_hyper = raw_cfg.setdefault("hyperparameters", {})
             raw_cv_cfg = raw_hyper.get("cv_tuning")
             if isinstance(raw_cv_cfg, dict):
-                raw_cv_cfg.setdefault("n_trials", int(_STAGE2_CVTUNE_DEFAULT_N_TRIALS))
-                raw_cv_cfg.setdefault(
-                    "random_start_trials",
-                    int(_STAGE2_CVTUNE_DEFAULT_RANDOM_START_TRIALS),
-                )
+                raw_cv_cfg["n_trials"] = int(n_trials)
+                raw_cv_cfg["random_start_trials"] = int(random_start_trials)
             else:
                 raw_hyper["cv_tuning"] = {
-                    "n_trials": int(_STAGE2_CVTUNE_DEFAULT_N_TRIALS),
-                    "random_start_trials": int(_STAGE2_CVTUNE_DEFAULT_RANDOM_START_TRIALS),
+                    "n_trials": int(n_trials),
+                    "random_start_trials": int(random_start_trials),
                 }
             _write_raw_config(cfg_path, raw_cfg)
 
@@ -753,19 +757,16 @@ def _run_topk_subset_cv_tuning(
             if isinstance(cv_cfg, dict):
                 cv_cfg["enabled"] = True
                 cv_cfg["artifact_dir"] = str(out_dir / f"subset_{feature_tag}")
-                cv_cfg.setdefault("n_trials", int(_STAGE2_CVTUNE_DEFAULT_N_TRIALS))
-                cv_cfg.setdefault(
-                    "random_start_trials",
-                    int(_STAGE2_CVTUNE_DEFAULT_RANDOM_START_TRIALS),
-                )
+                cv_cfg["n_trials"] = int(n_trials)
+                cv_cfg["random_start_trials"] = int(random_start_trials)
                 # Vary seed per subset to avoid identical trial sequences.
                 cv_cfg["seed"] = int(abs(hash(feature_tag)) % 10_000_000)
             else:
                 hyper_cfg["cv_tuning"] = {
                     "enabled": True,
                     "artifact_dir": str(out_dir / f"subset_{feature_tag}"),
-                    "n_trials": int(_STAGE2_CVTUNE_DEFAULT_N_TRIALS),
-                    "random_start_trials": int(_STAGE2_CVTUNE_DEFAULT_RANDOM_START_TRIALS),
+                    "n_trials": int(n_trials),
+                    "random_start_trials": int(random_start_trials),
                     "seed": int(abs(hash(feature_tag)) % 10_000_000),
                 }
 
@@ -791,12 +792,9 @@ def _run_topk_subset_cv_tuning(
                 include_one_se=_ELITE_INCLUDE_ONE_SE,
             )
             if run_candidates:
-                norm = sum(max(0.0, c.get("candidate_weight_raw", 0.0)) for c in run_candidates)
-                norm = norm if norm > 0 else float(len(run_candidates))
                 for c in run_candidates:
                     c = dict(c)
-                    weight = max(0.0, c.get("candidate_weight_raw", 0.0))
-                    c["candidate_weight"] = float((weight if norm > 0 else 1.0) / norm)
+                    c["candidate_weight"] = float(max(0.0, c.get("candidate_weight_raw", 0.0)))
                     c["row_count"] = int(row_count)
                     c["feature_tag"] = feature_tag
                     row_candidates.append(c)
@@ -982,6 +980,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-improve-patience", type=int, default=3)
     parser.add_argument("--max-swap-attempts", type=int, default=200)
 
+    parser.add_argument(
+        "--stage2-cv-n-trials",
+        type=int,
+        default=_STAGE2_CVTUNE_DEFAULT_N_TRIALS,
+        help=(
+            "n_trials for Stage B (top-k subset) CV tuning. "
+            "Overrides config cv_tuning.n_trials for subset runs "
+            f"(default: {_STAGE2_CVTUNE_DEFAULT_N_TRIALS})."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-cv-random-start-trials",
+        type=int,
+        default=_STAGE2_CVTUNE_DEFAULT_RANDOM_START_TRIALS,
+        help=(
+            "random_start_trials for Stage B (top-k subset) CV tuning "
+            f"(default: {_STAGE2_CVTUNE_DEFAULT_RANDOM_START_TRIALS})."
+        ),
+    )
+
     parser.add_argument("--seed-subsets-csv", type=str, default=None)
     parser.add_argument("--max-seed-subsets", type=int, default=0)
 
@@ -1083,6 +1101,8 @@ def _run_pipeline(args: argparse.Namespace, data_root_resolved: Path) -> int:
     print(f"Shapley eval budget       : {args.shapley_eval_budget}")
     print(f"Optimizer eval budget     : {args.optimizer_eval_budget}")
     print(f"Parallel evaluators       : {max(1, int(args.parallel_evaluators))}")
+    print(f"Stage B CV n_trials       : {args.stage2_cv_n_trials}")
+    print(f"Stage B CV random_start   : {args.stage2_cv_random_start_trials}")
     optimizer_seeds = _parse_seed_list(args.optimizer_seeds)
     if not optimizer_seeds:
         optimizer_seeds = [int(args.optimizer_seed)]
@@ -1124,7 +1144,13 @@ def _run_pipeline(args: argparse.Namespace, data_root_resolved: Path) -> int:
                         return shapley_rc
                     continue
 
-                _run_topk_subset_cv_tuning(plan, row_counts=row_counts, top_k=int(args.final_top_k))
+                _run_topk_subset_cv_tuning(
+                    plan,
+                    row_counts=row_counts,
+                    top_k=int(args.final_top_k),
+                    n_trials=int(args.stage2_cv_n_trials),
+                    random_start_trials=int(args.stage2_cv_random_start_trials),
+                )
 
             if not args.skip_optimizer_stage:
                 # Critical isolation: optimizer outputs must not inherit Shapley namespace.

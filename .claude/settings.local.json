@@ -18,7 +18,8 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\(''''c:/Users/Master/Documents/GitHub/WQRegressors/src/z1_FeaturePostProcess.py''''\\).read\\(\\)\\); print\\(''''OK''''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/z1_FeaturePostProcess.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/utils/evaluation.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/h_RunMCFeatureSelectionSweep.py''\\).read\\(\\)\\); print\\(''OK''\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/h_RunMCFeatureSelectionSweep.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python3 -c \"import xgboost as xgb; import inspect; sig = inspect.signature\\(xgb.XGBRegressor.__init__\\); print\\(''XGBRegressor parameters:''\\); print\\([p for p in sig.parameters if ''seed'' in p.lower\\(\\) or ''random'' in p.lower\\(\\)]\\)\")"
     ]
   }
 }
