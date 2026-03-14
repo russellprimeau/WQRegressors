@@ -104,6 +104,7 @@ import seaborn as sns
 
 import e_Train as train_module
 import h_RunMCFeatureSelectionSweep as base
+from utils.notifications import notify
 
 _SHAPLEY_SWEEP_NAMESPACE = "Shapley_sweeps"
 
@@ -959,7 +960,19 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
     print("-" * 100)
     print(f"Datasets completed: {len(plans) - failed}")
     print(f"Datasets failed   : {failed}")
-    return 0 if failed == 0 else 2
+
+    rc = 0 if failed == 0 else 2
+    if getattr(args, "notify", False):
+        status = "Complete" if rc == 0 else f"Failed ({failed} dataset(s))"
+        notify(
+            title=f"i_RunMCFeatureSelectionShapleySweep \u2014 {status}",
+            message=(
+                f"Datasets completed: {len(plans) - failed}\n"
+                f"Datasets failed: {failed}\n"
+                f"Exit code: {rc}"
+            ),
+        )
+    return rc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1042,6 +1055,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--stop-on-error", action="store_true")
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Send a push notification on completion via ntfy.sh (requires NTFY_TOPIC env var).",
+    )
     return parser
 
 

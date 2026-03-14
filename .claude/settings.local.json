@@ -32,7 +32,12 @@
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\(''src/m_RunParallelPipeline.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\(''src/m_RunParallelPipeline.py''\\).read\\(\\)\\); print\\(''m OK''\\)\")",
-      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''l OK''\\)\")"
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''l OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/utils/notifications.py''\\).read\\(\\)\\); print\\(''notifications.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/i_RunMCFeatureSelectionShapleySweep.py''\\).read\\(\\)\\); print\\(''i_.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''l_.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/m_RunParallelPipeline.py''\\).read\\(\\)\\); print\\(''m_.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/h_RunMCFeatureSelectionSweep.py''\\).read\\(\\)\\); print\\(''h_.py OK''\\)\")"
     ]
   }
 }

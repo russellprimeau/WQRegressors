@@ -105,6 +105,7 @@ import torch
 import yaml
 import e_Train as train_module
 import f_Evaluate as eval_module
+from utils.notifications import notify
 import os
 import unicodedata
 import seaborn as sns
@@ -3663,8 +3664,19 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
     print("-" * 100)
     print(f"Datasets completed: {len(plans) - failed}")
     print(f"Datasets failed   : {failed}")
-    
-    return 0 if failed == 0 else 2
+
+    rc = 0 if failed == 0 else 2
+    if getattr(args, "notify", False):
+        status = "Complete" if rc == 0 else f"Failed ({failed} dataset(s))"
+        notify(
+            title=f"h_RunMCFeatureSelectionSweep \u2014 {status}",
+            message=(
+                f"Datasets completed: {len(plans) - failed}\n"
+                f"Datasets failed: {failed}\n"
+                f"Exit code: {rc}"
+            ),
+        )
+    return rc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3750,6 +3762,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--stop-on-error", action="store_true")
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Send a push notification on completion via ntfy.sh (requires NTFY_TOPIC env var).",
+    )
     # --exclude argument removed
     return parser
 

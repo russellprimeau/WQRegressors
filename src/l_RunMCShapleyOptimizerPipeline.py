@@ -132,6 +132,7 @@ import pandas as pd
 import h_RunMCFeatureSelectionSweep as optimizer_module
 import i_RunMCFeatureSelectionShapleySweep as shapley_module
 import e_Train as train_module
+from utils.notifications import notify
 
 
 _NAMESPACE_ENV = "WQ_FEATURE_SWEEP_NAMESPACE"
@@ -1088,6 +1089,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--stop-on-error", action="store_true")
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Send a push notification on completion via ntfy.sh (requires NTFY_TOPIC env var).",
+    )
 
     # Worker-partition arguments used by m_RunParallelPipeline.py.
     # --worker-index selects every Nth plan starting at index i (stride assignment).
@@ -1111,7 +1117,19 @@ def main() -> int:
         tee_stderr = _TeeTextIO(sys.stderr, log_file)
         with contextlib.redirect_stdout(tee_stdout), contextlib.redirect_stderr(tee_stderr):
             print(f"[PIPELINE] Logging terminal output to: {log_path}")
-            return _run_pipeline(args, data_root_resolved)
+            rc = _run_pipeline(args, data_root_resolved)
+
+    if args.notify:
+        status = "Complete" if rc == 0 else f"Finished with errors (rc={rc})"
+        notify(
+            title=f"l_RunMCShapleyOptimizerPipeline \u2014 {status}",
+            message=(
+                f"Data root: {data_root_resolved.name}\n"
+                f"Exit code: {rc}\n"
+                f"Log: {log_path.name}"
+            ),
+        )
+    return rc
 
 
 def _run_pipeline(args: argparse.Namespace, data_root_resolved: Path) -> int:

@@ -86,6 +86,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from utils.notifications import notify
+
 _PIPELINE_SCRIPT = Path(__file__).resolve().parent / "l_RunMCShapleyOptimizerPipeline.py"
 _WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 
@@ -264,6 +266,11 @@ def main() -> int:
             "IDs than GPU workers. Example: --gpu-workers 2 --gpu-ids 0,1"
         ),
     )
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Send a push notification when all workers finish via ntfy.sh (requires NTFY_TOPIC env var).",
+    )
     args, passthrough = parser.parse_known_args()
     num_workers = max(1, int(args.num_workers))
     max_worker_memory_bytes: int | None = (
@@ -401,6 +408,19 @@ def main() -> int:
         for i, rc in sorted(results.items()):
             status = "OK" if rc == 0 else f"FAILED (rc={rc})"
             _log(f"[PARALLEL] Worker {i}: {status}")
+
+        if args.notify:
+            status = "Complete" if not failed else f"Failed ({len(failed)}/{num_workers} workers)"
+            notify(
+                title=f"m_RunParallelPipeline \u2014 {status}",
+                message=(
+                    f"Workers: {num_workers}\n"
+                    + "\n".join(
+                        f"W{i}: {'OK' if rc == 0 else f'FAILED (rc={rc})'}"
+                        for i, rc in sorted(results.items())
+                    )
+                ),
+            )
 
         if failed:
             _log(f"[PARALLEL] {len(failed)}/{num_workers} worker(s) failed: {failed}")
