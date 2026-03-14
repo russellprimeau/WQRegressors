@@ -30,7 +30,9 @@
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\(''src/e_Train.py''\\).read\\(\\)\\); print\\(''e_Train OK''\\)\")",
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''Pipeline OK''\\)\")",
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\(''src/m_RunParallelPipeline.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
-      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''OK''\\)\")"
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\(''src/m_RunParallelPipeline.py''\\).read\\(\\)\\); print\\(''m OK''\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''l OK''\\)\")"
     ]
   }
 }

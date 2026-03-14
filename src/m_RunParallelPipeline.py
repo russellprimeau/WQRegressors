@@ -27,14 +27,29 @@ Output routing design:
 Usage:
     python src/m_RunParallelPipeline.py --num-workers 2 [all pipeline args]
 
-    Optional: --max-worker-memory-gb <GB>
-        Hard-kills any worker whose RSS exceeds <GB> gigabytes and logs a clear
-        message. Requires psutil (pip install psutil). Useful for diagnosing or
-        preventing silent OOM failures when running multiple workers.
+    Orchestrator-only flags (consumed here, not passed through to workers):
+        --gpu-workers <N>           (default: 1)
+            Give the first N workers GPU access via CUDA_VISIBLE_DEVICES.
+            Remaining workers receive CUDA_VISIBLE_DEVICES="" (CPU only).
+            Each worker's pipeline script reads this env var and automatically
+            overrides its config device fields to match.
+        --gpu-ids <IDS>             (default: "0")
+            Comma-separated CUDA device IDs assigned to GPU workers.
+            Worker i (i < N) receives gpu_ids[i % len(gpu_ids)].
+            Example: --gpu-workers 2 --gpu-ids 0,1 for two physical GPU
+        --max-worker-memory-gb <GB>
+            Hard-kills any worker whose RSS exceeds <GB> gigabytes and logs a
+            clear message. Requires psutil (pip install psutil). Useful for
+            diagnosing or preventing silent OOM failures.
+        --worker-timeout-hours <H>
+            Hard-kills any worker still running after <H> hours and records
+            its exit code as -1. Useful when a CUDA context hang leaves a
+            worker alive but permanently blocked.
 
 Example:
     python src/m_RunParallelPipeline.py --num-workers 2 \\
-        --max-worker-memory-gb 20 \\
+        --gpu-workers 1 --gpu-ids 0 \\
+        --max-worker-memory-gb 20 --worker-timeout-hours 6 \\
         --dataset-prefix MC --limit-datasets 14 \\
         --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4
 
@@ -48,11 +63,10 @@ GPU / CPU device assignment:
         --gpu-workers 2 --gpu-ids 0,1   → W0 gets GPU 0, W1 gets GPU 1
         --gpu-workers 0                 → all workers use CPU
 
-    IMPORTANT: CUDA_VISIBLE_DEVICES controls what the process can see, but it
-    does not rewrite config files. Worker config files must specify a matching
-    device (device: cuda for GPU workers, device: cpu / tree_method: hist for
-    CPU workers). A mismatch will cause a runtime error that the per-fold CPU
-    fallback will catch, but it is better to configure configs correctly.
+    l_RunMCShapleyOptimizerPipeline.py reads CUDA_VISIBLE_DEVICES at startup
+    and automatically overrides the device field in every config it loads to
+    match (cuda for GPU workers, cpu for CPU workers). Config YAML files do not
+    need to be edited between runs.
 
 CPU / RAM warning:
     Observed steady-state RAM usage scales with --num-workers. With ~40% RAM

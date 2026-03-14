@@ -54,10 +54,14 @@ Parallel execution (multi-dataset):
         tail -f "<master_log_path>"               (bash/WSL)
     The master log path is printed to the terminal at startup. Do not monitor
     individual worker logs during a parallel run; use the master log instead.
-- WARNING — GPU memory: each worker process creates its own CUDA context and
-    CuPy memory pool. Peak VRAM usage scales approximately as N × single-worker
-    peak. Monitor VRAM on the first parallel run and reduce --num-workers (or
-    set device: cpu in configs) if GPU OOM errors occur.
+- GPU / CPU device assignment: by default the orchestrator assigns worker 0
+    to the GPU (CUDA_VISIBLE_DEVICES=0) and all other workers to CPU
+    (CUDA_VISIBLE_DEVICES=""). This script reads CUDA_VISIBLE_DEVICES at
+    startup and automatically overrides the device field in every loaded config
+    to match, so config YAML files do not need to be edited between runs. Use
+    --gpu-workers and --gpu-ids in m_RunParallelPipeline.py to change the
+    assignment (e.g. --gpu-workers 2 --gpu-ids 0,1 for two physical GPUs, or
+    --gpu-workers 0 to force all workers to CPU).
 - WARNING — RAM: each worker independently loads data and holds model state.
     Observed steady-state RAM usage scales with --num-workers. With ~40% RAM at
     steady state for one worker, two workers may approach 80% before the OS can
@@ -84,8 +88,19 @@ python src/l_RunMCShapleyOptimizerPipeline.py \\
 python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 --keep-shapley-plots --keep-search-plots --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 --beam-width 16 --max-rounds 30 --max-swap-attempts 200 --parallel-evaluators 1 --data-root C:\\Users\\Master\\Documents\\GitHub\\WQRegressors\\data\\output\\CV8
 
 
-3) Full pipeline with parallel dataset processing (see GPU/RAM warnings above):
-python src/m_RunParallelPipeline.py --num-workers 2 --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 --keep-shapley-plots --keep-search-plots --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 --beam-width 16 --max-rounds 30 --max-swap-attempts 200 --parallel-evaluators 1 --data-root C:\\Users\\Master\\Documents\\GitHub\\WQRegressors\\data\\output\\CV7
+3) Full pipeline with parallel dataset processing:
+    Worker 0 runs on GPU, worker 1 runs on CPU (default single-GPU behaviour).
+    Device fields in config YAML files are overridden automatically at startup.
+python src/m_RunParallelPipeline.py --num-workers 2 \\
+        --gpu-workers 1 --gpu-ids 0 \\
+        --max-worker-memory-gb 20 --worker-timeout-hours 6 \\
+        --dataset-prefix MC --limit-datasets 14 \\
+        --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 \\
+        --keep-shapley-plots --keep-search-plots \\
+        --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 \\
+        --beam-width 16 --max-rounds 30 --max-swap-attempts 200 \\
+        --parallel-evaluators 1 \\
+        --data-root C:\\Users\\Master\\Documents\\GitHub\\WQRegressors\\data\\output\\CV7
 
 4) Multi-seed optimizer stage in one run:
 python src/l_RunMCShapleyOptimizerPipeline.py \\

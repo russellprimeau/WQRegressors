@@ -18,9 +18,10 @@ Notes:
     hyperparameters.cv_tuning.cv_max_bin. This setting is CV-tuning-only and
     does not affect final model training.
 - In GPU mode, each CV fold explicitly deletes the XGBoost booster (freeing its
-    CUDA QuantileDMatrix memory) and CuPy fold arrays (returning them to the pool
-    for reuse). No full pool flush is performed — pool reuse is intentional and
-    necessary for GPU throughput.
+    CUDA QuantileDMatrix memory) and CuPy fold arrays (returning them to the pool).
+    A full pool flush is performed after every GPU OOM recovery and after each
+    complete CV run and training run so that the CUDA allocator reclaims memory
+    across sequential evaluations of many feature subsets.
 - CV tuning pre-computes fold index arrays once before the trial loop and
     pre-transfers the full feature matrix X to the GPU once (as a CuPy array).
     This eliminates n_trials × n_folds redundant host-to-device copies and
@@ -103,6 +104,29 @@ NORMALIZATION_OUTPUT_PATH = (
 
 # Avoid repeated spam when GPU CV runs without CuPy GPU arrays.
 _XGB_GPU_CPU_INPUT_WARNING_EMITTED = False
+
+
+def _flush_gpu_memory() -> None:
+    """Free all unreferenced CuPy pool blocks and the PyTorch CUDA cache.
+
+    Called after GPU OOM recovery and at the end of each CV run and training
+    run so the CUDA allocator reclaims memory between sequential evaluations.
+    Safe to call when cp is None or CUDA is unavailable.
+    """
+    if cp is not None:
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        try:
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def _compact_stop_reason_for_plot(stop_reason_text: str) -> str:
@@ -1535,6 +1559,7 @@ def _xgb_cv_fold_score(
         print(f"[WARN] GPU OOM in CV fold — retrying on CPU: {_gpu_err}")
         del model
         del X_train_fit, y_train_fit, X_val_fit, y_val_fit
+        _flush_gpu_memory()
         cpu_kwargs = {k: v for k, v in model_kwargs.items()}
         cpu_kwargs["device"] = "cpu"
         cpu_kwargs.pop("tree_method", None)
@@ -1579,11 +1604,13 @@ def _xgb_cv_fold_score(
         r2 = _r2_score(y_val, preds)
 
     # Free GPU resources immediately: del model releases XGBoost's booster and its
-    # CUDA-side QuantileDMatrix memory. del on CuPy arrays returns blocks to the pool
-    # for reuse by the next fold without going back to the CUDA allocator.
+    # CUDA-side QuantileDMatrix memory. Flush the CuPy pool after every fold so
+    # the CUDA allocator reclaims the memory rather than letting it accumulate in
+    # the pool across the many folds/trials of a CV run.
     del model
     if use_gpu_arrays:
         del X_train_fit, y_train_fit, X_val_fit, y_val_fit
+        _flush_gpu_memory()
 
     return score, r2
 
@@ -1952,6 +1979,11 @@ def _xgb_tune_hyperparameters_cv(
     finally:
         if executor is not None:
             executor.shutdown(wait=True)
+        # Release the pre-transferred GPU feature matrix so the CUDA allocator
+        # reclaims the memory before the next evaluation starts.
+        if is_gpu_mode and cp is not None and id(X_cv) != id(X):
+            del X_cv
+        _flush_gpu_memory()
 
     summary = {
         "enabled": True,
@@ -2309,7 +2341,30 @@ def _train_xgb_model(
                 "[WARN] train-loss plateau stop requested but this xgboost sklearn "
                 "version does not support fit(callbacks=...). Skipping plateau rule."
             )
-    model.fit(X_train_fit, y_train_fit, **fit_kwargs)
+    try:
+        model.fit(X_train_fit, y_train_fit, **fit_kwargs)
+    except xgb.core.XGBoostError as _gpu_err:
+        if not (is_gpu_mode and cp is not None):
+            raise
+        print(f"[WARN] GPU OOM in training — flushing and retrying on CPU: {_gpu_err}")
+        del X_train_fit, y_train_fit, X_test_fit, y_test_fit
+        _flush_gpu_memory()
+        X_train_fit, y_train_fit = X_train, y_train
+        X_test_fit, y_test_fit = X_test, y_test
+        model.set_params(device="cpu", tree_method="hist")
+        try:
+            model.set_params(predictor=None)
+        except Exception:
+            pass
+        is_gpu_mode = False
+        if eval_set_override is None:
+            fit_kwargs["eval_set"] = [(X_train_fit, y_train_fit), (X_test_fit, y_test_fit)]
+        model.fit(X_train_fit, y_train_fit, **fit_kwargs)
+
+    # Release GPU arrays immediately so the CUDA allocator reclaims the memory.
+    if is_gpu_mode and cp is not None:
+        del X_train_fit, y_train_fit, X_test_fit, y_test_fit
+        _flush_gpu_memory()
 
     if plateau_state and plateau_state.get("triggered"):
         print(
