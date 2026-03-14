@@ -19,7 +19,12 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/z1_FeaturePostProcess.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/utils/evaluation.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/h_RunMCFeatureSelectionSweep.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
-      "Bash(python3 -c \"import xgboost as xgb; import inspect; sig = inspect.signature\\(xgb.XGBRegressor.__init__\\); print\\(''XGBRegressor parameters:''\\); print\\([p for p in sig.parameters if ''seed'' in p.lower\\(\\) or ''random'' in p.lower\\(\\)]\\)\")"
+      "Bash(python3 -c \"import xgboost as xgb; import inspect; sig = inspect.signature\\(xgb.XGBRegressor.__init__\\); print\\(''XGBRegressor parameters:''\\); print\\([p for p in sig.parameters if ''seed'' in p.lower\\(\\) or ''random'' in p.lower\\(\\)]\\)\")",
+      "Bash(grep -r \"µg_L\\\\|CFU\\\\|FNU\\\\|µg\\\\|unit\" /c/Users/Master/Documents/GitHub/WQRegressors/src/*.py)",
+      "Bash(head -1 \"c:\\\\Users\\\\Master\\\\Documents\\\\GitHub\\\\WQRegressors\\\\data\\\\output\\\\CV4\\\\MC_Total_coliforms_37°C_\\(CFU_100mL\\)_res\\\\horizons\\\\lookahead_sweeps\\\\lookahead_metrics.csv\")",
+      "Bash(wc -l \"data/output/CV4/MC_Total_coliforms_37°C_\\(CFU_100mL\\)_res/horizons/horizon_024hr/rep_000/forecasts/horizon_024hr_rep_000/evaluation_summary.csv\")",
+      "Bash(head -20 \"data/output/CV4/MC_Total_coliforms_37°C_\\(CFU_100mL\\)_res/horizons/lookahead_sweeps/lookahead_metrics.csv\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/z2_HorizonPostProcess.py''\\).read\\(\\)\\); print\\(''OK''\\)\")"
     ]
   }
 }

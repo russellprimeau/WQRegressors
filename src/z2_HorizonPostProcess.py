@@ -2,10 +2,12 @@
 Generates horizon-sweep comparison figures across all MC datasets.
 
 Reads ``lookahead_metrics.csv`` from each dataset's ``horizons/lookahead_sweeps/``
-directory (written by ``k_RunHorizonSweep.py``) and produces two summary figures:
+directory (written by ``k_RunHorizonSweep.py``) and produces:
 
   1. ``lookahead_r2_comparison.png``    – R² vs forecast horizon (hours)
   2. ``lookahead_nrmse_comparison.png`` – nRMSE vs forecast horizon (hours)
+  3. ``lookahead_skill_comparison.png`` – skill vs. best baseline per horizon
+  4. ``lookahead_aggregate.csv``        – combined table of all datasets × horizons × replicates
 
 nRMSE (= RMSE / std_target) is used instead of raw RMSE so that datasets with
 very different target magnitudes can be compared on the same axis.  The
@@ -13,8 +15,7 @@ very different target magnitudes can be compared on the same axis.  The
 ``forecasts/feature_sweeps/feature_sweep_final_metrics.csv`` (populated by
 ``z1_PostProcess.py``).
 
-Both figures are written to the ``summaries/`` subdirectory of the data root,
-the same location used by ``z1_PostProcess.py``.
+All outputs are written to the ``summaries/horizons/`` subdirectory of the data root.
 
 Uncertainty bands (replicates > 1):
     When ``k_RunHorizonSweep.py`` is run with ``--replicates M > 1``,
@@ -49,6 +50,7 @@ import sys
 import textwrap
 import traceback
 from pathlib import Path
+import numpy as np
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
@@ -82,6 +84,44 @@ def _clean_label(dataset_name: str, prefix: str) -> str:
     if label.endswith("_res"):
         label = label[:-4]
     return label.replace("_", " ")
+
+
+def _load_baseline_rmses(dataset_dir: Path, horizon_hr: int, replicate: int) -> dict[str, float]:
+    """Return ``{baseline_label: rmse}`` from the evaluation_summary.csv for one horizon/replicate.
+
+    Returns an empty dict when the file is absent or unreadable.
+    """
+    folder = (
+        dataset_dir
+        / "horizons"
+        / f"horizon_{horizon_hr:03d}hr"
+        / f"rep_{replicate:03d}"
+        / "forecasts"
+        / f"horizon_{horizon_hr:03d}hr_rep_{replicate:03d}"
+    )
+    csv_path = folder / "evaluation_summary.csv"
+    if not csv_path.exists():
+        return {}
+    try:
+        df = pd.read_csv(csv_path)
+        if "rmse" not in df.columns:
+            return {}
+        # Accept rows whose kind == "baseline" or whose label contains a known baseline name
+        _known = {"naive", "seasonal", "linear"}
+        if "kind" in df.columns:
+            mask = df["kind"].str.lower() == "baseline"
+        else:
+            mask = df["label"].str.lower().apply(lambda s: any(k in s for k in _known))
+        baselines = df[mask].dropna(subset=["rmse"])
+        result: dict[str, float] = {}
+        for _, row in baselines.iterrows():
+            lbl = str(row.get("label", "")).lower()
+            rmse_val = float(row["rmse"])
+            if np.isfinite(rmse_val) and rmse_val > 0:
+                result[lbl] = rmse_val
+        return result
+    except Exception:
+        return {}
 
 
 def _load_std_target(dataset_dir: Path) -> float | None:
@@ -151,6 +191,42 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path) -> int:
             else:
                 df["nrmse"] = float("nan")
                 std_note = "std_target not found – nRMSE will be NaN"
+
+            # Skill vs. each baseline — requires per-horizon evaluation_summary.csv.
+            # Cache lookups so each (horizon, replicate) pair is read at most once.
+            rep_col = "replicate" if "replicate" in df.columns else None
+            _baseline_cache: dict[tuple[int, int], dict[str, float]] = {}
+            for _, _row in df.iterrows():
+                _h = int(_row["lookahead"])
+                _r = int(_row[rep_col]) if rep_col else 0
+                _key = (_h, _r)
+                if _key not in _baseline_cache:
+                    _baseline_cache[_key] = _load_baseline_rmses(dataset_dir, _h, _r)
+
+            def _skill(model_rmse: float, baseline_rmse: float) -> float:
+                if np.isfinite(model_rmse) and np.isfinite(baseline_rmse) and baseline_rmse > 0:
+                    return 1.0 - model_rmse / baseline_rmse
+                return float("nan")
+
+            def _get_skills(row: pd.Series) -> pd.Series:
+                h = int(row["lookahead"])
+                r = int(row[rep_col]) if rep_col else 0
+                bl = _baseline_cache.get((h, r), {})
+                m = float(row["rmse"])
+                return pd.Series({
+                    "skill_v_naive":    _skill(m, bl.get("naive",    float("nan"))),
+                    "skill_v_seasonal": _skill(m, bl.get("seasonal", float("nan"))),
+                    "skill_v_linear":   _skill(m, bl.get("linear",   float("nan"))),
+                })
+
+            _skills = df.apply(_get_skills, axis=1)
+            df["skill_v_naive"]    = _skills["skill_v_naive"]
+            df["skill_v_seasonal"] = _skills["skill_v_seasonal"]
+            df["skill_v_linear"]   = _skills["skill_v_linear"]
+            df["skill_v_best_baseline"] = _skills[
+                ["skill_v_naive", "skill_v_seasonal", "skill_v_linear"]
+            ].max(axis=1)
+
             label = _clean_label(name, prefix)
             records.append((label, df))
             n_horizons = df["lookahead"].nunique()
@@ -325,6 +401,60 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path) -> int:
                               any_replicates=any_replicates, ylim=nrmse_ylim)
     print(f"[INFO] Wrote nRMSE figure: {nrmse_path}")
 
+    # Skill vs. best-baseline figure
+    _skill_all = pd.concat(
+        [df["skill_v_best_baseline"] for _, df in records if "skill_v_best_baseline" in df.columns],
+        ignore_index=True,
+    ).dropna()
+    if not _skill_all.empty:
+        _s_min, _s_max = float(_skill_all.min()), float(_skill_all.max())
+        _s_margin = max(0.05, 0.1 * (_s_max - _s_min))
+        skill_ylim: tuple | None = (max(-2.0, _s_min - _s_margin), min(1.05, _s_max + _s_margin))
+    else:
+        skill_ylim = None
+
+    skill_path = _make_figure(
+        "skill_v_best_baseline",
+        "Skill vs. Best Baseline",
+        "lookahead_skill_comparison.png",
+        hline_zero=True,
+        any_replicates=any_replicates,
+        ylim=skill_ylim,
+    )
+    print(f"[INFO] Wrote skill figure:  {skill_path}")
+
+    # Aggregate CSV — all datasets × horizons × replicates in one table
+    _drop_suffix = "_replicate"   # these columns repeat per-replicate values; redundant here
+    _front_cols = [
+        "dataset", "lookahead", "replicate",
+        "mae", "rmse", "nrmse", "r2", "pearson_r",
+        "skill_v_naive", "skill_v_seasonal", "skill_v_linear", "skill_v_best_baseline",
+    ]
+    agg_frames = []
+    for lbl, df in records:
+        frame = df.copy()
+        # Drop redundant *_replicate aggregate columns
+        frame = frame.drop(columns=[c for c in frame.columns if c.endswith(_drop_suffix)],
+                           errors="ignore")
+        frame.insert(0, "dataset", lbl)
+        # Append a replicate=mean row for each lookahead value
+        _numeric_means = (
+            frame.groupby("lookahead", sort=True)
+                 .mean(numeric_only=True)
+                 .reset_index()
+        )
+        _numeric_means["dataset"]   = lbl
+        _numeric_means["replicate"] = "mean"
+        frame = pd.concat([frame, _numeric_means], ignore_index=True)
+        agg_frames.append(frame)
+    agg_df = pd.concat(agg_frames, ignore_index=True)
+    # Reorder: metric/skill columns first, then remaining metadata
+    _rest_cols = [c for c in agg_df.columns if c not in _front_cols]
+    agg_df = agg_df[[c for c in _front_cols if c in agg_df.columns] + _rest_cols]
+    agg_path = summaries_dir / "lookahead_aggregate.csv"
+    agg_df.to_csv(agg_path, index=False)
+    print(f"[INFO] Wrote aggregate CSV: {agg_path}")
+
     return 0
 
 
@@ -355,7 +485,7 @@ def main() -> int:
     data_root = Path(args.data_root)
     if not data_root.is_absolute():
         data_root = (workspace_root / data_root).resolve()
-    summaries_dir = (data_root / "summaries").resolve()
+    summaries_dir = (data_root / "summaries" / "horizons").resolve()
     print(f"[INFO] data_root : {data_root}")
     print(f"[INFO] summaries : {summaries_dir}")
     return generate_figures(data_root=data_root, prefix=args.dataset_prefix, summaries_dir=summaries_dir)

@@ -1188,10 +1188,7 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
 
     baseline_preds = payload["baseline_preds"]
     pval_records: list[tuple[str, str, float]] = []
-    baseline_tiers: list[str] = []
     baseline_scores: list[int] = []
-    tier_rank = {"very_low": 0, "low": 1, "moderate": 2, "high": 3}
-    inv_tier_rank = {v: k for k, v in tier_rank.items()}
     interval_alpha = float(getattr(args, "interval_alpha", 0.1))
     coverage_tol = float(getattr(args, "coverage_tolerance", 0.03))
     model_int = _interval_proxy_metrics(pred_model, y_test, alpha=interval_alpha)
@@ -1293,18 +1290,8 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
         evidence[f"gate_wilcoxon_{prefix}"] = gate_wilc
         evidence[f"gate_sign_{prefix}"] = gate_sign
         evidence[f"gate_coverage_{prefix}"] = gate_cov
-        score = int(gate_min_n) + int(gate_prob) + int(gate_lcb) + int(gate_dm) + int(gate_wilc) + int(gate_sign) + int(gate_cov)
+        score = int(gate_lcb) + int(gate_dm) + int(gate_wilc) + int(gate_sign) + int(gate_cov)
         evidence[f"evidence_score_{prefix}"] = score
-        if score >= 6:
-            tier = "high"
-        elif score >= 4:
-            tier = "moderate"
-        elif score >= 2:
-            tier = "low"
-        else:
-            tier = "very_low"
-        evidence[f"evidence_tier_{prefix}"] = tier
-        baseline_tiers.append(tier)
         baseline_scores.append(score)
 
     if pval_records:
@@ -1323,11 +1310,6 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
             evidence[f"gate_wilcoxon_q_{prefix}"] = bool(np.isfinite(wilc_q) and wilc_q < float(args.evidence_alpha))
             evidence[f"gate_sign_q_{prefix}"] = bool(np.isfinite(sign_q) and sign_q < float(args.evidence_alpha) and np.isfinite(sign_wr) and sign_wr > 0.5)
 
-    if baseline_tiers:
-        min_rank = min(tier_rank.get(t, 0) for t in baseline_tiers)
-        evidence["evidence_tier_overall"] = inv_tier_rank.get(min_rank, "very_low")
-    else:
-        evidence["evidence_tier_overall"] = "very_low"
     if baseline_scores:
         evidence["evidence_score_overall_min"] = int(min(baseline_scores))
         evidence["evidence_score_overall_mean"] = float(np.mean(baseline_scores))
@@ -1844,8 +1826,6 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             print(f"[INFO] Wrote skill score subplot: {skill_path}")
 
             # --- Confidence / uncertainty subplot ---
-            tier_map = {"very_low": 0, "low": 1, "moderate": 2, "high": 3}
-            tier_labels = ["very_low", "low", "moderate", "high"]
             n_perf = len(perf_df)
 
             def _perf_col(name: str) -> pd.Series:
@@ -1861,13 +1841,8 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             seasonal_picp = _perf_col("seasonal_picp")
             linear_picp = _perf_col("linear_picp")
             nominal_cov = _perf_col("model_nominal_coverage")
-            overall_tier_vals = pd.Series(
-                [tier_map.get(str(v), np.nan) for v in perf_df.get("evidence_tier_overall", pd.Series(["very_low"] * n_perf))],
-                dtype=float,
-            )
-
             fig_conf, conf_axes = plt.subplots(
-                5, 1, figsize=(max(12, len(perf_df) * 0.8), 18), sharex=True
+                4, 1, figsize=(max(12, len(perf_df) * 0.8), 15), sharex=True
             )
             # Order: component diagnostics first, overall summaries last.
             _draw_bar_group(
@@ -1914,15 +1889,8 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             _annotate_bars_within_ylim(conf_axes[3], bars_score, '.0f')
             conf_axes[3].set_ylabel('Overall Evidence Score\n(Minimum Across Baselines)')
             conf_axes[3].grid(axis='y', alpha=0.3)
-
-            bars_tier = conf_axes[4].bar(x, overall_tier_vals, width=0.5, color='tab:purple')
-            _annotate_bars_within_ylim(conf_axes[4], bars_tier, '.0f')
-            conf_axes[4].set_yticks([0, 1, 2, 3])
-            conf_axes[4].set_yticklabels(tier_labels)
-            conf_axes[4].set_ylabel('Overall Evidence Tier')
-            conf_axes[4].grid(axis='y', alpha=0.3)
-            conf_axes[4].set_xticks(x)
-            conf_axes[4].set_xticklabels(labels, rotation=45, ha='right')
+            conf_axes[3].set_xticks(x)
+            conf_axes[3].set_xticklabels(labels, rotation=45, ha='right')
             _finalize_stacked_figure(fig_conf, conf_axes, left=0.30, hspace=0.48)
             conf_path = combined_dir / "summary_best_model_confidence.png"
             fig_conf.savefig(conf_path, dpi=300, bbox_inches='tight')
@@ -1976,19 +1944,11 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 ax.set_ylabel('Overall Evidence Score\n(Minimum Across Baselines)')
                 ax.grid(axis='y', alpha=0.3)
 
-            def _conf_panel_tier(ax):
-                bars = ax.bar(x, overall_tier_vals, width=0.5, color='tab:purple')
-                _annotate_bars_within_ylim(ax, bars, '.0f')
-                ax.set_yticks([0, 1, 2, 3])
-                ax.set_yticklabels(tier_labels)
-                ax.set_ylabel('Overall Evidence Tier')
-                ax.grid(axis='y', alpha=0.3)
-
             conf_panels = _save_individual_panels_from_builders(
                 out_dir=individual_dir,
                 base_name="summary_best_model_confidence",
                 labels=labels,
-                builders=[_conf_panel_prob, _conf_panel_lcb, _conf_panel_picp, _conf_panel_score, _conf_panel_tier],
+                builders=[_conf_panel_prob, _conf_panel_lcb, _conf_panel_picp, _conf_panel_score],
                 figsize=(max(11, len(perf_df) * 0.85), 6.2),
                 dpi=300,
                 left=0.36,
@@ -2398,46 +2358,18 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             # --- Single model quality matrix (accuracy, precision, reliability, support) ---
             # Matrix-specific ordering: evidence tier, then p-value, then q-value.
             matrix_perf_df = perf_df.copy()
-            _raw_labels = [
-                _derive_target_name(name, args.dataset_prefix)
-                for name in matrix_perf_df["dataset"].astype(str).tolist()
-            ]
-            if len(_raw_labels) > 1:
-                # Strip longest common prefix, trimmed to last separator boundary.
-                _cp_len = 0
-                for _chars in zip(*_raw_labels):
-                    if len(set(_chars)) == 1:
-                        _cp_len += 1
-                    else:
-                        break
-                if _cp_len > 0:
-                    _cp_str = _raw_labels[0][:_cp_len]
-                    for _sep in ('_', '-', ' ', '.'):
-                        _last = _cp_str.rfind(_sep)
-                        if _last >= 0:
-                            _cp_len = _last + 1
-                            break
-                _stripped_labels = [n[_cp_len:] for n in _raw_labels]
-                # Strip longest common suffix, trimmed to last separator boundary from tail.
-                _cs_len = 0
-                for _chars in zip(*[s[::-1] for s in _stripped_labels]):
-                    if len(set(_chars)) == 1:
-                        _cs_len += 1
-                    else:
-                        break
-                if _cs_len > 0:
-                    _cs_str = _stripped_labels[0][-_cs_len:]
-                    for _sep in ('_', '-', ' ', '.'):
-                        _first_sep = _cs_str.find(_sep)
-                        if _first_sep >= 0:
-                            _cs_len = len(_cs_str) - _first_sep
-                            break
-                _final_labels = [
-                    (s[:-_cs_len] if _cs_len else s) or n
-                    for s, n in zip(_stripped_labels, _raw_labels)
-                ]
-            else:
-                _final_labels = _raw_labels
+            _bare_prefix = args.dataset_prefix.rstrip("_")
+            _final_labels = []
+            for _name in matrix_perf_df["dataset"].astype(str).tolist():
+                _lbl = _name
+                if _lbl.startswith(_bare_prefix + "_"):
+                    _lbl = _lbl[len(_bare_prefix) + 1:]
+                if _lbl.startswith("ex"):
+                    _lbl = _lbl[2:]
+                if _lbl.endswith("_res"):
+                    _lbl = _lbl[:-4]
+                _lbl = re.sub(r"_\([^)]*\)$", "", _lbl)
+                _final_labels.append(_lbl.replace("_", " ").strip())
             matrix_perf_df["_target_label"] = _final_labels
 
             n_rows_mat = len(matrix_perf_df)
@@ -2495,13 +2427,8 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 "Test Sample Count": _col_values("n_eval_raw_segments"),
                 "R²": _col_values("r2"),
                 "nRMSE": _col_values("nrmse"),
-                "Prediction Interval Coverage Probability": _col_values("model_picp"),
+                "Coverage Gap (PICP − Nominal)": _col_values("model_coverage_gap"),
                 "Normalized Mean Prediction Interval Width": _col_values("model_nmpiw"),
-                "Minimum Probability of Positive Skill": pd.concat([
-                    pd.Series(_col_values("bootstrap_prob_skill_gt0_vs_naive")),
-                    pd.Series(_col_values("bootstrap_prob_skill_gt0_vs_seasonal")),
-                    pd.Series(_col_values("bootstrap_prob_skill_gt0_vs_linear")),
-                ], axis=1).min(axis=1, skipna=True).to_numpy(dtype=float),
                 "Minimum 95% Lower Confidence Bound of Skill": pd.concat([
                     pd.Series(_col_values("lcb95_skill_vs_naive")),
                     pd.Series(_col_values("lcb95_skill_vs_seasonal")),
@@ -2521,9 +2448,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 "Test Sample Count": True,
                 "R²": True,
                 "nRMSE": False,
-                "Prediction Interval Coverage Probability": True,
                 "Normalized Mean Prediction Interval Width": False,
-                "Minimum Probability of Positive Skill": True,
                 "Minimum 95% Lower Confidence Bound of Skill": True,
                 "Best False Discovery Rate Adjusted q-value": False,
                 "Evidence Score": True,
@@ -2536,11 +2461,10 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 "Best Model",
                 "R²",
                 "nRMSE",
-                "Prediction Interval Coverage Probability",
                 "Normalized Mean Prediction Interval Width",
             ]
             gate_cols = [
-                "Minimum Probability of Positive Skill",
+                "Coverage Gap (PICP − Nominal)",
                 "Minimum 95% Lower Confidence Bound of Skill",
                 "Best False Discovery Rate Adjusted q-value",
                 "Evidence Score",
@@ -2581,11 +2505,23 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 axis=1,
             ).copy()
 
+            zero_centered_cols = {"Coverage Gap (PICP − Nominal)"}
             norm = display_df.copy()
             for c in norm.columns:
                 if c == 'Best Model':
                     # Categorical column: fill with 0.5 (no heatmap)
                     norm[c] = 0.5
+                elif c in zero_centered_cols:
+                    vals = pd.to_numeric(norm[c], errors="coerce")
+                    finite = vals[np.isfinite(vals)]
+                    if finite.empty:
+                        norm[c] = np.nan
+                        continue
+                    max_abs = float(finite.abs().max())
+                    if max_abs == 0:
+                        norm[c] = pd.Series([1.0] * len(vals), index=vals.index, dtype=float)
+                    else:
+                        norm[c] = 1.0 - vals.abs() / max_abs
                 else:
                     vals = pd.to_numeric(norm[c], errors="coerce")
                     finite = vals[np.isfinite(vals)]
@@ -2664,9 +2600,16 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 )
             ax_mat.set_title("")
             # ax_mat.set_xlabel("Metrics")
-            # ax_mat.set_ylabel("Dataset")
+            # ax_mat.set_ylabel("Target")
             ax_mat.set_yticklabels(ax_mat.get_yticklabels(), rotation=0, fontsize=8)
-            ax_mat.set_xticklabels(ax_mat.get_xticklabels(), rotation=35, ha="right", fontsize=8)
+            dm_suffix_cols = {"Best False Discovery Rate Adjusted q-value", "Best p-value"}
+            wrapped_xlabels = []
+            for xt in ax_mat.get_xticklabels():
+                txt = xt.get_text()
+                if txt in dm_suffix_cols:
+                    txt = txt + " (DM/Wilcoxon/Sign)"
+                wrapped_xlabels.append(textwrap.fill(txt, width=18))
+            ax_mat.set_xticklabels(wrapped_xlabels, rotation=60, ha="right", fontsize=8)
             plt.tight_layout()
             matrix_path = evaluation_dir / "summary_model_quality_matrix.png"
             fig_mat.savefig(matrix_path, dpi=300, bbox_inches='tight')
