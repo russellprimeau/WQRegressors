@@ -47,11 +47,16 @@ Usage:
             worker alive but permanently blocked.
 
 Example:
-    python src/m_RunParallelPipeline.py --num-workers 2 \\
-        --gpu-workers 1 --gpu-ids 0 \\
-        --max-worker-memory-gb 20 --worker-timeout-hours 6 \\
-        --dataset-prefix MC --limit-datasets 14 \\
-        --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4
+export NTFY_TOPIC=your-secret-topic 
+OR
+[System.Environment]::SetEnvironmentVariable("NTFY_TOPIC", "my-topic", "User")
+
+python src/m_RunParallelPipeline.py --num-workers 2 `
+    --gpu-workers 1 --gpu-ids 0 `
+    --max-worker-memory-gb 20 --worker-timeout-hours 6 `
+    --dataset-prefix MC --limit-datasets 14 `
+    --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4
+    --notify
 
 GPU / CPU device assignment:
     By default worker 0 is assigned CUDA_VISIBLE_DEVICES=0 (GPU) and all

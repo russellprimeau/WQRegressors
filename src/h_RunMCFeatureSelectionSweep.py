@@ -1093,6 +1093,7 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     }
 
     r2_pivot = grouped.pivot(index="subset_rank", columns="model_norm", values="r2")
+    rmse_pivot = grouped.pivot(index="subset_rank", columns="model_norm", values="rmse")
     finite_max_r2 = {}
     for model in FINAL_METRICS_MODEL_ORDER:
         if model not in r2_pivot.columns:
@@ -1148,7 +1149,11 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
 
     subset_order = sorted(
         rank_to_label.keys(),
-        key=lambda rank: (-_skill_for_rank_model(rank, best_model), int(rank)),
+        key=lambda rank: (
+            -_skill_for_rank_model(rank, best_model),
+            -_rmse_for_rank_model(rank, best_model),  # decreasing RMSE (higher RMSE first)
+            _r2_for_rank_model(rank, best_model),     # increasing R² (lower R² first)
+        ),
     )
 
     # For each subset cluster, order model bars by descending local min-skill.
@@ -1158,8 +1163,14 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     def _r2_for_rank_model(rank: int, model: str) -> float:
         if rank in r2_pivot.index and model in r2_pivot.columns:
             val = pd.to_numeric(r2_pivot.loc[rank, model], errors="coerce")
-            return float(val) if np.isfinite(val) else float("nan")
-        return float("nan")
+            return float(val) if np.isfinite(val) else float("inf")
+        return float("inf")
+
+    def _rmse_for_rank_model(rank: int, model: str) -> float:
+        if rank in rmse_pivot.index and model in rmse_pivot.columns:
+            val = pd.to_numeric(rmse_pivot.loc[rank, model], errors="coerce")
+            return float(val) if np.isfinite(val) else float("inf")
+        return float("inf")
 
     models_by_rank: dict[int, list[str]] = {}
     for rank in subset_order:
@@ -1168,7 +1179,9 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
             key=lambda model, _rank=rank: (
                 1 if not np.isfinite(_skill_for_rank_model(int(_rank), model)) else 0,
                 -_skill_for_rank_model(int(_rank), model),
-                model_order_index[model],
+                -_rmse_for_rank_model(int(_rank), model),  # decreasing RMSE
+                _r2_for_rank_model(int(_rank), model),     # increasing R²
+                model_order_index[model],                  # deterministic final tiebreaker
             ),
         )
 
@@ -1240,7 +1253,7 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
             ymin_s = float(np.min(finite_vals)) if finite_vals.size > 0 else -0.2
             ymax_s = float(np.max(finite_vals)) if finite_vals.size > 0 else 1.0
             pad = max(abs(ymax_s - ymin_s) * 0.08, 0.02)
-            ax.set_ylim(min(ymin_s - pad, -pad), max(ymax_s + pad, pad))
+            ax.set_ylim(min(ymin_s - pad, -pad, -1.0), max(ymax_s + pad, pad))
             ax.axhline(0.0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
         else:
             ymin_base = float(np.min(finite_vals)) if finite_vals.size > 0 else -1.0
@@ -1275,7 +1288,7 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
                 va=va,
                 fontsize=7,
                 rotation=90,
-                clip_on=False,
+                clip_on=True,
             )
 
     axes[-1].set_xticks(x)

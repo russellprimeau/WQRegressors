@@ -74,45 +74,67 @@ Common usage:
         python src/l_RunMCShapleyOptimizerPipeline.py --dry-run
 
 2) Full pipeline with explicit budgets (sequential):
-python src/l_RunMCShapleyOptimizerPipeline.py \\
-            --dataset-prefix MC --limit-datasets 14 \\
+python src/l_RunMCShapleyOptimizerPipeline.py `
+            --dataset-prefix MC --limit-datasets 14 `
             --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4
 
-python src/l_RunMCShapleyOptimizerPipeline.py \\
-            --dataset-prefix MC --limit-datasets 14 \\
-            --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 \\
-            --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 \\
-            --beam-width 16 --max-rounds 30 --max-swap-attempts 200 \\
+python src/l_RunMCShapleyOptimizerPipeline.py `
+            --dataset-prefix MC --limit-datasets 14 `
+            --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 `
+            --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 `
+            --beam-width 16 --max-rounds 30 --max-swap-attempts 200 `
             --keep-shapley-plots --keep-search-plots
 
+export NTFY_TOPIC=your-secret-topic 
+OR
+[System.Environment]::SetEnvironmentVariable("NTFY_TOPIC", "my-topic", "User")
+
 python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datasets 14 --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 --keep-shapley-plots --keep-search-plots --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 --beam-width 16 --max-rounds 30 --max-swap-attempts 200 --parallel-evaluators 1 --data-root C:\\Users\\Master\\Documents\\GitHub\\WQRegressors\\data\\output\\CV8
+
+=
+
+python src/l_RunMCShapleyOptimizerPipeline.py `
+--dataset-prefix MC `
+--limit-datasets 14 `
+--shapley-eval-budget 270 `
+--optimizer-eval-budget 270 `
+--final-top-k 4 `
+--keep-shapley-plots `
+--keep-search-plots `
+--shapley-samples-per-feature 10 `
+--tmc-truncation-epsilon 0.0005 `
+--beam-width 16 `
+--max-rounds 30 `
+--max-swap-attempts 200 `
+--parallel-evaluators 1 `
+--data-root C:\\Users\\Master\\Documents\\GitHub\\WQRegressors\\data\\output\\CV8
 
 
 3) Full pipeline with parallel dataset processing:
     Worker 0 runs on GPU, worker 1 runs on CPU (default single-GPU behaviour).
     Device fields in config YAML files are overridden automatically at startup.
-python src/m_RunParallelPipeline.py --num-workers 2 \\
-        --gpu-workers 1 --gpu-ids 0 \\
-        --max-worker-memory-gb 20 --worker-timeout-hours 6 \\
-        --dataset-prefix MC --limit-datasets 14 \\
-        --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 \\
-        --keep-shapley-plots --keep-search-plots \\
-        --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 \\
-        --beam-width 16 --max-rounds 30 --max-swap-attempts 200 \\
-        --parallel-evaluators 1 \\
+python src/m_RunParallelPipeline.py --num-workers 2 `
+        --gpu-workers 1 --gpu-ids 0 `
+        --max-worker-memory-gb 20 --worker-timeout-hours 6 `
+        --dataset-prefix MC --limit-datasets 14 `
+        --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 `
+        --keep-shapley-plots --keep-search-plots `
+        --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 `
+        --beam-width 16 --max-rounds 30 --max-swap-attempts 200 `
+        --parallel-evaluators 1 `
         --data-root C:\\Users\\Master\\Documents\\GitHub\\WQRegressors\\data\\output\\CV7
 
 4) Multi-seed optimizer stage in one run:
-python src/l_RunMCShapleyOptimizerPipeline.py \\
+python src/l_RunMCShapleyOptimizerPipeline.py `
             --dataset-prefix MC --optimizer-seeds 7,11,19
 
 5) Reuse existing Shapley artifacts and skip Stage 1:
-python src/l_RunMCShapleyOptimizerPipeline.py \\
+python src/l_RunMCShapleyOptimizerPipeline.py `
             --skip-shapley-stage --optimizer-seeds 7,11,19
 
 6) Override seed subset source with explicit CSV:
-python src/l_RunMCShapleyOptimizerPipeline.py \\
-            --seed-subsets-csv data/output/regression/MC_exColor_res/forecasts/Shapley_sweeps/feature_seed_subsets_r671.csv \\
+python src/l_RunMCShapleyOptimizerPipeline.py `
+            --seed-subsets-csv data/output/regression/MC_exColor_res/forecasts/Shapley_sweeps/feature_seed_subsets_r671.csv `
             --skip-shapley-stage
 """
 
