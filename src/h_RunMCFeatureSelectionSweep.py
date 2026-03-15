@@ -1253,7 +1253,8 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
             ymin_s = float(np.min(finite_vals)) if finite_vals.size > 0 else -0.2
             ymax_s = float(np.max(finite_vals)) if finite_vals.size > 0 else 1.0
             pad = max(abs(ymax_s - ymin_s) * 0.08, 0.02)
-            ax.set_ylim(min(ymin_s - pad, -pad, -1.0), max(ymax_s + pad, pad))
+            lower = 0.0 if ymin_s >= 0 else ymin_s - pad
+            ax.set_ylim(lower, max(ymax_s + pad, pad))
             ax.axhline(0.0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
         else:
             ymin_base = float(np.min(finite_vals)) if finite_vals.size > 0 else -1.0
@@ -1266,7 +1267,7 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         y_low, y_high = ax.get_ylim()
         y_span = float(y_high - y_low) if np.isfinite(y_high - y_low) and (y_high - y_low) > 0 else 1.0
         text_pad = 0.02 * y_span
-        edge_band = 0.03 * y_span
+        edge_band = 0.15 * y_span
 
         for bar, val in axis_bars_and_vals:
             if not np.isfinite(val):
