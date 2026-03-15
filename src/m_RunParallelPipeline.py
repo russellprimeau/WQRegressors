@@ -55,7 +55,7 @@ python src/m_RunParallelPipeline.py --num-workers 2 `
     --gpu-workers 1 --gpu-ids 0 `
     --max-worker-memory-gb 20 --worker-timeout-hours 6 `
     --dataset-prefix MC --limit-datasets 14 `
-    --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4
+    --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4`
     --notify
 
 GPU / CPU device assignment:
@@ -277,6 +277,15 @@ def main() -> int:
         help="Send a push notification when all workers finish via ntfy.sh (requires NTFY_TOPIC env var).",
     )
     args, passthrough = parser.parse_known_args()
+    if args.notify:
+        num_workers_preview = max(1, int(args.num_workers))
+        notify(
+            title="m_RunParallelPipeline \u2014 Starting",
+            message=(
+                f"Workers: {num_workers_preview}\n"
+                f"GPU workers: {args.gpu_workers}"
+            ),
+        )
     num_workers = max(1, int(args.num_workers))
     max_worker_memory_bytes: int | None = (
         int(args.max_worker_memory_gb * (1024 ** 3))

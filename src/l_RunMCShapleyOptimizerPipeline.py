@@ -95,6 +95,7 @@ python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datase
 
 python src/l_RunMCShapleyOptimizerPipeline.py `
 --dataset-prefix MC `
+--data-root C:\\Users\\Master\\Documents\\GitHub\\WQRegressors\\data\\output\\CV9 `
 --limit-datasets 14 `
 --shapley-eval-budget 270 `
 --optimizer-eval-budget 270 `
@@ -107,22 +108,22 @@ python src/l_RunMCShapleyOptimizerPipeline.py `
 --max-rounds 30 `
 --max-swap-attempts 200 `
 --parallel-evaluators 1 `
---data-root C:\\Users\\Master\\Documents\\GitHub\\WQRegressors\\data\\output\\CV8
+--notify
 
 
 3) Full pipeline with parallel dataset processing:
     Worker 0 runs on GPU, worker 1 runs on CPU (default single-GPU behaviour).
     Device fields in config YAML files are overridden automatically at startup.
-python src/m_RunParallelPipeline.py --num-workers 2 `
-        --gpu-workers 1 --gpu-ids 0 `
-        --max-worker-memory-gb 20 --worker-timeout-hours 6 `
-        --dataset-prefix MC --limit-datasets 14 `
-        --shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 `
-        --keep-shapley-plots --keep-search-plots `
-        --shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 `
-        --beam-width 16 --max-rounds 30 --max-swap-attempts 200 `
-        --parallel-evaluators 1 `
-        --data-root C:\\Users\\Master\\Documents\\GitHub\\WQRegressors\\data\\output\\CV7
+python src/m_RunParallelPipeline.py --num-workers 2 ` --gpu-workers 1 --gpu-ids 0 `
+--max-worker-memory-gb 20 --worker-timeout-hours 6 `
+--dataset-prefix MC --limit-datasets 14 `
+--data-root C:\\Users\\Master\\Documents\\GitHub\\WQRegressors\\data\\output\\CV8 `
+--shapley-eval-budget 270 --optimizer-eval-budget 270 --final-top-k 4 `
+--keep-shapley-plots --keep-search-plots `
+--shapley-samples-per-feature 10 --tmc-truncation-epsilon 0.0005 `
+--beam-width 16 --max-rounds 30 --max-swap-attempts 200 `
+--parallel-evaluators 1 `
+--notify
 
 4) Multi-seed optimizer stage in one run:
 python src/l_RunMCShapleyOptimizerPipeline.py `
@@ -1139,6 +1140,20 @@ def main() -> int:
         tee_stderr = _TeeTextIO(sys.stderr, log_file)
         with contextlib.redirect_stdout(tee_stdout), contextlib.redirect_stderr(tee_stderr):
             print(f"[PIPELINE] Logging terminal output to: {log_path}")
+            if args.notify:
+                stages = (
+                    "Shapley + Optimizer" if not args.skip_shapley_stage and not args.skip_optimizer_stage
+                    else "Optimizer only" if args.skip_shapley_stage
+                    else "Shapley only"
+                )
+                notify(
+                    title="l_RunMCShapleyOptimizerPipeline \u2014 Starting",
+                    message=(
+                        f"Stages: {stages}\n"
+                        f"Data root: {data_root_resolved.name}\n"
+                        f"Log: {log_path.name}"
+                    ),
+                )
             rc = _run_pipeline(args, data_root_resolved)
 
     if args.notify:

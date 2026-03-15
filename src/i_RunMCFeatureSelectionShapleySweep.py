@@ -817,6 +817,16 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
         print("No matching datasets/configs found.")
         return 1
 
+    if getattr(args, "notify", False):
+        notify(
+            title="i_RunMCFeatureSelectionShapleySweep \u2014 Starting",
+            message=(
+                f"Datasets: {len(plans)}\n"
+                f"Data root: {data_root.name}\n"
+                f"Row counts: {getattr(args, 'row_counts', 'default')}"
+            ),
+        )
+
     if args.run_baselines_in_search and args.disable_baselines_for_search:
         raise ValueError("Cannot use both --run-baselines-in-search and --disable-baselines-for-search.")
 

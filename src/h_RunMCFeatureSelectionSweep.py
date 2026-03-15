@@ -1132,6 +1132,18 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
             return float(val) if np.isfinite(val) else float("-inf")
         return float("-inf")
 
+    def _r2_for_rank_model(rank: int, model: str) -> float:
+        if rank in r2_pivot.index and model in r2_pivot.columns:
+            val = pd.to_numeric(r2_pivot.loc[rank, model], errors="coerce")
+            return float(val) if np.isfinite(val) else float("inf")
+        return float("inf")
+
+    def _rmse_for_rank_model(rank: int, model: str) -> float:
+        if rank in rmse_pivot.index and model in rmse_pivot.columns:
+            val = pd.to_numeric(rmse_pivot.loc[rank, model], errors="coerce")
+            return float(val) if np.isfinite(val) else float("inf")
+        return float("inf")
+
     # Select best model by highest max skill across subsets; fall back to r2 if skill unavailable.
     finite_max_skill = {}
     for model in FINAL_METRICS_MODEL_ORDER:
@@ -1151,26 +1163,14 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         rank_to_label.keys(),
         key=lambda rank: (
             -_skill_for_rank_model(rank, best_model),
-            -_rmse_for_rank_model(rank, best_model),  # decreasing RMSE (higher RMSE first)
-            _r2_for_rank_model(rank, best_model),     # increasing R² (lower R² first)
+            -_rmse_for_rank_model(rank, best_model),
+            _r2_for_rank_model(rank, best_model),
         ),
     )
 
     # For each subset cluster, order model bars by descending local min-skill.
     base_model_order = list(FINAL_METRICS_MODEL_ORDER)
     model_order_index = {model: idx for idx, model in enumerate(base_model_order)}
-
-    def _r2_for_rank_model(rank: int, model: str) -> float:
-        if rank in r2_pivot.index and model in r2_pivot.columns:
-            val = pd.to_numeric(r2_pivot.loc[rank, model], errors="coerce")
-            return float(val) if np.isfinite(val) else float("inf")
-        return float("inf")
-
-    def _rmse_for_rank_model(rank: int, model: str) -> float:
-        if rank in rmse_pivot.index and model in rmse_pivot.columns:
-            val = pd.to_numeric(rmse_pivot.loc[rank, model], errors="coerce")
-            return float(val) if np.isfinite(val) else float("inf")
-        return float("inf")
 
     models_by_rank: dict[int, list[str]] = {}
     for rank in subset_order:
@@ -3523,6 +3523,16 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
             limit_datasets=args.limit_datasets,
             include_regular=include_regular,
             include_res=include_res,
+        )
+
+    if getattr(args, "notify", False):
+        notify(
+            title="h_RunMCFeatureSelectionSweep \u2014 Starting",
+            message=(
+                f"Datasets: {len(plans)}\n"
+                f"Data root: {data_root.name}\n"
+                f"Row counts: {getattr(args, 'row_counts', 'default')}"
+            ),
         )
 
     if args.run_baselines_in_search and args.disable_baselines_for_search:
