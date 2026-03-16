@@ -56,6 +56,10 @@ import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 matplotlib.use("Agg")
+# Ensure src/ is on the path so utils can be imported when the script is run
+# directly (python src/z2_...) or from the workspace root.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from utils.names import clean_target_label
 
 # Color palette matching b_ExploreData.py _safe_series_colors — avoids red/orange hues
 # so uncertainty bands (same color, lower alpha) stay visually distinct from alarm states.
@@ -76,14 +80,8 @@ _SERIES_COLORS = [
 
 
 def _clean_label(dataset_name: str, prefix: str) -> str:
-    """Strip the dataset prefix (+ underscore separator) and trailing ``_res``."""
-    label = dataset_name
-    bare_prefix = prefix.rstrip("_")
-    if label.startswith(bare_prefix + "_"):
-        label = label[len(bare_prefix) + 1:]
-    if label.endswith("_res"):
-        label = label[:-4]
-    return label.replace("_", " ")
+    """Delegate to the shared ``clean_target_label`` in ``utils.names``."""
+    return clean_target_label(dataset_name, prefix)
 
 
 def _load_baseline_rmses(dataset_dir: Path, horizon_hr: int, replicate: int) -> dict[str, float]:
@@ -148,6 +146,39 @@ def _load_std_target(dataset_dir: Path) -> float | None:
         return None
 
 
+def _rate_table(records: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
+    """One row per dataset: linear slope of each metric vs. horizon (units per hour)."""
+    rows = []
+    for label, df in records:
+        grp = df.groupby("lookahead")
+        means = grp[["rmse", "nrmse", "r2", "skill_v_best_baseline"]].mean()
+        has_reps = "replicate" in df.columns and df["replicate"].nunique() > 1
+        std_rmse  = grp["rmse"].std()               if has_reps else pd.Series(dtype=float)
+        std_r2    = grp["r2"].std()                 if has_reps else pd.Series(dtype=float)
+        std_skill = grp["skill_v_best_baseline"].std() if has_reps else pd.Series(dtype=float)
+
+        def _slope(series: pd.Series) -> float:
+            s = series.dropna()
+            if len(s) < 2:
+                return float("nan")
+            return float(np.polyfit(s.index.astype(float), s.values, 1)[0])
+
+        def _std_slope(series: pd.Series) -> float:
+            return _slope(series) if not series.empty else float("nan")
+
+        rows.append({
+            "dataset":         label,
+            "rmse_rate":       _slope(means["rmse"]),
+            "nrmse_rate":      _slope(means["nrmse"]),
+            "r2_rate":         _slope(means["r2"]),
+            "std_rate":        _std_slope(std_rmse),
+            "skill_rate":      _slope(means["skill_v_best_baseline"]),
+            "std_r2_rate":     _std_slope(std_r2),
+            "std_skill_rate":  _std_slope(std_skill),
+        })
+    return pd.DataFrame(rows)
+
+
 def _discover_datasets(data_root: Path, prefix: str) -> list[tuple[str, Path, Path]]:
     """Return ``(dataset_name, dataset_dir, lookahead_metrics_path)`` for every qualifying dataset."""
     hits: list[tuple[str, Path, Path]] = []
@@ -165,7 +196,101 @@ def _discover_datasets(data_root: Path, prefix: str) -> list[tuple[str, Path, Pa
     return hits
 
 
-def generate_figures(data_root: Path, prefix: str, summaries_dir: Path) -> int:
+def _plot_rate_bar(
+    rate_df: pd.DataFrame,
+    col: str,
+    ylabel: str,
+    title: str,
+    filename: str,
+    summaries_dir: Path,
+    ascending: bool = False,
+    color: str = _SERIES_COLORS[0],
+    std_col: str | None = None,
+    std_label: str = "σ rate (/hr)",
+    std_color: str = _SERIES_COLORS[3],
+) -> Path:
+    """Bar chart for one rate column, with an optional paired std bar.
+
+    When *std_col* is provided the bars are clustered (±bar_w/2 offset);
+    otherwise a single centred bar is drawn.
+    """
+    df = rate_df.dropna(subset=[col]).copy()
+    df = df.sort_values(col, ascending=ascending).reset_index(drop=True)
+
+    n = len(df)
+    x = np.arange(n)
+    clustered = std_col is not None and df[std_col].notna().any()
+    bar_w = 0.35 if clustered else 0.6
+
+    fig_w = max(6.0, 0.9 * n + 1.5)
+    fig, ax = plt.subplots(figsize=(fig_w, 4.5))
+
+    x_main = x - bar_w / 2 if clustered else x
+    ax.bar(x_main, df[col], width=bar_w, color=color,
+           label=col.replace("_", " "))
+    if clustered:
+        ax.bar(x + bar_w / 2, df[std_col], width=bar_w,
+               color=std_color, label=std_label)
+        ax.legend(fontsize=11, framealpha=0.85)
+
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(df["dataset"], rotation=45, ha="right", fontsize=10)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(title, fontsize=13)
+    ax.grid(axis="y", alpha=0.3)
+
+    fig.tight_layout()
+    out = summaries_dir / filename
+    fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.02)
+    plt.close(fig)
+    return out
+
+
+def _plot_rates(rate_df: pd.DataFrame, summaries_dir: Path, show_std: bool = True) -> Path:
+    """Clustered bar chart of nrmse_rate and std_rate per dataset.
+
+    Clusters are ordered by decreasing nrmse_rate.  std_rate bars are omitted
+    (rendered as NaN-height, i.e. absent) for datasets with only one replicate,
+    or when *show_std* is False.
+    """
+    df = rate_df.dropna(subset=["nrmse_rate"]).copy()
+    df = df.sort_values("nrmse_rate", ascending=False).reset_index(drop=True)
+
+    n = len(df)
+    x = np.arange(n)
+    bar_w = 0.35
+
+    fig_w = max(6.0, 0.9 * n + 1.5)
+    fig, ax = plt.subplots(figsize=(fig_w, 4.5))
+
+    rmse_color = _SERIES_COLORS[0]   # blue
+    std_color  = _SERIES_COLORS[3]   # purple
+
+    ax.bar(x - bar_w / 2, df["nrmse_rate"], width=bar_w,
+           color=rmse_color, label="nRMSE rate (/hr)")
+
+    std_vals = df["std_rate"]
+    if show_std and std_vals.notna().any():
+        ax.bar(x + bar_w / 2, std_vals, width=bar_w,
+               color=std_color, label="σ(RMSE) rate (units/hr)")
+
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(df["dataset"], rotation=45, ha="right", fontsize=10)
+    ax.set_ylabel("Rate of change (/ hr)", fontsize=12)
+    ax.set_title("Metric rates of change across forecast horizon", fontsize=13)
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend(fontsize=11, framealpha=0.85)
+
+    fig.tight_layout()
+    out = summaries_dir / "lookahead_rates_bar.png"
+    fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.02)
+    plt.close(fig)
+    return out
+
+
+def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std: bool = True) -> int:
     datasets = _discover_datasets(data_root, prefix)
     if not datasets:
         print(f"[WARN] No datasets with lookahead metrics found under {data_root}.")
@@ -243,8 +368,9 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path) -> int:
     # Collect all x-values across datasets for consistent tick marks
     all_x = sorted({v for _, df in records for v in df["lookahead"].dropna().tolist()})
 
-    # Detect whether any dataset has multiple replicates (drives legend content)
-    any_replicates = any(
+    # Detect whether any dataset has multiple replicates (drives σ-band and legend content).
+    # Suppressed entirely when show_std=False.
+    any_replicates = show_std and any(
         "replicate" in df.columns and df["replicate"].nunique() > 1
         for _, df in records
     )
@@ -455,6 +581,34 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path) -> int:
     agg_df.to_csv(agg_path, index=False)
     print(f"[INFO] Wrote aggregate CSV: {agg_path}")
 
+    rate_df = _rate_table(records)
+    rate_path = summaries_dir / "lookahead_rates.csv"
+    rate_df.to_csv(rate_path, index=False)
+    print(f"[INFO] Wrote rates CSV:     {rate_path}")
+
+    rates_path = _plot_rates(rate_df, summaries_dir, show_std=show_std)
+    print(f"[INFO] Wrote rates figure:  {rates_path}")
+
+    skill_bar_path = _plot_rate_bar(
+        rate_df, "skill_rate", "Rate of change (/ hr)",
+        "Skill rate of change across forecast horizon",
+        "lookahead_skill_rate_bar.png", summaries_dir,
+        ascending=True, color=_SERIES_COLORS[1],
+        std_col="std_skill_rate" if show_std else None,
+        std_label="σ(skill) rate (/hr)",
+    )
+    print(f"[INFO] Wrote skill rate bar: {skill_bar_path}")
+
+    r2_bar_path = _plot_rate_bar(
+        rate_df, "r2_rate", "Rate of change (/ hr)",
+        "R² rate of change across forecast horizon",
+        "lookahead_r2_rate_bar.png", summaries_dir,
+        ascending=True, color=_SERIES_COLORS[2],
+        std_col="std_r2_rate" if show_std else None,
+        std_label="σ(R²) rate (/hr)",
+    )
+    print(f"[INFO] Wrote R² rate bar:   {r2_bar_path}")
+
     return 0
 
 
@@ -476,6 +630,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="MC",
         help="Only include dataset directories whose name starts with this prefix (default: MC).",
     )
+    parser.add_argument(
+        "--std",
+        action="store_true",
+        help=(
+            "Include σ-band uncertainty series in line plots and σ-rate columns in bar "
+            "charts.  Omitted by default because σ is not comparable across datasets "
+            "that use different model types."
+        ),
+    )
     return parser
 
 
@@ -488,7 +651,12 @@ def main() -> int:
     summaries_dir = (data_root / "summaries" / "horizons").resolve()
     print(f"[INFO] data_root : {data_root}")
     print(f"[INFO] summaries : {summaries_dir}")
-    return generate_figures(data_root=data_root, prefix=args.dataset_prefix, summaries_dir=summaries_dir)
+    return generate_figures(
+        data_root=data_root,
+        prefix=args.dataset_prefix,
+        summaries_dir=summaries_dir,
+        show_std=args.std,
+    )
 
 
 if __name__ == "__main__":

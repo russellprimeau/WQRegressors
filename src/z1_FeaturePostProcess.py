@@ -41,6 +41,8 @@ from __future__ import annotations
 import contextlib
 import argparse
 import copy
+import shutil
+import subprocess
 import glob
 import hashlib
 import io
@@ -64,6 +66,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from utils.training import load_samples, group_samples_by_segment, _filter_samples_by_nan_tolerance
+from utils.names import clean_target_label
 from h_RunMCFeatureSelectionSweep import build_parser, discover_mc_dataset_plans, _derive_target_name, _select_surrogate_config, _parse_row_counts, _available_row_counts_for_postprocess, _regenerate_saved_outputs_for_row, _load_feature_stats_artifacts_with_source, _compile_multi_target_comparison, _resolve_dataset_inclusion, _run_rolling_origin_cv, _ensure_k01_baselines, _write_dataset_evaluation_summary, _forecast_sweeps_dir, _plot_final_metrics_comparison
 
 try:
@@ -1095,9 +1098,225 @@ def _collect_prediction_payload(eval_cfg_path: Path) -> dict:
 
     return {
         "y_test": _safe_as_2d(y_test),
+        "X_test": X_test,
         "pred_model": _safe_as_2d(pred_model),
         "baseline_preds": baseline_preds,
         "split_files": split_files,
+        "model_type": model_type,
+        "model_name": model_name,
+        "model_config": model_config,
+        "data_cfg": data_cfg,
+        "split_cfg": split_cfg,
+        "train_samples": train_samples,
+    }
+
+
+def _compute_retraining_stability(
+    eval_cfg_path: Path,
+    variant_dir: Path,
+    args: argparse.Namespace,
+    payload: dict,
+) -> dict:
+    """Run N independent retraining replicates and return stability statistics.
+
+    Replicate-0 is the already-trained model from *payload* (free — no retraining).
+    Replicates 1..N-1 are trained by modifying the ``cv_tuning.seed`` in the training
+    config and calling ``e_Train.py`` as a subprocess.  All replicates are evaluated on
+    the **same** held-out test data as replicate-0 (same split, same samples) so that
+    predictions are directly comparable and can be ensemble-averaged.
+
+    Only ``hyperparameters.cv_tuning.seed`` is varied — ``data_split.random_state`` is
+    kept fixed — so that the test set is identical across replicates and prediction
+    averaging is meaningful.
+
+    Returns an empty dict when ``args.stability_replicates <= 1``.
+    """
+    n_reps = int(getattr(args, "stability_replicates", 5))
+    if n_reps <= 1:
+        return {}
+
+    base_seed    = int(getattr(args, "bootstrap_seed", 42))
+    cv_thr       = float(getattr(args, "stability_cv_threshold", 0.15))
+    y_test       = payload["y_test"]
+    X_test       = payload["X_test"]
+    pred_rep0    = payload["pred_model"]
+    model_type   = payload["model_type"]
+    model_name   = payload["model_name"]
+    model_config = payload["model_config"]
+    data_cfg_abs = payload["data_cfg"]    # data_dir already resolved to absolute
+    split_cfg    = payload["split_cfg"]
+    train_samples = payload["train_samples"]  # non-None only for gp_regressor
+
+    data_dir_abs  = Path(str(data_cfg_abs["data_dir"]))
+    orig_forecast = str(data_cfg_abs.get("forecast_name", ""))
+
+    # Rep-0 metrics (original trained model)
+    m0 = _compute_point_metrics(pred_rep0, y_test)
+    r2_vals   = [_safe_float(m0["r2"])]
+    rmse_vals = [_safe_float(m0["rmse"])]
+    mae_vals  = [_safe_float(m0["mae"])]
+    pred_list = [_safe_as_2d(pred_rep0)]
+
+    train_script = Path(__file__).resolve().parent / "e_Train.py"
+    # Prefer the variant's training config as the base; fall back to eval config
+    train_cfg_candidate = variant_dir / f"config_train_{variant_dir.name}.yml"
+    base_cfg_for_retrain = train_cfg_candidate if train_cfg_candidate.exists() else eval_cfg_path
+
+    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tmp_paths: list[Path] = []
+
+    for r in range(1, n_reps):
+        rep_seed     = base_seed + r
+        rep_forecast = f"{orig_forecast}_stab{r:03d}"
+        rep_cfg_path = variant_dir / f"config_stability_rep{r:03d}.yml"
+        tmp_paths.append(rep_cfg_path)
+
+        # Build a modified copy of the training config
+        raw_cfg = train_module.load_config(str(base_cfg_for_retrain))
+        raw_cfg.pop("__config_dir", None)
+        rep_cfg = copy.deepcopy(raw_cfg)
+        # Vary only the training/tuning seed; keep data split identical
+        rep_cfg.setdefault("hyperparameters", {}).setdefault("cv_tuning", {})["seed"] = rep_seed
+        # Redirect model output so we don't overwrite the original
+        rep_cfg.setdefault("data", {})["forecast_name"] = rep_forecast
+
+        with open(rep_cfg_path, "w", encoding="utf-8") as fh:
+            yaml.dump(rep_cfg, fh, default_flow_style=False, allow_unicode=True)
+
+        print(f"[INFO] Stability rep {r}/{n_reps - 1}: seed={rep_seed}")
+        proc = subprocess.run(
+            [sys.executable, str(train_script), "--config", str(rep_cfg_path)],
+            capture_output=True, text=True, check=False,
+        )
+        if proc.returncode != 0:
+            print(f"[WARN] Stability rep {r} training failed (rc={proc.returncode})")
+            if proc.stderr:
+                print(proc.stderr[-800:])
+            continue
+
+        # Load the newly trained model.
+        # model_config is reloaded per-replicate because Optuna may have found a
+        # different architecture (e.g. different d_model or num_layers) under the new
+        # seed.  Reusing rep-0's model_config would cause state_dict shape mismatches.
+        try:
+            rep_data_cfg = {**data_cfg_abs, "forecast_name": rep_forecast}
+            rep_model_config = eval_module.load_model_config(
+                str(data_dir_abs),
+                rep_forecast,
+                model_name,
+                fallback_data=rep_data_cfg,
+            )
+            rep_model = eval_module.load_model(
+                model_type, rep_data_cfg, split_cfg,
+                model_name, rep_model_config, device, train_samples, variant_dir,
+            )
+        except Exception as exc:
+            print(f"[WARN] Stability rep {r} model load failed: {exc}")
+            continue
+
+        # Inference on the same X_test as rep-0
+        try:
+            if model_type == "gp_regressor":
+                pred_r = _safe_as_2d(eval_module._predict_gp_bundle(rep_model, X_test, device))
+            elif model_type == "transformer":
+                pred_r = _safe_as_2d(
+                    rep_model(torch.tensor(X_test, dtype=torch.float32, device=device))
+                    .detach().cpu().numpy()
+                )
+            else:  # xgb_regressor / xgb_classifier
+                out_dim = y_test.shape[1] if y_test.ndim > 1 else 1
+                pred_r = _safe_as_2d(rep_model.predict(X_test).reshape(-1, out_dim))
+        except Exception as exc:
+            print(f"[WARN] Stability rep {r} inference failed: {exc}")
+            continue
+
+        mr = _compute_point_metrics(pred_r, y_test)
+        r2_vals.append(_safe_float(mr["r2"]))
+        rmse_vals.append(_safe_float(mr["rmse"]))
+        mae_vals.append(_safe_float(mr["mae"]))
+        pred_list.append(pred_r)
+
+        # Delete the replicate model files to reclaim disk space
+        rep_model_dir = data_dir_abs / "forecasts" / rep_forecast
+        if rep_model_dir.exists():
+            shutil.rmtree(rep_model_dir, ignore_errors=True)
+
+    # Remove temp config files
+    for p in tmp_paths:
+        p.unlink(missing_ok=True)
+
+    n_ok = int(len(r2_vals))
+    if n_ok < 2:
+        return {
+            "stability_n_replicates": n_reps,
+            "stability_n_successful": n_ok,
+            "stability_cv_threshold": cv_thr,
+            "gate_stability": False,
+        }
+
+    # --- Per-model metric statistics (used for gate and variance diagnostics) ---
+    r2_arr   = np.array([v for v in r2_vals   if np.isfinite(v)], dtype=float)
+    rmse_arr = np.array([v for v in rmse_vals  if np.isfinite(v)], dtype=float)
+    mae_arr  = np.array([v for v in mae_vals   if np.isfinite(v)], dtype=float)
+
+    r2_mean   = float(np.mean(r2_arr))                           if r2_arr.size   else float("nan")
+    r2_std    = float(np.std(r2_arr,   ddof=1))                  if r2_arr.size   >= 2 else float("nan")
+    rmse_mean = float(np.mean(rmse_arr))                         if rmse_arr.size else float("nan")
+    rmse_std  = float(np.std(rmse_arr,  ddof=1))                 if rmse_arr.size >= 2 else float("nan")
+
+    r2_cv   = (float(r2_std   / abs(r2_mean))
+               if np.isfinite(r2_std)   and np.isfinite(r2_mean)   and abs(r2_mean)   > 1e-12
+               else float("nan"))
+    rmse_cv = (float(rmse_std / abs(rmse_mean))
+               if np.isfinite(rmse_std) and np.isfinite(rmse_mean) and abs(rmse_mean) > 1e-12
+               else float("nan"))
+    r2_lcb  = (float(r2_mean - 2.0 * r2_std)
+               if np.isfinite(r2_std) and np.isfinite(r2_mean)
+               else float("nan"))
+
+    # --- Ensemble (prediction-averaged) statistics ---
+    # All reps use the same test set, so predictions are directly comparable.
+    # Per Jensen's inequality, r2_ensemble >= r2_mean always; the gap measures
+    # how much ensembling helps.
+    n_test = pred_list[0].shape[0]
+    stack = [p for p in pred_list if p.shape[0] == n_test]
+    r2_ens = r2_mean
+    rmse_ens = rmse_mean
+    mae_ens  = float(np.mean(mae_arr)) if mae_arr.size else float("nan")
+    if len(stack) >= 2:
+        pred_ensemble = np.mean(np.stack(stack, axis=0), axis=0)
+        ens_m = _compute_point_metrics(pred_ensemble, y_test)
+        r2_ens   = _safe_float(ens_m["r2"])
+        rmse_ens = _safe_float(ens_m["rmse"])
+        mae_ens  = _safe_float(ens_m["mae"])
+
+    ens_benefit = (float(r2_ens - r2_mean)
+                   if np.isfinite(r2_ens) and np.isfinite(r2_mean)
+                   else float("nan"))
+
+    # --- Gate: CV low enough AND worst-case lower tail still positive ---
+    gate_stability = bool(
+        n_ok >= 2
+        and np.isfinite(r2_cv)
+        and r2_cv <= cv_thr
+        and np.isfinite(r2_lcb)
+        and r2_lcb > 0.0
+    )
+
+    return {
+        "stability_r2_mean":          r2_mean,
+        "stability_r2_std":           r2_std,
+        "stability_r2_cv":            r2_cv,
+        "stability_r2_lcb":           r2_lcb,
+        "stability_rmse_cv":          rmse_cv,
+        "stability_r2_ensemble":      r2_ens,
+        "stability_rmse_ensemble":    rmse_ens,
+        "stability_mae_ensemble":     mae_ens,
+        "stability_ensemble_benefit": ens_benefit,
+        "stability_n_replicates":     n_reps,
+        "stability_n_successful":     n_ok,
+        "stability_cv_threshold":     cv_thr,
+        "gate_stability":             gate_stability,
     }
 
 
@@ -1320,6 +1539,21 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
     evidence["evidence_alpha"] = float(args.evidence_alpha)
     evidence["bootstrap_mode"] = str(getattr(args, "bootstrap_mode", "iid"))
     evidence["bootstrap_block_len"] = int(getattr(args, "bootstrap_block_len", 3))
+
+    if getattr(args, "stability_replicates", 1) > 1:
+        try:
+            stab = _compute_retraining_stability(eval_cfg_path, variant_dir, args, payload)
+            evidence.update(stab)
+            if stab:
+                print(
+                    f"[INFO] Stability check: {stab.get('stability_n_successful', 0)}/"
+                    f"{stab.get('stability_n_replicates', 0)} reps OK, "
+                    f"R² CV={stab.get('stability_r2_cv', float('nan')):.3f}, "
+                    f"gate_stability={stab.get('gate_stability', False)}"
+                )
+        except Exception as _stab_exc:
+            print(f"[WARN] Retraining stability check failed: {_stab_exc}")
+            traceback.print_exc()
 
     evidence["evidence_status"] = "ok"
     evidence["evidence_variant_dir"] = str(variant_dir) if variant_dir is not None else ""
@@ -2359,17 +2593,10 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             # Matrix-specific ordering: evidence tier, then p-value, then q-value.
             matrix_perf_df = perf_df.copy()
             _bare_prefix = args.dataset_prefix.rstrip("_")
-            _final_labels = []
-            for _name in matrix_perf_df["dataset"].astype(str).tolist():
-                _lbl = _name
-                if _lbl.startswith(_bare_prefix + "_"):
-                    _lbl = _lbl[len(_bare_prefix) + 1:]
-                if _lbl.startswith("ex"):
-                    _lbl = _lbl[2:]
-                if _lbl.endswith("_res"):
-                    _lbl = _lbl[:-4]
-                _lbl = re.sub(r"_\([^)]*\)$", "", _lbl)
-                _final_labels.append(_lbl.replace("_", " ").strip())
+            _final_labels = [
+                clean_target_label(_name, _bare_prefix)
+                for _name in matrix_perf_df["dataset"].astype(str).tolist()
+            ]
             matrix_perf_df["_target_label"] = _final_labels
 
             n_rows_mat = len(matrix_perf_df)
@@ -2715,6 +2942,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     importance_label="Shapley Expected Contribution (mean marginal objective delta)",
                     summary_axis_label="Total Shapley Contribution",
                     target_order=target_order_by_r2,
+                    dataset_prefix=args.dataset_prefix,
                 )
             elif importance_sources_used and any(src.startswith("shapley_") for src in importance_sources_used):
                 comparison_plot = _compile_multi_target_comparison(
@@ -2723,12 +2951,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     importance_label="Feature Importance (mixed: removal delta + Shapley contribution)",
                     summary_axis_label="Total Feature Importance",
                     target_order=target_order_by_r2,
+                    dataset_prefix=args.dataset_prefix,
                 )
             else:
                 comparison_plot = _compile_multi_target_comparison(
                     sweep_results,
                     data_root,
                     target_order=target_order_by_r2,
+                    dataset_prefix=args.dataset_prefix,
                 )
             if comparison_plot.exists():
                 print(f"[INFO] Wrote multi-target comparison plots to {comparison_plot.parent}")
@@ -2770,6 +3000,25 @@ def main() -> int:
     parser.add_argument("--evidence-ref-raw-samples", type=int, default=40, help="Reference raw-sample count for reliability weighting.")
     parser.add_argument("--interval-alpha", type=float, default=0.1, help="Alpha for post-hoc residual interval proxy metrics (PICP/NMPIW).")
     parser.add_argument("--coverage-tolerance", type=float, default=0.03, help="Allowable shortfall tolerance for coverage gate.")
+    parser.add_argument(
+        "--stability-replicates",
+        type=int,
+        default=5,
+        help=(
+            "Number of independent retraining replicates for the stability gate "
+            "(includes the original fit as replicate-0). "
+            "Set to 1 to skip the stability check entirely. Default: 5."
+        ),
+    )
+    parser.add_argument(
+        "--stability-cv-threshold",
+        type=float,
+        default=0.15,
+        help=(
+            "Maximum allowed coefficient of variation of R² across retraining replicates "
+            "for gate_stability to pass (CV = std / |mean|). Default: 0.15."
+        ),
+    )
     parser.add_argument(
         "--run-rolling-cv",
         action="store_true",

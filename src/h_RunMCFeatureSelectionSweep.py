@@ -113,6 +113,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from utils.training import load_samples, group_samples_by_segment, SampleComplianceError
+from utils.names import clean_target_label
 
 
 SUPPORTED_CONFIG_SUFFIXES = {".yml", ".yaml", ".json"}
@@ -2167,6 +2168,7 @@ def _compile_multi_target_comparison(
     importance_label: str = "Removal Sensitivity (avg delta)",
     summary_axis_label: str = "Total Removal Sensitivity",
     target_order: list[str] | None = None,
+    dataset_prefix: str = "MC",
 ) -> Path:
     """Compile and visualize feature importance across multiple targets using removal sensitivity."""
     if not sweep_results:
@@ -2240,7 +2242,8 @@ def _compile_multi_target_comparison(
             if matched is None:
                 continue
             targets.append(matched)
-            yticklabels.append(str(requested) if str(requested).strip() else matched)
+            raw_lbl = str(requested) if str(requested).strip() else matched
+            yticklabels.append(clean_target_label(raw_lbl, dataset_prefix))
             used_keys.add(matched)
 
     # Fallback to CSV-based target ordering when no explicit order is provided.
@@ -2254,7 +2257,7 @@ def _compile_multi_target_comparison(
                 if matched is None:
                     continue
                 targets.append(matched)
-                yticklabels.append(csv_col)
+                yticklabels.append(clean_target_label(csv_col, dataset_prefix))
                 used_keys.add(matched)
         except Exception:
             pass
@@ -2264,7 +2267,7 @@ def _compile_multi_target_comparison(
         if key in used_keys:
             continue
         targets.append(key)
-        yticklabels.append(key)
+        yticklabels.append(clean_target_label(key, dataset_prefix))
         used_keys.add(key)
 
     matrix = np.zeros((len(targets), len(all_features)))
@@ -2297,6 +2300,18 @@ def _compile_multi_target_comparison(
         if norm_target:
             target_rank_norm[norm_target] = min(idx, target_rank_norm.get(norm_target, idx))
 
+    # Direct feature→target-rank lookup built from membership data.
+    # This correctly handles cases where feature names and target names use
+    # different languages or formats (e.g. "Turbidity (FNU)" vs "04-Turbiditet").
+    feature_to_target_rank: dict[str, int] = {}
+    for _tgt, _feats in target_feature_sets.items():
+        _rank = target_rank.get(_tgt)
+        if _rank is None:
+            continue
+        for _feat in _feats:
+            if _feat not in feature_to_target_rank or _rank < feature_to_target_rank[_feat]:
+                feature_to_target_rank[_feat] = _rank
+
     def _feature_target_candidates(feature_name: str) -> list[str]:
         feature_name = str(feature_name)
         candidates = [feature_name]
@@ -2318,13 +2333,16 @@ def _compile_multi_target_comparison(
         return out
 
     def _matching_target_rank(feature_name: str) -> int | None:
+        # Primary: membership-based lookup — works regardless of name language/format.
+        if feature_name in feature_to_target_rank:
+            return feature_to_target_rank[feature_name]
+
+        # Fallback: name-based matching for features absent from target_feature_sets.
         candidates = _feature_target_candidates(feature_name)
-        # Prefer exact target names first.
         for cand in candidates:
             if cand in target_rank:
                 return int(target_rank[cand])
 
-        # Fallback to normalized target matching.
         best_rank: int | None = None
         for cand in candidates:
             norm_cand = _norm_name(cand)
@@ -2512,7 +2530,74 @@ def _compile_multi_target_comparison(
     plot_path = summaries_dir / "multi_target_importance_heatmap.png"
     fig.savefig(plot_path, dpi=180, bbox_inches='tight')
     plt.close(fig)
-    
+
+    # --- Transposed standalone heatmaps (predictors on y-axis, targets on x-axis) ---
+    # Each feature block gets its own narrow figure, document-friendly width.
+    _xtlabels_t = [textwrap.fill(lbl, 20) for lbl in yticklabels_with_total]
+    _n_cols_t = len(yticklabels_with_total)
+    if multi_idx and single_idx:
+        for _t_block, _t_feats, _t_suffix in [
+            (left_block, multi_target_features, "multi"),
+            (right_block, single_target_features, "single"),
+        ]:
+            _t_mat = _t_block.T  # shape: (n_features, n_targets+1)
+            _fig_t, _ax_t = plt.subplots(
+                figsize=(max(5, _n_cols_t * 0.85), max(4, len(_t_feats) * 0.38)),
+                constrained_layout=True,
+            )
+            sns.heatmap(
+                _t_mat,
+                ax=_ax_t,
+                cmap="RdYlGn",
+                vmin=vmin,
+                vmax=vmax,
+                annot=False,
+                cbar_kws={"label": wrapped_importance_label, "pad": 0.01},
+                xticklabels=_xtlabels_t,
+                yticklabels=[textwrap.fill(f, 20) for f in _t_feats],
+                linewidths=0.5,
+                linecolor="#eeeeee",
+                square=False,
+            )
+            _annotate_heat_cells(_ax_t, _t_mat, annot_fontsize)
+            _ax_t.set_xticklabels(_xtlabels_t, rotation=45, ha='right', fontsize=heat_xtick_font)
+            _ax_t.set_yticklabels([textwrap.fill(f, 20) for f in _t_feats], rotation=0, fontsize=heat_ytick_font)
+            _ax_t.set_xlabel("Target", fontsize=heat_axis_label_font)
+            _ax_t.set_ylabel("Predictor", fontsize=heat_axis_label_font)
+            _t_path = summaries_dir / f"multi_target_importance_heatmap_{_t_suffix}.png"
+            _fig_t.savefig(_t_path, dpi=180, bbox_inches='tight')
+            plt.close(_fig_t)
+            print(f"[INFO] Wrote transposed heatmap ({_t_suffix}): {_t_path}")
+    else:
+        _t_mat = matrix_with_total.T  # shape: (n_features, n_targets+1)
+        _fig_t, _ax_t = plt.subplots(
+            figsize=(max(5, _n_cols_t * 0.85), max(4, len(all_features) * 0.38)),
+            constrained_layout=True,
+        )
+        sns.heatmap(
+            _t_mat,
+            ax=_ax_t,
+            cmap="RdYlGn",
+            vmin=vmin,
+            vmax=vmax,
+            annot=False,
+            cbar_kws={"label": wrapped_importance_label, "pad": 0.01},
+            xticklabels=_xtlabels_t,
+            yticklabels=[textwrap.fill(f, 20) for f in all_features],
+            linewidths=0.5,
+            linecolor="#eeeeee",
+            square=False,
+        )
+        _annotate_heat_cells(_ax_t, _t_mat, annot_fontsize)
+        _ax_t.set_xticklabels(_xtlabels_t, rotation=45, ha='right', fontsize=heat_xtick_font)
+        _ax_t.set_yticklabels([textwrap.fill(f, 20) for f in all_features], rotation=0, fontsize=heat_ytick_font)
+        _ax_t.set_xlabel("Target", fontsize=heat_axis_label_font)
+        _ax_t.set_ylabel("Predictor", fontsize=heat_axis_label_font)
+        _t_path = summaries_dir / "multi_target_importance_heatmap_all.png"
+        _fig_t.savefig(_t_path, dpi=180, bbox_inches='tight')
+        plt.close(_fig_t)
+        print(f"[INFO] Wrote transposed heatmap (all): {_t_path}")
+
     # Create grouped bar charts: multi-target features and single-target features.
     score_map = {feat: float(score) for feat, score in zip(top_features, summed_scores)}
     multi_scores = [score_map[feat] for feat in multi_target_features if feat in score_map]

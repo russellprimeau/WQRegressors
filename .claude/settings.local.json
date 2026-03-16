@@ -37,7 +37,11 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/i_RunMCFeatureSelectionShapleySweep.py''\\).read\\(\\)\\); print\\(''i_.py OK''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/l_RunMCShapleyOptimizerPipeline.py''\\).read\\(\\)\\); print\\(''l_.py OK''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/m_RunParallelPipeline.py''\\).read\\(\\)\\); print\\(''m_.py OK''\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/h_RunMCFeatureSelectionSweep.py''\\).read\\(\\)\\); print\\(''h_.py OK''\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/h_RunMCFeatureSelectionSweep.py''\\).read\\(\\)\\); print\\(''h_.py OK''\\)\")",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/data/output -maxdepth 1 -type d -name MC_*)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/utils/names.py''\\).read\\(\\)\\); print\\(''names OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/z2_HorizonPostProcess.py''\\).read\\(\\)\\); print\\(''z2 OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/z1_FeaturePostProcess.py''\\).read\\(\\)\\); print\\(''z1 OK''\\)\")"
     ]
   }
 }
