@@ -2516,7 +2516,13 @@ def _compile_multi_target_comparison(
     # Create grouped bar charts: multi-target features and single-target features.
     score_map = {feat: float(score) for feat, score in zip(top_features, summed_scores)}
     multi_scores = [score_map[feat] for feat in multi_target_features if feat in score_map]
-    single_scores = [score_map[feat] for feat in single_target_features if feat in score_map]
+    # Sort single-target features by decreasing score for the bar chart (heatmap uses rank ordering).
+    single_target_features_bar = sorted(
+        [feat for feat in single_target_features if feat in score_map],
+        key=lambda feat: score_map[feat],
+        reverse=True,
+    )
+    single_scores = [score_map[feat] for feat in single_target_features_bar]
     all_scores = multi_scores + single_scores
 
     score_min = float(np.min(all_scores)) if all_scores else 0.0
@@ -2578,9 +2584,9 @@ def _compile_multi_target_comparison(
         )
         _draw_group_bars(
             ax_bottom,
-            single_target_features,
+            single_target_features_bar,
             single_scores,
-            f"Single-target Features (n={len(single_target_features)})",
+            f"Single-target Features (n={len(single_target_features_bar)})",
         )
         ax_top.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
         ax_bottom.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)

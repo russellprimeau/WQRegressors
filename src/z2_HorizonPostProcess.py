@@ -40,9 +40,9 @@ CLI arguments:
                             prefix.  Default: MC
 
 Examples:
-    python src/z2_HorizonPostProcess.py
-    python src/z2_HorizonPostProcess.py --data-root data/output/regression
-    python src/z2_HorizonPostProcess.py --data-root data/output/CV4 --dataset-prefix MC
+python src/z2_HorizonPostProcess.py
+python src/z2_HorizonPostProcess.py --data-root data/output/regression
+python src/z2_HorizonPostProcess.py --data-root data/output/CV4 --dataset-prefix MC
 """
 from __future__ import annotations
 import argparse
