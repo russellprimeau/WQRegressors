@@ -6,8 +6,9 @@ directory (written by ``k_RunHorizonSweep.py``) and produces:
 
   1. ``lookahead_r2_comparison.png``    – R² vs forecast horizon (hours)
   2. ``lookahead_nrmse_comparison.png`` – nRMSE vs forecast horizon (hours)
-  3. ``lookahead_skill_comparison.png`` – skill vs. best baseline per horizon
-  4. ``lookahead_aggregate.csv``        – combined table of all datasets × horizons × replicates
+  3. ``lookahead_skill_comparison.png``     – skill vs. best baseline per horizon
+  4. ``lookahead_time_to_zero_skill.png``   – initial skill / skill rate (hours to zero skill)
+  5. ``lookahead_aggregate.csv``            – combined table of all datasets × horizons × replicates
 
 nRMSE (= RMSE / std_target) is used instead of raw RMSE so that datasets with
 very different target magnitudes can be compared on the same axis.  The
@@ -166,6 +167,10 @@ def _rate_table(records: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
         def _std_slope(series: pd.Series) -> float:
             return _slope(series) if not series.empty else float("nan")
 
+        skill_by_h = df.groupby("lookahead")["skill_v_best_baseline"].mean()
+        _min_h = skill_by_h.index.min()
+        initial_skill = float(skill_by_h.loc[_min_h]) if pd.notna(skill_by_h.loc[_min_h]) else float("nan")
+
         rows.append({
             "dataset":         label,
             "rmse_rate":       _slope(means["rmse"]),
@@ -175,6 +180,7 @@ def _rate_table(records: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
             "skill_rate":      _slope(means["skill_v_best_baseline"]),
             "std_r2_rate":     _std_slope(std_r2),
             "std_skill_rate":  _std_slope(std_skill),
+            "initial_skill":   initial_skill,
         })
     return pd.DataFrame(rows)
 
@@ -196,11 +202,31 @@ def _discover_datasets(data_root: Path, prefix: str) -> list[tuple[str, Path, Pa
     return hits
 
 
+def _bar_fmt(v: float) -> str:
+    """Scientific notation without padding or explicit positive sign (e.g. '1.23e3')."""
+    s = f"{v:.3g}"
+    if "e" in s:
+        mantissa, exp = s.split("e")
+        return f"{mantissa}e{int(exp)}"
+    return s
+
+
+def _annotate_bars(ax: plt.Axes, fontsize: int = 9) -> None:
+    """Annotate each bar patch with its numeric value (rotated 90°)."""
+    for rect in ax.patches:
+        h = rect.get_height()
+        if not np.isfinite(h) or h == 0:
+            continue
+        x = rect.get_x() + rect.get_width() / 2
+        va = "bottom" if h >= 0 else "top"
+        ax.text(x, h, _bar_fmt(h), ha="center", va=va, fontsize=fontsize,
+                rotation=90, clip_on=False)
+
+
 def _plot_rate_bar(
     rate_df: pd.DataFrame,
     col: str,
     ylabel: str,
-    title: str,
     filename: str,
     summaries_dir: Path,
     ascending: bool = False,
@@ -220,7 +246,7 @@ def _plot_rate_bar(
     n = len(df)
     x = np.arange(n)
     clustered = std_col is not None and df[std_col].notna().any()
-    bar_w = 0.35 if clustered else 0.6
+    bar_w = 0.42 if clustered else 0.72
 
     fig_w = max(6.0, 0.9 * n + 1.5)
     fig, ax = plt.subplots(figsize=(fig_w, 4.5))
@@ -235,10 +261,15 @@ def _plot_rate_bar(
 
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
     ax.set_xticks(x)
-    ax.set_xticklabels(df["dataset"], rotation=45, ha="right", fontsize=10)
-    ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_title(title, fontsize=13)
+    ax.set_xticklabels(df["dataset"], rotation=45, ha="right", fontsize=14)
+    ax.tick_params(axis="y", labelsize=14)
+    ax.set_ylabel(textwrap.fill(ylabel, width=20), fontsize=14)
+    ax.set_xlim(-0.5, n - 0.5)
     ax.grid(axis="y", alpha=0.3)
+    _annotate_bars(ax)
+    _ylo, _yhi = ax.get_ylim()
+    _span = _yhi - _ylo
+    ax.set_ylim(_ylo - 0.12 * _span, _yhi + 0.2 * _span)
 
     fig.tight_layout()
     out = summaries_dir / filename
@@ -259,7 +290,7 @@ def _plot_rates(rate_df: pd.DataFrame, summaries_dir: Path, show_std: bool = Tru
 
     n = len(df)
     x = np.arange(n)
-    bar_w = 0.35
+    bar_w = 0.42
 
     fig_w = max(6.0, 0.9 * n + 1.5)
     fig, ax = plt.subplots(figsize=(fig_w, 4.5))
@@ -277,11 +308,16 @@ def _plot_rates(rate_df: pd.DataFrame, summaries_dir: Path, show_std: bool = Tru
 
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
     ax.set_xticks(x)
-    ax.set_xticklabels(df["dataset"], rotation=45, ha="right", fontsize=10)
-    ax.set_ylabel("Rate of change (/ hr)", fontsize=12)
-    ax.set_title("Metric rates of change across forecast horizon", fontsize=13)
+    ax.set_xticklabels(df["dataset"], rotation=45, ha="right", fontsize=14)
+    ax.tick_params(axis="y", labelsize=14)
+    ax.set_ylabel(textwrap.fill("nRMSE avg. rate of change (/hr)", width=20), fontsize=14)
+    ax.set_xlim(-0.5, n - 0.5)
     ax.grid(axis="y", alpha=0.3)
     ax.legend(fontsize=11, framealpha=0.85)
+    _annotate_bars(ax)
+    _ylo, _yhi = ax.get_ylim()
+    _span = _yhi - _ylo
+    ax.set_ylim(_ylo - 0.12 * _span, _yhi + 0.12 * _span)
 
     fig.tight_layout()
     out = summaries_dir / "lookahead_rates_bar.png"
@@ -410,7 +446,7 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std
                 ax.set_visible(False)
                 continue
 
-            has_replicates = "replicate" in df.columns and df["replicate"].nunique() > 1
+            has_replicates = show_std and "replicate" in df.columns and df["replicate"].nunique() > 1
             if has_replicates:
                 grp = df.groupby("lookahead")[metric].agg(["mean", "std"]).reset_index()
                 x = grp["lookahead"]
@@ -482,7 +518,7 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std
         # Single figure-level legend above top subplot with generic black lines
         legend_handles = [
             plt.Line2D([0], [0], color="black", linewidth=1.5,
-                       marker="o", markersize=4, label="Mean"),
+                       marker="o", markersize=4, label=f"Mean {ylabel}"),
         ]
         if any_replicates:
             legend_handles += [
@@ -590,8 +626,7 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std
     print(f"[INFO] Wrote rates figure:  {rates_path}")
 
     skill_bar_path = _plot_rate_bar(
-        rate_df, "skill_rate", "Rate of change (/ hr)",
-        "Skill rate of change across forecast horizon",
+        rate_df, "skill_rate", "Skill avg. rate of change (/hr)",
         "lookahead_skill_rate_bar.png", summaries_dir,
         ascending=True, color=_SERIES_COLORS[1],
         std_col="std_skill_rate" if show_std else None,
@@ -600,14 +635,25 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std
     print(f"[INFO] Wrote skill rate bar: {skill_bar_path}")
 
     r2_bar_path = _plot_rate_bar(
-        rate_df, "r2_rate", "Rate of change (/ hr)",
-        "R² rate of change across forecast horizon",
+        rate_df, "r2_rate", "$R^2$ avg. rate of change (/hr)",
         "lookahead_r2_rate_bar.png", summaries_dir,
         ascending=True, color=_SERIES_COLORS[2],
         std_col="std_r2_rate" if show_std else None,
         std_label="σ(R²) rate (/hr)",
     )
     print(f"[INFO] Wrote R² rate bar:   {r2_bar_path}")
+
+    # Time-to-zero-skill: initial skill / skill rate (hours at which linear
+    # extrapolation of skill reaches 0).  Larger positive values mean the model
+    # retains useful skill over a longer forecast horizon.
+    rate_df["time_to_zero_skill"] = rate_df["initial_skill"] / (-24*rate_df["skill_rate"])
+    tzs_path = _plot_rate_bar(
+        rate_df, "time_to_zero_skill",
+        "Forecast Horizon (days)",
+        "lookahead_time_to_zero_skill.png", summaries_dir,
+        ascending=False, color=_SERIES_COLORS[1],
+    )
+    print(f"[INFO] Wrote time-to-zero-skill bar: {tzs_path}")
 
     return 0
 

@@ -1686,6 +1686,184 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                 )
             out_path = out_dir / f"{figure_name}_{variant_suffix}.png"
             fig.savefig(out_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
+            # --- No-raster variant for Target timeseries ---
+            if figure_name == "Target" and _add_raster and variant_suffix == "timeseries":
+                _nr_fig_h = max(min_fig_height, row_height * n_rows)
+                _nr_fig, _nr_axes_raw = plt.subplots(
+                    n_rows, 1, sharex=True, figsize=(fig_width, _nr_fig_h),
+                    gridspec_kw={"hspace": shared_hspace},
+                )
+                _nr_axes = [_nr_axes_raw] if n_rows == 1 else list(_nr_axes_raw)
+                _nr_palette = _safe_series_colors(n_rows)
+                for _nr_i, (_nr_ax, _nr_col, _nr_label) in enumerate(zip(_nr_axes, cols, wrapped_labels)):
+                    _nr_ser = pd.to_numeric(df[_nr_col], errors="coerce")
+                    _nr_clr = _nr_palette[_nr_i]
+                    _nr_y_low = None
+                    _nr_y_high = None
+                    _nr_finite = _nr_ser.to_numpy(dtype=float)
+                    _nr_finite = _nr_finite[np.isfinite(_nr_finite)]
+                    if _nr_finite.size > 0:
+                        _nr_y_low = float(np.min(_nr_finite))
+                        _nr_y_high = float(np.max(_nr_finite))
+                    _nr_ax.plot(
+                        _nr_ser.index, _nr_ser.values,
+                        linestyle="", marker="o", markersize=4.5,
+                        color=_nr_clr, markeredgecolor=_nr_clr, markeredgewidth=0.0, alpha=0.95,
+                    )
+                    if _nr_col in all_limit_specs:
+                        _nr_upper, _nr_lower = _limit_bounds(all_limit_specs[_nr_col])
+                        if _nr_upper is not None:
+                            _nr_ax.axhline(y=_nr_upper, color="#ff0000", linewidth=0.7, linestyle="-", zorder=1.2)
+                            if _nr_y_low is None:
+                                _nr_y_low = _nr_upper; _nr_y_high = _nr_upper
+                            else:
+                                _nr_y_low = min(_nr_y_low, _nr_upper); _nr_y_high = max(_nr_y_high, _nr_upper)
+                        if _nr_lower is not None:
+                            _nr_ax.axhline(y=_nr_lower, color="#2ca02c", linewidth=0.7, linestyle="-", zorder=1.2)
+                            if _nr_y_low is None:
+                                _nr_y_low = _nr_lower; _nr_y_high = _nr_lower
+                            else:
+                                _nr_y_low = min(_nr_y_low, _nr_lower); _nr_y_high = max(_nr_y_high, _nr_lower)
+                    if _nr_y_low is not None and _nr_y_high is not None:
+                        _nr_y_span = _nr_y_high - _nr_y_low
+                        if _nr_y_span <= 0:
+                            _nr_y_pad = 0.12 * max(abs(_nr_y_low), 1.0)
+                        else:
+                            _nr_y_pad = max(0.08 * _nr_y_span, 0.03 * max(abs(_nr_y_low), abs(_nr_y_high), 1.0))
+                        _nr_ax.set_ylim(_nr_y_low - _nr_y_pad, _nr_y_high + _nr_y_pad)
+                    _nr_ax.set_ylabel(_nr_label, rotation=0, ha="right", va="center", fontsize=y_label_font_size, labelpad=y_label_pad)
+                    _nr_ax.grid(axis="y", linestyle="--", alpha=0.25, linewidth=0.4)
+                    _nr_ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=3))
+                    _nr_ax.tick_params(axis="y", labelsize=y_value_font_size)
+                    _nr_ax.tick_params(axis="x", labelsize=x_label_font_size)
+                    if _nr_i < n_rows - 1:
+                        _nr_ax.tick_params(axis="x", which="both", labelbottom=False)
+                _nr_qticks = pd.date_range(start=start_date, end=end_date, freq="QS-JAN")
+                _nr_axes[-1].set_xticks(_nr_qticks)
+                _nr_axes[-1].set_xticklabels([dt.strftime("%Y-%m-%d") for dt in _nr_qticks], rotation=25, ha="right", fontsize=x_label_font_size)
+                _nr_axes[-1].set_xlim(start_date, end_date)
+                _nr_top = max(0.86, min(0.995, 1.0 - (top_margin_in / _nr_fig_h)))
+                _nr_bottom = max(0.08, min(0.30, bottom_margin_in / _nr_fig_h))
+                _nr_fig.subplots_adjust(left=shared_left_margin, right=shared_right_margin, top=_nr_top, bottom=_nr_bottom, hspace=shared_hspace)
+                _nr_fig.legend(
+                    handles=[
+                        plt.Line2D([0], [0], color="#ff0000", linewidth=0.7, linestyle="-", label="Strictest legal threshold (upper bound)"),
+                        plt.Line2D([0], [0], color="#2ca02c", linewidth=0.7, linestyle="-", label="Strictest legal threshold (lower bound)"),
+                    ],
+                    loc="upper center",
+                    bbox_to_anchor=(0.5, 1.03),
+                    ncol=2,
+                    framealpha=0.85,
+                    fontsize=y_label_font_size,
+                    borderaxespad=0.12,
+                )
+                _nr_out_path = out_dir / "Target_timeseries_no_raster.png"
+                _nr_fig.savefig(_nr_out_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
+                plt.close(_nr_fig)
+                print(f"Wrote chart to: {_nr_out_path}")
+            # --- Alt-source overlay variant for Weather timeseries ---
+            if figure_name == "Weather" and variant_suffix == "timeseries":
+                _alt_csv = repo_root / "data" / "input" / "sensors" / "Weather_alt_source.csv"
+                if _alt_csv.exists():
+                    _alt_df = pd.read_csv(_alt_csv, sep=";", low_memory=False)
+                    if "Time" in _alt_df.columns:
+                        _alt_df["Time"] = pd.to_datetime(_alt_df["Time"], errors="coerce")
+                        _alt_df = (
+                            _alt_df[_alt_df["Time"].notna()]
+                            .set_index("Time")
+                            .sort_index()
+                        )
+                        _alt_df = _alt_df[
+                            (_alt_df.index >= start_date) & (_alt_df.index <= end_date)
+                        ]
+                    # Map alt CSV columns → normalized weather column keys (direct-unit columns only)
+                    _alt_col_to_norm = {
+                        "thredds_air_pressure_at_sea_level": _norm_col("Atmospheric pressure (mBar)"),
+                        "thredds_air_temperature_2m": _norm_col("Air temperature (°C)"),
+                        "thredds_integral_of_surface_downwelling_shortwave_flux_in_air_wrt_time": _norm_col("Shortwave (solar) radiation (W/m2)"),
+                        "thredds_integral_of_surface_downwelling_longwave_flux_in_air_wrt_time": _norm_col("Longwave (IR) radiation (W/m2)"),
+                        "thredds_relative_humidity_2m": _norm_col("Humidity (%)"),
+                    }
+                    _alt_overlay = {}  # actual weather col name → alt series
+                    for _alt_c, _alt_norm in _alt_col_to_norm.items():
+                        if _alt_c in _alt_df.columns:
+                            _wc = all_cols_by_norm.get(_alt_norm)
+                            if _wc is not None and _wc in cols:
+                                _alt_overlay[_wc] = pd.to_numeric(_alt_df[_alt_c], errors="coerce")
+                    # Wind x/y: decompose direction + speed (mirrors decompose_direction in preprocessing.py)
+                    _dir_col = "thredds_wind_direction_10m"
+                    _spd_col = "thredds_wind_speed_10m"
+                    if _dir_col in _alt_df.columns and _spd_col in _alt_df.columns:
+                        _alt_dir = pd.to_numeric(_alt_df[_dir_col], errors="coerce")
+                        _alt_spd = pd.to_numeric(_alt_df[_spd_col], errors="coerce")
+                        _alt_rad = np.deg2rad(_alt_dir)
+                        _wc_x = all_cols_by_norm.get(_norm_col("Wind speed x (m/s)"))
+                        _wc_y = all_cols_by_norm.get(_norm_col("Wind speed y (m/s)"))
+                        if _wc_x is not None and _wc_x in cols:
+                            _alt_overlay[_wc_x] = np.cos(_alt_rad) * _alt_spd
+                        if _wc_y is not None and _wc_y in cols:
+                            _alt_overlay[_wc_y] = np.sin(_alt_rad) * _alt_spd
+                    # Precipitation: 24-hour rolling sum (mirrors rolling_sum(..., interval_hours=24))
+                    _precip_col = "thredds_precipitation_amount"
+                    _wc_precip = all_cols_by_norm.get(_norm_col("24hr precipitation total (mm)"))
+                    if _precip_col in _alt_df.columns and _wc_precip is not None and _wc_precip in cols:
+                        _alt_precip = pd.to_numeric(_alt_df[_precip_col], errors="coerce")
+                        _alt_overlay[_wc_precip] = _alt_precip.rolling("24h", closed="both", min_periods=1).sum()
+                    _PRIMARY_BLUE = "#1f77b4"
+                    _ALT_ORANGE = "#ff7f0e"
+                    _as_fig_h = max(min_fig_height, row_height * n_rows)
+                    _as_fig, _as_axes_raw = plt.subplots(
+                        n_rows, 1, sharex=True, figsize=(fig_width, _as_fig_h),
+                        gridspec_kw={"hspace": shared_hspace},
+                    )
+                    _as_axes = [_as_axes_raw] if n_rows == 1 else list(_as_axes_raw)
+                    for _as_i, (_as_ax, _as_col, _as_label) in enumerate(zip(_as_axes, cols, wrapped_labels)):
+                        _as_broken = _series_with_gap_breaks(pd.to_numeric(df[_as_col], errors="coerce"), max_gap_hours=1)
+                        _as_ax.plot(
+                            _as_broken.index, _as_broken.values,
+                            linestyle="-", linewidth=0.45, color=_PRIMARY_BLUE, alpha=0.85, zorder=1.3,
+                        )
+                        if _as_col in _alt_overlay:
+                            _as_alt_broken = _series_with_gap_breaks(_alt_overlay[_as_col], max_gap_hours=1)
+                            _as_ax.plot(
+                                _as_alt_broken.index, _as_alt_broken.values,
+                                linestyle="-", linewidth=0.45, color=_ALT_ORANGE, alpha=0.85, zorder=1.4,
+                            )
+                        _as_ax.set_ylabel(_as_label, rotation=0, ha="right", va="center", fontsize=y_label_font_size, labelpad=y_label_pad)
+                        _as_ax.grid(axis="y", linestyle="--", alpha=0.25, linewidth=0.4)
+                        _as_ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=3))
+                        _as_ax.tick_params(axis="y", labelsize=y_value_font_size)
+                        _as_ax.tick_params(axis="x", labelsize=x_label_font_size)
+                        if _as_i < n_rows - 1:
+                            _as_ax.tick_params(axis="x", which="both", labelbottom=False)
+                    _as_qticks = pd.date_range(start=start_date, end=end_date, freq="QS-JAN")
+                    _as_axes[-1].set_xticks(_as_qticks)
+                    _as_axes[-1].set_xticklabels(
+                        [dt.strftime("%Y-%m-%d") for dt in _as_qticks], rotation=25, ha="right", fontsize=x_label_font_size,
+                    )
+                    _as_axes[-1].set_xlim(start_date, end_date)
+                    _as_top = max(0.86, min(0.995, 1.0 - (top_margin_in / _as_fig_h)))
+                    _as_bottom = max(0.08, min(0.30, bottom_margin_in / _as_fig_h))
+                    _as_fig.subplots_adjust(
+                        left=shared_left_margin, right=shared_right_margin,
+                        top=_as_top, bottom=_as_bottom, hspace=shared_hspace,
+                    )
+                    _as_fig.legend(
+                        handles=[
+                            plt.Line2D([0], [0], color=_PRIMARY_BLUE, linewidth=1.0, linestyle="-", label="Sensor"),
+                            plt.Line2D([0], [0], color=_ALT_ORANGE, linewidth=1.0, linestyle="-", label="Analysis"),
+                        ],
+                        loc="upper center",
+                        bbox_to_anchor=(0.5, 1.03),
+                        ncol=2,
+                        framealpha=0.85,
+                        fontsize=font_size,
+                        borderaxespad=0.12,
+                    )
+                    _as_out_path = out_dir / "Weather_timeseries_alt_source.png"
+                    _as_fig.savefig(_as_out_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
+                    plt.close(_as_fig)
+                    print(f"Wrote chart to: {_as_out_path}")
             if figure_name in {"Target", "Target_diff"} and variant_suffix == "timeseries":
                 # Overlay variant: restore marker borders for readability on shaded backgrounds.
                 for ax in axes:

@@ -90,6 +90,9 @@ BASELINE_PLOT_COLORS = {
 BASELINE_MODEL_IDS = {"naive", "seasonal", "linear"}
 MIN_REQUIRED_VALID_INDEPENDENT = 5
 
+ML_COMPARISON_MODEL_TYPES = ['XGB', 'Trans.', 'GP']
+ML_COMPARISON_COLORS = {'XGB': 'tab:blue', 'Trans.': 'tab:purple', 'GP': 'tab:olive'}
+
 
 def _resolve_summaries_dir(data_root: Path, sweep_namespace: str) -> Path:
     # Keep summary outputs anchored to the selected data root.
@@ -240,6 +243,35 @@ def _annotate_bars_within_ylim(ax, bars, fmt: str, fontsize: int = 8) -> None:
         )
 
 
+def _annotate_ml_bars(ax, bars, vals, ns, fmt: str, fontsize: int = 7) -> None:
+    """Annotate bars with combined value and sample-count label, e.g. '1.23e-02, n=8'."""
+    ymin, ymax = ax.get_ylim()
+    yspan = float(ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
+    pad = 0.01 * yspan
+    for bar, val, n in zip(bars, vals, ns):
+        if not np.isfinite(val):
+            continue
+        h = bar.get_height()
+        if h < ymin or h > ymax:
+            continue
+        n_str = f", n={int(n)}" if np.isfinite(n) else ""
+        label = f"{val:{fmt}}{n_str}"
+        y_txt = h + pad
+        va = 'bottom'
+        if y_txt > (ymax - pad):
+            y_txt = h - pad
+            va = 'top'
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            y_txt,
+            label,
+            ha='center',
+            va=va,
+            fontsize=fontsize,
+            rotation=90,
+        )
+
+
 def _compute_rolling_cv_r2_stats(df_cv: "pd.DataFrame") -> tuple[float, float, float, float]:
     """Return CV R2 stats as (mean, median, last50_mean, pooled)."""
     try:
@@ -320,6 +352,240 @@ def _resolve_summary_plot_dirs(summaries_dir: Path) -> tuple[Path, Path, Path]:
     for out_dir in (combined_dir, individual_dir, evaluation_dir):
         out_dir.mkdir(parents=True, exist_ok=True)
     return combined_dir, individual_dir, evaluation_dir
+
+
+def _normalize_ml_model_display(val: str) -> str:
+    """Map raw model string to ML_COMPARISON_MODEL_TYPES display key."""
+    key = str(val).strip().lower()
+    if 'xgb' in key:
+        return 'XGB'
+    if 'transformer' in key:
+        return 'Trans.'
+    if 'gp' in key:
+        return 'GP'
+    return None
+
+
+def _plot_ml_model_comparison(
+    plans: "list",
+    data_root: "Path",
+    summaries_dir: "Path",
+    args: "argparse.Namespace",
+) -> None:
+    """Generate 4 clustered bar charts comparing best-per-model-type scores across targets.
+
+    Output files in summaries_dir/ML_comparison/:
+      ml_comparison_rmse.png
+      ml_comparison_nrmse.png
+      ml_comparison_r2.png
+      ml_comparison_skill_vs_best_baseline.png
+    """
+    ml_comp_dir = (summaries_dir / "ML_comparison").resolve()
+    ml_comp_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset_prefix = str(getattr(args, "dataset_prefix", "MC"))
+    records = []  # list of dicts, one per (dataset, model_display)
+
+    for plan in plans:
+        dataset_name = plan.dataset_dir.name
+        final_metrics_csv = _forecast_sweeps_dir(plan.dataset_dir) / "feature_sweep_final_metrics.csv"
+        if not final_metrics_csv.exists():
+            continue
+        try:
+            df = pd.read_csv(final_metrics_csv)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+
+        # Apply the same validity filters used for best-model selection
+        valid_df = _exclude_baseline_metric_rows(
+            _filter_min_valid_independent(
+                _filter_valid_rows(df),
+                min_required=MIN_REQUIRED_VALID_INDEPENDENT,
+            )
+        )
+        if valid_df.empty:
+            continue
+
+        # Determine n_samples column
+        if 'n_test_valid' in valid_df.columns:
+            n_col = 'n_test_valid'
+        elif 'n_test_independent' in valid_df.columns:
+            n_col = 'n_test_independent'
+        else:
+            n_col = None
+
+        # Read baseline RMSE from evaluation_summary.csv
+        eval_csv = data_root / dataset_name / 'evaluation_summary.csv'
+        baseline_rmse = {}
+        if eval_csv.exists():
+            try:
+                df_eval = pd.read_csv(eval_csv)
+                for kind in BASELINE_ORDER:
+                    match = df_eval[df_eval['label'].str.lower().str.contains(kind)]
+                    if not match.empty:
+                        baseline_rmse[kind] = _safe_float(match.iloc[0].get('rmse', float('nan')))
+                    else:
+                        baseline_rmse[kind] = float('nan')
+            except Exception:
+                for kind in BASELINE_ORDER:
+                    baseline_rmse[kind] = float('nan')
+        else:
+            for kind in BASELINE_ORDER:
+                baseline_rmse[kind] = float('nan')
+
+        best_baseline_rmse = min(
+            (v for v in baseline_rmse.values() if np.isfinite(v) and v > 0),
+            default=float('nan'),
+        )
+
+        # Add normalized display type column
+        valid_df = valid_df.copy()
+        valid_df['_model_display'] = valid_df['model'].apply(_normalize_ml_model_display)
+
+        for model_display in ML_COMPARISON_MODEL_TYPES:
+            subset = valid_df[valid_df['_model_display'] == model_display]
+            if subset.empty:
+                continue
+            best_idx = subset['r2'].idxmax()
+            row = subset.loc[best_idx]
+            rmse_val = _safe_float(row.get('rmse', float('nan')))
+            nrmse_val = _safe_float(row.get('nrmse', float('nan')))
+            r2_val = _safe_float(row.get('r2', float('nan')))
+            n_val = _safe_float(row.get(n_col, float('nan'))) if n_col else float('nan')
+
+            # Skill vs best baseline: 1 - model_rmse / best_baseline_rmse
+            if np.isfinite(rmse_val) and np.isfinite(best_baseline_rmse) and best_baseline_rmse > 0:
+                skill_val = 1.0 - rmse_val / best_baseline_rmse
+            else:
+                skill_val = float('nan')
+
+            records.append({
+                'dataset': dataset_name,
+                'target_label': clean_target_label(dataset_name, dataset_prefix),
+                'model_display': model_display,
+                'rmse': rmse_val,
+                'nrmse': nrmse_val,
+                'r2': r2_val,
+                'skill_vs_best': skill_val,
+                'n_samples': n_val,
+            })
+
+    if not records:
+        print("[INFO] ML comparison: no valid per-model-type data found; skipping.")
+        return
+
+    comp_df = pd.DataFrame(records)
+
+    # Determine target order: sort by best R2 per dataset (descending)
+    best_r2_per_dataset = (
+        comp_df.groupby('dataset')['r2'].max().sort_values(ascending=False)
+    )
+    ordered_datasets = list(best_r2_per_dataset.index)
+    # Deduplicated target labels in the same order
+    seen: set = set()
+    ordered_targets: list[tuple[str, str]] = []  # (dataset, target_label)
+    for ds in ordered_datasets:
+        lbl = comp_df.loc[comp_df['dataset'] == ds, 'target_label'].iloc[0]
+        if ds not in seen:
+            seen.add(ds)
+            ordered_targets.append((ds, lbl))
+
+    n_targets = len(ordered_targets)
+    x = np.arange(n_targets)
+    # width=0.29 gives ~50% less inter-cluster gap vs 0.25 (gap: 1-3*0.29≈0.13 vs 1-3*0.25=0.25)
+    width = 0.29
+    n_models = len(ML_COMPARISON_MODEL_TYPES)
+    offsets = np.array([(i - (n_models - 1) / 2) for i in range(n_models)])
+    _FS = 12  # unified font size for all text elements
+
+    metric_specs = [
+        ('rmse',          'RMSE',                    '.2e', False),
+        ('nrmse',         'nRMSE',                   '.2e', False),
+        ('r2',            'R²',                      '.2f', False),
+        ('skill_vs_best', 'Skill vs. Best Baseline', '.2f', True),
+    ]
+    file_names = {
+        'rmse':          'ml_comparison_rmse.png',
+        'nrmse':         'ml_comparison_nrmse.png',
+        'r2':            'ml_comparison_r2.png',
+        'skill_vs_best': 'ml_comparison_skill_vs_best_baseline.png',
+    }
+
+    for metric_key, ylabel, fmt, add_hline in metric_specs:
+        fig, ax = plt.subplots(figsize=(max(10, n_targets * 1.4), 6))
+        # Build proxy Patch handles upfront so labels are always correct.
+        legend_handles = [
+            matplotlib.patches.Patch(facecolor=ML_COMPARISON_COLORS[m], label=m)
+            for m in ML_COMPARISON_MODEL_TYPES
+        ]
+
+        for mi, model_display in enumerate(ML_COMPARISON_MODEL_TYPES):
+            color = ML_COMPARISON_COLORS[model_display]
+            vals = []
+            ns = []
+            bar_x = []
+            for ti, (ds, _lbl) in enumerate(ordered_targets):
+                row_match = comp_df[
+                    (comp_df['dataset'] == ds) & (comp_df['model_display'] == model_display)
+                ]
+                if row_match.empty or not np.isfinite(_safe_float(row_match.iloc[0][metric_key])):
+                    continue
+                bar_x.append(x[ti] + offsets[mi] * width)
+                vals.append(_safe_float(row_match.iloc[0][metric_key]))
+                ns.append(_safe_float(row_match.iloc[0]['n_samples']))
+
+            if not bar_x:
+                continue
+
+            bars = ax.bar(bar_x, vals, width, color=color)
+            _annotate_ml_bars(ax, bars, vals, ns, fmt)
+
+        if add_hline:
+            ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
+
+        # Constrain y-axis lower limit: never below -1; if all bars positive, floor at 0.
+        ymin_cur, ymax_cur = ax.get_ylim()
+        all_metric_vals = comp_df[metric_key].dropna().to_numpy(dtype=float)
+        all_metric_vals = all_metric_vals[np.isfinite(all_metric_vals)]
+        min_val = float(np.min(all_metric_vals)) if all_metric_vals.size else 0.0
+        if min_val >= 0.0:
+            ax.set_ylim(bottom=0.0)
+        else:
+            ax.set_ylim(bottom=max(ymin_cur, -1.0))
+
+        # Tight horizontal bounds: ~0.07 units of padding beyond the outermost bar edges.
+        cluster_half = 1.5 * width
+        if n_targets > 0:
+            ax.set_xlim(x[0] - cluster_half - 0.07, x[-1] + cluster_half + 0.07)
+
+        ax.set_ylabel(ylabel, fontsize=_FS)
+        ax.tick_params(axis='y', labelsize=_FS)
+        ax.set_xticks(x)
+        ax.set_xticklabels(
+            [lbl for _ds, lbl in ordered_targets],
+            rotation=45,
+            ha='right',
+            fontsize=_FS,
+        )
+        ax.grid(axis='y', alpha=0.3)
+
+        # Legend in a single row above the plot area
+        ax.legend(
+            handles=legend_handles,
+            loc='lower center',
+            bbox_to_anchor=(0.5, 1.02),
+            ncol=len(ML_COMPARISON_MODEL_TYPES),
+            frameon=False,
+            fontsize=_FS,
+        )
+
+        fig.tight_layout(rect=[0, 0, 1, 0.92])
+        out_path = ml_comp_dir / file_names[metric_key]
+        fig.savefig(out_path, dpi=180, bbox_inches='tight')
+        plt.close(fig)
+        print(f"[INFO] Wrote ML comparison figure: {out_path}")
 
 
 def _save_subplot_panels(
@@ -2654,6 +2920,11 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 "Test Sample Count": _col_values("n_eval_raw_segments"),
                 "R²": _col_values("r2"),
                 "nRMSE": _col_values("nrmse"),
+                "Skill vs. Best Baseline": pd.concat([
+                    pd.Series(_col_values("skill_vs_naive")),
+                    pd.Series(_col_values("skill_vs_seasonal")),
+                    pd.Series(_col_values("skill_vs_linear")),
+                ], axis=1).min(axis=1, skipna=True).to_numpy(dtype=float),
                 "Coverage Gap (PICP − Nominal)": _col_values("model_coverage_gap"),
                 "Normalized Mean Prediction Interval Width": _col_values("model_nmpiw"),
                 "Minimum 95% Lower Confidence Bound of Skill": pd.concat([
@@ -2675,6 +2946,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 "Test Sample Count": True,
                 "R²": True,
                 "nRMSE": False,
+                "Skill vs. Best Baseline": True,
                 "Normalized Mean Prediction Interval Width": False,
                 "Minimum 95% Lower Confidence Bound of Skill": True,
                 "Best False Discovery Rate Adjusted q-value": False,
@@ -2688,6 +2960,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 "Best Model",
                 "R²",
                 "nRMSE",
+                "Skill vs. Best Baseline",
                 "Normalized Mean Prediction Interval Width",
             ]
             gate_cols = [
@@ -2928,6 +3201,18 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             print("[WARN] No best model performance data found; summary plot not generated.")
     except Exception as e:
         print(f"[ERROR] Failed to generate summary_best_model_performance.png: {e}")
+        traceback.print_exc()
+
+    # Generate ML model comparison charts (one figure per metric, bars clustered by target)
+    try:
+        if plans:
+            summaries_dir_ml = _resolve_summaries_dir(
+                data_root=data_root,
+                sweep_namespace=str(getattr(args, "sweep_namespace", "feature_sweeps")),
+            )
+            _plot_ml_model_comparison(plans, data_root, summaries_dir_ml, args)
+    except Exception as e:
+        print(f"[ERROR] Failed to generate ML model comparison plots: {e}")
         traceback.print_exc()
 
     if len(sweep_results) > 1:

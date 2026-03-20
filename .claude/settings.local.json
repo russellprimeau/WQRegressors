@@ -41,7 +41,18 @@
       "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/data/output -maxdepth 1 -type d -name MC_*)",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/utils/names.py''\\).read\\(\\)\\); print\\(''names OK''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/z2_HorizonPostProcess.py''\\).read\\(\\)\\); print\\(''z2 OK''\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/z1_FeaturePostProcess.py''\\).read\\(\\)\\); print\\(''z1 OK''\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/z1_FeaturePostProcess.py''\\).read\\(\\)\\); print\\(''z1 OK''\\)\")",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors -type d -name *output* -o -type d -name *result* -o -type d -name *summaries*)",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/data/output -type f \\\\\\(-name *.csv -o -name *.json \\\\\\))",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/data/output -type f -name *.csv)",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/data/output -name *.csv -path *forecasts* -type f)",
+      "Bash(grep -rn \"XGB\\\\|''''XGB''''\\\\|GP\\\\|''''GP''''\\\\|Transformer\\\\|''''Transformer''''\\\\|xgb_regressor\\\\|gp_regressor\\\\|transformer\" /c/Users/Master/Documents/GitHub/WQRegressors/src --include=*.py)",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/data/output -name *metrics*.csv -o -name *results*.csv)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/z3_Compare.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors -type d -name config* -o -type d -name data)",
+      "Bash(xargs cat:*)",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/data/output -type d -name MC_*)",
+      "Bash(ls /c/Users/Master/Documents/GitHub/WQRegressors/data/output/storage/res_small/MC_pH_res/*.yml)"
     ]
   }
 }

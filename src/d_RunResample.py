@@ -887,7 +887,10 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
     if pre_normalized:
         df = df.copy()
         if normalization_params is not None:
-            _write_normalization_params(normalization_params)
+            _write_normalization_params(
+                normalization_params,
+                output_path=Path(output_dir) / "normalization.json",
+            )
         else:
             # Fallback: preserve old behavior if caller did not provide params.
             df = normalize_columns(

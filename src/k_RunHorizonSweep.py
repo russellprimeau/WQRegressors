@@ -43,8 +43,8 @@ CLI arguments:
                             Default: 1
 
 Examples:
-    python src/k_RunHorizonSweep.py --resample-config data/output/sampling/resample_config.yml
-    python src/k_RunHorizonSweep.py --data-root data/output/CV4 --dataset-prefix MC --resample-config data/output/sampling/resample_config.yml --horizons 0 6 12 24 48 --replicates 5
+python src/k_RunHorizonSweep.py --resample-config data/output/sampling/resample_config.yml
+python src/k_RunHorizonSweep.py --data-root data/output/CV4 --dataset-prefix MC --resample-config data/output/sampling/resample_config.yml --horizons 0 6 12 24 480 6 12 24 48 96 168 336 --replicates 10
 
 """
 
