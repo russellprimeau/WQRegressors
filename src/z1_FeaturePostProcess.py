@@ -1826,6 +1826,251 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
     return evidence
 
 
+def _compile_feature_inclusion_heatmap(
+    perf_df: "pd.DataFrame",
+    plans: list,
+    data_root: Path,
+    target_order: list[str],
+    dataset_prefix: str = "MC",
+    sweep_namespace: str = "feature_sweeps",
+) -> Path:
+    """Binary heatmap: 1 if predictor is in the best model's feature set for a target, 0 otherwise."""
+    dataset_to_plan = {plan.dataset_dir.name: plan for plan in plans}
+    best_per_dataset = perf_df.drop_duplicates(subset="dataset", keep="first")
+
+    # Resolve feature lists per target
+    target_features: dict[str, list[str]] = {}  # target_name -> [feature, ...]
+    target_labels: dict[str, str] = {}  # target_name -> display label
+
+    for _, row in best_per_dataset.iterrows():
+        dataset_name = str(row["dataset"])
+        plan = dataset_to_plan.get(dataset_name)
+        if plan is None:
+            continue
+        row_count = int(row["row_count"])
+        feature_tag = str(row["feature_tag"])
+        out_dir = _forecast_sweeps_dir(plan.dataset_dir)
+
+        # Try feature_selected_subsets first, then feature_search_trace as fallback
+        features_list: list[str] | None = None
+        for csv_name in [
+            f"feature_selected_subsets_r{row_count:03d}.csv",
+            f"feature_search_trace_r{row_count:03d}.csv",
+        ]:
+            csv_path = out_dir / csv_name
+            if not csv_path.exists():
+                continue
+            try:
+                df_sub = pd.read_csv(csv_path)
+                matched = df_sub[df_sub["feature_tag"].astype(str) == feature_tag]
+                if not matched.empty and "features" in matched.columns:
+                    raw = str(matched.iloc[0]["features"]).strip()
+                    if raw and raw.lower() != "nan":
+                        features_list = [f.strip() for f in raw.split("|") if f.strip()]
+                        break
+            except Exception as exc:
+                print(f"[WARN] Could not read {csv_path.name} for {dataset_name}: {exc}")
+
+        if not features_list:
+            print(f"[WARN] Could not resolve features for {dataset_name} tag={feature_tag}; skipping.")
+            continue
+
+        target_name = _derive_target_name(dataset_name, dataset_prefix)
+        target_features[target_name] = features_list
+        target_labels[target_name] = clean_target_label(target_name, dataset_prefix)
+
+    if not target_features:
+        return Path()
+
+    # Collect all unique features
+    all_features_set: set[str] = set()
+    for feats in target_features.values():
+        all_features_set.update(feats)
+
+    # Canonical feature order from Consolidated_sparse.csv
+    csv_candidates = [
+        data_root / "Consolidated_sparse.csv",
+        data_root.parent / "regression" / "Consolidated_sparse.csv",
+    ]
+    csv_path = next((p for p in csv_candidates if p.exists()), csv_candidates[0])
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            header = f.readline().strip().split(",")
+        csv_features = [col for col in header if col in all_features_set]
+        all_features = csv_features + [f for f in sorted(all_features_set) if f not in csv_features]
+    except Exception:
+        all_features = sorted(all_features_set)
+
+    if not all_features:
+        return Path()
+
+    # Order targets by R2 rank (target_order), append unmatched
+    def _norm(s: str) -> str:
+        text = str(s).lower().replace("\u00b5", "u").replace("\u00b0", "deg")
+        text = unicodedata.normalize("NFKD", text)
+        text = "".join(c for c in text if not unicodedata.combining(c))
+        return re.sub(r"[^a-z0-9]", "", text)
+
+    available_keys = set(target_features.keys())
+    used: set[str] = set()
+    targets: list[str] = []
+    yticklabels: list[str] = []
+
+    for requested in (target_order or []):
+        req_norm = _norm(requested)
+        match = None
+        for key in available_keys - used:
+            key_norm = _norm(key)
+            if key_norm == req_norm or key_norm.endswith(req_norm) or req_norm.endswith(key_norm):
+                match = key
+                break
+        if match is not None:
+            targets.append(match)
+            yticklabels.append(target_labels.get(match, clean_target_label(match, dataset_prefix)))
+            used.add(match)
+
+    for key in sorted(available_keys - used):
+        targets.append(key)
+        yticklabels.append(target_labels.get(key, clean_target_label(key, dataset_prefix)))
+
+    # Build binary matrix
+    feature_to_idx = {feat: idx for idx, feat in enumerate(all_features)}
+    matrix = np.zeros((len(targets), len(all_features)), dtype=float)
+    for i, target in enumerate(targets):
+        for feat in target_features[target]:
+            if feat in feature_to_idx:
+                matrix[i, feature_to_idx[feat]] = 1.0
+
+    # Group: multi-target features (>1 target) first, then single-target
+    target_feature_sets = {t: set(target_features[t]) for t in targets}
+    presence_count = {
+        feat: sum(1 for t in targets if feat in target_feature_sets.get(t, set()))
+        for feat in all_features
+    }
+    target_rank = {t: idx for idx, t in enumerate(targets)}
+
+    multi_target_features = [f for f in all_features if presence_count.get(f, 0) > 1]
+    single_target_features = [f for f in all_features if presence_count.get(f, 0) == 1]
+
+    multi_target_features.sort(key=lambda f: (-presence_count.get(f, 0), f))
+
+    # Sort single-target features by the rank of the target they belong to
+    def _single_sort_key(feat: str) -> tuple:
+        for t in targets:
+            if feat in target_feature_sets.get(t, set()):
+                return (target_rank[t], feat)
+        return (len(targets), feat)
+
+    single_target_features.sort(key=_single_sort_key)
+
+    ordered_features = multi_target_features + single_target_features
+    if ordered_features:
+        ordered_indices = [feature_to_idx[f] for f in ordered_features]
+        matrix = matrix[:, ordered_indices]
+        all_features = ordered_features
+
+    # Recompute indices after reordering
+    multi_idx = list(range(len(multi_target_features)))
+    single_idx = list(range(len(multi_target_features), len(all_features)))
+
+    # Total row
+    total_row = matrix.sum(axis=0)
+
+    # Font sizing (consistent with existing heatmap)
+    heat_font = 8
+
+    # Annotation helper: show integer for >=1, blank for 0
+    def _annotate_inclusion_cells(ax_obj, values: np.ndarray, fontsize: int) -> None:
+        for row_i in range(values.shape[0]):
+            for col_j in range(values.shape[1]):
+                val = values[row_i, col_j]
+                if not np.isfinite(val) or val < 0.5:
+                    continue
+                ax_obj.text(
+                    col_j + 0.5, row_i + 0.5,
+                    str(int(val)),
+                    ha="center", va="center",
+                    color="black", fontsize=fontsize,
+                    clip_on=True,
+                )
+
+    n_targets = len(targets)
+    heat_h = max(4, (n_targets + 1) * 0.38)
+
+    if multi_idx and single_idx:
+        yticklabels_with_total = yticklabels + ["Total"]
+        left_block = np.vstack([matrix[:, multi_idx],
+                                total_row[multi_idx][None, :]])
+        right_block = np.vstack([matrix[:, single_idx],
+                                 total_row[single_idx][None, :]])
+        sep_col = np.full((left_block.shape[0], 1), np.nan)
+        combined_matrix = np.hstack([left_block, sep_col, right_block])
+        sep_pos = left_block.shape[1]
+        xticklabels_with_sep = multi_target_features + [""] + single_target_features
+
+        n_total_cols = combined_matrix.shape[1]
+        heat_w = max(14, n_total_cols * 0.85)
+        fig, ax = plt.subplots(figsize=(heat_w, heat_h), constrained_layout=True)
+
+        sns.heatmap(
+            combined_matrix, ax=ax,
+            cmap="YlGn", vmin=0, vmax=max(n_targets, 1),
+            annot=False,
+            cbar_kws={"label": "Number of targets including predictor", "pad": 0.01},
+            xticklabels=xticklabels_with_sep,
+            yticklabels=yticklabels_with_total,
+            linewidths=0.5, linecolor="#eeeeee", square=False,
+        )
+        _annotate_inclusion_cells(ax, combined_matrix, heat_font)
+
+        ax.add_patch(plt.Rectangle(
+            (sep_pos, 0), 1, combined_matrix.shape[0],
+            facecolor=ax.get_facecolor(), edgecolor="none", zorder=3,
+        ))
+        ax.set_xticklabels(xticklabels_with_sep, rotation=45, ha="right", fontsize=heat_font)
+        ax.set_yticklabels(
+            [textwrap.fill(lbl, 20) for lbl in yticklabels_with_total],
+            rotation=0, fontsize=heat_font,
+        )
+    else:
+        matrix_with_total = np.vstack([matrix, total_row[None, :]])
+        yticklabels_with_total = yticklabels + ["Total"]
+        n_total_features = max(len(all_features), 1)
+        fig, ax = plt.subplots(
+            figsize=(max(13, n_total_features * 0.85), heat_h),
+            constrained_layout=True,
+        )
+        sns.heatmap(
+            matrix_with_total, ax=ax,
+            cmap="YlGn", vmin=0, vmax=max(n_targets, 1),
+            annot=False,
+            cbar_kws={"label": "Number of targets including predictor", "pad": 0.01},
+            xticklabels=all_features,
+            yticklabels=yticklabels_with_total,
+            linewidths=0.5, linecolor="#eeeeee", square=False,
+        )
+        _annotate_inclusion_cells(ax, matrix_with_total, heat_font)
+        ax.set_xticklabels(all_features, rotation=45, ha="right", fontsize=heat_font)
+        ax.set_yticklabels(
+            [textwrap.fill(lbl, 20) for lbl in yticklabels_with_total],
+            rotation=0, fontsize=heat_font,
+        )
+
+    ax.set_xlabel("Predictor", fontsize=heat_font)
+    ax.set_ylabel("Target", fontsize=heat_font)
+    ax.set_title("Best Model Feature Inclusion", fontsize=heat_font + 2)
+
+    summaries_dir = (data_root / "summaries").resolve()
+    namespace = str(sweep_namespace).strip() or "feature_sweeps"
+    if namespace != "feature_sweeps":
+        summaries_dir = (summaries_dir / namespace).resolve()
+    summaries_dir.mkdir(parents=True, exist_ok=True)
+    plot_path = summaries_dir / "multi_target_feature_inclusion_heatmap.png"
+    fig.savefig(plot_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return plot_path
+
+
 def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
     workspace_root = Path(__file__).resolve().parent.parent
     data_root_arg = args.path if getattr(args, "path", None) else args.data_root
@@ -1843,7 +2088,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
     importance_sources_used: set[str] = set()
     datasets_with_outputs = 0
     best_model_performance = []
-    target_order_by_r2: list[str] = []
+    target_order_by_skill: list[str] = []
 
     for plan in plans:
         target_name = _derive_target_name(plan.dataset_dir.name, args.dataset_prefix)
@@ -2194,14 +2439,22 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     ),
                 ),
             )
-            # Reuse the same R2 ranking source for downstream multi-target heatmap y-order.
-            target_order_by_r2 = []
+            # Compute skill vs best baseline for target ordering in heatmaps.
+            _baseline_rmse_cols = [
+                perf_df.get(f'{name}_rmse', pd.Series(dtype=float)).replace(0, np.nan)
+                for name in BASELINE_ORDER
+            ]
+            _best_baseline_rmse = pd.concat(_baseline_rmse_cols, axis=1).min(axis=1)
+            perf_df['skill_vs_best_baseline'] = 1.0 - perf_df['rmse'] / _best_baseline_rmse
+            # Order targets by increasing skill (worst first → best last).
+            _skill_sorted = perf_df.sort_values('skill_vs_best_baseline', ascending=True, na_position='first')
+            target_order_by_skill = []
             seen_targets = set()
-            for dataset_name in perf_df['dataset'].astype(str).tolist():
+            for dataset_name in _skill_sorted['dataset'].astype(str).tolist():
                 tgt = _derive_target_name(dataset_name, args.dataset_prefix)
                 if tgt not in seen_targets:
                     seen_targets.add(tgt)
-                    target_order_by_r2.append(tgt)
+                    target_order_by_skill.append(tgt)
             summary_csv = summaries_dir / "summary_best_model_performance.csv"
             perf_df.to_csv(summary_csv, index=False)
             print(f"[INFO] Wrote summary CSV: {summary_csv}")
@@ -3226,7 +3479,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     data_root,
                     importance_label="Shapley Expected Contribution (mean marginal objective delta)",
                     summary_axis_label="Total Shapley Contribution",
-                    target_order=target_order_by_r2,
+                    target_order=target_order_by_skill,
                     dataset_prefix=args.dataset_prefix,
                 )
             elif importance_sources_used and any(src.startswith("shapley_") for src in importance_sources_used):
@@ -3235,20 +3488,37 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     data_root,
                     importance_label="Feature Importance (mixed: removal delta + Shapley contribution)",
                     summary_axis_label="Total Feature Importance",
-                    target_order=target_order_by_r2,
+                    target_order=target_order_by_skill,
                     dataset_prefix=args.dataset_prefix,
                 )
             else:
                 comparison_plot = _compile_multi_target_comparison(
                     sweep_results,
                     data_root,
-                    target_order=target_order_by_r2,
+                    target_order=target_order_by_skill,
                     dataset_prefix=args.dataset_prefix,
                 )
             if comparison_plot.exists():
                 print(f"[INFO] Wrote multi-target comparison plots to {comparison_plot.parent}")
         except Exception as e:
             print(f"[WARN] Failed to regenerate multi-target comparison: {e}")
+
+    # Feature inclusion heatmap (binary: is predictor in best model's feature set?)
+    if best_model_performance:
+        try:
+            inclusion_plot = _compile_feature_inclusion_heatmap(
+                perf_df=perf_df,
+                plans=plans,
+                data_root=data_root,
+                target_order=target_order_by_skill,
+                dataset_prefix=args.dataset_prefix,
+                sweep_namespace=str(getattr(args, "sweep_namespace", "feature_sweeps")),
+            )
+            if inclusion_plot.exists():
+                print(f"[INFO] Wrote feature inclusion heatmap: {inclusion_plot}")
+        except Exception as e:
+            print(f"[WARN] Failed to generate feature inclusion heatmap: {e}")
+            traceback.print_exc()
 
     if datasets_with_outputs == 0:
         print("[WARN] No dataset outputs were regenerated.")

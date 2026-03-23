@@ -52,7 +52,17 @@
       "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors -type d -name config* -o -type d -name data)",
       "Bash(xargs cat:*)",
       "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/data/output -type d -name MC_*)",
-      "Bash(ls /c/Users/Master/Documents/GitHub/WQRegressors/data/output/storage/res_small/MC_pH_res/*.yml)"
+      "Bash(ls /c/Users/Master/Documents/GitHub/WQRegressors/data/output/storage/res_small/MC_pH_res/*.yml)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/utils/transformer.py''\\).read\\(\\)\\); print\\(''transformer OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/e_Train.py''\\).read\\(\\)\\); print\\(''e_Train.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/utils/transformer.py''\\).read\\(\\)\\); print\\(''transformer.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/utils/config_utils.py''\\).read\\(\\)\\); print\\(''config_utils.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/utils/crossval_rolling_origin.py''\\).read\\(\\)\\); print\\(''crossval_rolling_origin.py OK''\\)\")",
+      "Bash(python -c \"import xgboost; print\\(xgboost.__version__\\)\")",
+      "Bash(grep -E \"\\\\.py$\")",
+      "Bash(ls c:/Users/Master/Documents/GitHub/WQRegressors/data/output/CV11/MC_Lead__µg_L__res/forecasts/feature_sweeps/*.csv)",
+      "Bash(find c:/Users/Master/Documents/GitHub/WQRegressors/data/output/CV11_horizons -path */horizons/*/evaluation_summary.csv)",
+      "Bash(find c:/Users/Master/Documents/GitHub/WQRegressors/data/output/CV11_horizons -path */horizons/* -name *.csv)"
     ]
   }
 }

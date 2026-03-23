@@ -43,16 +43,19 @@ CLI arguments:
 Examples:
 python src/z2_HorizonPostProcess.py
 python src/z2_HorizonPostProcess.py --data-root data/output/regression
-python src/z2_HorizonPostProcess.py --data-root data/output/CV4 --dataset-prefix MC
+python src/z2_HorizonPostProcess.py --data-root data/output/CV11_horizons --dataset-prefix MC
 """
 from __future__ import annotations
 import argparse
+import re
+import subprocess
 import sys
 import textwrap
 import traceback
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import yaml
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
@@ -80,6 +83,137 @@ _SERIES_COLORS = [
 ]
 
 
+def _find_horizon_forecast_dirs(dataset_dir: Path) -> list[tuple[int, int, Path]]:
+    """Discover ``(horizon, replicate, forecast_dir)`` tuples under *dataset_dir*/horizons/.
+
+    Supports two on-disk layouts:
+
+    **Shared-samples layout** (k_RunHorizonSweep with data_dir=horizon_dir)::
+
+        horizons/horizon_NNNhr/forecasts/horizon_NNNhr_rep_RRR/
+
+    **Per-replicate layout** (original k_RunHorizonSweep)::
+
+        horizons/horizon_NNNhr/rep_RRR/forecasts/horizon_NNNhr_rep_RRR/
+    """
+    _horizon_re = re.compile(r"^horizon_(\d+)hr$")
+    _rep_re = re.compile(r"_rep_(\d+)$")
+    hits: list[tuple[int, int, Path]] = []
+    horizons_root = dataset_dir / "horizons"
+    if not horizons_root.is_dir():
+        return hits
+    for h_dir in sorted(horizons_root.iterdir()):
+        m_h = _horizon_re.match(h_dir.name)
+        if not m_h:
+            continue
+        horizon = int(m_h.group(1))
+        # Shared-samples layout: horizon_dir/forecasts/horizon_NNNhr_rep_RRR/
+        forecasts_root = h_dir / "forecasts"
+        if forecasts_root.is_dir():
+            for fc_dir in sorted(forecasts_root.iterdir()):
+                m_r = _rep_re.search(fc_dir.name)
+                if m_r and fc_dir.is_dir():
+                    hits.append((horizon, int(m_r.group(1)), fc_dir))
+        # Per-replicate layout: horizon_dir/rep_RRR/forecasts/horizon_NNNhr_rep_RRR/
+        for rep_dir in sorted(h_dir.iterdir()):
+            if not rep_dir.is_dir() or not rep_dir.name.startswith("rep_"):
+                continue
+            rep_fc_root = rep_dir / "forecasts"
+            if not rep_fc_root.is_dir():
+                continue
+            for fc_dir in sorted(rep_fc_root.iterdir()):
+                m_r = _rep_re.search(fc_dir.name)
+                if m_r and fc_dir.is_dir():
+                    # Avoid duplicates when both layouts coexist
+                    entry = (horizon, int(m_r.group(1)), fc_dir)
+                    if entry not in hits:
+                        hits.append(entry)
+    return hits
+
+
+def _run_pending_evaluations(dataset_dir: Path) -> int:
+    """Run ``f_Evaluate.py`` for forecast dirs that have an eval config but no evaluation_summary.csv.
+
+    Returns the number of evaluations successfully completed.
+    """
+    completed = 0
+    for horizon, rep_idx, fc_dir in _find_horizon_forecast_dirs(dataset_dir):
+        summary_csv = fc_dir / "evaluation_summary.csv"
+        if summary_csv.exists():
+            continue
+        # Find eval config
+        eval_cfgs = list(fc_dir.glob("config_evaluate_*.yml"))
+        if not eval_cfgs:
+            continue
+        eval_cfg = eval_cfgs[0]
+        print(f"  [EVAL] Running pending evaluation: horizon {horizon}hr rep {rep_idx}")
+        try:
+            subprocess.run(
+                [sys.executable, "src/f_Evaluate.py", "--config", str(eval_cfg)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            if summary_csv.exists():
+                completed += 1
+            else:
+                print(f"  [WARN] Evaluation completed but no summary produced: {fc_dir.name}")
+        except subprocess.CalledProcessError as exc:
+            print(f"  [WARN] Evaluation failed for {fc_dir.name}:")
+            stderr_text = exc.stderr.decode(errors="replace") if exc.stderr else ""
+            if stderr_text:
+                for line in stderr_text.strip().splitlines()[-3:]:
+                    print(f"         {line}")
+    return completed
+
+
+def _reconstruct_lookahead_metrics(dataset_dir: Path) -> pd.DataFrame | None:
+    """Build a ``lookahead_metrics.csv``-equivalent DataFrame by scanning evaluation_summary.csv files.
+
+    Mimics the filtering logic in ``k_RunHorizonSweep.py``: keeps only test-set
+    rows, drops the ``label``/``kind`` columns, and adds ``horizon`` / ``replicate``
+    columns derived from the directory structure.
+    """
+    frames: list[pd.DataFrame] = []
+    for horizon, rep_idx, fc_dir in _find_horizon_forecast_dirs(dataset_dir):
+        summary_csv = fc_dir / "evaluation_summary.csv"
+        if not summary_csv.exists():
+            continue
+        try:
+            df = pd.read_csv(summary_csv)
+        except Exception:
+            continue
+        # Filter to test rows (same logic as k_RunHorizonSweep.py)
+        if "kind" in df.columns:
+            df = df[df["kind"] == "test"]
+        elif "label" in df.columns:
+            df = df[df["label"].str.contains("test", case=False, na=False)]
+        df = df.drop(columns=[c for c in ("label", "kind") if c in df.columns], errors="ignore")
+        df["horizon"] = horizon
+        df["replicate"] = rep_idx
+        # Derive input_rows from the eval config if available
+        eval_cfgs = list(fc_dir.glob("config_evaluate_*.yml"))
+        if eval_cfgs:
+            try:
+                with open(eval_cfgs[0], "r", encoding="utf-8") as fh:
+                    cfg = yaml.safe_load(fh)
+                data_cfg = cfg.get("data", {})
+                row1 = int(data_cfg.get("input_row_1", 0))
+                row2 = int(data_cfg.get("input_row_2", 0))
+                df["input_rows_included"] = row2 - row1 + 1
+                df["input_rows_excluded"] = horizon
+            except Exception:
+                pass
+        frames.append(df)
+    if not frames:
+        return None
+    result = pd.concat(frames, ignore_index=True)
+    # Put horizon and replicate first
+    front = [c for c in ("horizon", "replicate") if c in result.columns]
+    rest = [c for c in result.columns if c not in front]
+    return result[front + rest]
+
+
 def _clean_label(dataset_name: str, prefix: str) -> str:
     """Delegate to the shared ``clean_target_label`` in ``utils.names``."""
     return clean_target_label(dataset_name, prefix)
@@ -89,17 +223,21 @@ def _load_baseline_rmses(dataset_dir: Path, horizon_hr: int, replicate: int) -> 
     """Return ``{baseline_label: rmse}`` from the evaluation_summary.csv for one horizon/replicate.
 
     Returns an empty dict when the file is absent or unreadable.
+    Searches both the shared-samples layout (``horizon_dir/forecasts/rep_name/``)
+    and the per-replicate layout (``horizon_dir/rep_NNN/forecasts/rep_name/``).
     """
-    folder = (
-        dataset_dir
-        / "horizons"
-        / f"horizon_{horizon_hr:03d}hr"
-        / f"rep_{replicate:03d}"
-        / "forecasts"
-        / f"horizon_{horizon_hr:03d}hr_rep_{replicate:03d}"
-    )
-    csv_path = folder / "evaluation_summary.csv"
-    if not csv_path.exists():
+    rep_name = f"horizon_{horizon_hr:03d}hr_rep_{replicate:03d}"
+    h_dir = dataset_dir / "horizons" / f"horizon_{horizon_hr:03d}hr"
+    candidates = [
+        h_dir / "forecasts" / rep_name / "evaluation_summary.csv",
+        h_dir / f"rep_{replicate:03d}" / "forecasts" / rep_name / "evaluation_summary.csv",
+    ]
+    csv_path = None
+    for c in candidates:
+        if c.exists():
+            csv_path = c
+            break
+    if csv_path is None:
         return {}
     try:
         df = pd.read_csv(csv_path)
@@ -186,7 +324,16 @@ def _rate_table(records: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
 
 
 def _discover_datasets(data_root: Path, prefix: str) -> list[tuple[str, Path, Path]]:
-    """Return ``(dataset_name, dataset_dir, lookahead_metrics_path)`` for every qualifying dataset."""
+    """Return ``(dataset_name, dataset_dir, lookahead_metrics_path)`` for every qualifying dataset.
+
+    When ``lookahead_metrics.csv`` is missing (e.g. because the evaluation step
+    in ``k_RunHorizonSweep.py`` failed), this function:
+
+    1. Runs any pending evaluations whose eval config exists but whose
+       ``evaluation_summary.csv`` is absent.
+    2. Reconstructs ``lookahead_metrics.csv`` from the per-horizon
+       ``evaluation_summary.csv`` files found on disk.
+    """
     hits: list[tuple[str, Path, Path]] = []
     if not data_root.exists():
         print(f"[WARN] data_root does not exist: {data_root}")
@@ -196,6 +343,20 @@ def _discover_datasets(data_root: Path, prefix: str) -> list[tuple[str, Path, Pa
             continue
         metrics_csv = child / "horizons" / "lookahead_sweeps" / "lookahead_metrics.csv"
         if metrics_csv.exists():
+            hits.append((child.name, child, metrics_csv))
+            continue
+
+        # --- Fallback: run pending evaluations and reconstruct metrics ---
+        n_completed = _run_pending_evaluations(child)
+        if n_completed:
+            print(f"[INFO] Completed {n_completed} pending evaluation(s) for {child.name}")
+        reconstructed = _reconstruct_lookahead_metrics(child)
+        if reconstructed is not None and not reconstructed.empty:
+            sweep_dir = child / "horizons" / "lookahead_sweeps"
+            sweep_dir.mkdir(parents=True, exist_ok=True)
+            reconstructed.to_csv(metrics_csv, index=False)
+            print(f"[INFO] Reconstructed lookahead_metrics.csv for {child.name} "
+                  f"({len(reconstructed)} rows)")
             hits.append((child.name, child, metrics_csv))
         else:
             print(f"[SKIP] No lookahead_metrics.csv for {child.name}")

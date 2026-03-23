@@ -85,6 +85,7 @@ from utils.config_utils import (
     _load_uncertainty_std_map,
     _build_feature_uncertainty_variance,
     _build_feature_uncertainty_bundle,
+    _effective_sample_size,
 )
 from utils.gp_utils import (
     apply_gp_constraints_and_priors,
@@ -167,6 +168,12 @@ DEFAULT_TRANSFORMER_CONFIG = {
     "corr_lambda": 0.1,
     "corr_eps": 1e-8,
     "corr_clip": True,
+    # Controls early stopping data source:
+    # "cv"        — internal k-fold CV estimates optimal epoch count; no test exposure.
+    # "threshold" — use train combined loss threshold only (no test exposure).
+    # "test"      — original behavior: patience on test validation loss (leaks test info).
+    "early_stop_source": "cv",
+    "early_stop_cv_folds": 3,
     "num_workers": 0,
     "pin_memory": True,
     "persistent_workers": True,
@@ -181,6 +188,10 @@ DEFAULT_XGB_CV_TUNING_REGRESSOR = {
     "parallel_jobs": 1,
     "metric": "rmse",
     "search_method": "random",
+    # When True, tighten HP search bounds based on effective sample size.
+    "auto_constrain": True,
+    # "1se" selects the simplest model within 1 SE of the best; "best" selects the best.
+    "selection_rule": "1se",
     "optuna_sampler": "tpe",
     "optuna_startup_trials": 10,
     "random_start_trials": 10,
@@ -231,6 +242,11 @@ DEFAULT_XGB_REGRESSOR_CONFIG = {
     "learning_rate": 0.01,
     "n_jobs": -1,
     "early_stopping_rounds": 200,
+    # Controls the data source for early stopping decisions.
+    # "cv"             — internal 3-fold CV estimates optimal n_estimators; no test exposure.
+    # "train_plateau"  — uses _TrainLossPlateauCallback on training metrics only.
+    # "test"           — original behavior: early-stop on held-out test set (leaks test info).
+    "early_stop_source": "cv",
     # Optional second stop rule (disabled unless both keys are set in config).
     "train_loss_plateau_rounds": None,
     "train_loss_min_relative_improvement": None,
@@ -252,6 +268,7 @@ DEFAULT_XGB_CLASSIFIER_CONFIG = {
     "learning_rate": 0.01,
     "n_jobs": -1,
     "early_stopping_rounds": 50,
+    "early_stop_source": "cv",
     # Optional second stop rule (disabled unless both keys are set in config).
     "train_loss_plateau_rounds": None,
     "train_loss_min_relative_improvement": None,
@@ -423,6 +440,12 @@ DEFAULT_GP_REGRESSOR_CONFIG = {
     "uncertainty_source_mode": "aggregate_t",
     "uncertainty_summary_dir": None,
     "uncertainty_aggregate_csv": None,
+    # Controls early stopping data source:
+    # "cv"        — internal k-fold CV estimates optimal epoch count; no test exposure.
+    # "train_nll" — uses marginal likelihood only (principled for GP; no test exposure).
+    # "test"      — original behavior: val_rmse on test set (leaks test info).
+    "early_stop_source": "cv",
+    "early_stop_cv_folds": 3,
     "early_stop_metric": "val_rmse",
     "early_stop_alpha": 0.5,
     "lengthscale_min": 0.05,
@@ -744,16 +767,101 @@ def _write_training_stop_summary(config: dict, summary: dict) -> Path:
 # TRANSFORMER TRAINING
 # ===========================================================================================
 
+def _transformer_cv_estimate_epochs(
+    train_samples,
+    model_config: dict,
+    hyper_cfg: dict,
+    device,
+    n_folds: int = 3,
+    seed: int = 42,
+) -> int | None:
+    """Estimate optimal Transformer epoch count via internal k-fold CV.
+
+    Trains the Transformer on each fold with patience-based early stopping on
+    fold-validation combined loss and returns the median best_epoch.
+    Returns None if too few samples for CV.
+    """
+    n = len(train_samples)
+    if n < 2 * n_folds:
+        return None
+
+    rng = np.random.default_rng(seed)
+    indices = np.arange(n)
+    rng.shuffle(indices)
+    fold_size = n // n_folds
+    folds_idx = [indices[i * fold_size:(i + 1) * fold_size] for i in range(n_folds)]
+    leftover = indices[n_folds * fold_size:]
+    for li, idx_val in enumerate(leftover):
+        folds_idx[li % n_folds] = np.append(folds_idx[li % n_folds], idx_val)
+
+    num_workers = max(0, int(hyper_cfg.get("num_workers", 0)))
+    pin_memory = bool(hyper_cfg.get("pin_memory", device.type == "cuda")) and (device.type == "cuda")
+    persistent_workers = bool(hyper_cfg.get("persistent_workers", True)) and (num_workers > 0)
+    loader_kwargs = {
+        "batch_size": hyper_cfg["batch_size"],
+        "shuffle": True,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = max(1, int(hyper_cfg.get("prefetch_factor", 2)))
+
+    fold_best_epochs: list[int] = []
+    for fi in range(n_folds):
+        val_idx = folds_idx[fi]
+        train_idx = np.concatenate([folds_idx[fj] for fj in range(n_folds) if fj != fi])
+        fold_train = [train_samples[i] for i in train_idx]
+        fold_val = [train_samples[i] for i in val_idx]
+
+        tr_ds = TimeSeriesTargetDataset(fold_train)
+        va_ds = TimeSeriesTargetDataset(fold_val)
+        tr_loader = DataLoader(tr_ds, **loader_kwargs)
+        va_loader = DataLoader(va_ds, **loader_kwargs)
+
+        mdl = TimeSeriesTransformer(model_config).to(device)
+        result = train_transformer(
+            "",  # Not used (skip_plot=True).
+            mdl,
+            "_cv_fold",
+            tr_loader,
+            va_loader,
+            device,
+            hyper_cfg["num_epochs"],
+            hyper_cfg["learning_rate"],
+            hyper_cfg["loss_threshold"],
+            hyper_cfg["patience"],
+            "",
+            hyper_cfg["corr_lambda"],
+            hyper_cfg["corr_eps"],
+            hyper_cfg["corr_clip"],
+            skip_plot=True,
+        )
+        best_ep = result.get("observed", {}).get("best_val_epoch")
+        if best_ep is not None:
+            fold_best_epochs.append(int(best_ep))
+        del mdl
+
+    if not fold_best_epochs:
+        return None
+    median_ep = int(np.median(fold_best_epochs))
+    print(
+        f"[INFO] Transformer CV-estimated epoch budget: {median_ep} "
+        f"(fold best_epochs: {fold_best_epochs})"
+    )
+    return median_ep
+
+
 def train_transformer_model(config, train_samples, test_samples):
     """Train Transformer model."""
     print("\n" + "="*80)
     print("TRAINING TRANSFORMER MODEL")
     print("="*80)
-    
+
     device = torch.device(config["device"])
     data_cfg = config["data"]
     hyper_cfg = config["hyperparameters"]
-    
+
     # Prepare data
     train_dataset = TimeSeriesTargetDataset(train_samples)
     test_dataset = TimeSeriesTargetDataset(test_samples)
@@ -771,7 +879,7 @@ def train_transformer_model(config, train_samples, test_samples):
         loader_kwargs["prefetch_factor"] = max(1, int(hyper_cfg.get("prefetch_factor", 2)))
     trainloader = DataLoader(train_dataset, **loader_kwargs)
     testloader = DataLoader(test_dataset, **loader_kwargs)
-    
+
     model_config = {
         'input_dim': len(data_cfg["input_columns"]),
         'model_dim': hyper_cfg["model_dim"],
@@ -786,13 +894,40 @@ def train_transformer_model(config, train_samples, test_samples):
         'output_columns': data_cfg["output_columns"],
         'output_rows': data_cfg["output_rows"],
     }
-    
+
     # Write config
     write_config(model_config, data_cfg["data_dir"], data_cfg["forecast_name"], "")
-    
+
+    # Determine early stopping strategy.
+    transformer_early_stop_source = str(hyper_cfg.get("early_stop_source", "cv")).lower()
+    max_epochs_override = None
+
+    if transformer_early_stop_source == "cv":
+        max_epochs_override = _transformer_cv_estimate_epochs(
+            train_samples,
+            model_config,
+            hyper_cfg,
+            device,
+            n_folds=int(hyper_cfg.get("early_stop_cv_folds", 3)),
+            seed=int(config.get("data_split", {}).get("random_state", 42)),
+        )
+        if max_epochs_override is not None:
+            print(
+                f"[INFO] Transformer early_stop_source='cv': training for {max_epochs_override} epochs "
+                f"(CV-derived budget); no test-set early stopping."
+            )
+        else:
+            print(
+                "[WARN] Transformer CV epoch estimation failed; "
+                "falling back to threshold stopping."
+            )
+            transformer_early_stop_source = "threshold"
+    if transformer_early_stop_source == "threshold":
+        print("[INFO] Transformer early_stop_source='threshold': using train combined loss threshold only.")
+
     # Create and train model
     model = TimeSeriesTransformer(model_config).to(device)
-    
+
     stop_summary = train_transformer(
         data_cfg["data_dir"],
         model,
@@ -808,6 +943,7 @@ def train_transformer_model(config, train_samples, test_samples):
         hyper_cfg["corr_lambda"],
         hyper_cfg["corr_eps"],
         hyper_cfg["corr_clip"],
+        max_epochs_override=max_epochs_override,
     )
     
     # Save model
@@ -823,6 +959,140 @@ def train_transformer_model(config, train_samples, test_samples):
 # ===========================================================================================
 # GAUSSIAN PROCESS REGRESSOR TRAINING
 # ===========================================================================================
+
+def _gp_cv_estimate_epochs(
+    X_np: np.ndarray,
+    y_col: np.ndarray,
+    hyper_cfg: dict,
+    kernel_name: str,
+    use_uncertain_kernel: bool,
+    input_uncertainty_var,
+    ard_dims: int | None,
+    uncertainty_noise_deltas,
+    mc_samples: int,
+    mc_seed: int,
+    device,
+    n_folds: int = 3,
+    seed: int = 42,
+) -> int | None:
+    """Estimate optimal GP epoch count via internal k-fold CV (no test exposure).
+
+    Trains GP on each fold with patience-based early stopping on fold-validation
+    RMSE and returns the median best_epoch across folds.  Uses the first output
+    dimension only for efficiency.  Returns None if CV cannot run.
+    """
+    n_samples = len(X_np)
+    if n_samples < 2 * n_folds:
+        return None
+
+    input_standardize = bool(hyper_cfg.get("input_standardize", True))
+    target_standardize = bool(hyper_cfg.get("target_standardize", True))
+    num_epochs = int(hyper_cfg["num_epochs"])
+    patience = int(hyper_cfg["patience"])
+    lr = float(hyper_cfg["learning_rate"])
+
+    # Build simple fold indices (not MC-aware since data is already flattened).
+    fold_size = n_samples // n_folds
+    indices = np.arange(n_samples)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(indices)
+    folds_idx = [indices[i * fold_size:(i + 1) * fold_size] for i in range(n_folds)]
+    leftover = indices[n_folds * fold_size:]
+    for li, idx_val in enumerate(leftover):
+        folds_idx[li % n_folds] = np.append(folds_idx[li % n_folds], idx_val)
+
+    fold_best_epochs: list[int] = []
+
+    for fi in range(n_folds):
+        val_idx = folds_idx[fi]
+        train_idx = np.concatenate([folds_idx[fj] for fj in range(n_folds) if fj != fi])
+
+        X_tr_np = X_np[train_idx]
+        y_tr_np = y_col[train_idx]
+        X_va_np = X_np[val_idx]
+        y_va_np = y_col[val_idx]
+
+        # Standardize per fold.
+        x_mean = X_tr_np.mean(axis=0)
+        x_std = X_tr_np.std(axis=0)
+        x_std[x_std < 1e-8] = 1.0
+        y_mean = float(y_tr_np.mean())
+        y_std_val = float(y_tr_np.std())
+        if y_std_val < 1e-8:
+            y_std_val = 1.0
+
+        if input_standardize:
+            X_tr_s = (X_tr_np - x_mean) / x_std
+            X_va_s = (X_va_np - x_mean) / x_std
+        else:
+            X_tr_s, X_va_s = X_tr_np, X_va_np
+
+        if target_standardize:
+            y_tr_s = (y_tr_np - y_mean) / y_std_val
+        else:
+            y_tr_s = y_tr_np
+            y_mean, y_std_val = 0.0, 1.0
+
+        X_tr_t = torch.tensor(X_tr_s, dtype=torch.float32, device=device)
+        y_tr_t = torch.tensor(y_tr_s, dtype=torch.float32, device=device)
+        X_va_t = torch.tensor(X_va_s, dtype=torch.float32, device=device)
+
+        lh = gpytorch.likelihoods.GaussianLikelihood().to(device)
+        mdl = ExactGPRegressor(
+            X_tr_t, y_tr_t, lh,
+            build_base_kernel(
+                kernel_name, use_uncertain_kernel, input_uncertainty_var, ard_dims,
+                uncertainty_noise_deltas=uncertainty_noise_deltas,
+                uncertain_kernel_mc_samples=mc_samples,
+                uncertain_kernel_mc_seed=mc_seed,
+            )
+        ).to(device)
+        apply_gp_constraints_and_priors(mdl, lh, hyper_cfg)
+
+        mdl.train()
+        lh.train()
+        opt = torch.optim.Adam(mdl.parameters(), lr=lr)
+        mll_fn = gpytorch.mlls.ExactMarginalLogLikelihood(lh, mdl)
+
+        best_val = float("inf")
+        best_ep = 0
+        pat_ctr = 0
+        for ep in range(num_epochs):
+            opt.zero_grad()
+            out = mdl(X_tr_t)
+            loss = -mll_fn(out, y_tr_t)
+            loss.backward()
+            opt.step()
+
+            mdl.eval()
+            lh.eval()
+            with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                pred = lh(mdl(X_va_t)).mean.detach().cpu().numpy()
+            v_rmse = float(np.sqrt(np.mean((pred * y_std_val + y_mean - y_va_np) ** 2)))
+            mdl.train()
+            lh.train()
+
+            if math.isfinite(v_rmse) and v_rmse < best_val:
+                best_val = v_rmse
+                best_ep = ep + 1
+                pat_ctr = 0
+            else:
+                pat_ctr += 1
+                if pat_ctr >= patience:
+                    break
+
+        fold_best_epochs.append(best_ep)
+        del mdl, lh, opt
+
+    if not fold_best_epochs:
+        return None
+    median_ep = int(np.median(fold_best_epochs))
+    print(
+        f"[INFO] GP CV-estimated epoch budget: {median_ep} "
+        f"(fold best_epochs: {fold_best_epochs})"
+    )
+    return median_ep
+
 
 def train_gp_regressor_model(config, train_samples, test_samples):
     """Train GPyTorch Gaussian Process Regressor model(s)."""
@@ -927,6 +1197,39 @@ def train_gp_regressor_model(config, train_samples, test_samples):
     save_path = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
     os.makedirs(save_path, exist_ok=True)
 
+    # Determine early stopping strategy.
+    gp_early_stop_source = str(hyper_cfg.get("early_stop_source", "cv")).lower()
+    gp_cv_epoch_budget: int | None = None
+    if gp_early_stop_source == "cv":
+        gp_cv_epoch_budget = _gp_cv_estimate_epochs(
+            X_train_np if not input_standardize else (X_train_np - x_mean) / x_std,
+            y_train_np[:, 0],  # Estimate on first output dimension for efficiency.
+            hyper_cfg,
+            kernel_name,
+            use_uncertain_kernel,
+            input_uncertainty_var,
+            ard_dims,
+            uncertainty_noise_deltas,
+            mc_samples,
+            mc_seed,
+            device,
+            n_folds=int(hyper_cfg.get("early_stop_cv_folds", 3)),
+            seed=int(config.get("data_split", {}).get("random_state", 42)),
+        )
+        if gp_cv_epoch_budget is not None:
+            print(
+                f"[INFO] GP early_stop_source='cv': training for {gp_cv_epoch_budget} epochs "
+                f"(CV-derived budget); no test-set early stopping."
+            )
+        else:
+            print(
+                "[WARN] GP CV epoch estimation failed (too few samples); "
+                "falling back to train_nll stopping."
+            )
+            gp_early_stop_source = "train_nll"
+    if gp_early_stop_source == "train_nll":
+        print("[INFO] GP early_stop_source='train_nll': stopping on marginal likelihood only.")
+
     for output_idx in range(output_dim):
         y_train_col = y_train_np[:, output_idx]
         y_test_col = y_test_np[:, output_idx]
@@ -981,6 +1284,11 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         best_epoch = None
         early_stop_metric = str(hyper_cfg.get("early_stop_metric", "train_nll")).lower()
         early_stop_alpha = float(hyper_cfg.get("early_stop_alpha", 0.5))
+        # Override early_stop_metric when source is not "test".
+        if gp_early_stop_source == "train_nll":
+            early_stop_metric = "train_nll"
+        use_cv_epoch_budget = gp_cv_epoch_budget is not None and gp_early_stop_source == "cv"
+        effective_num_epochs = gp_cv_epoch_budget if use_cv_epoch_budget else int(hyper_cfg["num_epochs"])
         if early_stop_metric not in {"train_nll", "val_rmse", "mixed"}:
             raise ValueError(
                 "hyperparameters.early_stop_metric must be one of "
@@ -990,13 +1298,13 @@ def train_gp_regressor_model(config, train_samples, test_samples):
             raise ValueError("hyperparameters.early_stop_alpha must be in [0, 1]")
 
         stop_reason_code = "max_epochs_exhausted"
-        stop_epoch = int(hyper_cfg["num_epochs"])
+        stop_epoch = int(effective_num_epochs)
         stop_reason_text = (
             "Scheduled stop: all configured epochs exhausted "
-            f"({int(hyper_cfg['num_epochs'])}/{int(hyper_cfg['num_epochs'])} epochs)."
+            f"({int(effective_num_epochs)}/{int(effective_num_epochs)} epochs)."
         )
 
-        for epoch in range(hyper_cfg["num_epochs"]):
+        for epoch in range(effective_num_epochs):
             optimizer.zero_grad()
             output = model(X_train)
             loss = -mll(output, y_train)
@@ -1008,6 +1316,9 @@ def train_gp_regressor_model(config, train_samples, test_samples):
                 loss_value = float("inf")
             losses.append(loss_value)
 
+            # Compute val_rmse on test set for logging. When early_stop_source
+            # is not "test", this is purely informational and does not drive
+            # model selection or early stopping.
             model.eval()
             likelihood.eval()
             with torch.no_grad(), gpytorch.settings.fast_pred_var():
@@ -1018,6 +1329,15 @@ def train_gp_regressor_model(config, train_samples, test_samples):
             val_rmse_list.append(val_rmse)
             model.train()
             likelihood.train()
+
+            # When using CV epoch budget, just save the latest state (no early stopping).
+            if use_cv_epoch_budget:
+                best_loss = loss_value
+                best_val_rmse = val_rmse
+                best_epoch = int(epoch + 1)
+                best_model_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                best_likelihood_state = {k: v.detach().cpu() for k, v in likelihood.state_dict().items()}
+                continue
 
             if baseline_train_nll is None:
                 baseline_train_nll = loss_value if math.isfinite(loss_value) else 1.0
@@ -1607,12 +1927,141 @@ def _xgb_cv_fold_score(
     # CUDA-side QuantileDMatrix memory. Flush the CuPy pool after every fold so
     # the CUDA allocator reclaims the memory rather than letting it accumulate in
     # the pool across the many folds/trials of a CV run.
+    best_iter = getattr(model, "best_iteration", None)
+
     del model
     if use_gpu_arrays:
         del X_train_fit, y_train_fit, X_val_fit, y_val_fit
         _flush_gpu_memory()
 
-    return score, r2
+    return score, r2, best_iter
+
+
+def _constrain_fixed_hyperparams(
+    model_kwargs: dict,
+    n_train: int,
+    n_folds: int = 3,
+    verbose: bool = True,
+) -> dict:
+    """Adjust fixed XGBoost hyperparameters so they are compatible with the data size.
+
+    Checks that the effective per-tree sample count is large enough for
+    ``min_child_weight`` to allow at least one split, and caps ``max_depth``
+    based on N_eff.  Returns a shallow copy; the original is not mutated.
+
+    The constraints are derived from the *worst-case* CV fold (smallest training
+    partition), since the same kwargs are used for both CV estimation and final
+    training.
+    """
+    constrained = dict(model_kwargs)
+    adjustments: list[str] = []
+
+    # Worst-case fold training size (floor of (n_folds-1)/n_folds * n_train).
+    n_fold_train = int(n_train * (n_folds - 1) / n_folds)
+    if n_fold_train < 1:
+        return constrained
+
+    subsample = float(constrained.get("subsample", 1.0))
+    min_child_weight = float(constrained.get("min_child_weight", 1))
+
+    # --- subsample floor ---
+    # Each tree must see enough samples to learn signal rather than noise.
+    # Floor: at least ~20 samples per tree, or enough for 4 × min_child_weight
+    # (two levels of splits), whichever is larger.
+    min_per_tree = max(20, 4 * min_child_weight)
+    min_subsample = min(1.0, min_per_tree / max(1, n_fold_train))
+    if subsample < min_subsample:
+        old_sub = subsample
+        subsample = round(min_subsample, 3)
+        constrained["subsample"] = subsample
+        adjustments.append(
+            f"subsample: {old_sub} -> {subsample} "
+            f"(floor: {min_per_tree:.0f} samples/tree, "
+            f"n_fold_train={n_fold_train})"
+        )
+
+    per_tree_samples = subsample * n_fold_train
+
+    # --- min_child_weight cap ---
+    # After subsample adjustment, ensure min_child_weight is feasible.
+    # Need more than 2 × min_child_weight per tree for useful splits.
+    if per_tree_samples <= 2 * min_child_weight:
+        old_mcw = constrained["min_child_weight"]
+        max_mcw = max(1, int(per_tree_samples / 4))
+        constrained["min_child_weight"] = max_mcw
+        adjustments.append(
+            f"min_child_weight: {old_mcw} -> {max_mcw} "
+            f"(per-tree samples {per_tree_samples:.0f} "
+            f"<= 2 × min_child_weight={2 * int(old_mcw)})"
+        )
+
+    # --- max_depth cap ---
+    n_eff = max(1, n_fold_train)
+    max_depth_cap = int(np.floor(np.log2(max(1, n_eff)))) + 1
+    if int(constrained.get("max_depth", 6)) > max_depth_cap:
+        old_md = constrained["max_depth"]
+        constrained["max_depth"] = max(1, max_depth_cap)
+        adjustments.append(f"max_depth: {old_md} -> {constrained['max_depth']}")
+
+    if adjustments and verbose:
+        print(
+            f"[INFO] auto_constrain fixed HPs (n_train={n_train}, n_fold_train={n_fold_train}): "
+            + "; ".join(adjustments)
+        )
+
+    return constrained
+
+
+def _constrain_param_space(
+    param_space: dict,
+    n_eff: int,
+    verbose: bool = True,
+) -> dict:
+    """Tighten XGBoost HP search bounds based on effective independent sample size.
+
+    Rules:
+    - max_depth upper bound: min(configured, floor(log2(N_eff)) + 1)
+    - n_estimators upper bound: min(configured, 10 * N_eff)
+    - min_child_weight lower bound: max(configured, ceil(N_eff / 50))
+
+    Returns a shallow copy with updated bounds; original is not mutated.
+    """
+    constrained = {k: dict(v) if isinstance(v, dict) else v for k, v in param_space.items()}
+    adjustments: list[str] = []
+
+    if "max_depth" in constrained and isinstance(constrained["max_depth"], dict):
+        md = constrained["max_depth"]
+        max_allowed = int(np.floor(np.log2(max(1, n_eff)))) + 1
+        if md.get("high", 0) > max_allowed:
+            old_high = md["high"]
+            md["high"] = max(md.get("low", 2), max_allowed)
+            adjustments.append(f"max_depth.high: {old_high} -> {md['high']}")
+
+    if "n_estimators" in constrained and isinstance(constrained["n_estimators"], dict):
+        ne = constrained["n_estimators"]
+        max_allowed = 10 * n_eff
+        if ne.get("high", 0) > max_allowed:
+            old_high = ne["high"]
+            ne["high"] = max(ne.get("low", 50), max_allowed)
+            adjustments.append(f"n_estimators.high: {old_high} -> {ne['high']}")
+
+    if "min_child_weight" in constrained and isinstance(constrained["min_child_weight"], dict):
+        mcw = constrained["min_child_weight"]
+        min_allowed = int(np.ceil(n_eff / 50))
+        if mcw.get("low", 999) < min_allowed:
+            old_low = mcw["low"]
+            mcw["low"] = min(min_allowed, mcw.get("high", min_allowed))
+            adjustments.append(f"min_child_weight.low: {old_low} -> {mcw['low']}")
+
+    if adjustments and verbose:
+        print(
+            f"[INFO] auto_constrain (N_eff={n_eff}): "
+            + "; ".join(adjustments)
+        )
+    elif verbose:
+        print(f"[INFO] auto_constrain (N_eff={n_eff}): no adjustments needed.")
+
+    return constrained
 
 
 def _xgb_tune_hyperparameters_cv(
@@ -1668,6 +2117,10 @@ def _xgb_tune_hyperparameters_cv(
         return {}, {"enabled": False, "reason": "insufficient_groups"}
 
     param_space = cv_cfg.get("param_space") or {}
+    if bool(cv_cfg.get("auto_constrain", True)) and param_space:
+        n_unique_base = raw_diagnostics.get("raw_unique_base_count", len(names))
+        n_eff = _effective_sample_size(len(names), max(1, len(names) // max(1, n_unique_base)))
+        param_space = _constrain_param_space(param_space, n_eff, verbose=True)
     rng = np.random.default_rng(int(cv_cfg.get("seed", 42)))
     n_trials = int(max(1, cv_cfg.get("n_trials", 10)))
 
@@ -1731,6 +2184,7 @@ def _xgb_tune_hyperparameters_cv(
     trial_results: list[dict] = []
     best_score = float("inf")
     best_params: dict = {}
+    best_median_iter: int | None = None
 
     # Pre-compute fold index arrays once; they are constant across all trials.
     # This avoids rebuilding them via list comprehension for every trial × fold.
@@ -1794,6 +2248,7 @@ def _xgb_tune_hyperparameters_cv(
 
                 fold_scores: list[float] = []
                 fold_r2: list[float] = []
+                fold_best_iters: list[int] = []
                 if executor is not None:
                     futures = []
                     for train_idx, val_idx in precomputed_folds:
@@ -1813,16 +2268,18 @@ def _xgb_tune_hyperparameters_cv(
                         )
                     for future in as_completed(futures):
                         try:
-                            score, r2 = future.result()
+                            score, r2, best_iter = future.result()
                         except Exception as _fold_err:
                             print(f"[WARN] Parallel CV fold worker failed: {_fold_err}")
                             continue
                         fold_scores.append(float(score))
                         if r2 is not None and np.isfinite(r2):
                             fold_r2.append(float(r2))
+                        if best_iter is not None:
+                            fold_best_iters.append(int(best_iter) + 1)
                 else:
                     for train_idx, val_idx in precomputed_folds:
-                        score, r2 = _xgb_cv_fold_score(
+                        score, r2, best_iter = _xgb_cv_fold_score(
                             model_kind,
                             trial_kwargs,
                             X_cv,
@@ -1836,6 +2293,8 @@ def _xgb_tune_hyperparameters_cv(
                         fold_scores.append(float(score))
                         if r2 is not None and np.isfinite(r2):
                             fold_r2.append(float(r2))
+                        if best_iter is not None:
+                            fold_best_iters.append(int(best_iter) + 1)
 
                 mean_rmse = float(np.mean(fold_scores)) if fold_scores else float("inf")
                 std_score = float(np.std(fold_scores)) if fold_scores else float("nan")
@@ -1849,17 +2308,20 @@ def _xgb_tune_hyperparameters_cv(
                     deficit = float(r2_min) - mean_r2
                     if deficit > 0:
                         mean_score += float(r2_penalty) * deficit
+                median_best_iter = max(1, int(np.median(fold_best_iters))) if fold_best_iters else None
                 trial.set_user_attr("std_score", std_score)
                 trial.set_user_attr("mean_r2", mean_r2)
                 trial.set_user_attr("std_r2", std_r2)
                 trial.set_user_attr("mean_rmse", mean_rmse)
                 trial.set_user_attr("params", sampled)
+                trial.set_user_attr("median_best_iteration", median_best_iter)
                 if verbose:
+                    iter_info = f", median_best_iter={median_best_iter}" if median_best_iter is not None else ""
                     print(
                         f"[CV] Trial {trial.number + 1}/{n_trials} "
                         f"mean={mean_score:.6f} std={std_score:.6f} "
                         f"mean_rmse={mean_rmse:.6f} "
-                        f"mean_r2={mean_r2:.6f} params={sampled}"
+                        f"mean_r2={mean_r2:.6f}{iter_info} params={sampled}"
                     )
                 return mean_score
 
@@ -1868,6 +2330,7 @@ def _xgb_tune_hyperparameters_cv(
             try:
                 best_params = dict(study.best_trial.user_attrs.get("params", {}))
                 best_score = float(study.best_value)
+                best_median_iter = study.best_trial.user_attrs.get("median_best_iteration")
             except ValueError:
                 print(
                     "[WARN] All Optuna trials failed (e.g. all GPU OOM); "
@@ -1875,6 +2338,7 @@ def _xgb_tune_hyperparameters_cv(
                 )
                 best_params = {}
                 best_score = float("inf")
+                best_median_iter = None
             for t in study.trials:
                 trial_results.append(
                     {
@@ -1884,6 +2348,7 @@ def _xgb_tune_hyperparameters_cv(
                         "mean_r2": float(t.user_attrs.get("mean_r2", float("nan"))),
                         "std_r2": float(t.user_attrs.get("std_r2", float("nan"))),
                         "mean_rmse": float(t.user_attrs.get("mean_rmse", float("nan"))),
+                        "median_best_iteration": t.user_attrs.get("median_best_iteration"),
                         "params": dict(t.user_attrs.get("params", {})),
                     }
                 )
@@ -1901,6 +2366,7 @@ def _xgb_tune_hyperparameters_cv(
 
                 fold_scores: list[float] = []
                 fold_r2: list[float] = []
+                fold_best_iters: list[int] = []
                 if executor is not None:
                     futures = []
                     for train_idx, val_idx in precomputed_folds:
@@ -1920,16 +2386,18 @@ def _xgb_tune_hyperparameters_cv(
                         )
                     for future in as_completed(futures):
                         try:
-                            score, r2 = future.result()
+                            score, r2, best_iter = future.result()
                         except Exception as _fold_err:
                             print(f"[WARN] Parallel CV fold worker failed: {_fold_err}")
                             continue
                         fold_scores.append(float(score))
                         if r2 is not None and np.isfinite(r2):
                             fold_r2.append(float(r2))
+                        if best_iter is not None:
+                            fold_best_iters.append(int(best_iter) + 1)
                 else:
                     for train_idx, val_idx in precomputed_folds:
-                        score, r2 = _xgb_cv_fold_score(
+                        score, r2, best_iter = _xgb_cv_fold_score(
                             model_kind,
                             trial_kwargs,
                             X_cv,
@@ -1943,6 +2411,8 @@ def _xgb_tune_hyperparameters_cv(
                         fold_scores.append(float(score))
                         if r2 is not None and np.isfinite(r2):
                             fold_r2.append(float(r2))
+                        if best_iter is not None:
+                            fold_best_iters.append(int(best_iter) + 1)
 
                 mean_rmse = float(np.mean(fold_scores)) if fold_scores else float("inf")
                 std_score = float(np.std(fold_scores)) if fold_scores else float("nan")
@@ -1956,6 +2426,7 @@ def _xgb_tune_hyperparameters_cv(
                     deficit = float(r2_min) - mean_r2
                     if deficit > 0:
                         mean_score += float(r2_penalty) * deficit
+                median_best_iter = max(1, int(np.median(fold_best_iters))) if fold_best_iters else None
                 trial_results.append(
                     {
                         "trial": int(trial_idx + 1),
@@ -1964,12 +2435,14 @@ def _xgb_tune_hyperparameters_cv(
                         "mean_r2": mean_r2,
                         "std_r2": std_r2,
                         "mean_rmse": mean_rmse,
+                        "median_best_iteration": median_best_iter,
                         "params": dict(sampled),
                     }
                 )
                 if mean_score < best_score:
                     best_score = mean_score
                     best_params = dict(sampled)
+                    best_median_iter = median_best_iter
                 if verbose:
                     print(
                         f"[CV] Trial {trial_idx + 1}/{n_trials} "
@@ -1985,6 +2458,45 @@ def _xgb_tune_hyperparameters_cv(
             del X_cv
         _flush_gpu_memory()
 
+    # --- 1-SE selection rule ---------------------------------------------------
+    # Instead of picking the trial with the absolute best mean score, select the
+    # simplest model whose score is within 1 standard error of the best.
+    # "Simplest" is approximated by the lowest n_estimators × max_depth product.
+    selection_rule = str(cv_cfg.get("selection_rule", "1se")).lower()
+    if selection_rule == "1se" and len(trial_results) >= 2:
+        n_folds_for_se = int(len(folds))
+        scored_trials = [
+            t for t in trial_results
+            if np.isfinite(t.get("mean_score", float("inf")))
+        ]
+        if scored_trials:
+            best_mean = min(t["mean_score"] for t in scored_trials)
+            best_std = min(
+                (t["std_score"] for t in scored_trials if t["mean_score"] == best_mean),
+                default=0.0,
+            )
+            threshold = best_mean + best_std / max(1, np.sqrt(n_folds_for_se))
+
+            eligible = [t for t in scored_trials if t["mean_score"] <= threshold]
+            if eligible:
+                def _complexity(t):
+                    p = t.get("params", {})
+                    ne = p.get("n_estimators", 9999)
+                    md = p.get("max_depth", 9999)
+                    return ne * md
+
+                simplest = min(eligible, key=_complexity)
+                if simplest["mean_score"] != best_mean:
+                    print(
+                        f"[INFO] 1-SE rule: selected trial with mean_score="
+                        f"{simplest['mean_score']:.6f} "
+                        f"(threshold={threshold:.6f}, best={best_mean:.6f}). "
+                        f"Params: {simplest.get('params', {})}"
+                    )
+                    best_params = dict(simplest.get("params", {}))
+                    best_score = simplest["mean_score"]
+                    best_median_iter = simplest.get("median_best_iteration", best_median_iter)
+
     summary = {
         "enabled": True,
         "metric": metric,
@@ -1995,6 +2507,8 @@ def _xgb_tune_hyperparameters_cv(
         "use_early_stopping": bool(use_early_stopping),
         "early_stopping_rounds": None if early_stop_rounds is None else int(early_stop_rounds),
         "best_score": float(best_score),
+        "best_median_iteration": best_median_iter,
+        "selection_rule": selection_rule,
         "trials": trial_results,
         "param_space": param_space,
         "score_definition": "rmse*(1-r2)" if use_scalarized_rmse_r2 else metric_raw,
@@ -2225,6 +2739,67 @@ def _write_xgb_cv_parallel_coords_plot(config: dict, summary: dict, top_k: int =
     plt.close()
     return out_path
 
+def _xgb_cv_estimate_n_estimators(
+    train_samples,
+    model_kwargs: dict,
+    model_kind: str,
+    metric: str,
+    early_stopping_rounds: int,
+    cast_y=None,
+    n_folds: int = 3,
+    seed: int = 42,
+) -> int | None:
+    """Estimate optimal n_estimators via lightweight internal CV (no test exposure).
+
+    Trains the model with early stopping on each fold's held-out portion and
+    returns the median best_iteration across folds.  Returns None if CV cannot
+    be performed (e.g. too few samples).
+    """
+    X, y, names = _xgb_samples_to_arrays(train_samples, cast_y=cast_y)
+    if len(names) < 2 * n_folds:
+        return None
+
+    folds = _build_group_folds(names, n_folds, seed)
+    if len(folds) < 2:
+        return None
+
+    precomputed: list[tuple[np.ndarray, np.ndarray]] = []
+    for fi in range(len(folds)):
+        val_idx = np.array(folds[fi], dtype=int)
+        train_idx = np.array(
+            [i for fj, f in enumerate(folds) if fj != fi for i in f],
+            dtype=int,
+        )
+        precomputed.append((train_idx, val_idx))
+
+    fold_best_iters: list[int] = []
+    for train_idx, val_idx in precomputed:
+        _, _, best_iter = _xgb_cv_fold_score(
+            model_kind,
+            model_kwargs,
+            X,
+            y,
+            train_idx,
+            val_idx,
+            metric,
+            use_early_stopping=True,
+            early_stopping_rounds=early_stopping_rounds,
+        )
+        if best_iter is not None:
+            # best_iteration is 0-indexed; convert to round count for n_estimators.
+            fold_best_iters.append(int(best_iter) + 1)
+
+    if not fold_best_iters:
+        return None
+
+    median_iter = max(1, int(np.median(fold_best_iters)))
+    print(
+        f"[INFO] CV-estimated n_estimators: {median_iter} "
+        f"(fold best_iterations: {fold_best_iters})"
+    )
+    return median_iter
+
+
 def _train_xgb_model(
     config,
     train_samples,
@@ -2284,9 +2859,55 @@ def _train_xgb_model(
         "learning_rate": hyper_cfg["learning_rate"],
         "n_jobs": int(hyper_cfg.get("n_jobs", -1)),
     }
-    if hyper_cfg.get("early_stopping_rounds") is not None:
-        model_kwargs["early_stopping_rounds"] = hyper_cfg["early_stopping_rounds"]
-    if disable_early_stopping:
+    early_stop_source = str(hyper_cfg.get("early_stop_source", "cv")).lower()
+    has_early_stopping = hyper_cfg.get("early_stopping_rounds") is not None
+
+    # Ensure hyperparameters are compatible with the training data size.
+    # With small N and aggressive settings (e.g. subsample=0.2, min_child_weight=8),
+    # per-tree samples can be too few for any splits, making every tree a root-node
+    # mean and degrading the model from round 1.
+    model_kwargs = _constrain_fixed_hyperparams(
+        model_kwargs, n_train=len(train_samples), n_folds=3,
+    )
+
+    # When early_stop_source is "cv", estimate optimal n_estimators from internal
+    # CV rather than early-stopping on the test set.  This eliminates test-set
+    # information leakage while still adapting the training budget to the data.
+    cv_estimated_budget = False
+    if (
+        has_early_stopping
+        and not disable_early_stopping
+        and eval_set_override is None
+        and early_stop_source == "cv"
+    ):
+        model_kind = "classifier" if metric_key == "eval_metric" else "regressor"
+        cv_n_est = _xgb_cv_estimate_n_estimators(
+            train_samples,
+            {k: v for k, v in model_kwargs.items() if k != "early_stopping_rounds"},
+            model_kind,
+            metric,
+            early_stopping_rounds=hyper_cfg["early_stopping_rounds"],
+            cast_y=cast_y,
+        )
+        if cv_n_est is not None:
+            model_kwargs["n_estimators"] = cv_n_est
+            cv_estimated_budget = True
+            print(
+                f"[INFO] early_stop_source='cv': training for {cv_n_est} rounds "
+                f"(CV-derived budget); no test-set early stopping."
+            )
+
+    if has_early_stopping and not disable_early_stopping and not cv_estimated_budget:
+        if early_stop_source == "test":
+            model_kwargs["early_stopping_rounds"] = hyper_cfg["early_stopping_rounds"]
+        elif early_stop_source == "train_plateau":
+            # Do not set early_stopping_rounds; rely on _TrainLossPlateauCallback.
+            pass
+        else:
+            # Fallback: if cv estimation failed, use train_plateau if configured,
+            # otherwise fall through to default (no early stopping).
+            pass
+    if disable_early_stopping or cv_estimated_budget:
         model_kwargs.pop("early_stopping_rounds", None)
     if metric_key == "eval_metric":
         model_kwargs["eval_metric"] = metric
@@ -2329,6 +2950,9 @@ def _train_xgb_model(
     if eval_set_override is not None:
         fit_kwargs["eval_set"] = eval_set_override
     else:
+        # Always include test set in eval_set for loss-curve monitoring.
+        # Early stopping on the test set only happens when early_stopping_rounds
+        # is set on the model, which is controlled separately by early_stop_source.
         fit_kwargs["eval_set"] = [(X_train_fit, y_train_fit), (X_test_fit, y_test_fit)]
 
     supports_callbacks = "callbacks" in inspect.signature(model.fit).parameters
@@ -2405,6 +3029,12 @@ def _train_xgb_model(
             f"{float(plateau_state.get('min_relative_improvement', 0.0)):.6g}; "
             f"triggered at round {trigger_round}."
         )
+    elif cv_estimated_budget:
+        stop_reason_code = "cv_epoch_budget_exhausted"
+        stop_reason_text = (
+            f"Scheduled stop: CV-derived budget exhausted "
+            f"({executed_rounds} rounds from internal CV estimate)."
+        )
     elif (
         configured_early_stopping_rounds is not None
         and best_iteration is not None
@@ -2472,7 +3102,7 @@ def _train_xgb_model(
         {
             "stop_reason_code": stop_reason_code,
             "stop_reason_text": stop_reason_text,
-            "stopped_early": bool(stop_reason_code != "n_estimators_exhausted"),
+            "stopped_early": bool(stop_reason_code not in {"n_estimators_exhausted", "cv_epoch_budget_exhausted"}),
             "configured": {
                 "n_estimators": int(hyper_cfg["n_estimators"]),
                 "early_stopping_rounds": (
@@ -2550,6 +3180,15 @@ def _train_xgb_model_cv_tuned(
     tuned_hyper["early_stopping_rounds"] = None
     tuned_config["hyperparameters"] = tuned_hyper
 
+    # Use CV-derived median best_iteration as the training budget if available.
+    cv_median_iter = summary.get("best_median_iteration")
+    if cv_median_iter is not None and cv_median_iter > 0:
+        tuned_hyper["n_estimators"] = int(cv_median_iter)
+        print(
+            f"[INFO] Setting n_estimators={cv_median_iter} from CV median best_iteration "
+            f"(overrides configured n_estimators)."
+        )
+
     if tuning_ran:
         trials_csv = _write_xgb_cv_trials_csv(config, summary)
         if trials_csv is not None:
@@ -2558,9 +3197,10 @@ def _train_xgb_model_cv_tuned(
         if trials_plot is not None:
             print(f"[INFO] CV tuning trials plot saved to: {trials_plot}")
 
+    # Train on full training set with CV-derived budget; no test-set early stopping.
+    # eval_set contains train-only data for monitoring loss curves.
     X_train, y_train, _ = _xgb_samples_to_arrays(train_samples, cast_y=cast_y)
-    X_test, y_test, _ = _xgb_samples_to_arrays(test_samples, cast_y=cast_y)
-    eval_set_override = [(X_train, y_train), (X_test, y_test)]
+    eval_set_override = [(X_train, y_train)]
 
     _train_xgb_model(
         tuned_config,

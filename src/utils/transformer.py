@@ -43,7 +43,19 @@ def _batch_pearson_corr(y_pred, y_true, eps=1e-8, clip=True):
 
 def train_model(directory, model, forecast_name, trainloader, testloader, device, num_epochs=100, learning_rate=1e-3,
                 loss_threshold=1e-3, patience=5, model_subdir='transformer',
-                corr_lambda=0.1, corr_eps=1e-8, corr_clip=True):
+                corr_lambda=0.1, corr_eps=1e-8, corr_clip=True,
+                max_epochs_override=None, skip_plot=False):
+    """Train transformer model.
+
+    Parameters
+    ----------
+    max_epochs_override : int or None
+        When set, train for exactly this many epochs with no patience-based
+        early stopping on the validation set.  The loss_threshold stop rule
+        on training combined loss is still honoured.  This is used when the
+        epoch budget has been estimated externally (e.g. via internal CV) to
+        avoid leaking test-set information into the training process.
+    """
 
     mse_criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -60,8 +72,10 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
     stop_reason_code = None
     stop_reason_text = None
     stop_epoch = None
+    use_fixed_budget = max_epochs_override is not None
+    effective_num_epochs = max_epochs_override if use_fixed_budget else num_epochs
 
-    for epoch in range(num_epochs):
+    for epoch in range(effective_num_epochs):
         model.train()
         epoch_train_mse = 0.0
         epoch_train_corr = 0.0
@@ -137,7 +151,7 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
             best_val_combined = avg_val_combined
             best_val_epoch = int(epoch + 1)
             patience_counter = 0
-        else:
+        elif not use_fixed_budget:
             patience_counter += 1
             if patience_counter >= patience:
                 stop_reason_code = "validation_combined_patience_exhausted"
@@ -152,40 +166,41 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
                 break
 
     if stop_reason_code is None:
-        stop_reason_code = "max_epochs_exhausted"
+        stop_reason_code = "cv_epoch_budget_exhausted" if use_fixed_budget else "max_epochs_exhausted"
         stop_epoch = int(len(train_combined_losses))
         stop_reason_text = (
-            "Scheduled stop: all configured epochs exhausted "
-            f"({int(num_epochs)}/{int(num_epochs)} epochs)."
+            f"Scheduled stop: {'CV epoch budget' if use_fixed_budget else 'all configured epochs'} exhausted "
+            f"({int(effective_num_epochs)}/{int(effective_num_epochs)} epochs)."
         )
 
     # Plot all objective terms for train/validation to inspect optimization behavior.
-    filepath = Path(directory, "forecasts", forecast_name, model_subdir)
-    os.makedirs(filepath, exist_ok=True)
-    plt.figure(figsize=(8, 6))
-    x_vals = list(range(1, len(train_combined_losses) + 1))
-    plt.plot(x_vals, train_combined_losses, marker='o', label='Train Combined')
-    plt.plot(x_vals, val_combined_losses, marker='s', label='Val Combined')
-    plt.plot(x_vals, train_mse_losses, marker='o', linestyle='--', label='Train MSE')
-    plt.plot(x_vals, val_mse_losses, marker='s', linestyle='--', label='Val MSE')
-    plt.plot(x_vals, train_corr_terms, marker='o', linestyle=':', label='Train Corr')
-    plt.plot(x_vals, val_corr_terms, marker='s', linestyle=':', label='Val Corr')
-    plt.xlabel("Epoch")
-    plt.ylabel("Value")
-    plt.grid(True, ls="--")
-    plt.legend()
-    plt.gcf().text(
-        0.01,
-        0.99,
-        _compact_stop_reason_for_plot(stop_reason_text),
-        fontsize=8,
-        ha="left",
-        va="top",
-        bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "#666666", "boxstyle": "round,pad=0.15"},
-    )
-    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.9))
-    plt.savefig(filepath / "loss_plot.png")
-    plt.close()
+    if not skip_plot:
+        filepath = Path(directory, "forecasts", forecast_name, model_subdir)
+        os.makedirs(filepath, exist_ok=True)
+        plt.figure(figsize=(8, 6))
+        x_vals = list(range(1, len(train_combined_losses) + 1))
+        plt.plot(x_vals, train_combined_losses, marker='o', label='Train Combined')
+        plt.plot(x_vals, val_combined_losses, marker='s', label='Val Combined')
+        plt.plot(x_vals, train_mse_losses, marker='o', linestyle='--', label='Train MSE')
+        plt.plot(x_vals, val_mse_losses, marker='s', linestyle='--', label='Val MSE')
+        plt.plot(x_vals, train_corr_terms, marker='o', linestyle=':', label='Train Corr')
+        plt.plot(x_vals, val_corr_terms, marker='s', linestyle=':', label='Val Corr')
+        plt.xlabel("Epoch")
+        plt.ylabel("Value")
+        plt.grid(True, ls="--")
+        plt.legend()
+        plt.gcf().text(
+            0.01,
+            0.99,
+            _compact_stop_reason_for_plot(stop_reason_text),
+            fontsize=8,
+            ha="left",
+            va="top",
+            bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "#666666", "boxstyle": "round,pad=0.15"},
+        )
+        plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.9))
+        plt.savefig(filepath / "loss_plot.png")
+        plt.close()
 
     return {
         "model_type": "transformer",

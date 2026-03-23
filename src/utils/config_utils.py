@@ -11,6 +11,16 @@ from scipy import stats
 import yaml
 
 
+def _effective_sample_size(n_samples: int, n_mc_replicates: int = 1) -> int:
+    """Effective independent sample count, discounting MC replicates.
+
+    When samples are Monte Carlo replicates of the same underlying
+    observations, divides by the replicate count to estimate the number
+    of truly independent data points.  Returns at least 1.
+    """
+    return max(1, n_samples // max(1, n_mc_replicates))
+
+
 NORMALIZATION_OUTPUT_PATH = (
     Path(__file__).resolve().parent.parent.parent
     / "data"

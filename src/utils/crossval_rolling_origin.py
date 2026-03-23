@@ -78,7 +78,15 @@ def run_rolling_origin_cv(
     output_dir.mkdir(parents=True, exist_ok=True)
     # Prepare group ids if needed
     if group_by_segment:
-        group_ids = group_samples_by_segment(samples)
+        segment_groups = group_samples_by_segment(samples)
+        # Build a flat group_ids list: for each sample, the segment number it belongs to.
+        # group_samples_by_segment returns [(seg_num, [samples_in_seg]), ...] but uses
+        # actual sample objects (not indices), so we need to map back by identity.
+        sample_id_to_seg = {}
+        for seg_num, seg_samples in segment_groups:
+            for s in seg_samples:
+                sample_id_to_seg[id(s)] = seg_num
+        group_ids = [sample_id_to_seg.get(id(s), i) for i, s in enumerate(samples)]
         split_gen = rolling_origin_splits_grouped(samples, group_ids, min_train_size)
     else:
         split_gen = rolling_origin_splits_ungrouped(samples, min_train_size)
@@ -114,10 +122,21 @@ def run_rolling_origin_cv(
         mae = float(mean_absolute_error(y_test, y_pred))
         # Record filenames for test samples
         test_files = [samples[i][2] for i in test_indices]
+        # Count independent samples (distinct segment groups).
+        if group_by_segment:
+            train_groups_set = set(group_ids[i] for i in train_indices)
+            test_groups_set = set(group_ids[i] for i in test_indices)
+            n_train_independent = len(train_groups_set)
+            n_test_independent = len(test_groups_set)
+        else:
+            n_train_independent = len(train_indices)
+            n_test_independent = len(test_indices)
         results.append({
             "split": split_idx,
             "n_train": len(train_indices),
             "n_test": len(test_indices),
+            "n_train_independent": n_train_independent,
+            "n_test_independent": n_test_independent,
             "rmse": rmse,
             "r2": r2,
             "mae": mae,
