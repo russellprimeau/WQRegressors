@@ -96,7 +96,13 @@
       "Bash(python -c \"import json; d=json.load\\(open\\(''data/output/regression/MC_exCadmium_\\(µg_L\\)_res/forecasts/feature_sweeps/mlr/model_config.json''\\)\\); m=d[''per_target_meta''][0]; print\\(''Spearman kept:'', m.get\\(''spearman_kept_columns'',[]\\)\\); print\\(''Selected:'', m.get\\(''selected_features'',[]\\)\\); print\\(''n_selected:'', m.get\\(''n_selected''\\)\\); print\\(''Input cols:'', len\\(d[''input_columns'']\\)\\)\")",
       "Bash(python -c \"import json; d=json.load\\(open\\(''data/output/regression/MC_exChromium_\\(µg_L\\)_res/forecasts/feature_sweeps/mlr/model_config.json''\\)\\); m=d[''per_target_meta''][0]; print\\(''Spearman kept:'', m.get\\(''spearman_kept_columns'',[]\\)\\); print\\(''Selected:'', m.get\\(''selected_features'',[]\\)\\); print\\(''n_selected:'', m.get\\(''n_selected''\\)\\); print\\(''Input cols:'', len\\(d[''input_columns'']\\)\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/z1_FeaturePostProcess.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK''\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/h_RunMCFeatureSelectionSweep.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK''\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/h_RunMCFeatureSelectionSweep.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors -name *.csv -path *feature*)",
+      "Bash(wc -l \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/CV/MC_exCadmium_\\(µg_L\\)_res/forecasts/feature_sweeps/gp_01_r167_f4_7d8e3c9165_k01/test_files.txt\")",
+      "Bash(ls \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/CV/MC_exCadmium_\\(µg_L\\)_res/forecasts/feature_sweeps/\")",
+      "Bash(find c:UsersMasterDocumentsGitHubWQRegressorsdata -name feature_selected_subsets_r*.csv)",
+      "Bash(grep -l mlr c:UsersMasterDocumentsGitHubWQRegressorsdata/output/CV/*/forecasts/feature_sweeps/feature_sweep_final_metrics.csv)",
+      "Bash(ls -la \"data/output/regression/MC_exCadmium_\\(µg_L\\)_res/forecasts/feature_sweeps/feature_sweep_final_metrics_summary.png\")"
     ]
   }
 }

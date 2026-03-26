@@ -69,7 +69,7 @@ from pathlib import Path
 from utils.training import load_samples, group_samples_by_segment, _filter_samples_by_nan_tolerance
 from utils.names import clean_target_label
 from utils.mlr import evaluate_mlr as _evaluate_mlr
-from h_RunMCFeatureSelectionSweep import build_parser, discover_mc_dataset_plans, _derive_target_name, _select_surrogate_config, _parse_row_counts, _available_row_counts_for_postprocess, _regenerate_saved_outputs_for_row, _load_feature_stats_artifacts_with_source, _compile_multi_target_comparison, _resolve_dataset_inclusion, _run_rolling_origin_cv, _ensure_k01_baselines, _write_dataset_evaluation_summary, _forecast_sweeps_dir, _plot_final_metrics_comparison
+from h_RunMCFeatureSelectionSweep import build_parser, discover_mc_dataset_plans, _derive_target_name, _select_surrogate_config, _parse_row_counts, _available_row_counts_for_postprocess, _regenerate_saved_outputs_for_row, _load_feature_stats_artifacts_with_source, _compile_multi_target_comparison, _resolve_dataset_inclusion, _run_rolling_origin_cv, _ensure_k01_baselines, _write_dataset_evaluation_summary, _forecast_sweeps_dir, _plot_final_metrics_comparison, _feature_tag
 
 try:
     from scipy import stats as scipy_stats
@@ -242,6 +242,7 @@ def _annotate_bars_within_ylim(ax, bars, fmt: str, fontsize: int = 8) -> None:
             va=va,
             fontsize=fontsize,
             rotation=90,
+            clip_on=True,
         )
 
 
@@ -271,6 +272,7 @@ def _annotate_ml_bars(ax, bars, vals, ns, fmt: str, fontsize: int = 7) -> None:
             va=va,
             fontsize=fontsize,
             rotation=90,
+            clip_on=True,
         )
 
 
@@ -371,7 +373,8 @@ def _append_mlr_to_final_metrics(
     the standard output format of other data-driven models.
     """
     df = pd.read_csv(final_metrics_csv)
-    # Remove any existing MLR row so it is always recomputed
+    # Remove only the MLR *model* row (keep ML model rows for the MLR k-cluster
+    # that may have been created by the sweep pipeline).
     if "model" in df.columns:
         df = df[df["model"].astype(str).str.lower() != "mlr"]
 
@@ -460,11 +463,43 @@ def _append_mlr_to_final_metrics(
 
     n_selected = sum(m.get("n_selected", 0) for m in meta) / max(len(meta), 1)
 
+    # Determine the Spearman-filtered base columns for the feature_tag
+    spearman_kept = []
+    for m in meta:
+        spearman_kept = m.get("spearman_kept_columns", [])
+        if spearman_kept:
+            break
+    if spearman_kept:
+        mlr_ftag = _feature_tag(tuple(sorted(spearman_kept)))
+    else:
+        mlr_ftag = _feature_tag(tuple(sorted(input_columns)))
+
+    # Determine MLR k-cluster rank: use existing rank from sweep if present,
+    # otherwise assign max(existing_ranks) + 1
+    existing_mlr_ranks = []
+    if "feature_tag" in df.columns:
+        existing_mlr_ranks = df.loc[
+            df["feature_tag"].astype(str) == mlr_ftag, "subset_rank"
+        ].dropna().unique().tolist()
+    if existing_mlr_ranks:
+        mlr_rank = int(existing_mlr_ranks[0])
+    elif "subset_rank" in df.columns and not df["subset_rank"].dropna().empty:
+        mlr_rank = int(df["subset_rank"].dropna().max()) + 1
+    else:
+        mlr_rank = 1
+
+    # Compute test sample count and other statistics directly from MLR evaluation
+    n_test_valid = int(finite_mask.sum())
+    n_test_independent = n_test_valid  # If a more specific independent count is available, use it
+    n_samples = len(test_samples)
+    # Try to get n_eval_raw_segments if available (for summary_model_quality_matrix)
+    n_eval_raw_segments = n_test_valid
     mlr_row = {
         "dataset": best_row.get("dataset", plan.dataset_dir.name),
         "target": best_row.get("target", ""),
-        "subset_rank": best_row.get("subset_rank", 1),
-        "feature_tag": "mlr",
+        "subset_rank": mlr_rank,
+        "subset_label": "s01",
+        "feature_tag": mlr_ftag,
         "row_count": best_row.get("row_count", ""),
         "n_features": n_selected,
         "model": "mlr",
@@ -474,13 +509,28 @@ def _append_mlr_to_final_metrics(
         "pearson_r": pearson_val,
         "std_target": std_target,
         "nrmse": nrmse_val,
-        "n_test_independent": best_row.get("n_test_independent", ""),
-        "n_test_valid": int(finite_mask.sum()),
-        "n_test_evals": int(finite_mask.sum()),
-        "n_samples": best_row.get("n_samples", ""),
+        "n_test_independent": n_test_independent,
+        "n_test_valid": n_test_valid,
+        "n_test_evals": n_test_valid,
+        "n_samples": n_samples,
         "input_dim": float(len(input_columns)),
         "target_dim": float(len(output_columns)),
+        "n_eval_raw_segments": n_eval_raw_segments,
     }
+
+    # Fill any additional columns present in the DataFrame but missing in mlr_row with NaN
+    for col in df.columns:
+        if col not in mlr_row:
+            mlr_row[col] = float('nan')
+
+    # Validation: warn if any required field is missing or NaN
+    required_fields = [
+        "n_test_valid", "nrmse", "r2", "mae", "rmse", "pearson_r", "std_target", "n_eval_raw_segments"
+    ]
+    for field in required_fields:
+        val = mlr_row.get(field, None)
+        if val is None or (isinstance(val, float) and not np.isfinite(val)):
+            print(f"[WARN] MLR row missing or invalid value for '{field}' in {plan.dataset_dir.name}")
 
     df = pd.concat([df, pd.DataFrame([mlr_row])], ignore_index=True)
     df.to_csv(final_metrics_csv, index=False)
@@ -502,6 +552,7 @@ def _append_mlr_to_final_metrics(
     mlr_model_config = {
         "model_type": "mlr",
         "input_columns": input_columns,
+        "spearman_kept_columns": sorted(spearman_kept) if spearman_kept else input_columns,
         "output_columns": output_columns,
         "input_row_1": model_config.get("input_row_1"),
         "input_row_2": model_config.get("input_row_2"),
@@ -880,6 +931,7 @@ def _plot_ml_model_comparison(
             matplotlib.patches.Patch(facecolor=ML_COMPARISON_COLORS[m], label=m)
             for m in ML_COMPARISON_MODEL_TYPES
         ]
+        pending_annotations = []
 
         for mi, model_display in enumerate(ML_COMPARISON_MODEL_TYPES):
             color = ML_COMPARISON_COLORS[model_display]
@@ -900,20 +952,26 @@ def _plot_ml_model_comparison(
                 continue
 
             bars = ax.bar(bar_x, vals, width, color=color)
-            _annotate_ml_bars(ax, bars, vals, ns, fmt)
+            pending_annotations.append((bars, vals, ns))
 
         if add_hline:
             ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
 
-        # Constrain y-axis lower limit: never below -1; if all bars positive, floor at 0.
-        ymin_cur, ymax_cur = ax.get_ylim()
-        all_metric_vals = comp_df[metric_key].dropna().to_numpy(dtype=float)
-        all_metric_vals = all_metric_vals[np.isfinite(all_metric_vals)]
-        min_val = float(np.min(all_metric_vals)) if all_metric_vals.size else 0.0
-        if min_val >= 0.0:
-            ax.set_ylim(bottom=0.0)
+        if metric_key in {'r2', 'skill_vs_best'}:
+            ax.set_ylim(-1.0, 1.0)
         else:
-            ax.set_ylim(bottom=max(ymin_cur, -1.0))
+            # Constrain y-axis lower limit: never below -1; if all bars positive, floor at 0.
+            ymin_cur, ymax_cur = ax.get_ylim()
+            all_metric_vals = comp_df[metric_key].dropna().to_numpy(dtype=float)
+            all_metric_vals = all_metric_vals[np.isfinite(all_metric_vals)]
+            min_val = float(np.min(all_metric_vals)) if all_metric_vals.size else 0.0
+            if min_val >= 0.0:
+                ax.set_ylim(bottom=0.0)
+            else:
+                ax.set_ylim(bottom=max(ymin_cur, -1.0))
+
+        for bars, vals, ns in pending_annotations:
+            _annotate_ml_bars(ax, bars, vals, ns, fmt)
 
         # Tight horizontal bounds: ~0.07 units of padding beyond the outermost bar edges.
         cluster_half = 1.5 * width
@@ -3852,7 +3910,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     sweep_results,
                     data_root,
                     importance_label="Shapley Expected Contribution (mean marginal objective delta)",
-                    summary_axis_label="Total Shapley Contribution",
+                    summary_axis_label="Summed Target-wise Shapley z-score",
                     target_order=target_order_by_skill,
                     dataset_prefix=args.dataset_prefix,
                 )

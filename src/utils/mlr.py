@@ -25,8 +25,8 @@ from sklearn.linear_model import LassoCV, LinearRegression
 
 # MI and Lasso are efficient (sklearn-optimised); only VIF is O(p²) per
 # iteration with numpy lstsq, so that is the stage that needs a hard cap.
-_MAX_VIF_FEATURES = 50     # max features entering VIF (top by |Lasso coef|)
-_MAX_VIF_ITERATIONS = 50   # max removal rounds inside VIF
+_MAX_VIF_FEATURES = 500     # max features entering VIF (top by |Lasso coef|)
+_MAX_VIF_ITERATIONS = 500   # max removal rounds inside VIF
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +96,26 @@ def _prefilter_by_spearman(train_samples, target_idx, base_feature_names,
         return list(range(n_cols)), spearman_results
 
     return keep_cols, spearman_results
+
+
+def get_spearman_features(train_samples, feature_names, target_idx=0,
+                          p_threshold=0.05, rho_threshold=0.20):
+    """Return base column names that pass the Spearman pre-filter.
+
+    Convenience wrapper around :func:`_prefilter_by_spearman` for use
+    by the sweep pipeline (which needs the filtered columns without running
+    the full MLR evaluation).
+
+    Returns
+    -------
+    kept_names : list[str] — base column names that pass the filter
+    spearman_results : dict[str, (rho, p)] — per-column correlation results
+    """
+    keep_cols, results = _prefilter_by_spearman(
+        train_samples, target_idx, feature_names,
+        p_threshold=p_threshold, rho_threshold=rho_threshold,
+    )
+    return [feature_names[c] for c in keep_cols], results
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +322,7 @@ def fit_and_predict(X_train, y_train, X_test, feature_names=None, verbose=False)
             print("[MLR] Fewer than 2 valid training rows; returning NaN predictions.")
         return predictions, meta
 
+    # Refit OLS (LinearRegression) on features selected by Lasso
     model = LinearRegression()
     model.fit(Xtr[train_mask], y_train[train_mask])
     predictions[test_mask] = model.predict(Xte[test_mask])

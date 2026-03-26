@@ -24,7 +24,7 @@ from scipy import stats
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _CSV_PATH = _PROJECT_ROOT / "data" / "output" / "regression" / "Consolidated_sparse.csv"
-_OUT_DIR = _PROJECT_ROOT / "data" / "output" / "regression"
+_OUT_DIR = _PROJECT_ROOT / "data" / "output" / "sensors" / "correlation"
 _HEATMAP_PATH = _OUT_DIR / "predictor_target_correlations.png"
 
 # ---------------------------------------------------------------------------
@@ -268,19 +268,11 @@ def main() -> None:
     if missing_tgt:
         raise ValueError(f"Missing target columns: {missing_tgt}")
 
-    pearson_r, pearson_p, spearman_r, spearman_p = compute_correlations(df)
-
-    print("Pearson r:")
-    print(pearson_r.to_string())
-
-    plot_correlation_matrix(pearson_r, pearson_p, _HEATMAP_PATH)
-    plot_correlation_matrix(
-        spearman_r, spearman_p,
-        _OUT_DIR / "predictor_target_correlations_spearman.png",
-    )
-
+    corr = compute_correlations(df)
+    print(corr.to_string())
+    plot_correlation_matrix(corr, _HEATMAP_PATH)
     for group_key in PREDICTOR_GROUPS:
-        plot_scatter_group(df, pearson_r, group_key, _OUT_DIR)
+        plot_scatter_group(df, corr, group_key, _OUT_DIR)
 
 
 if __name__ == "__main__":
