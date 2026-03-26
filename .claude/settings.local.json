@@ -62,7 +62,26 @@
       "Bash(grep -E \"\\\\.py$\")",
       "Bash(ls c:/Users/Master/Documents/GitHub/WQRegressors/data/output/CV11/MC_Lead__µg_L__res/forecasts/feature_sweeps/*.csv)",
       "Bash(find c:/Users/Master/Documents/GitHub/WQRegressors/data/output/CV11_horizons -path */horizons/*/evaluation_summary.csv)",
-      "Bash(find c:/Users/Master/Documents/GitHub/WQRegressors/data/output/CV11_horizons -path */horizons/* -name *.csv)"
+      "Bash(find c:/Users/Master/Documents/GitHub/WQRegressors/data/output/CV11_horizons -path */horizons/* -name *.csv)",
+      "Bash(python src/utils/correlate_profiler_targets.py)",
+      "Bash(taskkill /F /FI \"WINDOWTITLE eq *correlate_profiler*\")",
+      "Bash(taskkill /F /IM python.exe /FI \"WINDOWTITLE eq *\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/utils/correlate_profiler_targets.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(grep -r \"MLR\\\\|linear regression\\\\|OLS\" src/ --include=*.py)",
+      "Bash(grep -r baseline src/ --include=*.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/utils/mlr.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"from utils.mlr import evaluate_mlr; print\\(''Import OK''\\)\")",
+      "Bash(ls -la \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/regression/MC_exArsenic_\\(µg_L\\)_res/forecasts/\")",
+      "Bash(ls -la \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/regression/MC_exArsenic_\\(µg_L\\)_res/forecasts/feature_sweeps/\")",
+      "Bash(ls -la \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/regression/MC_exArsenic_\\(µg_L\\)_res/forecasts/feature_sweeps/xgb_01_r167_f4_18fde88486/\")",
+      "Bash(ls -la \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/regression/MC_exArsenic_\\(µg_L\\)_res/forecasts/feature_sweeps/gp_01_r167_f4_b681f3c017_k01/\")",
+      "Bash(ls -la \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/regression/MC_exArsenic_\\(µg_L\\)_res/forecasts/feature_sweeps/transformer_01_r167_f4_b681f3c017_k01/\")",
+      "Bash(grep -rn \"model_config.json\" /c/Users/Master/Documents/GitHub/WQRegressors/src/*.py)",
+      "Bash(head -2 \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/regression/MC_exArsenic_\\(µg_L\\)_res/forecasts/feature_sweeps/gp_01_r167_f4_18fde88486_k03/predictions.csv\")",
+      "Bash(find C:UsersMasterDocumentsGitHubWQRegressorsdataoutputregression -path */forecasts/feature_sweeps/* -type d)",
+      "Bash(ls -la \"C:\\\\Users\\\\Master\\\\Documents\\\\GitHub\\\\WQRegressors\\\\data\\\\output\\\\regression\\\\MC_exArsenic_\\(µg_L\\)_res\\\\forecasts\\\\feature_sweeps\")",
+      "Bash(ls -la \"C:\\\\Users\\\\Master\\\\Documents\\\\GitHub\\\\WQRegressors\\\\data\\\\output\\\\regression\\\\MC_exCadmium_\\(µg_L\\)_res\\\\forecasts\\\\feature_sweeps\")",
+      "Bash(python src/z1_FeaturePostProcess.py --path data/output/regression --sweep-namespace feature_sweeps --limit-datasets 1)"
     ]
   }
 }

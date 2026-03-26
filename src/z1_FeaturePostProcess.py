@@ -41,6 +41,7 @@ from __future__ import annotations
 import contextlib
 import argparse
 import copy
+import json
 import shutil
 import subprocess
 import glob
@@ -67,6 +68,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from utils.training import load_samples, group_samples_by_segment, _filter_samples_by_nan_tolerance
 from utils.names import clean_target_label
+from utils.mlr import evaluate_mlr as _evaluate_mlr
 from h_RunMCFeatureSelectionSweep import build_parser, discover_mc_dataset_plans, _derive_target_name, _select_surrogate_config, _parse_row_counts, _available_row_counts_for_postprocess, _regenerate_saved_outputs_for_row, _load_feature_stats_artifacts_with_source, _compile_multi_target_comparison, _resolve_dataset_inclusion, _run_rolling_origin_cv, _ensure_k01_baselines, _write_dataset_evaluation_summary, _forecast_sweeps_dir, _plot_final_metrics_comparison
 
 try:
@@ -90,8 +92,8 @@ BASELINE_PLOT_COLORS = {
 BASELINE_MODEL_IDS = {"naive", "seasonal", "linear"}
 MIN_REQUIRED_VALID_INDEPENDENT = 5
 
-ML_COMPARISON_MODEL_TYPES = ['XGB', 'Trans.', 'GP']
-ML_COMPARISON_COLORS = {'XGB': 'tab:blue', 'Trans.': 'tab:purple', 'GP': 'tab:olive'}
+ML_COMPARISON_MODEL_TYPES = ['XGB', 'Trans.', 'GP', 'MLR']
+ML_COMPARISON_COLORS = {'XGB': 'tab:blue', 'Trans.': 'tab:purple', 'GP': 'tab:olive', 'MLR': 'tab:red'}
 
 
 def _resolve_summaries_dir(data_root: Path, sweep_namespace: str) -> Path:
@@ -354,6 +356,250 @@ def _resolve_summary_plot_dirs(summaries_dir: Path) -> tuple[Path, Path, Path]:
     return combined_dir, individual_dir, evaluation_dir
 
 
+def _append_mlr_to_final_metrics(
+    plan: "DatasetPlan",
+    final_metrics_csv: Path,
+    best_row: "pd.Series",
+    args: "argparse.Namespace",
+) -> None:
+    """Fit MLR on train data, evaluate on test data, append row to final_metrics CSV.
+
+    Uses the same train/test split as the best ML model for the dataset.
+    Feature selection (MI + L1 + VIF) is performed independently on training data.
+    Also writes per-variant output artifacts (evaluation_summary.csv, predictions.csv,
+    model_config.json, boxplot.png, predictions.png, metrics_summary.png) matching
+    the standard output format of other data-driven models.
+    """
+    df = pd.read_csv(final_metrics_csv)
+    # Skip if MLR row already present
+    if "model" in df.columns and (df["model"].astype(str).str.lower() == "mlr").any():
+        print(f"[INFO] MLR row already exists for {plan.dataset_dir.name}; skipping.")
+        return
+
+    variant_dir, eval_cfg_path, match_status = _find_best_variant_eval_config(plan, best_row)
+    if eval_cfg_path is None or not eval_cfg_path.exists():
+        print(f"[WARN] Cannot compute MLR for {plan.dataset_dir.name}: no eval config ({match_status})")
+        return
+
+    cfg = eval_module.load_config(str(eval_cfg_path))
+    config_dir = cfg["__config_dir"]
+    data_cfg = cfg["data"]
+    split_cfg = cfg.get("data_split", {"random_state": 42})
+
+    data_cfg["data_dir"], data_cfg["sample_subdir"] = eval_module._resolve_data_paths(data_cfg, config_dir)
+
+    model_config = eval_module.load_model_config(
+        data_cfg["data_dir"],
+        data_cfg["forecast_name"],
+        cfg.get("model_name", ""),
+        fallback_data=data_cfg,
+    )
+    input_columns = model_config["input_columns"]
+    output_columns = model_config["output_columns"]
+    input_rows = slice(model_config["input_row_1"], model_config["input_row_2"])
+    output_rows = model_config["output_rows"]
+    input_aggregation = str(model_config.get("input_aggregation", data_cfg.get("input_aggregation", "none"))).lower()
+
+    model_type = cfg.get("model_type", "")
+    load_fault_tolerant, enforced_nan_tolerance = _model_sample_policy(model_type, split_cfg)
+    split_base_dir = Path(data_cfg.get("forecast_dir", eval_cfg_path.parent))
+
+    load_kw = dict(
+        data_dir=data_cfg["data_dir"],
+        sample_subdir=data_cfg["sample_subdir"],
+        forecast_name=data_cfg["forecast_name"],
+        input_columns=input_columns,
+        output_columns=output_columns,
+        input_rows=input_rows,
+        output_rows=output_rows,
+        split_source_dir=split_base_dir,
+        fault_tolerant=load_fault_tolerant,
+        input_aggregation=input_aggregation,
+    )
+
+    train_samples = eval_module.load_split_samples(**load_kw, split_file="train_files.txt")
+    test_samples = eval_module.load_split_samples(**load_kw, split_file="test_files.txt")
+
+    if load_fault_tolerant and enforced_nan_tolerance is not None:
+        train_samples = _filter_samples_by_nan_tolerance(train_samples, float(enforced_nan_tolerance))
+        test_samples = _filter_samples_by_nan_tolerance(test_samples, float(enforced_nan_tolerance))
+
+    if len(train_samples) < 3 or len(test_samples) < 1:
+        print(f"[WARN] Insufficient samples for MLR ({plan.dataset_dir.name}): "
+              f"train={len(train_samples)}, test={len(test_samples)}")
+        return
+
+    # Read split file lists for predictions table
+    test_split_files = eval_module._read_split_files(split_base_dir, "test_files.txt")
+
+    predictions, targets, meta = _evaluate_mlr(
+        train_samples, test_samples, feature_names=input_columns, verbose=False,
+    )
+
+    # Compute metrics
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+    finite_mask = np.all(np.isfinite(predictions), axis=1) & np.all(np.isfinite(targets), axis=1)
+    if finite_mask.sum() < 1:
+        print(f"[WARN] MLR produced no finite predictions for {plan.dataset_dir.name}")
+        return
+
+    p_flat = predictions[finite_mask].flatten()
+    t_flat = targets[finite_mask].flatten()
+    mae_val = float(mean_absolute_error(t_flat, p_flat))
+    rmse_val = float(np.sqrt(mean_squared_error(t_flat, p_flat)))
+    r2_val = float(r2_score(t_flat, p_flat))
+    pearson_val = float(np.corrcoef(t_flat, p_flat)[0, 1]) if len(t_flat) >= 2 else float("nan")
+
+    std_target = _safe_float(best_row.get("std_target", float("nan")))
+    nrmse_val = rmse_val / std_target if np.isfinite(std_target) and std_target > 0 else float("nan")
+
+    n_selected = sum(m.get("n_selected", 0) for m in meta) / max(len(meta), 1)
+
+    mlr_row = {
+        "dataset": best_row.get("dataset", plan.dataset_dir.name),
+        "target": best_row.get("target", ""),
+        "subset_rank": best_row.get("subset_rank", 1),
+        "feature_tag": "mlr",
+        "row_count": best_row.get("row_count", ""),
+        "n_features": n_selected,
+        "model": "mlr",
+        "mae": mae_val,
+        "rmse": rmse_val,
+        "r2": r2_val,
+        "pearson_r": pearson_val,
+        "std_target": std_target,
+        "nrmse": nrmse_val,
+        "n_test_independent": best_row.get("n_test_independent", ""),
+        "n_test_valid": int(finite_mask.sum()),
+        "n_test_evals": int(finite_mask.sum()),
+        "n_samples": best_row.get("n_samples", ""),
+        "input_dim": float(len(input_columns)),
+        "target_dim": float(len(output_columns)),
+    }
+
+    df = pd.concat([df, pd.DataFrame([mlr_row])], ignore_index=True)
+    df.to_csv(final_metrics_csv, index=False)
+    print(f"[INFO] Appended MLR row for {plan.dataset_dir.name}: "
+          f"R²={r2_val:.3f}, RMSE={rmse_val:.4f}, n_features={n_selected:.0f}")
+
+    # --- Write per-variant output artifacts ---
+    sweep_dir = _forecast_sweeps_dir(plan.dataset_dir)
+    mlr_dir = sweep_dir / "mlr"
+    mlr_dir.mkdir(parents=True, exist_ok=True)
+
+    # Derive forecast_name relative to dataset_dir so visualizer outputs land in mlr_dir
+    try:
+        mlr_forecast_name = str(mlr_dir.relative_to(plan.dataset_dir / "forecasts"))
+    except ValueError:
+        mlr_forecast_name = mlr_dir.name
+
+    # 1. model_config.json — selected features and MLR metadata per target
+    mlr_model_config = {
+        "model_type": "mlr",
+        "input_columns": input_columns,
+        "output_columns": output_columns,
+        "input_row_1": model_config.get("input_row_1"),
+        "input_row_2": model_config.get("input_row_2"),
+        "output_rows": output_rows,
+        "input_aggregation": input_aggregation,
+        "n_train_samples": len(train_samples),
+        "n_test_samples": len(test_samples),
+        "feature_selection": {
+            "method": "MI + L1/Lasso + VIF",
+            "mi_quantile": 0.25,
+            "vif_threshold": 10.0,
+        },
+        "per_target_meta": [],
+    }
+    for j, m in enumerate(meta):
+        target_meta = {
+            "target_index": j,
+            "target_name": output_columns[j] if j < len(output_columns) else f"target_{j}",
+            "selected_features": m.get("selected_features", []),
+            "n_selected": m.get("n_selected", 0),
+            "coefficients": m.get("coefficients", []),
+            "intercept": m.get("intercept", None),
+            "n_train_valid": m.get("n_train", 0),
+        }
+        mlr_model_config["per_target_meta"].append(target_meta)
+
+    model_config_path = mlr_dir / "model_config.json"
+    with open(model_config_path, "w") as f:
+        json.dump(mlr_model_config, f, indent=2, default=str)
+    print(f"[INFO] Wrote MLR model config: {model_config_path}")
+
+    # 2. Copy train_files.txt / test_files.txt from reference variant
+    for split_name in ("train_files.txt", "test_files.txt"):
+        src = split_base_dir / split_name
+        dst = mlr_dir / split_name
+        if src.exists():
+            shutil.copy2(src, dst)
+
+    # 3. evaluation_summary.csv
+    model_label = "MLR"
+    summary_row = eval_module._compute_regression_summary(
+        f"{model_label} (test)",
+        predictions,
+        targets,
+        len(targets),
+        metadata={"kind": "test", "gp_uncertainty_mode": "not_gp"},
+        split_files=test_split_files,
+    )
+    summary_row["n_train_samples"] = len(train_samples)
+    summary_row["n_test_samples"] = len(test_samples)
+    summary_row["input_dim"] = len(input_columns)
+    summary_row["target_dim"] = len(output_columns)
+    summary_row["data_dir"] = str(data_cfg["data_dir"])
+    eval_module._write_summary_csv([summary_row], mlr_dir / "evaluation_summary.csv")
+
+    # 4. predictions.csv
+    predictions_entries = [
+        {
+            "kind": "test",
+            "label": model_label,
+            "preds": predictions,
+            "targets": targets,
+            "split_files": test_split_files,
+            "include_mc_stats": False,
+        },
+    ]
+    pred_rows, pred_columns = eval_module._build_predictions_table(
+        predictions_entries,
+        gp_uncertainty_mode="not_gp",
+        include_mc_output_columns=False,
+    )
+    eval_module._write_predictions_csv(pred_rows, mlr_dir / "predictions.csv", pred_columns)
+
+    # 5. Plots (predictions.png, metrics_summary.png, boxplot.png)
+    matplotlib.use("Agg")
+    try:
+        eval_module.visualizer(
+            (predictions, targets),
+            labels=[model_label],
+            directory=str(plan.dataset_dir),
+            forecast_name=mlr_forecast_name,
+            num_samples=200,
+            split_files_by_pair=[test_split_files],
+            collapse_error_points_by_pair=[False],
+        )
+    except Exception as exc:
+        print(f"[WARN] MLR predictions/metrics plots failed for {plan.dataset_dir.name}: {exc}")
+
+    try:
+        boxplot_rows = eval_module._build_boxplot_error_rows_from_predictions(
+            pred_rows,
+            model_label=model_label,
+            baseline_labels=[],
+        )
+        eval_module.boxplot_from_error_rows(
+            boxplot_rows,
+            directory=str(plan.dataset_dir),
+            forecast_name=mlr_forecast_name,
+        )
+    except Exception as exc:
+        print(f"[WARN] MLR boxplot failed for {plan.dataset_dir.name}: {exc}")
+
+
 def _normalize_ml_model_display(val: str) -> str:
     """Map raw model string to ML_COMPARISON_MODEL_TYPES display key."""
     key = str(val).strip().lower()
@@ -363,6 +609,8 @@ def _normalize_ml_model_display(val: str) -> str:
         return 'Trans.'
     if 'gp' in key:
         return 'GP'
+    if 'mlr' in key:
+        return 'MLR'
     return None
 
 
@@ -494,8 +742,7 @@ def _plot_ml_model_comparison(
 
     n_targets = len(ordered_targets)
     x = np.arange(n_targets)
-    # width=0.29 gives ~50% less inter-cluster gap vs 0.25 (gap: 1-3*0.29≈0.13 vs 1-3*0.25=0.25)
-    width = 0.29
+    width = 0.22
     n_models = len(ML_COMPARISON_MODEL_TYPES)
     offsets = np.array([(i - (n_models - 1) / 2) for i in range(n_models)])
     _FS = 12  # unified font size for all text elements
@@ -2239,6 +2486,13 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                             _write_dataset_evaluation_summary(plan=plan, final_metrics_csv=final_metrics_csv)
                         except Exception as exc:
                             print(f"[WARN] Failed to write dataset evaluation summary for {plan.dataset_dir.name}: {exc}")
+                            traceback.print_exc()
+
+                        # Compute MLR baseline and append to final_metrics CSV
+                        try:
+                            _append_mlr_to_final_metrics(plan, final_metrics_csv, best_row, args)
+                        except Exception as exc:
+                            print(f"[WARN] MLR computation failed for {plan.dataset_dir.name}: {exc}")
                             traceback.print_exc()
 
                         # Re-run best model evaluation context and compute statistical evidence

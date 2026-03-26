@@ -92,6 +92,7 @@ import hashlib
 import io
 import json
 import re
+import shutil
 import sys
 import textwrap
 import time
@@ -3153,6 +3154,184 @@ def _evaluate_selected_subsets_all_models(
         for baseline_id, (_, _, payload) in best_baseline_rows.items():
             if baseline_id not in {"naive", "seasonal", "linear"}:
                 rows.append(payload)
+
+    # --- MLR model row for the k01 (best) subset ---
+    try:
+        from utils.mlr import evaluate_mlr as _evaluate_mlr_pipeline
+        _mlr_done = False
+        if selected:
+            k01 = selected[0]
+            _mlr_tag = f"{k01.feature_tag}_k01"
+            _mlr_variant_dirs = sorted(output_dir.glob(f"*_r{k01.row_count:03d}_{_mlr_tag}*"))
+            for _vd in _mlr_variant_dirs:
+                _ecfg = _vd / f"config_evaluate_{_vd.name}.yml"
+                if not _ecfg.exists():
+                    continue
+                try:
+                    _cfg = yaml.safe_load(open(_ecfg, encoding="utf-8"))
+                    _dcfg = _cfg.get("data", {})
+                    _cfg_dir = _ecfg.parent
+                    _data_dir = str((_cfg_dir / _dcfg.get("data_dir", "")).resolve())
+                    _sample_sub = _dcfg.get("sample_subdir", "samples")
+                    _input_cols = _dcfg.get("input_columns", [])
+                    _output_cols = _dcfg.get("output_columns", [])
+                    _in_r1 = _dcfg.get("input_row_1", 0)
+                    _in_r2 = _dcfg.get("input_row_2", 96)
+                    _out_rows = _dcfg.get("output_rows", -1)
+                    _in_agg = str(_dcfg.get("input_aggregation", "none")).lower()
+                    _split_dir = _vd
+
+                    _load_kw = dict(
+                        data_dir=_data_dir, sample_subdir=_sample_sub,
+                        forecast_name=_dcfg.get("forecast_name", ""),
+                        input_columns=_input_cols, output_columns=_output_cols,
+                        input_rows=slice(_in_r1, _in_r2), output_rows=_out_rows,
+                        split_source_dir=_split_dir, input_aggregation=_in_agg,
+                    )
+                    _tr = eval_module.load_split_samples(**_load_kw, split_file="train_files.txt")
+                    _te = eval_module.load_split_samples(**_load_kw, split_file="test_files.txt")
+                    if len(_tr) >= 3 and len(_te) >= 1:
+                        _preds, _tgts, _meta = _evaluate_mlr_pipeline(_tr, _te, feature_names=_input_cols)
+                        _fm = np.all(np.isfinite(_preds), axis=1) & np.all(np.isfinite(_tgts), axis=1)
+                        if _fm.sum() >= 1:
+                            _pf = _preds[_fm].flatten()
+                            _tf = _tgts[_fm].flatten()
+                            from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+                            _n_sel = sum(m.get("n_selected", 0) for m in _meta) / max(len(_meta), 1)
+                            _mae = float(mean_absolute_error(_tf, _pf))
+                            _rmse = float(np.sqrt(mean_squared_error(_tf, _pf)))
+                            _r2 = float(r2_score(_tf, _pf))
+                            _pr = float(np.corrcoef(_tf, _pf)[0, 1])
+                            rows.append({
+                                "dataset": dataset_plan.dataset_dir.name,
+                                "target": target_name,
+                                "subset_rank": 1,
+                                "feature_tag": "mlr",
+                                "row_count": k01.row_count,
+                                "n_features": _n_sel,
+                                "model": "mlr",
+                                "mae": _mae,
+                                "rmse": _rmse,
+                                "r2": _r2,
+                                "pearson_r": _pr,
+                                "std_target": float(np.std(_tf, ddof=1)) if len(_tf) > 1 else float("nan"),
+                                "n_test_valid": int(_fm.sum()),
+                                "n_test_evals": int(_fm.sum()),
+                                "input_dim": float(len(_input_cols)),
+                                "target_dim": float(len(_output_cols)),
+                            })
+                            print(f"[INFO] MLR row appended for {dataset_plan.dataset_dir.name}: "
+                                  f"R²={_r2:.3f}")
+
+                            # --- Write per-variant MLR artifacts ---
+                            try:
+                                _mlr_dir = output_dir / "mlr"
+                                _mlr_dir.mkdir(parents=True, exist_ok=True)
+                                try:
+                                    _mlr_fn = str(_mlr_dir.relative_to(dataset_plan.dataset_dir / "forecasts"))
+                                except ValueError:
+                                    _mlr_fn = _mlr_dir.name
+
+                                # model_config.json
+                                _mlr_mc = {
+                                    "model_type": "mlr",
+                                    "input_columns": _input_cols,
+                                    "output_columns": _output_cols,
+                                    "input_row_1": _in_r1,
+                                    "input_row_2": _in_r2,
+                                    "output_rows": _out_rows,
+                                    "input_aggregation": _in_agg,
+                                    "n_train_samples": len(_tr),
+                                    "n_test_samples": len(_te),
+                                    "feature_selection": {
+                                        "method": "MI + L1/Lasso + VIF",
+                                        "mi_quantile": 0.25,
+                                        "vif_threshold": 10.0,
+                                    },
+                                    "per_target_meta": [],
+                                }
+                                for _j, _m in enumerate(_meta):
+                                    _mlr_mc["per_target_meta"].append({
+                                        "target_index": _j,
+                                        "target_name": _output_cols[_j] if _j < len(_output_cols) else f"target_{_j}",
+                                        "selected_features": _m.get("selected_features", []),
+                                        "n_selected": _m.get("n_selected", 0),
+                                        "coefficients": _m.get("coefficients", []),
+                                        "intercept": _m.get("intercept", None),
+                                        "n_train_valid": _m.get("n_train", 0),
+                                    })
+                                with open(_mlr_dir / "model_config.json", "w") as _mcf:
+                                    json.dump(_mlr_mc, _mcf, indent=2, default=str)
+
+                                # Copy split files
+                                for _sfn in ("train_files.txt", "test_files.txt"):
+                                    _sf_src = _split_dir / _sfn
+                                    if _sf_src.exists():
+                                        shutil.copy2(_sf_src, _mlr_dir / _sfn)
+
+                                # Read test split file list for predictions table
+                                _test_sf = eval_module._read_split_files(_split_dir, "test_files.txt")
+
+                                # evaluation_summary.csv
+                                _sr = eval_module._compute_regression_summary(
+                                    "MLR (test)", _preds, _tgts, len(_tgts),
+                                    metadata={"kind": "test", "gp_uncertainty_mode": "not_gp"},
+                                    split_files=_test_sf,
+                                )
+                                _sr["n_train_samples"] = len(_tr)
+                                _sr["n_test_samples"] = len(_te)
+                                _sr["input_dim"] = len(_input_cols)
+                                _sr["target_dim"] = len(_output_cols)
+                                _sr["data_dir"] = _data_dir
+                                eval_module._write_summary_csv([_sr], _mlr_dir / "evaluation_summary.csv")
+
+                                # predictions.csv
+                                _pe = [{
+                                    "kind": "test", "label": "MLR",
+                                    "preds": _preds, "targets": _tgts,
+                                    "split_files": _test_sf, "include_mc_stats": False,
+                                }]
+                                _pr_rows, _pr_cols = eval_module._build_predictions_table(
+                                    _pe, gp_uncertainty_mode="not_gp", include_mc_output_columns=False,
+                                )
+                                eval_module._write_predictions_csv(_pr_rows, _mlr_dir / "predictions.csv", _pr_cols)
+
+                                # Plots
+                                matplotlib.use("Agg")
+                                try:
+                                    eval_module.visualizer(
+                                        (_preds, _tgts), labels=["MLR"],
+                                        directory=str(dataset_plan.dataset_dir),
+                                        forecast_name=_mlr_fn, num_samples=200,
+                                        split_files_by_pair=[_test_sf],
+                                        collapse_error_points_by_pair=[False],
+                                    )
+                                except Exception as _plot_exc:
+                                    print(f"[WARN] MLR plots failed: {_plot_exc}")
+                                try:
+                                    _bx = eval_module._build_boxplot_error_rows_from_predictions(
+                                        _pr_rows, model_label="MLR", baseline_labels=[],
+                                    )
+                                    eval_module.boxplot_from_error_rows(
+                                        _bx, directory=str(dataset_plan.dataset_dir),
+                                        forecast_name=_mlr_fn,
+                                    )
+                                except Exception as _bx_exc:
+                                    print(f"[WARN] MLR boxplot failed: {_bx_exc}")
+
+                                print(f"[INFO] MLR artifacts written to {_mlr_dir}")
+                            except Exception as _art_exc:
+                                print(f"[WARN] MLR artifact generation failed: {_art_exc}")
+
+                            _mlr_done = True
+                except Exception as _mlr_exc:
+                    print(f"[WARN] MLR eval failed for variant {_vd.name}: {_mlr_exc}")
+                if _mlr_done:
+                    break
+        if not _mlr_done:
+            print(f"[INFO] MLR row not computed for {dataset_plan.dataset_dir.name} (no suitable variant found).")
+    except Exception as _mlr_outer_exc:
+        print(f"[WARN] MLR integration skipped for {dataset_plan.dataset_dir.name}: {_mlr_outer_exc}")
 
     final_df = pd.DataFrame(rows)
 
