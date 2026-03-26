@@ -124,6 +124,7 @@ FINAL_METRICS_MODEL_ORDER = [
     "gp_regressor",
     "transformer",
     "xgb_regressor",
+    "mlr",
     "naive",
     "seasonal",
     "linear",
@@ -132,6 +133,7 @@ FINAL_METRICS_MODEL_STYLE = {
     "gp_regressor": {"label": "GP", "color": "#1f77b4", "hatch": ""},
     "transformer": {"label": "Transformer", "color": "#ff7f0e", "hatch": ""},
     "xgb_regressor": {"label": "XGB", "color": "#2ca02c", "hatch": ""},
+    "mlr": {"label": "MLR", "color": "#d62728", "hatch": ""},
     "naive": {"label": "Naive", "color": "#7f7f7f", "hatch": "//"},
     "seasonal": {"label": "Seasonal", "color": "#17becf", "hatch": "//"},
     "linear": {"label": "Linear", "color": "#bcbd22", "hatch": "//"},
@@ -1309,7 +1311,7 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         legend_labels,
         loc="lower center",
         bbox_to_anchor=(0.5, 0.905),
-        ncol=6,
+        ncol=len(legend_handles),
         frameon=True,
         fontsize=9,
     )
@@ -3173,13 +3175,19 @@ def _evaluate_selected_subsets_all_models(
                     _cfg_dir = _ecfg.parent
                     _data_dir = str((_cfg_dir / _dcfg.get("data_dir", "")).resolve())
                     _sample_sub = _dcfg.get("sample_subdir", "samples")
-                    _input_cols = _dcfg.get("input_columns", [])
                     _output_cols = _dcfg.get("output_columns", [])
                     _in_r1 = _dcfg.get("input_row_1", 0)
                     _in_r2 = _dcfg.get("input_row_2", 96)
                     _out_rows = _dcfg.get("output_rows", -1)
                     _in_agg = str(_dcfg.get("input_aggregation", "none")).lower()
                     _split_dir = _vd
+
+                    # MLR feature selection is fully independent of the ML
+                    # feature sweep — load the FULL input columns from the
+                    # surrogate (base) config, not the variant's reduced subset.
+                    _surrogate_path = _select_surrogate_config(dataset_plan.train_configs)
+                    _surrogate_cfg = train_module.load_config(str(_surrogate_path))
+                    _input_cols = list(_surrogate_cfg["data"]["input_columns"])
 
                     _load_kw = dict(
                         data_dir=_data_dir, sample_subdir=_sample_sub,
@@ -3244,7 +3252,9 @@ def _evaluate_selected_subsets_all_models(
                                     "n_train_samples": len(_tr),
                                     "n_test_samples": len(_te),
                                     "feature_selection": {
-                                        "method": "MI + L1/Lasso + VIF",
+                                        "method": "Spearman + MI + L1/Lasso + VIF",
+                                        "spearman_p_threshold": 0.05,
+                                        "spearman_rho_threshold": 0.25,
                                         "mi_quantile": 0.25,
                                         "vif_threshold": 10.0,
                                     },
@@ -3259,9 +3269,34 @@ def _evaluate_selected_subsets_all_models(
                                         "coefficients": _m.get("coefficients", []),
                                         "intercept": _m.get("intercept", None),
                                         "n_train_valid": _m.get("n_train", 0),
+                                        "spearman_kept_columns": _m.get("spearman_kept_columns", []),
                                     })
                                 with open(_mlr_dir / "model_config.json", "w") as _mcf:
                                     json.dump(_mlr_mc, _mcf, indent=2, default=str)
+
+                                # mlr_equation.txt
+                                _eq_lines = []
+                                for _tm in _mlr_mc["per_target_meta"]:
+                                    _tgt = _tm["target_name"]
+                                    _feats = _tm["selected_features"]
+                                    _coefs = _tm["coefficients"]
+                                    _intercept = _tm["intercept"]
+                                    _eq_lines.append(f"Target: {_tgt}")
+                                    _eq_lines.append(f"  n_selected = {_tm['n_selected']}")
+                                    _eq_lines.append(f"  n_train    = {_tm['n_train_valid']}")
+                                    if _intercept is not None and _feats and _coefs:
+                                        _terms = [f"{_intercept:.6g}"]
+                                        for _feat, _c in zip(_feats, _coefs):
+                                            _sign = "+" if _c >= 0 else "-"
+                                            _terms.append(f"{_sign} {abs(_c):.6g} * {_feat}")
+                                        _eq_lines.append(f"  y = {_terms[0]}")
+                                        for _term in _terms[1:]:
+                                            _eq_lines.append(f"      {_term}")
+                                    else:
+                                        _eq_lines.append("  (no features selected)")
+                                    _eq_lines.append("")
+                                with open(_mlr_dir / "mlr_equation.txt", "w", encoding="utf-8") as _eqf:
+                                    _eqf.write("\n".join(_eq_lines))
 
                                 # Copy split files
                                 for _sfn in ("train_files.txt", "test_files.txt"):
@@ -3272,7 +3307,13 @@ def _evaluate_selected_subsets_all_models(
                                 # Read test split file list for predictions table
                                 _test_sf = eval_module._read_split_files(_split_dir, "test_files.txt")
 
-                                # evaluation_summary.csv
+                                # Evaluate baselines on same test set
+                                _summary_rows = []
+                                _pred_entries = []
+                                _bl_labels = []
+                                _bl_pairs = []
+                                _bl_split_files = []
+
                                 _sr = eval_module._compute_regression_summary(
                                     "MLR (test)", _preds, _tgts, len(_tgts),
                                     metadata={"kind": "test", "gp_uncertainty_mode": "not_gp"},
@@ -3283,34 +3324,91 @@ def _evaluate_selected_subsets_all_models(
                                 _sr["input_dim"] = len(_input_cols)
                                 _sr["target_dim"] = len(_output_cols)
                                 _sr["data_dir"] = _data_dir
-                                eval_module._write_summary_csv([_sr], _mlr_dir / "evaluation_summary.csv")
-
-                                # predictions.csv
-                                _pe = [{
+                                _summary_rows.append(_sr)
+                                _pred_entries.append({
                                     "kind": "test", "label": "MLR",
                                     "preds": _preds, "targets": _tgts,
                                     "split_files": _test_sf, "include_mc_stats": False,
-                                }]
+                                })
+
+                                try:
+                                    _eval_cfg = eval_module.merge_eval_config(_cfg)
+                                    for _ek in ["historic_path"]:
+                                        if _eval_cfg.get(_ek):
+                                            _eval_cfg[_ek] = str(eval_module._resolve_path_from_config(
+                                                _eval_cfg[_ek], _cfg_dir))
+                                    _historic = _eval_cfg.get("historic_path")
+                                    if _historic:
+                                        _bl_output_rows = eval_module._baseline_output_rows_start(
+                                            _dcfg.get("output_rows", _out_rows))
+                                        _secondary, _bl_wh = eval_module.load_secondary(
+                                            _output_cols, int(_eval_cfg.get("window_hours", 340)))
+                                        _bl_deduped = eval_module._dedupe_split_files_by_base_sample(_test_sf)
+
+                                        _pn, _tn = eval_module.evaluate_naive(
+                                            _te, _historic, _output_cols, _data_dir,
+                                            output_rows=_bl_output_rows,
+                                            gap_hours=int(_eval_cfg.get("gap_hours", 5)),
+                                            sample_subdir=_sample_sub)
+                                        _ps, _ts = eval_module.evaluate_seasonal(
+                                            _te, _historic, _output_cols, _data_dir,
+                                            output_rows=_bl_output_rows,
+                                            diurnal_window=int(_eval_cfg.get("diurnal_window", 2)),
+                                            secondary=_secondary, sample_subdir=_sample_sub)
+                                        _pl, _tl = eval_module.evaluate_linear(
+                                            _data_dir, _dcfg.get("forecast_name", ""),
+                                            _te, _historic, _output_cols,
+                                            output_rows=_bl_output_rows,
+                                            window_hours=int(_bl_wh),
+                                            gap_hours=int(_eval_cfg.get("gap_hours", 0)),
+                                            debug_plot=False, examples=0,
+                                            sample_subdir=_sample_sub)
+                                        _bl_pairs = [(_pn, _tn), (_ps, _ts), (_pl, _tl)]
+                                        _bl_labels = ["Naive", "Seasonal", "Linear"]
+                                        _bl_split_files = [_bl_deduped] * 3
+                                        for (_bp, _bt), _bll in zip(_bl_pairs, _bl_labels):
+                                            _blr = eval_module._compute_regression_summary(
+                                                _bll, _bp, _bt, len(_te),
+                                                metadata={"kind": "baseline", "gp_uncertainty_mode": "not_gp"},
+                                                split_files=_test_sf)
+                                            _summary_rows.append(_blr)
+                                            _pred_entries.append({
+                                                "kind": "test", "label": _bll,
+                                                "preds": _bp, "targets": _bt,
+                                                "split_files": _test_sf, "include_mc_stats": False,
+                                            })
+                                except Exception as _bl_exc:
+                                    print(f"[WARN] MLR baseline evaluation failed: {_bl_exc}")
+
+                                # evaluation_summary.csv
+                                eval_module._write_summary_csv(_summary_rows, _mlr_dir / "evaluation_summary.csv")
+
+                                # predictions.csv
                                 _pr_rows, _pr_cols = eval_module._build_predictions_table(
-                                    _pe, gp_uncertainty_mode="not_gp", include_mc_output_columns=False,
+                                    _pred_entries, gp_uncertainty_mode="not_gp",
+                                    include_mc_output_columns=False,
                                 )
                                 eval_module._write_predictions_csv(_pr_rows, _mlr_dir / "predictions.csv", _pr_cols)
 
                                 # Plots
                                 matplotlib.use("Agg")
+                                _plot_pairs = [(_preds, _tgts)] + _bl_pairs
+                                _plot_labels = ["MLR"] + _bl_labels
+                                _plot_sf = [_test_sf] + _bl_split_files
+                                _collapse = [False] + [True] * len(_bl_pairs)
                                 try:
                                     eval_module.visualizer(
-                                        (_preds, _tgts), labels=["MLR"],
+                                        *_plot_pairs, labels=_plot_labels,
                                         directory=str(dataset_plan.dataset_dir),
                                         forecast_name=_mlr_fn, num_samples=200,
-                                        split_files_by_pair=[_test_sf],
-                                        collapse_error_points_by_pair=[False],
+                                        split_files_by_pair=_plot_sf,
+                                        collapse_error_points_by_pair=_collapse,
                                     )
                                 except Exception as _plot_exc:
                                     print(f"[WARN] MLR plots failed: {_plot_exc}")
                                 try:
                                     _bx = eval_module._build_boxplot_error_rows_from_predictions(
-                                        _pr_rows, model_label="MLR", baseline_labels=[],
+                                        _pr_rows, model_label="MLR", baseline_labels=_bl_labels,
                                     )
                                     eval_module.boxplot_from_error_rows(
                                         _bx, directory=str(dataset_plan.dataset_dir),

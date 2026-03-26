@@ -1,23 +1,105 @@
 """Multiple Linear Regression with independent feature selection.
 
 Feature selection pipeline (training data only):
+  0. Spearman pre-filter — on *base* predictor columns (averaged across time
+     steps), keep only columns with significant correlation to the target
+     (p < 0.05 and |ρ| > 0.25).  Reduces dimensionality before flattening.
   1. Drop constant / near-constant columns
-  2. Mutual information — drop features below a quantile threshold
-  3. L1 / Lasso (LassoCV) — retain non-zero coefficients
+  2. Mutual information — keep top features by MI score (above quantile)
+  3. L1 / Lasso (LassoCV) — retain non-zero coefficients; cap at *max_lasso_features*
   4. Variance Inflation Factor — iteratively remove highest VIF > threshold
+
+Computational guard: VIF is O(p²) per iteration, so features entering
+VIF are capped at 50 (top by |Lasso coefficient|) with 50 max iterations.
 
 Usage:
     from utils.mlr import evaluate_mlr
     predictions, targets = evaluate_mlr(train_samples, test_samples)
 """
 
+import warnings
 import numpy as np
+from scipy.stats import spearmanr
 from sklearn.feature_selection import mutual_info_regression
 from sklearn.linear_model import LassoCV, LinearRegression
 
+# MI and Lasso are efficient (sklearn-optimised); only VIF is O(p²) per
+# iteration with numpy lstsq, so that is the stage that needs a hard cap.
+_MAX_VIF_FEATURES = 50     # max features entering VIF (top by |Lasso coef|)
+_MAX_VIF_ITERATIONS = 50   # max removal rounds inside VIF
+
 
 # ---------------------------------------------------------------------------
-# Feature selection
+# Spearman pre-filter (operates on base columns before flattening)
+# ---------------------------------------------------------------------------
+
+def _prefilter_by_spearman(train_samples, target_idx, base_feature_names,
+                           p_threshold=0.05, rho_threshold=0.25):
+    """Pre-filter base predictor columns using Spearman's rank correlation.
+
+    For each base column, compute the mean across time steps (rows) per
+    training sample, then correlate that vector with the target across
+    samples.  Keep columns where *both* p < *p_threshold* and |ρ| >
+    *rho_threshold*.
+
+    Parameters
+    ----------
+    train_samples : list of (X, y, filename) — X is (n_rows, n_cols)
+    target_idx : int — index into the target vector for this output
+    base_feature_names : list[str] — one name per input column
+    p_threshold : float
+    rho_threshold : float
+
+    Returns
+    -------
+    keep_cols : list[int] — indices of base columns that pass the filter
+    spearman_results : dict[str, (rho, p)] — per-column results for metadata
+    """
+    n_cols = len(base_feature_names)
+
+    # Build per-sample column means and target values
+    col_means = []
+    targets = []
+    for s in train_samples:
+        X = np.asarray(s[0], dtype=float)   # (n_rows, n_cols)
+        y = np.asarray(s[1], dtype=float).flatten()
+        y_val = y[target_idx] if target_idx < len(y) else y[0]
+        if not np.isfinite(y_val):
+            continue
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            col_means.append(np.nanmean(X, axis=0))  # (n_cols,)
+        targets.append(y_val)
+
+    spearman_results = {}
+
+    if len(targets) < 5:
+        # Not enough data — keep everything
+        return list(range(n_cols)), spearman_results
+
+    col_means = np.array(col_means)  # (n_valid, n_cols)
+    targets = np.array(targets)
+
+    keep_cols = []
+    for c in range(n_cols):
+        col = col_means[:, c]
+        finite = np.isfinite(col) & np.isfinite(targets)
+        if finite.sum() < 5:
+            continue
+        rho, p = spearmanr(col[finite], targets[finite])
+        spearman_results[base_feature_names[c]] = (float(rho), float(p))
+        if p < p_threshold and abs(rho) > rho_threshold:
+            keep_cols.append(c)
+
+    if not keep_cols:
+        # Fallback: keep all if nothing passes (avoid empty selection)
+        return list(range(n_cols)), spearman_results
+
+    return keep_cols, spearman_results
+
+
+# ---------------------------------------------------------------------------
+# Feature selection (on flattened features)
 # ---------------------------------------------------------------------------
 
 def _drop_constant(X, feature_idx):
@@ -46,7 +128,11 @@ def _select_by_mutual_info(X, y, feature_idx, mi_quantile=0.25, random_state=0):
 
 
 def _select_by_lasso(X, y, feature_idx, random_state=0):
-    """Retain features with non-zero Lasso coefficients (CV-tuned alpha)."""
+    """Retain features with non-zero Lasso coefficients (CV-tuned alpha).
+
+    If more than _MAX_VIF_FEATURES survive, keep those with the largest
+    absolute coefficients so VIF remains tractable.
+    """
     if len(feature_idx) <= 1:
         return feature_idx
 
@@ -54,11 +140,26 @@ def _select_by_lasso(X, y, feature_idx, random_state=0):
     if mask.sum() < 5:
         return feature_idx
 
-    lasso = LassoCV(cv=min(5, mask.sum()), random_state=random_state, max_iter=20000, tol=2e-4)
-    lasso.fit(X[mask], y[mask])
-    nonzero = np.abs(lasso.coef_) > 0
-    selected = [idx for idx, keep in zip(feature_idx, nonzero) if keep]
-    return selected if selected else feature_idx  # fallback: keep all if Lasso zeroes everything
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning)
+        warnings.filterwarnings("ignore", message=".*Objective did not converge.*")
+        lasso = LassoCV(cv=min(5, mask.sum()), random_state=random_state,
+                        max_iter=20000, tol=5e-4)
+        lasso.fit(X[mask], y[mask])
+
+    coef_abs = np.abs(lasso.coef_)
+    nonzero_mask = coef_abs > 0
+    selected = [(idx, c) for idx, keep, c in zip(feature_idx, nonzero_mask, coef_abs) if keep]
+
+    if not selected:
+        return feature_idx  # fallback: keep all if Lasso zeroes everything
+
+    # Cap before VIF — keep top features by |coefficient| to bound O(p²) cost.
+    if len(selected) > _MAX_VIF_FEATURES:
+        selected.sort(key=lambda t: t[1], reverse=True)
+        selected = selected[:_MAX_VIF_FEATURES]
+
+    return [idx for idx, _ in selected]
 
 
 def _compute_vif(X):
@@ -87,7 +188,10 @@ def _compute_vif(X):
 
 
 def _select_by_vif(X, y, feature_idx, vif_threshold=10.0):
-    """Iteratively remove the feature with highest VIF until all are below threshold."""
+    """Iteratively remove the feature with highest VIF until all are below threshold.
+
+    Capped at _MAX_VIF_ITERATIONS removals to prevent hangs on wide feature sets.
+    """
     if len(feature_idx) <= 1:
         return feature_idx
 
@@ -98,7 +202,9 @@ def _select_by_vif(X, y, feature_idx, vif_threshold=10.0):
     Xv = X[mask].copy()
     idx_list = list(range(len(feature_idx)))
 
-    while len(idx_list) > 1:
+    for _ in range(_MAX_VIF_ITERATIONS):
+        if len(idx_list) <= 1:
+            break
         vifs = _compute_vif(Xv[:, idx_list])
         worst = int(np.argmax(vifs))
         if vifs[worst] <= vif_threshold:
@@ -139,13 +245,13 @@ def select_features(X_train, y_train, feature_names,
     if not idx:
         return [], []
 
-    # Step 3: L1 / Lasso
+    # Step 3: L1 / Lasso (caps at _MAX_VIF_FEATURES before VIF)
     X_sub = X_train[:, idx]
     idx = _select_by_lasso(X_sub, y_train, idx, random_state)
     if not idx:
         return [], []
 
-    # Step 4: VIF
+    # Step 4: VIF (capped at _MAX_VIF_ITERATIONS removals)
     X_sub = X_train[:, idx]
     idx = _select_by_vif(X_sub, y_train, idx, vif_threshold)
 
@@ -233,34 +339,63 @@ def evaluate_mlr(train_samples, test_samples, feature_names=None, verbose=False)
     targets : ndarray [n_test, n_outputs]
     metadata : list[dict] — per-target metadata (selected features, coefficients, etc.)
     """
-    X_train = np.array([s[0].flatten() for s in train_samples], dtype=float)
-    y_train = np.array([s[1].flatten() for s in train_samples], dtype=float)
-    X_test = np.array([s[0].flatten() for s in test_samples], dtype=float)
-    y_test = np.array([s[1].flatten() for s in test_samples], dtype=float)
+    # Determine shapes from the first sample
+    sample_shape = np.asarray(train_samples[0][0], dtype=float).shape
+    n_rows = sample_shape[0] if len(sample_shape) > 1 else 1
+    n_cols = sample_shape[1] if len(sample_shape) > 1 else sample_shape[0]
 
+    y_train = np.array([np.asarray(s[1], dtype=float).flatten() for s in train_samples])
+    y_test = np.array([np.asarray(s[1], dtype=float).flatten() for s in test_samples])
     if y_train.ndim == 1:
         y_train = y_train.reshape(-1, 1)
     if y_test.ndim == 1:
         y_test = y_test.reshape(-1, 1)
 
-    # Expand feature_names to match flattened dimension (n_rows * n_cols)
-    n_flat = X_train.shape[1]
-    if feature_names is not None and len(feature_names) < n_flat:
-        n_rows_per_sample = n_flat // len(feature_names)
-        feature_names = [
-            f"{name}_r{r}" for r in range(n_rows_per_sample) for name in feature_names
-        ]
-
     n_outputs = y_train.shape[1]
     predictions = np.full_like(y_test, np.nan)
     all_meta = []
 
+    # Base feature names (one per input column, before time-step expansion)
+    base_names = feature_names if feature_names is not None else [f"f{i}" for i in range(n_cols)]
+
     for j in range(n_outputs):
+        # --- Step 0: Spearman pre-filter on base columns ---
+        keep_cols, spearman_results = _prefilter_by_spearman(
+            train_samples, j, base_names,
+        )
+
+        if verbose:
+            print(f"[MLR] Spearman pre-filter: {len(keep_cols)}/{len(base_names)} "
+                  f"base columns pass (p<0.05, |ρ|>0.25)")
+
+        # Flatten only the surviving base columns
+        def _flatten_filtered(samples):
+            """Flatten each sample keeping only *keep_cols* columns."""
+            rows = []
+            for s in samples:
+                X = np.asarray(s[0], dtype=float)
+                if X.ndim == 1:
+                    X = X.reshape(1, -1)
+                rows.append(X[:, keep_cols].flatten())
+            return np.array(rows, dtype=float)
+
+        X_train_f = _flatten_filtered(train_samples)
+        X_test_f = _flatten_filtered(test_samples)
+
+        # Build flattened feature names for the filtered columns
+        filtered_names = [
+            f"{base_names[c]}_r{r}" for r in range(n_rows) for c in keep_cols
+        ]
+
         pred_j, meta_j = fit_and_predict(
-            X_train, y_train[:, j], X_test,
-            feature_names=feature_names, verbose=verbose,
+            X_train_f, y_train[:, j], X_test_f,
+            feature_names=filtered_names, verbose=verbose,
         )
         predictions[:, j] = pred_j
+
+        # Record Spearman filter results in metadata
+        meta_j["spearman_kept_columns"] = [base_names[c] for c in keep_cols]
+        meta_j["spearman_results"] = spearman_results
         all_meta.append(meta_j)
 
     return predictions, y_test, all_meta
