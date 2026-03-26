@@ -3,7 +3,7 @@
 Feature selection pipeline (training data only):
   0. Spearman pre-filter — on *base* predictor columns (averaged across time
      steps), keep only columns with significant correlation to the target
-     (p < 0.05 and |ρ| > 0.25).  Reduces dimensionality before flattening.
+     (p < 0.05 and |ρ| > 0.20).  Reduces dimensionality before flattening.
   1. Drop constant / near-constant columns
   2. Mutual information — keep top features by MI score (above quantile)
   3. L1 / Lasso (LassoCV) — retain non-zero coefficients; cap at *max_lasso_features*
@@ -34,7 +34,7 @@ _MAX_VIF_ITERATIONS = 50   # max removal rounds inside VIF
 # ---------------------------------------------------------------------------
 
 def _prefilter_by_spearman(train_samples, target_idx, base_feature_names,
-                           p_threshold=0.05, rho_threshold=0.25):
+                           p_threshold=0.05, rho_threshold=0.20):
     """Pre-filter base predictor columns using Spearman's rank correlation.
 
     For each base column, compute the mean across time steps (rows) per

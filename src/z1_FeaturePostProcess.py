@@ -512,7 +512,7 @@ def _append_mlr_to_final_metrics(
         "feature_selection": {
             "method": "Spearman + MI + L1/Lasso + VIF",
             "spearman_p_threshold": 0.05,
-            "spearman_rho_threshold": 0.25,
+            "spearman_rho_threshold": 0.20,
             "mi_quantile": 0.25,
             "vif_threshold": 10.0,
         },
