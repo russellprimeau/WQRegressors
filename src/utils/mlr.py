@@ -1,12 +1,16 @@
 """Multiple Linear Regression with independent feature selection.
 
-MLR uses only the latest predictor row from each loaded sample. It does not
-expand the input window into lag-specific regressors.
+MLR extracts a single predictor vector per sample from the input window.
+Three aggregation modes are supported:
+
+  * ``"last"``   — use only the latest (last) predictor row (original behaviour)
+  * ``"avg12"``  — average the last 12 rows with ``np.nanmean``
+  * ``"avgall"`` — average all rows with ``np.nanmean``
 
 Feature selection pipeline (training data only):
-  0. Spearman pre-filter — on base predictor columns from the aligned predictor
-     row, keep only columns with significant correlation to the target
-     (p < 0.05 and |ρ| > 0.20).
+  0. Spearman pre-filter — on base predictor columns from the aggregated
+     predictor row, keep only columns with significant correlation to the
+     target (p < 0.05 and |ρ| > 0.20).
   1. Drop constant / near-constant columns
   2. Mutual information — keep top features by MI score (above quantile)
   3. L1 / Lasso (LassoCV) — retain non-zero coefficients; cap at *max_lasso_features*
@@ -31,22 +35,48 @@ from sklearn.linear_model import LassoCV, LinearRegression
 _MAX_VIF_FEATURES = 500     # max features entering VIF (top by |Lasso coef|)
 _MAX_VIF_ITERATIONS = 500   # max removal rounds inside VIF
 
+# ---------------------------------------------------------------------------
+# Variant definitions
+# ---------------------------------------------------------------------------
+
+MLR_VARIANTS = [
+    {"model_name": "mlr",        "aggregation_mode": "last",   "dir_prefix": "mlr",        "subset_label": "s01"},
+    {"model_name": "mlr_avg12",  "aggregation_mode": "avg12",  "dir_prefix": "mlr_avg12",  "subset_label": "m01"},
+    {"model_name": "mlr_avgall", "aggregation_mode": "avgall", "dir_prefix": "mlr_avgall", "subset_label": "l01"},
+]
+
 
 # ---------------------------------------------------------------------------
 # Single-row extraction and Spearman pre-filter
 # ---------------------------------------------------------------------------
 
-def _extract_aligned_predictor_row(X):
-    """Return the single predictor row used by MLR for one sample."""
+def _extract_aligned_predictor_row(X, aggregation_mode="last"):
+    """Return the single predictor vector used by MLR for one sample.
+
+    Parameters
+    ----------
+    X : array-like — shape (n_rows, n_cols) or (n_cols,)
+    aggregation_mode : str
+        ``"last"``   — last row only (default, original behaviour)
+        ``"avg12"``  — nanmean of the last 12 rows
+        ``"avgall"`` — nanmean of all rows
+    """
     arr = np.asarray(X, dtype=float)
     if arr.ndim == 1:
         return arr.astype(float, copy=False)
     if arr.ndim != 2:
         raise ValueError(f"Expected 1D or 2D predictor array, got shape {arr.shape}")
-    return arr[-1, :].astype(float, copy=False)
+    if aggregation_mode == "last":
+        return arr[-1, :].astype(float, copy=False)
+    if aggregation_mode == "avg12":
+        return np.nanmean(arr[-12:, :], axis=0).astype(float, copy=False)
+    if aggregation_mode == "avgall":
+        return np.nanmean(arr, axis=0).astype(float, copy=False)
+    raise ValueError(f"Unknown aggregation_mode: {aggregation_mode!r}")
 
 def _prefilter_by_spearman(train_samples, target_idx, base_feature_names,
-                           p_threshold=0.05, rho_threshold=0.20):
+                           p_threshold=0.05, rho_threshold=0.20,
+                           aggregation_mode="last"):
     """Pre-filter base predictor columns using Spearman's rank correlation.
 
     For each base column, use the latest predictor row per training sample,
@@ -73,7 +103,7 @@ def _prefilter_by_spearman(train_samples, target_idx, base_feature_names,
     aligned_rows = []
     targets = []
     for s in train_samples:
-        X = _extract_aligned_predictor_row(s[0])
+        X = _extract_aligned_predictor_row(s[0], aggregation_mode)
         y = np.asarray(s[1], dtype=float).flatten()
         y_val = y[target_idx] if target_idx < len(y) else y[0]
         if not np.isfinite(y_val):
@@ -109,7 +139,8 @@ def _prefilter_by_spearman(train_samples, target_idx, base_feature_names,
 
 
 def get_spearman_features(train_samples, feature_names, target_idx=0,
-                          p_threshold=0.05, rho_threshold=0.20):
+                          p_threshold=0.05, rho_threshold=0.20,
+                          aggregation_mode="last"):
     """Return base column names that pass the Spearman pre-filter.
 
     Convenience wrapper around :func:`_prefilter_by_spearman` for use
@@ -124,6 +155,7 @@ def get_spearman_features(train_samples, feature_names, target_idx=0,
     keep_cols, results = _prefilter_by_spearman(
         train_samples, target_idx, feature_names,
         p_threshold=p_threshold, rho_threshold=rho_threshold,
+        aggregation_mode=aggregation_mode,
     )
     return [feature_names[c] for c in keep_cols], results
 
@@ -245,8 +277,55 @@ def _select_by_vif(X, y, feature_idx, vif_threshold=10.0):
     return [feature_idx[i] for i in idx_list]
 
 
+def _drop_near_duplicate_features(X, y, feature_idx, corr_threshold=0.9999):
+    """Drop effectively duplicate columns using pairwise correlation.
+
+    For any near-perfectly correlated pair, keep the feature with the stronger
+    absolute correlation to the target on rows where both are finite.
+    """
+    if len(feature_idx) <= 1:
+        return feature_idx
+
+    mask_y = np.isfinite(y)
+    keep_local = [True] * len(feature_idx)
+
+    for i in range(len(feature_idx)):
+        if not keep_local[i]:
+            continue
+        xi = X[:, i]
+        for j in range(i + 1, len(feature_idx)):
+            if not keep_local[j]:
+                continue
+            xj = X[:, j]
+            mask = np.isfinite(xi) & np.isfinite(xj) & mask_y
+            if int(np.count_nonzero(mask)) < 3:
+                continue
+            xi_m = xi[mask]
+            xj_m = xj[mask]
+            if np.std(xi_m, ddof=1) <= 0 or np.std(xj_m, ddof=1) <= 0:
+                keep_local[j] = False
+                continue
+            corr = np.corrcoef(xi_m, xj_m)[0, 1]
+            if not np.isfinite(corr) or abs(corr) < corr_threshold:
+                continue
+            yi_m = y[mask]
+            corr_i = np.corrcoef(xi_m, yi_m)[0, 1]
+            corr_j = np.corrcoef(xj_m, yi_m)[0, 1]
+            score_i = abs(corr_i) if np.isfinite(corr_i) else -np.inf
+            score_j = abs(corr_j) if np.isfinite(corr_j) else -np.inf
+            if score_i >= score_j:
+                keep_local[j] = False
+            else:
+                keep_local[i] = False
+                break
+
+    return [idx for idx, keep in zip(feature_idx, keep_local) if keep]
+
+
 def select_features(X_train, y_train, feature_names,
-                    mi_quantile=0.25, vif_threshold=10.0, random_state=0):
+                    mi_quantile=0.25, vif_threshold=10.0, random_state=0,
+                    use_mutual_info=True, use_lasso=True,
+                    deduplicate_threshold=0.9999):
     """Run the full feature selection pipeline on training data.
 
     Parameters
@@ -271,18 +350,29 @@ def select_features(X_train, y_train, feature_names,
         return [], []
 
     # Step 2: mutual information
-    X_sub = X_train[:, idx]
-    idx = _select_by_mutual_info(X_sub, y_train, idx, mi_quantile, random_state)
-    if not idx:
-        return [], []
+    if use_mutual_info:
+        X_sub = X_train[:, idx]
+        idx = _select_by_mutual_info(X_sub, y_train, idx, mi_quantile, random_state)
+        if not idx:
+            return [], []
 
     # Step 3: L1 / Lasso (caps at _MAX_VIF_FEATURES before VIF)
-    X_sub = X_train[:, idx]
-    idx = _select_by_lasso(X_sub, y_train, idx, random_state)
-    if not idx:
-        return [], []
+    if use_lasso:
+        X_sub = X_train[:, idx]
+        idx = _select_by_lasso(X_sub, y_train, idx, random_state)
+        if not idx:
+            return [], []
 
-    # Step 4: VIF (capped at _MAX_VIF_ITERATIONS removals)
+    # Step 4: remove effectively duplicate columns before VIF
+    if deduplicate_threshold is not None and len(idx) > 1:
+        X_sub = X_train[:, idx]
+        idx = _drop_near_duplicate_features(
+            X_sub, y_train, idx, corr_threshold=float(deduplicate_threshold)
+        )
+        if not idx:
+            return [], []
+
+    # Step 5: VIF (capped at _MAX_VIF_ITERATIONS removals)
     X_sub = X_train[:, idx]
     idx = _select_by_vif(X_sub, y_train, idx, vif_threshold)
 
@@ -351,7 +441,14 @@ def _fit_intercept_only(y_train, n_test, meta, verbose=False, reason="intercept_
 # Fit & predict
 # ---------------------------------------------------------------------------
 
-def fit_and_predict(X_train, y_train, X_test, feature_names=None, verbose=False):
+def fit_and_predict(
+    X_train,
+    y_train,
+    X_test,
+    feature_names=None,
+    verbose=False,
+    selection_config=None,
+):
     """Feature-select, fit MLR on training data, predict on test data.
 
     Parameters
@@ -368,7 +465,13 @@ def fit_and_predict(X_train, y_train, X_test, feature_names=None, verbose=False)
     if feature_names is None:
         feature_names = [f"f{i}" for i in range(X_train.shape[1])]
 
-    sel_idx, sel_names = select_features(X_train, y_train, feature_names)
+    selection_config = dict(selection_config or {})
+    sel_idx, sel_names = select_features(
+        X_train,
+        y_train,
+        feature_names,
+        **selection_config,
+    )
 
     predictions = np.full(X_test.shape[0], np.nan)
     meta = {
@@ -380,6 +483,7 @@ def fit_and_predict(X_train, y_train, X_test, feature_names=None, verbose=False)
         "n_test_predictable": 0,
         "failure_reason": None,
         "fallback_mode": None,
+        "selection_config": selection_config,
     }
 
     if not sel_idx:
@@ -460,7 +564,14 @@ def fit_and_predict(X_train, y_train, X_test, feature_names=None, verbose=False)
 # Top-level evaluator
 # ---------------------------------------------------------------------------
 
-def evaluate_mlr(train_samples, test_samples, feature_names=None, verbose=False):
+def evaluate_mlr(
+    train_samples,
+    test_samples,
+    feature_names=None,
+    verbose=False,
+    selection_config=None,
+    aggregation_mode="last",
+):
     """Multiple Linear Regression with independent feature selection.
 
     Matches the interface pattern of other model evaluators.
@@ -501,6 +612,7 @@ def evaluate_mlr(train_samples, test_samples, feature_names=None, verbose=False)
         # --- Step 0: Spearman pre-filter on base columns ---
         keep_cols, spearman_results = _prefilter_by_spearman(
             train_samples, j, base_names,
+            aggregation_mode=aggregation_mode,
         )
 
         if verbose:
@@ -510,10 +622,10 @@ def evaluate_mlr(train_samples, test_samples, feature_names=None, verbose=False)
             )
 
         def _extract_filtered(samples):
-            """Return the aligned predictor row for each sample, filtered to keep_cols."""
+            """Return the aggregated predictor row for each sample, filtered to keep_cols."""
             rows = []
             for s in samples:
-                X = _extract_aligned_predictor_row(s[0])
+                X = _extract_aligned_predictor_row(s[0], aggregation_mode)
                 rows.append(X[keep_cols])
             return np.array(rows, dtype=float)
 
@@ -523,7 +635,9 @@ def evaluate_mlr(train_samples, test_samples, feature_names=None, verbose=False)
 
         pred_j, meta_j = fit_and_predict(
             X_train_f, y_train[:, j], X_test_f,
-            feature_names=filtered_names, verbose=verbose,
+            feature_names=filtered_names,
+            verbose=verbose,
+            selection_config=selection_config,
         )
         predictions[:, j] = pred_j
 
@@ -531,6 +645,7 @@ def evaluate_mlr(train_samples, test_samples, feature_names=None, verbose=False)
         meta_j["spearman_kept_columns"] = [base_names[c] for c in keep_cols]
         meta_j["spearman_results"] = spearman_results
         meta_j["aligned_input_row_index"] = int(n_rows - 1) if n_rows > 0 else 0
+        meta_j["aggregation_mode"] = aggregation_mode
         all_meta.append(meta_j)
 
     return predictions, y_test, all_meta

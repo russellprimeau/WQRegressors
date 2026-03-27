@@ -125,6 +125,8 @@ FINAL_METRICS_MODEL_ORDER = [
     "transformer",
     "xgb_regressor",
     "mlr",
+    "mlr_avg12",
+    "mlr_avgall",
     "naive",
     "seasonal",
     "linear",
@@ -134,6 +136,8 @@ FINAL_METRICS_MODEL_STYLE = {
     "transformer": {"label": "Transformer", "color": "#ff7f0e", "hatch": ""},
     "xgb_regressor": {"label": "XGB", "color": "#2ca02c", "hatch": ""},
     "mlr": {"label": "MLR", "color": "#d62728", "hatch": ""},
+    "mlr_avg12": {"label": "MLR-12", "color": "#e377c2", "hatch": ""},
+    "mlr_avgall": {"label": "MLR-All", "color": "#9467bd", "hatch": ""},
     "naive": {"label": "Naive", "color": "#7f7f7f", "hatch": "//"},
     "seasonal": {"label": "Seasonal", "color": "#17becf", "hatch": "//"},
     "linear": {"label": "Linear", "color": "#bcbd22", "hatch": "//"},
@@ -826,11 +830,12 @@ def _set_eval_overrides(eval_config_path: Path, run_baselines: bool) -> None:
         yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
 
 
-def _mlr_artifact_dir(output_dir: Path, subset_label: str) -> Path:
+def _mlr_artifact_dir(output_dir: Path, subset_label: str,
+                      model_prefix: str = "mlr") -> Path:
     token = str(subset_label).strip().lower()
     if not token:
         token = "main"
-    return output_dir / f"mlr_{token}"
+    return output_dir / f"{model_prefix}_{token}"
 
 
 def _append_mlr_baseline_outputs(
@@ -960,12 +965,13 @@ def _write_mlr_artifacts(
     ref_cfg_path: Path | None = None,
     ref_data_cfg: dict | None = None,
     model_config_extra: dict | None = None,
+    model_prefix: str = "mlr",
 ) -> Path:
-    mlr_dir = _mlr_artifact_dir(output_dir, subset_label)
+    mlr_dir = _mlr_artifact_dir(output_dir, subset_label, model_prefix=model_prefix)
     mlr_dir.mkdir(parents=True, exist_ok=True)
 
     model_config = {
-        "model_type": "mlr",
+        "model_type": model_prefix,
         "subset_label": str(subset_label),
         "input_columns": input_columns,
         "output_columns": output_columns,
@@ -980,11 +986,17 @@ def _write_mlr_artifacts(
             "spearman_p_threshold": 0.05,
             "spearman_rho_threshold": 0.20,
             "mi_quantile": 0.25,
+            "deduplicate_threshold": 0.9999,
             "vif_threshold": 10.0,
+            "use_mutual_info": True,
+            "use_lasso": True,
         },
         "per_target_meta": [],
     }
     if model_config_extra:
+        feature_selection_extra = model_config_extra.get("feature_selection")
+        if isinstance(feature_selection_extra, dict):
+            model_config["feature_selection"].update(feature_selection_extra)
         model_config.update(model_config_extra)
 
     for idx, meta in enumerate(per_target_meta):
@@ -1003,6 +1015,41 @@ def _write_mlr_artifacts(
 
     with open(mlr_dir / "model_config.json", "w", encoding="utf-8") as f:
         json.dump(model_config, f, indent=2, default=str)
+
+    # Write config_evaluate_*.yml so _find_best_variant_eval_config can discover
+    # this MLR artifact dir and _collect_prediction_payload can load its data.
+    _eval_cfg_name = f"config_evaluate_{mlr_dir.name}.yml"
+    _eval_cfg = {
+        "model_type": model_prefix,
+        "model_name": model_prefix,
+        "data": {
+            "data_dir": str(os.path.relpath(data_dir, mlr_dir)),
+            "sample_subdir": sample_subdir,
+            "forecast_name": str(mlr_dir.relative_to(dataset_dir / "forecasts"))
+            if dataset_dir is not None
+            else mlr_dir.name,
+            "input_columns": input_columns,
+            "output_columns": output_columns,
+            "input_row_1": input_row_1,
+            "input_row_2": input_row_2,
+            "output_rows": output_rows,
+            "input_aggregation": input_aggregation,
+        },
+        "data_split": {
+            "random_state": 42,
+            "fault_tolerant": True,
+        },
+    }
+    # Inherit evaluation section (historic_path, window_hours, etc.) from ref config
+    if ref_cfg is not None:
+        if "evaluation" in ref_cfg:
+            _eval_cfg["evaluation"] = dict(ref_cfg["evaluation"])
+        if "data_split" in ref_cfg:
+            for _ds_key in ("random_state", "test_size", "split_type"):
+                if _ds_key in ref_cfg["data_split"]:
+                    _eval_cfg["data_split"][_ds_key] = ref_cfg["data_split"][_ds_key]
+    with open(mlr_dir / _eval_cfg_name, "w", encoding="utf-8") as f:
+        yaml.dump(_eval_cfg, f, default_flow_style=False, sort_keys=False)
 
     equation_lines = []
     for target_meta in model_config["per_target_meta"]:
@@ -1042,8 +1089,9 @@ def _write_mlr_artifacts(
     baseline_labels: list[str] = []
     baseline_split_files: list[list[str]] = []
 
+    _model_label = model_prefix.upper().replace("_", "-")
     summary_row = eval_module._compute_regression_summary(
-        "MLR (test)",
+        f"{_model_label} (test)",
         preds,
         targets,
         len(test_samples),
@@ -1059,7 +1107,7 @@ def _write_mlr_artifacts(
     pred_entries.append(
         {
             "kind": "test",
-            "label": "MLR",
+            "label": _model_label,
             "preds": preds,
             "targets": targets,
             "split_files": test_split_files,
@@ -1477,38 +1525,74 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     else:
         best_model = max(finite_max_r2.items(), key=lambda item: item[1])[0]
 
+    # Separate baseline and non-baseline model lists.
+    non_baseline_models = [m for m in FINAL_METRICS_MODEL_ORDER if not _is_baseline_model_value(m)]
+    baseline_models = [m for m in FINAL_METRICS_MODEL_ORDER if _is_baseline_model_value(m)]
+
+    # Sort feature clusters by highest skill across ALL non-baseline models,
+    # then by highest R² (both descending).
+    def _best_skill_in_cluster(rank: int) -> float:
+        best = float("-inf")
+        for model in non_baseline_models:
+            s = _skill_for_rank_model(rank, model)
+            if np.isfinite(s) and s > best:
+                best = s
+        return best
+
+    def _best_r2_in_cluster(rank: int) -> float:
+        best = float("-inf")
+        for model in non_baseline_models:
+            v = _r2_for_rank_model(rank, model)
+            if np.isfinite(v) and v > best:
+                best = v
+        return best
+
     subset_order = sorted(
         rank_to_label.keys(),
         key=lambda rank: (
-            -_skill_for_rank_model(rank, best_model),
-            -_rmse_for_rank_model(rank, best_model),
-            _r2_for_rank_model(rank, best_model),
+            -_best_skill_in_cluster(rank),
+            -_best_r2_in_cluster(rank),
         ),
     )
 
-    # For each subset cluster, order model bars by descending local min-skill.
-    base_model_order = list(FINAL_METRICS_MODEL_ORDER)
-    model_order_index = {model: idx for idx, model in enumerate(base_model_order)}
+    # For each subset cluster, order non-baseline model bars by descending local min-skill.
+    model_order_index = {model: idx for idx, model in enumerate(FINAL_METRICS_MODEL_ORDER)}
 
     models_by_rank: dict[int, list[str]] = {}
     for rank in subset_order:
-        models_by_rank[int(rank)] = sorted(
-            base_model_order,
-            key=lambda model, _rank=rank: (
-                1 if not np.isfinite(_skill_for_rank_model(int(_rank), model)) else 0,
-                -_skill_for_rank_model(int(_rank), model),
-                -_rmse_for_rank_model(int(_rank), model),  # decreasing RMSE
-                _r2_for_rank_model(int(_rank), model),     # increasing R²
-                model_order_index[model],                  # deterministic final tiebreaker
-            ),
-        )
+        def _sort_key(model: str, _rank: int = rank) -> tuple:
+            skill = _skill_for_rank_model(int(_rank), model)
+            has_skill = 0 if np.isfinite(skill) else 1
+            r2_val = _r2_for_rank_model(int(_rank), model)
+            neg_r2 = -r2_val if np.isfinite(r2_val) else float("inf")
+            return (
+                has_skill,
+                -skill if np.isfinite(skill) else float("inf"),
+                neg_r2,
+                model_order_index[model],
+            )
+        models_by_rank[int(rank)] = sorted(non_baseline_models, key=_sort_key)
 
-    x = np.arange(len(subset_order), dtype=float)
-    n_models = len(FINAL_METRICS_MODEL_ORDER)
+    # Append a single "Baselines" cluster (baseline metrics are feature-independent).
+    _BASELINES_LABEL = "Baselines"
+    cluster_labels = [rank_to_label[r] for r in subset_order] + [_BASELINES_LABEL]
+
+    # Sort baseline bars within their cluster using the same skill/R² key (rank arbitrary, use first).
+    _any_rank = subset_order[0] if subset_order else 0
+    baseline_bar_order = sorted(baseline_models, key=lambda m: (
+        0 if np.isfinite(_skill_for_rank_model(_any_rank, m)) else 1,
+        -_skill_for_rank_model(_any_rank, m) if np.isfinite(_skill_for_rank_model(_any_rank, m)) else float("inf"),
+        -_r2_for_rank_model(_any_rank, m) if np.isfinite(_r2_for_rank_model(_any_rank, m)) else float("inf"),
+        model_order_index[m],
+    ))
+
+    n_clusters = len(cluster_labels)
+    x = np.arange(n_clusters, dtype=float)
+    n_bars_max = max(len(non_baseline_models), len(baseline_models))
     cluster_width = 0.86
-    bar_w = cluster_width / max(1, n_models)
+    bar_w = cluster_width / max(1, n_bars_max)
 
-    fig, axes = plt.subplots(5, 1, figsize=(max(10, 0.85 * len(subset_order) + 6), 17), sharex=True, constrained_layout=False)
+    fig, axes = plt.subplots(5, 1, figsize=(max(10, 0.85 * n_clusters + 6), 17), sharex=True, constrained_layout=False)
     metric_specs = [
         ("mae", "MAE"),
         ("rmse", "RMSE"),
@@ -1516,6 +1600,10 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         ("r2", "R\N{SUPERSCRIPT TWO}"),
         ("min_skill_rmse", "Min Skill (RMSE)"),
     ]
+
+    # Pre-compute average baseline metric values (feature-independent).
+    _baseline_rows = grouped[grouped["model_norm"].isin(baseline_models)]
+    _baseline_avg = _baseline_rows.groupby("model_norm")[metric_cols + ["min_skill_rmse"]].mean(numeric_only=True)
 
     legend_handles_by_model: dict[str, object] = {}
     legend_labels_by_model: dict[str, str] = {}
@@ -1525,7 +1613,8 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         axis_bars_and_vals: list[tuple[object, float]] = []
 
         for j, rank in enumerate(subset_order):
-            ordered_models = models_by_rank.get(int(rank), base_model_order)
+            # Feature clusters: non-baseline models only.
+            ordered_models = models_by_rank.get(int(rank), non_baseline_models)
             for i, model in enumerate(ordered_models):
                 style = FINAL_METRICS_MODEL_STYLE[model]
                 if rank in metric_pivot.index and model in metric_pivot.columns:
@@ -1551,6 +1640,34 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
                 if model not in legend_handles_by_model:
                     legend_handles_by_model[model] = bar
                     legend_labels_by_model[model] = style["label"]
+
+        # Baselines cluster (last position).
+        j_bl = len(subset_order)
+        for i, model in enumerate(baseline_bar_order):
+            style = FINAL_METRICS_MODEL_STYLE[model]
+            if model in _baseline_avg.index and metric in _baseline_avg.columns:
+                raw_val = _baseline_avg.loc[model, metric]
+                val = float(raw_val) if np.isfinite(raw_val) else float("nan")
+            else:
+                val = float("nan")
+
+            xpos = float(x[j_bl]) - (cluster_width / 2.0) + (i + 0.5) * bar_w
+            bars = ax.bar(
+                [xpos],
+                [val],
+                width=bar_w,
+                color=style["color"],
+                hatch=style["hatch"],
+                edgecolor="black" if style["hatch"] else "none",
+                linewidth=0.8 if style["hatch"] else 0.0,
+            )
+            bar = bars[0]
+            axis_bars_and_vals.append((bar, val))
+            if np.isfinite(val):
+                axis_vals.append(float(val))
+            if model not in legend_handles_by_model:
+                legend_handles_by_model[model] = bar
+                legend_labels_by_model[model] = style["label"]
 
         ax.set_ylabel(ylabel)
         ax.grid(axis="y", alpha=0.3)
@@ -1607,8 +1724,12 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
             )
 
     axes[-1].set_xticks(x)
-    axes[-1].set_xticklabels([rank_to_label[r] for r in subset_order], rotation=0)
+    axes[-1].set_xticklabels(cluster_labels, rotation=0)
     axes[-1].set_xlabel("Candidate Feature Subset")
+    # Tighten horizontal margins to less than one cluster width.
+    h_margin = cluster_width * 0.6
+    for ax in axes:
+        ax.set_xlim(x[0] - h_margin, x[-1] + h_margin)
 
     for ax in axes[:-1]:
         ax.tick_params(axis="x", labelbottom=False)
@@ -3501,9 +3622,10 @@ def _evaluate_selected_subsets_all_models(
             if baseline_id not in {"naive", "seasonal", "linear"}:
                 rows.append(payload)
 
-        # --- MLR model on this k## feature set ---
+        # --- MLR model variants on this k## feature set ---
         try:
             from utils.mlr import evaluate_mlr as _evaluate_mlr_pipeline
+            from utils.mlr import MLR_VARIANTS as _MLR_VARIANTS
             _k_tag = f"{cand.feature_tag}_k{rank:02d}"
             _k_variant_dirs = sorted(output_dir.glob(f"*_r{cand.row_count:03d}_{_k_tag}*"))
             _mlr_on_k_done = False
@@ -3523,79 +3645,95 @@ def _evaluate_selected_subsets_all_models(
                     _kout_rows = _kdcfg.get("output_rows", -1)
                     _kin_agg = str(_kdcfg.get("input_aggregation", "none")).lower()
 
-                    _surrogate_path = _select_surrogate_config(dataset_plan.train_configs)
-                    _surrogate_cfg = train_module.load_config(str(_surrogate_path))
-                    _full_input_cols = list(_surrogate_cfg["data"]["input_columns"])
+                    _candidate_input_cols = list(cand.features)
+                    _k_selection_cfg = {
+                        "use_mutual_info": True,
+                        "use_lasso": False,
+                        "deduplicate_threshold": 0.9999,
+                        "vif_threshold": 10.0,
+                    }
 
                     _kload_kw = dict(
                         data_dir=_kdata_dir, sample_subdir=_ksample_sub,
                         forecast_name=_kdcfg.get("forecast_name", ""),
-                        input_columns=_full_input_cols, output_columns=_koutput_cols,
+                        input_columns=_candidate_input_cols, output_columns=_koutput_cols,
                         input_rows=slice(_kin_r1, _kin_r2), output_rows=_kout_rows,
                         split_source_dir=_vd, input_aggregation=_kin_agg,
                     )
                     _ktr = eval_module.load_split_samples(**_kload_kw, split_file="train_files.txt", fault_tolerant=True)
                     _kte = eval_module.load_split_samples(**_kload_kw, split_file="test_files.txt", fault_tolerant=True)
                     if len(_ktr) >= 3 and len(_kte) >= 1:
-                        _kpreds, _ktgts, _kmeta = _evaluate_mlr_pipeline(
-                            _ktr, _kte, feature_names=_full_input_cols)
-                        _kfm = np.all(np.isfinite(_kpreds), axis=1) & np.all(np.isfinite(_ktgts), axis=1)
-                        if _kfm.sum() >= 1:
-                            _kpf = _kpreds[_kfm].flatten()
-                            _ktf = _ktgts[_kfm].flatten()
-                            from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-                            _kn_sel = sum(m.get("n_selected", 0) for m in _kmeta) / max(len(_kmeta), 1)
-                            rows.append({
-                                "dataset": dataset_plan.dataset_dir.name,
-                                "target": target_name,
-                                "subset_rank": rank,
-                                "subset_label": f"k{rank:02d}",
-                                "feature_tag": cand.feature_tag,
-                                "row_count": cand.row_count,
-                                "n_features": _kn_sel,
-                                "objective_search": cand.objective,
-                                "drop_rate_search": cand.drop_rate,
-                                "model": "mlr",
-                                "gp_uncertainty_mode": "",
-                                "n_samples": int(_kfm.sum()),
-                                "n_test_independent": int(_kfm.sum()),
-                                "mae": float(mean_absolute_error(_ktf, _kpf)),
-                                "rmse": float(np.sqrt(mean_squared_error(_ktf, _kpf))),
-                                "r2": float(r2_score(_ktf, _kpf)),
-                                "pearson_r": float(np.corrcoef(_ktf, _kpf)[0, 1]),
-                                "std_target": float(np.std(_ktf, ddof=1)) if len(_ktf) > 1 else float("nan"),
-                                "n_test_valid": int(_kfm.sum()),
-                                "n_test_evals": int(_kfm.sum()),
-                                "input_dim": float(len(_full_input_cols)),
-                                "target_dim": float(len(_koutput_cols)),
-                            })
-                            print(f"[INFO] MLR on k{rank:02d}: R²={float(r2_score(_ktf, _kpf)):.3f}")
+                        for _mlr_v in _MLR_VARIANTS:
+                            try:
+                                _kpreds, _ktgts, _kmeta = _evaluate_mlr_pipeline(
+                                    _ktr, _kte,
+                                    feature_names=_candidate_input_cols,
+                                    selection_config=_k_selection_cfg,
+                                    aggregation_mode=_mlr_v["aggregation_mode"],
+                                )
+                                _kfm = np.all(np.isfinite(_kpreds), axis=1) & np.all(np.isfinite(_ktgts), axis=1)
+                                if _kfm.sum() >= 1:
+                                    _kpf = _kpreds[_kfm].flatten()
+                                    _ktf = _ktgts[_kfm].flatten()
+                                    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+                                    _kn_sel = sum(m.get("n_selected", 0) for m in _kmeta) / max(len(_kmeta), 1)
+                                    rows.append({
+                                        "dataset": dataset_plan.dataset_dir.name,
+                                        "target": target_name,
+                                        "subset_rank": rank,
+                                        "subset_label": f"k{rank:02d}",
+                                        "feature_tag": cand.feature_tag,
+                                        "row_count": cand.row_count,
+                                        "n_features": _kn_sel,
+                                        "objective_search": cand.objective,
+                                        "drop_rate_search": cand.drop_rate,
+                                        "model": _mlr_v["model_name"],
+                                        "gp_uncertainty_mode": "",
+                                        "n_samples": int(_kfm.sum()),
+                                        "n_test_independent": int(_kfm.sum()),
+                                        "mae": float(mean_absolute_error(_ktf, _kpf)),
+                                        "rmse": float(np.sqrt(mean_squared_error(_ktf, _kpf))),
+                                        "r2": float(r2_score(_ktf, _kpf)),
+                                        "pearson_r": float(np.corrcoef(_ktf, _kpf)[0, 1]),
+                                        "std_target": float(np.std(_ktf, ddof=1)) if len(_ktf) > 1 else float("nan"),
+                                        "n_test_valid": int(_kfm.sum()),
+                                        "n_test_evals": int(_kfm.sum()),
+                                        "input_dim": float(len(_candidate_input_cols)),
+                                        "target_dim": float(len(_koutput_cols)),
+                                    })
+                                    print(f"[INFO] {_mlr_v['model_name']} on k{rank:02d}: R²={float(r2_score(_ktf, _kpf)):.3f}")
 
-                            _mlr_k_dir = _write_mlr_artifacts(
-                                output_dir=output_dir,
-                                dataset_dir=dataset_plan.dataset_dir,
-                                subset_label=f"k{rank:02d}",
-                                data_dir=_kdata_dir,
-                                sample_subdir=_ksample_sub,
-                                input_columns=_full_input_cols,
-                                output_columns=_koutput_cols,
-                                input_row_1=_kin_r1,
-                                input_row_2=_kin_r2,
-                                output_rows=_kout_rows,
-                                input_aggregation=_kin_agg,
-                                train_samples=_ktr,
-                                test_samples=_kte,
-                                preds=_kpreds,
-                                targets=_ktgts,
-                                per_target_meta=_kmeta,
-                                split_source_dir=_vd,
-                                ref_cfg=_kcfg,
-                                ref_cfg_path=_ecfg_path,
-                                ref_data_cfg=_kdcfg,
-                                model_config_extra={"candidate_features": list(cand.features)},
-                            )
-                            print(f"[INFO] MLR k{rank:02d} artifacts written to {_mlr_k_dir}")
-                            _mlr_on_k_done = True
+                                    _mlr_k_dir = _write_mlr_artifacts(
+                                        output_dir=output_dir,
+                                        dataset_dir=dataset_plan.dataset_dir,
+                                        subset_label=f"k{rank:02d}",
+                                        data_dir=_kdata_dir,
+                                        sample_subdir=_ksample_sub,
+                                        input_columns=_candidate_input_cols,
+                                        output_columns=_koutput_cols,
+                                        input_row_1=_kin_r1,
+                                        input_row_2=_kin_r2,
+                                        output_rows=_kout_rows,
+                                        input_aggregation=_kin_agg,
+                                        train_samples=_ktr,
+                                        test_samples=_kte,
+                                        preds=_kpreds,
+                                        targets=_ktgts,
+                                        per_target_meta=_kmeta,
+                                        split_source_dir=_vd,
+                                        ref_cfg=_kcfg,
+                                        ref_cfg_path=_ecfg_path,
+                                        ref_data_cfg=_kdcfg,
+                                        model_config_extra={
+                                            "candidate_features": list(cand.features),
+                                            "feature_selection": dict(_k_selection_cfg),
+                                        },
+                                        model_prefix=_mlr_v["dir_prefix"],
+                                    )
+                                    print(f"[INFO] {_mlr_v['model_name']} k{rank:02d} artifacts written to {_mlr_k_dir}")
+                            except Exception as _mlr_v_exc:
+                                print(f"[WARN] {_mlr_v['model_name']} eval on k{rank:02d}: {_mlr_v_exc}")
+                        _mlr_on_k_done = True
                 except Exception as _mlr_k_exc:
                     print(f"[WARN] MLR eval on k{rank:02d} variant {_vd.name}: {_mlr_k_exc}")
                 if _mlr_on_k_done:
@@ -3605,22 +3743,25 @@ def _evaluate_selected_subsets_all_models(
         except Exception as _mlr_k_outer:
             print(f"[WARN] MLR on k{rank:02d} skipped: {_mlr_k_outer}")
 
-    # --- MLR k-cluster: Spearman-filtered features evaluated by ALL models ---
+    # --- MLR k-clusters: Spearman-filtered features evaluated by ALL models ---
     try:
         from utils.mlr import evaluate_mlr as _evaluate_mlr_pipeline
         from utils.mlr import get_spearman_features as _get_spearman_features
+        from utils.mlr import MLR_VARIANTS as _MLR_VARIANTS
         _mlr_done = False
         if selected:
             k01 = selected[0]
             _ref_tag = f"{k01.feature_tag}_k01"
             _ref_variant_dirs = sorted(output_dir.glob(f"*_r{k01.row_count:03d}_{_ref_tag}*"))
 
-            # --- Phase A: determine MLR feature set via Spearman pre-filter ---
-            _spearman_cols = None
+            # --- Phase A: load samples and determine Spearman feature sets for each MLR variant ---
+            _spearman_by_variant: dict[str, tuple[list[str], dict]] = {}
             _ref_vd = None
             _ref_ecfg = None
             _ref_cfg = None
             _ref_dcfg = None
+            _tr = None
+            _te = None
             for _vd in _ref_variant_dirs:
                 _ecfg = _vd / f"config_evaluate_{_vd.name}.yml"
                 if not _ecfg.exists():
@@ -3652,8 +3793,14 @@ def _evaluate_selected_subsets_all_models(
                     _tr = eval_module.load_split_samples(**_load_kw, split_file="train_files.txt", fault_tolerant=True)
                     _te = eval_module.load_split_samples(**_load_kw, split_file="test_files.txt", fault_tolerant=True)
                     if len(_tr) >= 3 and len(_te) >= 1:
-                        _spearman_cols, _spearman_results = _get_spearman_features(
-                            _tr, _input_cols, target_idx=0)
+                        for _fv in _MLR_VARIANTS:
+                            try:
+                                _sp_cols, _sp_results = _get_spearman_features(
+                                    _tr, _input_cols, target_idx=0,
+                                    aggregation_mode=_fv["aggregation_mode"])
+                                _spearman_by_variant[_fv["model_name"]] = (_sp_cols, _sp_results)
+                            except Exception as _sp_v_exc:
+                                print(f"[WARN] Spearman pre-filter failed for {_fv['model_name']}: {_sp_v_exc}")
                         _ref_vd = _vd
                         _ref_ecfg = _ecfg
                         _ref_cfg = _cfg
@@ -3662,15 +3809,23 @@ def _evaluate_selected_subsets_all_models(
                 except Exception as _sp_exc:
                     print(f"[WARN] Spearman pre-filter failed for {_vd.name}: {_sp_exc}")
 
-            if _spearman_cols:
-                # --- Phase B: evaluate ALL data-driven models on MLR feature set ---
+            # --- Phase B & C: for each variant's feature set, evaluate all models + all MLR variants ---
+            for _fv in _MLR_VARIANTS:
+                _spearman_entry = _spearman_by_variant.get(_fv["model_name"])
+                if not _spearman_entry:
+                    continue
+                _spearman_cols, _spearman_results = _spearman_entry
+                if not _spearman_cols:
+                    continue
+
                 mlr_rank = len(selected) + 1
                 mlr_feature_tag = _feature_tag(tuple(sorted(_spearman_cols)))
-                mlr_subset_label = "s01"
+                mlr_subset_label = _fv["subset_label"]
                 mlr_full_tag = f"{mlr_feature_tag}_{mlr_subset_label}"
-                print(f"[INFO] MLR Spearman pre-filter: {len(_spearman_cols)}/{len(_input_cols)} "
+                print(f"[INFO] {_fv['model_name']} Spearman pre-filter: {len(_spearman_cols)}/{len(_input_cols)} "
                       f"base columns pass → {mlr_subset_label} ({mlr_feature_tag})")
 
+                # Phase B: evaluate ALL data-driven (non-MLR) models on this feature set
                 best_baseline_rows_mlr: dict[str, tuple[float, float, dict]] = {}
                 for base_cfg in dataset_plan.train_configs:
                     variant_cfg = _prepare_variant_config(
@@ -3694,10 +3849,10 @@ def _evaluate_selected_subsets_all_models(
                             min_test_samples=FINAL_TOPK_MIN_TEST_SAMPLES,
                         )
                         if split_status == "rebalanced":
-                            print(f"[INFO] Final split rebalance for MLR k-cluster {eval_cfg.parent.name}: "
+                            print(f"[INFO] Final split rebalance for {mlr_subset_label} cluster {eval_cfg.parent.name}: "
                                   f"train={train_n}, test={test_n}")
                         if skip_eval:
-                            print(f"[WARN] MLR k-cluster variant {eval_cfg.parent.name} has insufficient test samples; skipping.")
+                            print(f"[WARN] {mlr_subset_label} cluster variant {eval_cfg.parent.name} has insufficient test samples; skipping.")
                             continue
 
                         _set_eval_overrides(eval_cfg, run_baselines=run_baselines_in_final)
@@ -3734,7 +3889,7 @@ def _evaluate_selected_subsets_all_models(
                                     summary_rows_mlr.append(_row.to_dict())
                                     seen_baselines.add(baseline_id)
                             except Exception as read_exc:
-                                print(f"[WARN] Could not read MLR k-cluster eval summary: {read_exc}")
+                                print(f"[WARN] Could not read {mlr_subset_label} cluster eval summary: {read_exc}")
 
                         for srow in summary_rows_mlr:
                             _eval_cfg_data = {}
@@ -3754,7 +3909,7 @@ def _evaluate_selected_subsets_all_models(
                             gp_uncertainty_mode = str(srow.get("gp_uncertainty_mode", ""))
 
                             row_context = (
-                                f"mlr_cluster:{eval_cfg.parent.name} "
+                                f"{mlr_subset_label}_cluster:{eval_cfg.parent.name} "
                                 f"dataset={dataset_plan.dataset_dir.name} subset_rank={mlr_rank} model={model_name}"
                             )
                             try:
@@ -3833,12 +3988,12 @@ def _evaluate_selected_subsets_all_models(
 
                     except SampleComplianceError as e:
                         ctx = getattr(e, "context", {}) or {}
-                        print(f"[COMPLIANCE] MLR k-cluster: {e.reason}: {e}. "
+                        print(f"[COMPLIANCE] {mlr_subset_label} cluster: {e.reason}: {e}. "
                               f"variant={ctx.get('variant_dir', str(variant_cfg))}")
                     except Exception as e:
-                        print(f"[ERROR] MLR k-cluster evaluation failed for {variant_cfg}: {e}")
+                        print(f"[ERROR] {mlr_subset_label} cluster evaluation failed for {variant_cfg}: {e}")
 
-                # Append deduplicated baseline rows for the MLR k-cluster
+                # Append deduplicated baseline rows for this cluster
                 for baseline_id in ("naive", "seasonal", "linear"):
                     best = best_baseline_rows_mlr.get(baseline_id)
                     if best is not None:
@@ -3847,9 +4002,8 @@ def _evaluate_selected_subsets_all_models(
                     if baseline_id not in {"naive", "seasonal", "linear"}:
                         rows.append(payload)
 
-                # --- Also run MLR model itself on the full feature set ---
+                # Phase C: run ALL MLR model variants on this feature set
                 try:
-                    # Use one of the MLR k-cluster variant dirs for split files
                     _mlr_variant_dirs = sorted(output_dir.glob(f"*_r{k01.row_count:03d}_{mlr_full_tag}*"))
                     _mlr_split_dir = _mlr_variant_dirs[0] if _mlr_variant_dirs else _ref_vd
                     _load_kw_mlr = dict(
@@ -3859,87 +4013,96 @@ def _evaluate_selected_subsets_all_models(
                         input_rows=slice(_in_r1, _in_r2), output_rows=_out_rows,
                         split_source_dir=_mlr_split_dir, input_aggregation=_in_agg,
                     )
-                    _tr = eval_module.load_split_samples(**_load_kw_mlr, split_file="train_files.txt", fault_tolerant=True)
-                    _te = eval_module.load_split_samples(**_load_kw_mlr, split_file="test_files.txt", fault_tolerant=True)
-                    if len(_tr) >= 3 and len(_te) >= 1:
-                        _preds, _tgts, _meta = _evaluate_mlr_pipeline(_tr, _te, feature_names=_input_cols)
-                        _fm = np.all(np.isfinite(_preds), axis=1) & np.all(np.isfinite(_tgts), axis=1)
-                        if _fm.sum() >= 1:
-                            _pf = _preds[_fm].flatten()
-                            _tf = _tgts[_fm].flatten()
-                            from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-                            _n_sel = sum(m.get("n_selected", 0) for m in _meta) / max(len(_meta), 1)
-                            _mae = float(mean_absolute_error(_tf, _pf))
-                            _rmse = float(np.sqrt(mean_squared_error(_tf, _pf)))
-                            _r2 = float(r2_score(_tf, _pf))
-                            _pr = float(np.corrcoef(_tf, _pf)[0, 1])
-                            rows.append({
-                                "dataset": dataset_plan.dataset_dir.name,
-                                "target": target_name,
-                                "subset_rank": mlr_rank,
-                                "subset_label": mlr_subset_label,
-                                "feature_tag": mlr_feature_tag,
-                                "row_count": k01.row_count,
-                                "n_features": _n_sel,
-                                "objective_search": float("nan"),
-                                "drop_rate_search": float("nan"),
-                                "model": "mlr",
-                                "gp_uncertainty_mode": "",
-                                "n_samples": int(_fm.sum()),
-                                "n_test_independent": int(_fm.sum()),
-                                "mae": _mae,
-                                "rmse": _rmse,
-                                "r2": _r2,
-                                "pearson_r": _pr,
-                                "std_target": float(np.std(_tf, ddof=1)) if len(_tf) > 1 else float("nan"),
-                                "n_test_valid": int(_fm.sum()),
-                                "n_test_evals": int(_fm.sum()),
-                                "input_dim": float(len(_input_cols)),
-                                "target_dim": float(len(_output_cols)),
-                            })
-                            print(f"[INFO] MLR model row appended for {dataset_plan.dataset_dir.name}: "
-                                  f"R²={_r2:.3f}, rank={mlr_subset_label}")
-                        else:
-                            _failure_reasons = [str(m.get("failure_reason", "")).strip() for m in _meta if str(m.get("failure_reason", "")).strip()]
-                            _fallback_modes = [str(m.get("fallback_mode", "")).strip() for m in _meta if str(m.get("fallback_mode", "")).strip()]
-                            print(
-                                f"[WARN] MLR produced no finite predictions for {dataset_plan.dataset_dir.name}; "
-                                f"failure_reasons={_failure_reasons or ['<none>']} "
-                                f"fallback_modes={_fallback_modes or ['<none>']}"
-                            )
-                        _mlr_dir = _write_mlr_artifacts(
-                            output_dir=output_dir,
-                            dataset_dir=dataset_plan.dataset_dir,
-                            subset_label=mlr_subset_label,
-                            data_dir=_data_dir,
-                            sample_subdir=_sample_sub,
-                            input_columns=_input_cols,
-                            output_columns=_output_cols,
-                            input_row_1=_in_r1,
-                            input_row_2=_in_r2,
-                            output_rows=_out_rows,
-                            input_aggregation=_in_agg,
-                            train_samples=_tr,
-                            test_samples=_te,
-                            preds=_preds,
-                            targets=_tgts,
-                            per_target_meta=_meta,
-                            split_source_dir=_mlr_split_dir,
-                            ref_cfg=_ref_cfg,
-                            ref_cfg_path=_ref_ecfg,
-                            ref_data_cfg=_ref_dcfg,
-                            model_config_extra={"spearman_kept_columns": sorted(_spearman_cols)},
-                        )
-                        print(f"[INFO] MLR artifacts written to {_mlr_dir}")
+                    _tr_mlr = eval_module.load_split_samples(**_load_kw_mlr, split_file="train_files.txt", fault_tolerant=True)
+                    _te_mlr = eval_module.load_split_samples(**_load_kw_mlr, split_file="test_files.txt", fault_tolerant=True)
+                    if len(_tr_mlr) >= 3 and len(_te_mlr) >= 1:
+                        for _mv in _MLR_VARIANTS:
+                            try:
+                                _preds, _tgts, _meta = _evaluate_mlr_pipeline(
+                                    _tr_mlr, _te_mlr, feature_names=_input_cols,
+                                    aggregation_mode=_mv["aggregation_mode"])
+                                _fm = np.all(np.isfinite(_preds), axis=1) & np.all(np.isfinite(_tgts), axis=1)
+                                if _fm.sum() >= 1:
+                                    _pf = _preds[_fm].flatten()
+                                    _tf = _tgts[_fm].flatten()
+                                    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+                                    _n_sel = sum(m.get("n_selected", 0) for m in _meta) / max(len(_meta), 1)
+                                    _mae = float(mean_absolute_error(_tf, _pf))
+                                    _rmse = float(np.sqrt(mean_squared_error(_tf, _pf)))
+                                    _r2 = float(r2_score(_tf, _pf))
+                                    _pr = float(np.corrcoef(_tf, _pf)[0, 1])
+                                    rows.append({
+                                        "dataset": dataset_plan.dataset_dir.name,
+                                        "target": target_name,
+                                        "subset_rank": mlr_rank,
+                                        "subset_label": mlr_subset_label,
+                                        "feature_tag": mlr_feature_tag,
+                                        "row_count": k01.row_count,
+                                        "n_features": _n_sel,
+                                        "objective_search": float("nan"),
+                                        "drop_rate_search": float("nan"),
+                                        "model": _mv["model_name"],
+                                        "gp_uncertainty_mode": "",
+                                        "n_samples": int(_fm.sum()),
+                                        "n_test_independent": int(_fm.sum()),
+                                        "mae": _mae,
+                                        "rmse": _rmse,
+                                        "r2": _r2,
+                                        "pearson_r": _pr,
+                                        "std_target": float(np.std(_tf, ddof=1)) if len(_tf) > 1 else float("nan"),
+                                        "n_test_valid": int(_fm.sum()),
+                                        "n_test_evals": int(_fm.sum()),
+                                        "input_dim": float(len(_input_cols)),
+                                        "target_dim": float(len(_output_cols)),
+                                    })
+                                    print(f"[INFO] {_mv['model_name']} row appended for {dataset_plan.dataset_dir.name}: "
+                                          f"R²={_r2:.3f}, subset={mlr_subset_label}")
+                                else:
+                                    _failure_reasons = [str(m.get("failure_reason", "")).strip() for m in _meta if str(m.get("failure_reason", "")).strip()]
+                                    _fallback_modes = [str(m.get("fallback_mode", "")).strip() for m in _meta if str(m.get("fallback_mode", "")).strip()]
+                                    print(
+                                        f"[WARN] {_mv['model_name']} produced no finite predictions for "
+                                        f"{dataset_plan.dataset_dir.name} on {mlr_subset_label}; "
+                                        f"failure_reasons={_failure_reasons or ['<none>']} "
+                                        f"fallback_modes={_fallback_modes or ['<none>']}"
+                                    )
+                                _mlr_dir = _write_mlr_artifacts(
+                                    output_dir=output_dir,
+                                    dataset_dir=dataset_plan.dataset_dir,
+                                    subset_label=mlr_subset_label,
+                                    data_dir=_data_dir,
+                                    sample_subdir=_sample_sub,
+                                    input_columns=_input_cols,
+                                    output_columns=_output_cols,
+                                    input_row_1=_in_r1,
+                                    input_row_2=_in_r2,
+                                    output_rows=_out_rows,
+                                    input_aggregation=_in_agg,
+                                    train_samples=_tr_mlr,
+                                    test_samples=_te_mlr,
+                                    preds=_preds,
+                                    targets=_tgts,
+                                    per_target_meta=_meta,
+                                    split_source_dir=_mlr_split_dir,
+                                    ref_cfg=_ref_cfg,
+                                    ref_cfg_path=_ref_ecfg,
+                                    ref_data_cfg=_ref_dcfg,
+                                    model_config_extra={"spearman_kept_columns": sorted(_spearman_cols)},
+                                    model_prefix=_mv["dir_prefix"],
+                                )
+                                print(f"[INFO] {_mv['model_name']} artifacts written to {_mlr_dir}")
+                            except Exception as _mv_exc:
+                                print(f"[WARN] {_mv['model_name']} evaluation on {mlr_subset_label} failed: {_mv_exc}")
                 except Exception as _mlr_model_exc:
-                    print(f"[WARN] MLR model evaluation failed: {_mlr_model_exc}")
+                    print(f"[WARN] MLR model evaluation on {mlr_subset_label} failed: {_mlr_model_exc}")
 
                 _mlr_done = True
-            else:
-                print(f"[INFO] MLR k-cluster not computed for {dataset_plan.dataset_dir.name} "
+
+            if not _spearman_by_variant:
+                print(f"[INFO] MLR k-clusters not computed for {dataset_plan.dataset_dir.name} "
                       "(no suitable variant found for Spearman pre-filter).")
         if not _mlr_done and selected:
-            print(f"[INFO] MLR k-cluster not added for {dataset_plan.dataset_dir.name}.")
+            print(f"[INFO] MLR k-clusters not added for {dataset_plan.dataset_dir.name}.")
     except Exception as _mlr_outer_exc:
         print(f"[WARN] MLR k-cluster integration skipped for {dataset_plan.dataset_dir.name}: {_mlr_outer_exc}")
 
@@ -4277,8 +4440,12 @@ def _ensure_k01_baselines(plan: DatasetPlan, final_metrics_csv: Path) -> None:
     best_row_count = int(best_row["row_count"])
     best_feature_tag = str(best_row["feature_tag"])
 
-    if str(best_model_str).strip().lower() == "mlr":
-        variant_dir = _mlr_artifact_dir(_forecast_sweeps_dir(plan.dataset_dir), "k01")
+    _mlr_model_names = {"mlr", "mlr_avg12", "mlr_avgall"}
+    if str(best_model_str).strip().lower() in _mlr_model_names:
+        _best_mlr_prefix = str(best_model_str).strip().lower()
+        if _best_mlr_prefix not in _mlr_model_names:
+            _best_mlr_prefix = "mlr"
+        variant_dir = _mlr_artifact_dir(_forecast_sweeps_dir(plan.dataset_dir), "k01", model_prefix=_best_mlr_prefix)
         eval_csv = variant_dir / "evaluation_summary.csv"
         if eval_csv.exists():
             try:
@@ -4362,8 +4529,12 @@ def _write_dataset_evaluation_summary(plan: DatasetPlan, final_metrics_csv: Path
     best_row_count = int(best_row["row_count"])
     best_feature_tag = str(best_row["feature_tag"])
 
-    if str(best_model_type).strip().lower() == "mlr":
-        src_csv = _mlr_artifact_dir(_forecast_sweeps_dir(plan.dataset_dir), "k01") / "evaluation_summary.csv"
+    _mlr_model_names_wr = {"mlr", "mlr_avg12", "mlr_avgall"}
+    if str(best_model_type).strip().lower() in _mlr_model_names_wr:
+        _wr_prefix = str(best_model_type).strip().lower()
+        if _wr_prefix not in _mlr_model_names_wr:
+            _wr_prefix = "mlr"
+        src_csv = _mlr_artifact_dir(_forecast_sweeps_dir(plan.dataset_dir), "k01", model_prefix=_wr_prefix) / "evaluation_summary.csv"
         if not src_csv.exists():
             print(f"[WARN] _write_dataset_evaluation_summary: evaluation_summary.csv not found at {src_csv}")
             return None

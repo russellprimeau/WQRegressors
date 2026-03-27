@@ -102,7 +102,25 @@
       "Bash(ls \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/CV/MC_exCadmium_\\(µg_L\\)_res/forecasts/feature_sweeps/\")",
       "Bash(find c:UsersMasterDocumentsGitHubWQRegressorsdata -name feature_selected_subsets_r*.csv)",
       "Bash(grep -l mlr c:UsersMasterDocumentsGitHubWQRegressorsdata/output/CV/*/forecasts/feature_sweeps/feature_sweep_final_metrics.csv)",
-      "Bash(ls -la \"data/output/regression/MC_exCadmium_\\(µg_L\\)_res/forecasts/feature_sweeps/feature_sweep_final_metrics_summary.png\")"
+      "Bash(ls -la \"data/output/regression/MC_exCadmium_\\(µg_L\\)_res/forecasts/feature_sweeps/feature_sweep_final_metrics_summary.png\")",
+      "Bash(ls c:/Users/Master/Documents/GitHub/WQRegressors/src/l_*)",
+      "Bash(find c:UsersMasterDocumentsGitHubWQRegressors -maxdepth 3 -name *config* -type f)",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/data -name *.yml -o -name *.yaml)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/utils/mlr.py''\\).read\\(\\)\\); print\\(''mlr.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/h_RunMCFeatureSelectionSweep.py''\\).read\\(\\)\\); print\\(''h_RunMCFeatureSelectionSweep.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/z1_FeaturePostProcess.py''\\).read\\(\\)\\); print\\(''z1_FeaturePostProcess.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/utils/mlr.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''mlr.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/h_RunMCFeatureSelectionSweep.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''h_RunMCFeatureSelectionSweep.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/z1_FeaturePostProcess.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''z1_FeaturePostProcess.py OK''\\)\")",
+      "Bash(grep -n '== \"\"mlr\"\"\\\\|!= \"\"mlr\"\"\\\\|\"\"mlr\"\" ==' \"/c/Users/Master/Documents/GitHub/WQRegressors/src/h_RunMCFeatureSelectionSweep.py\")",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/data/output -name config_evaluate_*.yml -print)",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/data/output -name mlr_* -type d)",
+      "Bash(head -20 \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/CV/MC_exCadmium_\\(µg_L\\)_res/forecasts/feature_sweeps/gp_01_r167_f4_6246c6c0ca_k02/model_config.json\")",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/data/output/CV11 -name config_evaluate_mlr*.yml)",
+      "Bash(head -5 \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/CV/MC_exCadmium_\\(µg_L\\)_res/forecasts/feature_sweeps/gp_01_r167_f4_6246c6c0ca_k02/predictions.csv\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/z1_FeaturePostProcess.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''z1 OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/h_RunMCFeatureSelectionSweep.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''h OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/utils/mlr.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''mlr OK''\\)\")"
     ]
   }
 }
