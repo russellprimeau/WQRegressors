@@ -3010,13 +3010,13 @@ def _compile_multi_target_comparison(
             ax_top,
             multi_target_features,
             multi_scores,
-            f"Multi-target Features (summed target-wise z-score, n={len(multi_target_features)})",
+            f"Multi-target Features",
         )
         _draw_group_bars(
             ax_bottom,
             single_target_features_bar,
             single_scores,
-            f"Single-target Features (summed target-wise z-score, n={len(single_target_features_bar)})",
+            f"Single-target Features",
         )
         ax_top.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
         ax_bottom.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)

@@ -1,9 +1,12 @@
 """Multiple Linear Regression with independent feature selection.
 
+MLR uses only the latest predictor row from each loaded sample. It does not
+expand the input window into lag-specific regressors.
+
 Feature selection pipeline (training data only):
-  0. Spearman pre-filter — on *base* predictor columns (averaged across time
-     steps), keep only columns with significant correlation to the target
-     (p < 0.05 and |ρ| > 0.20).  Reduces dimensionality before flattening.
+  0. Spearman pre-filter — on base predictor columns from the aligned predictor
+     row, keep only columns with significant correlation to the target
+     (p < 0.05 and |ρ| > 0.20).
   1. Drop constant / near-constant columns
   2. Mutual information — keep top features by MI score (above quantile)
   3. L1 / Lasso (LassoCV) — retain non-zero coefficients; cap at *max_lasso_features*
@@ -30,16 +33,25 @@ _MAX_VIF_ITERATIONS = 500   # max removal rounds inside VIF
 
 
 # ---------------------------------------------------------------------------
-# Spearman pre-filter (operates on base columns before flattening)
+# Single-row extraction and Spearman pre-filter
 # ---------------------------------------------------------------------------
+
+def _extract_aligned_predictor_row(X):
+    """Return the single predictor row used by MLR for one sample."""
+    arr = np.asarray(X, dtype=float)
+    if arr.ndim == 1:
+        return arr.astype(float, copy=False)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 1D or 2D predictor array, got shape {arr.shape}")
+    return arr[-1, :].astype(float, copy=False)
 
 def _prefilter_by_spearman(train_samples, target_idx, base_feature_names,
                            p_threshold=0.05, rho_threshold=0.20):
     """Pre-filter base predictor columns using Spearman's rank correlation.
 
-    For each base column, compute the mean across time steps (rows) per
-    training sample, then correlate that vector with the target across
-    samples.  Keep columns where *both* p < *p_threshold* and |ρ| >
+    For each base column, use the latest predictor row per training sample,
+    then correlate that vector with the target across samples. Keep columns
+    where *both* p < *p_threshold* and |ρ| >
     *rho_threshold*.
 
     Parameters
@@ -57,18 +69,16 @@ def _prefilter_by_spearman(train_samples, target_idx, base_feature_names,
     """
     n_cols = len(base_feature_names)
 
-    # Build per-sample column means and target values
-    col_means = []
+    # Build per-sample aligned predictor rows and target values
+    aligned_rows = []
     targets = []
     for s in train_samples:
-        X = np.asarray(s[0], dtype=float)   # (n_rows, n_cols)
+        X = _extract_aligned_predictor_row(s[0])
         y = np.asarray(s[1], dtype=float).flatten()
         y_val = y[target_idx] if target_idx < len(y) else y[0]
         if not np.isfinite(y_val):
             continue
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            col_means.append(np.nanmean(X, axis=0))  # (n_cols,)
+        aligned_rows.append(X)
         targets.append(y_val)
 
     spearman_results = {}
@@ -77,12 +87,12 @@ def _prefilter_by_spearman(train_samples, target_idx, base_feature_names,
         # Not enough data — keep everything
         return list(range(n_cols)), spearman_results
 
-    col_means = np.array(col_means)  # (n_valid, n_cols)
+    aligned_rows = np.array(aligned_rows)  # (n_valid, n_cols)
     targets = np.array(targets)
 
     keep_cols = []
     for c in range(n_cols):
-        col = col_means[:, c]
+        col = aligned_rows[:, c]
         finite = np.isfinite(col) & np.isfinite(targets)
         if finite.sum() < 5:
             continue
@@ -484,7 +494,7 @@ def evaluate_mlr(train_samples, test_samples, feature_names=None, verbose=False)
     predictions = np.full_like(y_test, np.nan)
     all_meta = []
 
-    # Base feature names (one per input column, before time-step expansion)
+    # Base feature names (one per input column)
     base_names = feature_names if feature_names is not None else [f"f{i}" for i in range(n_cols)]
 
     for j in range(n_outputs):
@@ -494,27 +504,22 @@ def evaluate_mlr(train_samples, test_samples, feature_names=None, verbose=False)
         )
 
         if verbose:
-            print(f"[MLR] Spearman pre-filter: {len(keep_cols)}/{len(base_names)} "
-                  f"base columns pass (p<0.05, |ρ|>0.25)")
+            print(
+                f"[MLR] Spearman pre-filter: {len(keep_cols)}/{len(base_names)} "
+                f"base columns pass on the aligned predictor row (p<0.05, |ρ|>0.20)"
+            )
 
-        # Flatten only the surviving base columns
-        def _flatten_filtered(samples):
-            """Flatten each sample keeping only *keep_cols* columns."""
+        def _extract_filtered(samples):
+            """Return the aligned predictor row for each sample, filtered to keep_cols."""
             rows = []
             for s in samples:
-                X = np.asarray(s[0], dtype=float)
-                if X.ndim == 1:
-                    X = X.reshape(1, -1)
-                rows.append(X[:, keep_cols].flatten())
+                X = _extract_aligned_predictor_row(s[0])
+                rows.append(X[keep_cols])
             return np.array(rows, dtype=float)
 
-        X_train_f = _flatten_filtered(train_samples)
-        X_test_f = _flatten_filtered(test_samples)
-
-        # Build flattened feature names for the filtered columns
-        filtered_names = [
-            f"{base_names[c]}_r{r}" for r in range(n_rows) for c in keep_cols
-        ]
+        X_train_f = _extract_filtered(train_samples)
+        X_test_f = _extract_filtered(test_samples)
+        filtered_names = [base_names[c] for c in keep_cols]
 
         pred_j, meta_j = fit_and_predict(
             X_train_f, y_train[:, j], X_test_f,
@@ -525,6 +530,7 @@ def evaluate_mlr(train_samples, test_samples, feature_names=None, verbose=False)
         # Record Spearman filter results in metadata
         meta_j["spearman_kept_columns"] = [base_names[c] for c in keep_cols]
         meta_j["spearman_results"] = spearman_results
+        meta_j["aligned_input_row_index"] = int(n_rows - 1) if n_rows > 0 else 0
         all_meta.append(meta_j)
 
     return predictions, y_test, all_meta
