@@ -144,7 +144,8 @@ def _select_by_mutual_info(X, y, feature_idx, mi_quantile=0.25, random_state=0):
 
     mi = mutual_info_regression(X[mask], y[mask], random_state=random_state)
     threshold = np.quantile(mi, mi_quantile)
-    return [idx for idx, score in zip(feature_idx, mi) if score > threshold]
+    selected = [idx for idx, score in zip(feature_idx, mi) if score >= threshold]
+    return selected if selected else feature_idx
 
 
 def _select_by_lasso(X, y, feature_idx, random_state=0):
@@ -279,6 +280,63 @@ def select_features(X_train, y_train, feature_names,
     return idx, names
 
 
+def _best_coverage_feature_subset(X_train, y_train, X_test, feature_idx):
+    """Return a reduced feature subset that maximizes usable train/test rows.
+
+    This keeps strict finite-value requirements for scored rows, but avoids
+    selecting a feature set so wide that it makes every row unusable.
+    """
+    if not feature_idx:
+        return []
+
+    ranked = sorted(
+        feature_idx,
+        key=lambda idx: (
+            int(np.count_nonzero(np.isfinite(X_test[:, idx]))),
+            int(np.count_nonzero(np.isfinite(X_train[:, idx]))),
+        ),
+        reverse=True,
+    )
+
+    best_subset = []
+    best_score = None
+    for k in range(1, len(ranked) + 1):
+        subset = ranked[:k]
+        train_mask = np.all(np.isfinite(X_train[:, subset]), axis=1) & np.isfinite(y_train)
+        test_mask = np.all(np.isfinite(X_test[:, subset]), axis=1)
+        train_count = int(np.count_nonzero(train_mask))
+        test_count = int(np.count_nonzero(test_mask))
+        if train_count < 2 or test_count < 1:
+            continue
+        score = (test_count, train_count, -k)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_subset = list(subset)
+
+    return best_subset
+
+
+def _fit_intercept_only(y_train, n_test, meta, verbose=False, reason="intercept_only"):
+    predictions = np.full(int(n_test), np.nan, dtype=float)
+    finite_y = np.isfinite(y_train)
+    if int(np.count_nonzero(finite_y)) < 1:
+        meta["failure_reason"] = f"{reason}_no_finite_targets"
+        return predictions, meta
+
+    intercept = float(np.nanmean(y_train[finite_y]))
+    predictions[:] = intercept
+    meta["n_train"] = int(np.count_nonzero(finite_y))
+    meta["coefficients"] = []
+    meta["intercept"] = intercept
+    meta["selected_features"] = []
+    meta["n_selected"] = 0
+    meta["fallback_mode"] = reason
+    meta["n_test_predictable"] = int(n_test)
+    if verbose:
+        print(f"[MLR] Falling back to intercept-only model ({reason}).")
+    return predictions, meta
+
+
 # ---------------------------------------------------------------------------
 # Fit & predict
 # ---------------------------------------------------------------------------
@@ -303,36 +361,86 @@ def fit_and_predict(X_train, y_train, X_test, feature_names=None, verbose=False)
     sel_idx, sel_names = select_features(X_train, y_train, feature_names)
 
     predictions = np.full(X_test.shape[0], np.nan)
-    meta = {"selected_features": sel_names, "n_selected": len(sel_idx),
-            "n_train": 0, "coefficients": [], "intercept": np.nan}
+    meta = {
+        "selected_features": sel_names,
+        "n_selected": len(sel_idx),
+        "n_train": 0,
+        "coefficients": [],
+        "intercept": np.nan,
+        "n_test_predictable": 0,
+        "failure_reason": None,
+        "fallback_mode": None,
+    }
 
     if not sel_idx:
-        if verbose:
-            print("[MLR] No features survived selection; returning NaN predictions.")
-        return predictions, meta
+        meta["failure_reason"] = "no_features_survived_selection"
+        return _fit_intercept_only(
+            y_train,
+            X_test.shape[0],
+            meta,
+            verbose=verbose,
+            reason="no_features_survived_selection",
+        )
 
-    Xtr = X_train[:, sel_idx]
-    Xte = X_test[:, sel_idx]
+    chosen_idx = list(sel_idx)
+    chosen_names = list(sel_names)
+    Xtr = X_train[:, chosen_idx]
+    Xte = X_test[:, chosen_idx]
 
     train_mask = np.all(np.isfinite(Xtr), axis=1) & np.isfinite(y_train)
     test_mask = np.all(np.isfinite(Xte), axis=1)
 
+    if train_mask.sum() < 2 or test_mask.sum() < 1:
+        reduced_idx = _best_coverage_feature_subset(X_train, y_train, X_test, chosen_idx)
+        if reduced_idx:
+            chosen_idx = list(reduced_idx)
+            chosen_names = [feature_names[i] for i in chosen_idx]
+            Xtr = X_train[:, chosen_idx]
+            Xte = X_test[:, chosen_idx]
+            train_mask = np.all(np.isfinite(Xtr), axis=1) & np.isfinite(y_train)
+            test_mask = np.all(np.isfinite(Xte), axis=1)
+            meta["fallback_mode"] = "coverage_relaxed_feature_subset"
+            if verbose:
+                print(
+                    "[MLR] Relaxed feature subset for coverage: "
+                    f"{len(chosen_idx)} feature(s), train={int(train_mask.sum())}, test={int(test_mask.sum())}."
+                )
+
     if train_mask.sum() < 2:
-        if verbose:
-            print("[MLR] Fewer than 2 valid training rows; returning NaN predictions.")
-        return predictions, meta
+        meta["failure_reason"] = "insufficient_finite_training_rows_after_selection"
+        return _fit_intercept_only(
+            y_train,
+            X_test.shape[0],
+            meta,
+            verbose=verbose,
+            reason="insufficient_finite_training_rows_after_selection",
+        )
+
+    if test_mask.sum() < 1:
+        meta["failure_reason"] = "no_predictable_test_rows_after_selection"
+        return _fit_intercept_only(
+            y_train,
+            X_test.shape[0],
+            meta,
+            verbose=verbose,
+            reason="no_predictable_test_rows_after_selection",
+        )
 
     # Refit OLS (LinearRegression) on features selected by Lasso
     model = LinearRegression()
     model.fit(Xtr[train_mask], y_train[train_mask])
     predictions[test_mask] = model.predict(Xte[test_mask])
 
+    meta["selected_features"] = chosen_names
+    meta["n_selected"] = len(chosen_idx)
     meta["n_train"] = int(train_mask.sum())
+    meta["n_test_predictable"] = int(test_mask.sum())
     meta["coefficients"] = model.coef_.tolist()
     meta["intercept"] = float(model.intercept_)
+    meta["failure_reason"] = None
 
     if verbose:
-        print(f"[MLR] {len(sel_idx)} features selected: {sel_names}")
+        print(f"[MLR] {len(chosen_idx)} features selected: {chosen_names}")
         print(f"[MLR] Trained on {train_mask.sum()} samples, predicting {test_mask.sum()} test samples.")
 
     return predictions, meta

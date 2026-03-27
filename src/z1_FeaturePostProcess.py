@@ -69,7 +69,7 @@ from pathlib import Path
 from utils.training import load_samples, group_samples_by_segment, _filter_samples_by_nan_tolerance
 from utils.names import clean_target_label
 from utils.mlr import evaluate_mlr as _evaluate_mlr
-from h_RunMCFeatureSelectionSweep import build_parser, discover_mc_dataset_plans, _derive_target_name, _select_surrogate_config, _parse_row_counts, _available_row_counts_for_postprocess, _regenerate_saved_outputs_for_row, _load_feature_stats_artifacts_with_source, _compile_multi_target_comparison, _resolve_dataset_inclusion, _run_rolling_origin_cv, _ensure_k01_baselines, _write_dataset_evaluation_summary, _forecast_sweeps_dir, _plot_final_metrics_comparison, _feature_tag
+from h_RunMCFeatureSelectionSweep import build_parser, discover_mc_dataset_plans, _derive_target_name, _select_surrogate_config, _parse_row_counts, _available_row_counts_for_postprocess, _regenerate_saved_outputs_for_row, _load_feature_stats_artifacts_with_source, _compile_multi_target_comparison, _resolve_dataset_inclusion, _run_rolling_origin_cv, _ensure_k01_baselines, _write_dataset_evaluation_summary, _forecast_sweeps_dir, _plot_final_metrics_comparison, _feature_tag, _mlr_artifact_dir
 
 try:
     from scipy import stats as scipy_stats
@@ -408,8 +408,6 @@ def _append_mlr_to_final_metrics(
     surrogate_cfg = train_module.load_config(str(surrogate_cfg_path))
     input_columns = list(surrogate_cfg["data"]["input_columns"])
 
-    model_type = cfg.get("model_type", "")
-    load_fault_tolerant, enforced_nan_tolerance = _model_sample_policy(model_type, split_cfg)
     split_base_dir = Path(data_cfg.get("forecast_dir", eval_cfg_path.parent))
 
     load_kw = dict(
@@ -421,16 +419,12 @@ def _append_mlr_to_final_metrics(
         input_rows=input_rows,
         output_rows=output_rows,
         split_source_dir=split_base_dir,
-        fault_tolerant=load_fault_tolerant,
+        fault_tolerant=True,
         input_aggregation=input_aggregation,
     )
 
     train_samples = eval_module.load_split_samples(**load_kw, split_file="train_files.txt")
     test_samples = eval_module.load_split_samples(**load_kw, split_file="test_files.txt")
-
-    if load_fault_tolerant and enforced_nan_tolerance is not None:
-        train_samples = _filter_samples_by_nan_tolerance(train_samples, float(enforced_nan_tolerance))
-        test_samples = _filter_samples_by_nan_tolerance(test_samples, float(enforced_nan_tolerance))
 
     if len(train_samples) < 3 or len(test_samples) < 1:
         print(f"[WARN] Insufficient samples for MLR ({plan.dataset_dir.name}): "
@@ -446,13 +440,20 @@ def _append_mlr_to_final_metrics(
 
     # Compute metrics
     from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-    finite_mask = np.all(np.isfinite(predictions), axis=1) & np.all(np.isfinite(targets), axis=1)
-    if finite_mask.sum() < 1:
-        print(f"[WARN] MLR produced no finite predictions for {plan.dataset_dir.name}")
+    p_flat = np.asarray(predictions, dtype=float).reshape(-1)
+    t_flat = np.asarray(targets, dtype=float).reshape(-1)
+    finite_mask = np.isfinite(p_flat) & np.isfinite(t_flat)
+    if int(np.count_nonzero(finite_mask)) < 1:
+        failure_reasons = [str(m.get("failure_reason", "")).strip() for m in meta if str(m.get("failure_reason", "")).strip()]
+        fallback_modes = [str(m.get("fallback_mode", "")).strip() for m in meta if str(m.get("fallback_mode", "")).strip()]
+        print(
+            f"[WARN] MLR produced no finite predictions for {plan.dataset_dir.name}; "
+            f"failure_reasons={failure_reasons or ['<none>']} fallback_modes={fallback_modes or ['<none>']}"
+        )
         return
 
-    p_flat = predictions[finite_mask].flatten()
-    t_flat = targets[finite_mask].flatten()
+    p_flat = p_flat[finite_mask]
+    t_flat = t_flat[finite_mask]
     mae_val = float(mean_absolute_error(t_flat, p_flat))
     rmse_val = float(np.sqrt(mean_squared_error(t_flat, p_flat)))
     r2_val = float(r2_score(t_flat, p_flat))
@@ -539,7 +540,7 @@ def _append_mlr_to_final_metrics(
 
     # --- Write per-variant output artifacts ---
     sweep_dir = _forecast_sweeps_dir(plan.dataset_dir)
-    mlr_dir = sweep_dir / "mlr"
+    mlr_dir = _mlr_artifact_dir(sweep_dir, "s01")
     mlr_dir.mkdir(parents=True, exist_ok=True)
 
     # Derive forecast_name relative to dataset_dir so visualizer outputs land in mlr_dir
@@ -551,6 +552,7 @@ def _append_mlr_to_final_metrics(
     # 1. model_config.json — selected features and MLR metadata per target
     mlr_model_config = {
         "model_type": "mlr",
+        "subset_label": "s01",
         "input_columns": input_columns,
         "spearman_kept_columns": sorted(spearman_kept) if spearman_kept else input_columns,
         "output_columns": output_columns,
@@ -1175,10 +1177,25 @@ def _find_best_variant_eval_config(plan: DatasetPlan, row: "pd.Series") -> "tupl
 
     model_key = _normalize_model_key(str(row.get("model", "")))
     output_dir = _forecast_sweeps_dir(plan.dataset_dir)
-    variant_dirs = [
-        p for p in sorted(output_dir.glob(f"*_r{row_count:03d}_{feature_tag}_k*"))
-        if p.is_dir()
-    ]
+    subset_label = str(row.get("subset_label", "")).strip().lower()
+    search_patterns: list[str] = []
+    if subset_label:
+        search_patterns.append(f"*_r{row_count:03d}_{feature_tag}_{subset_label}*")
+    search_patterns.extend(
+        [
+            f"*_r{row_count:03d}_{feature_tag}_k*",
+            f"*_r{row_count:03d}_{feature_tag}_s*",
+        ]
+    )
+
+    variant_dirs = []
+    seen_variant_dirs: set[Path] = set()
+    for pattern in search_patterns:
+        for path in sorted(output_dir.glob(pattern)):
+            if not path.is_dir() or path in seen_variant_dirs:
+                continue
+            seen_variant_dirs.add(path)
+            variant_dirs.append(path)
     if not variant_dirs:
         return None, None, "missing_variant_dir"
 

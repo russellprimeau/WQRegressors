@@ -111,6 +111,9 @@ def compute_correlations(df: pd.DataFrame):
         for pred in ALL_PREDICTORS:
             pair = df.loc[target_valid, [pred, target]].dropna()
             if len(pair) >= 3:
+                # Correlation is undefined when either input has no variation.
+                if pair[pred].nunique(dropna=True) < 2 or pair[target].nunique(dropna=True) < 2:
+                    continue
                 r, p = stats.pearsonr(pair[pred], pair[target])
                 pearson_r.loc[pred, target] = r
                 pearson_p.loc[pred, target] = p
@@ -259,6 +262,7 @@ def plot_scatter_group(df: pd.DataFrame, corr: pd.DataFrame,
 
 def main() -> None:
     df = pd.read_csv(_CSV_PATH, parse_dates=["TIMESTAMP"], index_col="TIMESTAMP")
+    _OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Verify expected columns are present
     missing_pred = [c for c in ALL_PREDICTORS if c not in df.columns]
@@ -268,11 +272,11 @@ def main() -> None:
     if missing_tgt:
         raise ValueError(f"Missing target columns: {missing_tgt}")
 
-    corr = compute_correlations(df)
-    print(corr.to_string())
-    plot_correlation_matrix(corr, _HEATMAP_PATH)
+    pearson_r, pearson_p, spearman_r, spearman_p = compute_correlations(df)
+    print(pearson_r.to_string())
+    plot_correlation_matrix(pearson_r, pearson_p, _HEATMAP_PATH)
     for group_key in PREDICTOR_GROUPS:
-        plot_scatter_group(df, corr, group_key, _OUT_DIR)
+        plot_scatter_group(df, pearson_r, group_key, _OUT_DIR)
 
 
 if __name__ == "__main__":
