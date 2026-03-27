@@ -2317,8 +2317,8 @@ def _compile_multi_target_comparison(
             continue
         zscore_matrix[i, finite_mask] = (finite_vals - row_mean) / row_std
 
-    # Group feature order so multi-target features (common + partial) come first,
-    # followed by strictly single-target features.
+    # Order features globally by decreasing aggregated standardized score so the
+    # heatmap columns and bar charts share the same ranking.
     feature_to_idx = {feat: idx for idx, feat in enumerate(all_features)}
     summed_sensitivity_raw = np.nansum(zscore_matrix, axis=0)
     feature_total_score = {
@@ -2397,7 +2397,6 @@ def _compile_multi_target_comparison(
     multi_target_features = [feat for feat in all_features if presence_count.get(feat, 0) > 1]
     single_target_features = [feat for feat in all_features if presence_count.get(feat, 0) == 1]
 
-    multi_target_features.sort(key=lambda feat: feature_total_score.get(feat, float("-inf")), reverse=True)
     single_target_rank = {feat: _matching_target_rank(feat) for feat in single_target_features}
     single_matched = [feat for feat in single_target_features if single_target_rank.get(feat) is not None]
     single_unmatched = [feat for feat in single_target_features if single_target_rank.get(feat) is None]
@@ -2417,10 +2416,17 @@ def _compile_multi_target_comparison(
     )
     single_target_features = single_matched + single_unmatched
 
-    ordered_features = multi_target_features + single_target_features
+    ordered_features = sorted(
+        all_features,
+        key=lambda feat: (
+            -float(feature_total_score.get(feat, float("-inf"))),
+            str(feat),
+        ),
+    )
     if ordered_features:
         ordered_indices = [feature_to_idx[feat] for feat in ordered_features]
         matrix = matrix[:, ordered_indices]
+        zscore_matrix = zscore_matrix[:, ordered_indices]
         all_features = ordered_features
 
     ordered_feature_to_idx = {feat: idx for idx, feat in enumerate(all_features)}
@@ -2637,15 +2643,10 @@ def _compile_multi_target_comparison(
         plt.close(_fig_t)
         print(f"[INFO] Wrote transposed heatmap (all): {_t_path}")
 
-    # Create grouped bar charts: multi-target features and single-target features.
+    # Create grouped bar charts using the same aggregated-score ordering as the heatmap.
     score_map = {feat: float(score) for feat, score in zip(top_features, summed_scores)}
     multi_scores = [score_map[feat] for feat in multi_target_features if feat in score_map]
-    # Sort single-target features by decreasing score for the bar chart (heatmap uses rank ordering).
-    single_target_features_bar = sorted(
-        [feat for feat in single_target_features if feat in score_map],
-        key=lambda feat: score_map[feat],
-        reverse=True,
-    )
+    single_target_features_bar = [feat for feat in single_target_features if feat in score_map]
     single_scores = [score_map[feat] for feat in single_target_features_bar]
     all_scores = multi_scores + single_scores
 
@@ -3247,7 +3248,12 @@ def _evaluate_selected_subsets_all_models(
                                 "feature_tag": cand.feature_tag,
                                 "row_count": cand.row_count,
                                 "n_features": _kn_sel,
+                                "objective_search": cand.objective,
+                                "drop_rate_search": cand.drop_rate,
                                 "model": "mlr",
+                                "gp_uncertainty_mode": "",
+                                "n_samples": int(_kfm.sum()),
+                                "n_test_independent": int(_kfm.sum()),
                                 "mae": float(mean_absolute_error(_ktf, _kpf)),
                                 "rmse": float(np.sqrt(mean_squared_error(_ktf, _kpf))),
                                 "r2": float(r2_score(_ktf, _kpf)),
@@ -3259,6 +3265,132 @@ def _evaluate_selected_subsets_all_models(
                                 "target_dim": float(len(_koutput_cols)),
                             })
                             print(f"[INFO] MLR on k{rank:02d}: R²={float(r2_score(_ktf, _kpf)):.3f}")
+
+                            # --- Write MLR artifacts for k## ---
+                            _mlr_k_dir = output_dir / f"mlr_k{rank:02d}"
+                            _mlr_k_dir.mkdir(parents=True, exist_ok=True)
+
+                            # model_config.json
+                            _mlr_k_mc = {
+                                "model_type": "mlr",
+                                "subset_label": f"k{rank:02d}",
+                                "input_columns": _full_input_cols,
+                                "candidate_features": list(cand.features),
+                                "output_columns": _koutput_cols,
+                                "input_row_1": _kin_r1,
+                                "input_row_2": _kin_r2,
+                                "output_rows": _kout_rows,
+                                "input_aggregation": _kin_agg,
+                                "n_train_samples": len(_ktr),
+                                "n_test_samples": len(_kte),
+                                "feature_selection": {
+                                    "method": "Spearman + MI + L1/Lasso + VIF",
+                                    "spearman_p_threshold": 0.05,
+                                    "spearman_rho_threshold": 0.20,
+                                    "mi_quantile": 0.25,
+                                    "vif_threshold": 10.0,
+                                },
+                                "per_target_meta": [],
+                            }
+                            for _kj, _km in enumerate(_kmeta):
+                                _mlr_k_mc["per_target_meta"].append({
+                                    "target_index": _kj,
+                                    "target_name": _koutput_cols[_kj] if _kj < len(_koutput_cols) else f"target_{_kj}",
+                                    "selected_features": _km.get("selected_features", []),
+                                    "n_selected": _km.get("n_selected", 0),
+                                    "coefficients": _km.get("coefficients", []),
+                                    "intercept": _km.get("intercept", None),
+                                    "n_train_valid": _km.get("n_train", 0),
+                                    "spearman_kept_columns": _km.get("spearman_kept_columns", []),
+                                })
+                            with open(_mlr_k_dir / "model_config.json", "w") as _mcf:
+                                json.dump(_mlr_k_mc, _mcf, indent=2, default=str)
+
+                            # mlr_equation.txt
+                            _keq_lines = []
+                            for _ktm in _mlr_k_mc["per_target_meta"]:
+                                _keq_lines.append(f"Target: {_ktm['target_name']}")
+                                _keq_lines.append(f"  n_selected = {_ktm['n_selected']}")
+                                _keq_lines.append(f"  n_train    = {_ktm['n_train_valid']}")
+                                _kfeats = _ktm["selected_features"]
+                                _kcoefs = _ktm["coefficients"]
+                                _kintercept = _ktm["intercept"]
+                                if _kintercept is not None and _kfeats and _kcoefs:
+                                    _kterms = [f"{_kintercept:.6g}"]
+                                    for _kfeat, _kc in zip(_kfeats, _kcoefs):
+                                        _ksign = "+" if _kc >= 0 else "-"
+                                        _kterms.append(f"{_ksign} {abs(_kc):.6g} * {_kfeat}")
+                                    _keq_lines.append(f"  y = {_kterms[0]}")
+                                    for _kt in _kterms[1:]:
+                                        _keq_lines.append(f"      {_kt}")
+                                else:
+                                    _keq_lines.append("  (no features selected)")
+                                _keq_lines.append("")
+                            with open(_mlr_k_dir / "mlr_equation.txt", "w", encoding="utf-8") as _eqf:
+                                _eqf.write("\n".join(_keq_lines))
+
+                            # Copy split files
+                            for _ksfn in ("train_files.txt", "test_files.txt"):
+                                _ksf_src = _vd / _ksfn
+                                if _ksf_src.exists():
+                                    shutil.copy2(_ksf_src, _mlr_k_dir / _ksfn)
+
+                            # evaluation_summary.csv + predictions.csv
+                            _ktest_sf = eval_module._read_split_files(_vd, "test_files.txt")
+                            _k_summary_rows = []
+                            _k_pred_entries = []
+
+                            _ksr = eval_module._compute_regression_summary(
+                                "MLR (test)", _kpreds, _ktgts, len(_ktgts),
+                                metadata={"kind": "test", "gp_uncertainty_mode": "not_gp"},
+                                split_files=_ktest_sf,
+                            )
+                            _ksr["n_train_samples"] = len(_ktr)
+                            _ksr["n_test_samples"] = len(_kte)
+                            _ksr["input_dim"] = len(_full_input_cols)
+                            _ksr["target_dim"] = len(_koutput_cols)
+                            _ksr["data_dir"] = _kdata_dir
+                            _k_summary_rows.append(_ksr)
+                            _k_pred_entries.append({
+                                "kind": "test", "label": "MLR",
+                                "preds": _kpreds, "targets": _ktgts,
+                                "split_files": _ktest_sf, "include_mc_stats": False,
+                            })
+
+                            eval_module._write_summary_csv(
+                                _k_summary_rows, _mlr_k_dir / "evaluation_summary.csv")
+                            _kpr_rows, _kpr_cols = eval_module._build_predictions_table(
+                                _k_pred_entries, gp_uncertainty_mode="not_gp",
+                                include_mc_output_columns=False)
+                            eval_module._write_predictions_csv(
+                                _kpr_rows, _mlr_k_dir / "predictions.csv", _kpr_cols)
+
+                            try:
+                                _mlr_k_fn = str(_mlr_k_dir.relative_to(
+                                    dataset_plan.dataset_dir / "forecasts"))
+                            except ValueError:
+                                _mlr_k_fn = _mlr_k_dir.name
+
+                            matplotlib.use("Agg")
+                            try:
+                                eval_module.visualizer(
+                                    _kpreds, _ktgts, labels=["MLR"],
+                                    directory=str(dataset_plan.dataset_dir),
+                                    forecast_name=_mlr_k_fn, num_samples=200,
+                                    split_files_by_pair=[_ktest_sf],
+                                    collapse_error_points_by_pair=[False])
+                            except Exception as _kplot_exc:
+                                print(f"[WARN] MLR k{rank:02d} plots failed: {_kplot_exc}")
+                            try:
+                                _kbx = eval_module._build_boxplot_error_rows_from_predictions(
+                                    _kpr_rows, model_label="MLR", baseline_labels=[])
+                                eval_module.boxplot_from_error_rows(
+                                    _kbx, directory=str(dataset_plan.dataset_dir),
+                                    forecast_name=_mlr_k_fn)
+                            except Exception as _kbx_exc:
+                                print(f"[WARN] MLR k{rank:02d} boxplot failed: {_kbx_exc}")
+
+                            print(f"[INFO] MLR k{rank:02d} artifacts written to {_mlr_k_dir}")
                             _mlr_on_k_done = True
                 except Exception as _mlr_k_exc:
                     print(f"[WARN] MLR eval on k{rank:02d} variant {_vd.name}: {_mlr_k_exc}")
@@ -3558,7 +3690,12 @@ def _evaluate_selected_subsets_all_models(
                                 "feature_tag": mlr_feature_tag,
                                 "row_count": k01.row_count,
                                 "n_features": _n_sel,
+                                "objective_search": float("nan"),
+                                "drop_rate_search": float("nan"),
                                 "model": "mlr",
+                                "gp_uncertainty_mode": "",
+                                "n_samples": int(_fm.sum()),
+                                "n_test_independent": int(_fm.sum()),
                                 "mae": _mae,
                                 "rmse": _rmse,
                                 "r2": _r2,

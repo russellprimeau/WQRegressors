@@ -95,7 +95,7 @@ python src/l_RunMCShapleyOptimizerPipeline.py --dataset-prefix MC --limit-datase
 
 python src/l_RunMCShapleyOptimizerPipeline.py `
 --dataset-prefix MC `
---data-root C:\\Users\\Master\\Documents\\GitHub\\WQRegressors\\data\\output\\CV10 `
+--data-root C:\\Users\\Master\\Documents\\GitHub\\WQRegressors\\data\\output\\CV13 `
 --limit-datasets 14 `
 --shapley-eval-budget 270 `
 --optimizer-eval-budget 270 `
@@ -104,12 +104,10 @@ python src/l_RunMCShapleyOptimizerPipeline.py `
 --keep-search-plots `
 --shapley-samples-per-feature 10 `
 --tmc-truncation-epsilon 0.0005 `
---beam-width 16 `
+--beam-width 15 `
 --max-rounds 30 `
 --max-swap-attempts 200 `
 --parallel-evaluators 1 `
---notify
-
 
 3) Full pipeline with parallel dataset processing:
     Worker 0 runs on GPU, worker 1 runs on CPU (default single-GPU behaviour).
