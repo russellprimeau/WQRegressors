@@ -830,6 +830,18 @@ def _set_eval_overrides(eval_config_path: Path, run_baselines: bool) -> None:
         yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
 
 
+def _copy_eval_directory(source_dir: Path, dest_dir: Path) -> None:
+    """Copy an evaluation results directory, renaming internal config files to match."""
+    if dest_dir.exists():
+        shutil.rmtree(dest_dir)
+    shutil.copytree(source_dir, dest_dir)
+    # Rename config_evaluate_*.yml to match the new directory name.
+    old_cfg = dest_dir / f"config_evaluate_{source_dir.name}.yml"
+    new_cfg = dest_dir / f"config_evaluate_{dest_dir.name}.yml"
+    if old_cfg.exists() and old_cfg != new_cfg:
+        old_cfg.rename(new_cfg)
+
+
 def _mlr_artifact_dir(output_dir: Path, subset_label: str,
                       model_prefix: str = "mlr") -> Path:
     token = str(subset_label).strip().lower()
@@ -1414,6 +1426,22 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     df = df[df["subset_rank"].notnull()].copy()
     df["subset_rank"] = df["subset_rank"].astype(int)
 
+    # Merge clusters that share the same feature_tag (identical feature sets should
+    # be plotted once, with a combined label like "k01/s01/l01").
+    _combined_rank_labels: dict[int, str] = {}
+    if "feature_tag" in df.columns:
+        _ft_primary = df.groupby("feature_tag")["subset_rank"].min().to_dict()
+        _ft_labels: dict[str, str] = {}
+        for ft in df["feature_tag"].dropna().unique():
+            labels = sorted(
+                df.loc[df["feature_tag"] == ft, "subset_label"].dropna().unique()
+            )
+            _ft_labels[ft] = "/".join(labels) if labels else ft
+        df["subset_rank"] = df["feature_tag"].map(_ft_primary).fillna(df["subset_rank"]).astype(int)
+        _combined_rank_labels = {
+            int(_ft_primary[ft]): _ft_labels[ft] for ft in _ft_primary
+        }
+
     def _normalize_plot_model(raw: object) -> str:
         baseline_id = _normalize_baseline_label(raw)
         if baseline_id is not None:
@@ -1444,8 +1472,14 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         .mean(numeric_only=True)
     )
 
-    # Build rank → display label mapping; prefer subset_label column if present.
-    if "subset_label" in df.columns:
+    # Build rank → display label mapping.
+    # Use combined labels from feature_tag merging when available; fall back to subset_label.
+    if _combined_rank_labels:
+        rank_to_label = dict(_combined_rank_labels)
+        # Ensure all ranks in grouped are present (in case some lack feature_tag).
+        for rank in grouped["subset_rank"].dropna().unique():
+            rank_to_label.setdefault(int(rank), f"k{int(rank):02d}")
+    elif "subset_label" in df.columns:
         rank_to_label = {}
         _lbl_pairs = df[["subset_rank", "subset_label"]].dropna(subset=["subset_rank"]).drop_duplicates()
         for _, _row in _lbl_pairs.iterrows():
@@ -3345,6 +3379,11 @@ def _evaluate_selected_subsets_all_models(
     output_dir.mkdir(parents=True, exist_ok=True)
     cfg_dir = output_dir / "configs"
 
+    # Registry of evaluated (base_feature_tag, model_name) → (source_dir, row_payload).
+    # Used to skip retraining when a candidate feature set has already been evaluated
+    # under a different subset label (e.g. k01 and s01 share the same features).
+    _eval_registry: dict[tuple[str, str], tuple[Path, dict]] = {}
+
     target_name = _derive_target_name(dataset_plan.dataset_dir.name, dataset_prefix)
 
     for rank, cand in enumerate(selected, start=1):
@@ -3607,6 +3646,7 @@ def _evaluate_selected_subsets_all_models(
 
                 if baseline_id is None:
                     rows.append(row_payload)
+                    _eval_registry[(cand.feature_tag, model_name)] = (eval_cfg.parent, row_payload)
                 else:
                     valid_score = n_test_valid if np.isfinite(n_test_valid) else float("-inf")
                     eval_score = n_test_evals if np.isfinite(n_test_evals) else float("-inf")
@@ -3731,6 +3771,7 @@ def _evaluate_selected_subsets_all_models(
                                         model_prefix=_mlr_v["dir_prefix"],
                                     )
                                     print(f"[INFO] {_mlr_v['model_name']} k{rank:02d} artifacts written to {_mlr_k_dir}")
+                                    _eval_registry[(cand.feature_tag, _mlr_v["model_name"])] = (_mlr_k_dir, rows[-1])
                             except Exception as _mlr_v_exc:
                                 print(f"[WARN] {_mlr_v['model_name']} eval on k{rank:02d}: {_mlr_v_exc}")
                         _mlr_on_k_done = True
@@ -3810,7 +3851,7 @@ def _evaluate_selected_subsets_all_models(
                     print(f"[WARN] Spearman pre-filter failed for {_vd.name}: {_sp_exc}")
 
             # --- Phase B & C: for each variant's feature set, evaluate all models + all MLR variants ---
-            for _fv in _MLR_VARIANTS:
+            for _fv_idx, _fv in enumerate(_MLR_VARIANTS):
                 _spearman_entry = _spearman_by_variant.get(_fv["model_name"])
                 if not _spearman_entry:
                     continue
@@ -3818,7 +3859,7 @@ def _evaluate_selected_subsets_all_models(
                 if not _spearman_cols:
                     continue
 
-                mlr_rank = len(selected) + 1
+                mlr_rank = len(selected) + 1 + _fv_idx
                 mlr_feature_tag = _feature_tag(tuple(sorted(_spearman_cols)))
                 mlr_subset_label = _fv["subset_label"]
                 mlr_full_tag = f"{mlr_feature_tag}_{mlr_subset_label}"
@@ -3837,27 +3878,44 @@ def _evaluate_selected_subsets_all_models(
                         forced_data_dir=dataset_plan.dataset_dir,
                     )
                     try:
-                        eval_cfg = _train_single_config(
-                            variant_cfg,
-                            dataset_plan.dataset_dir,
-                            disable_training_plots=disable_training_plots,
-                            disable_eval_plots=disable_eval_plots,
-                            suppress_training_logs=suppress_training_logs,
-                        )
-                        skip_eval, split_status, train_n, test_n = _ensure_min_test_samples_for_final(
-                            split_dir=eval_cfg.parent,
-                            min_test_samples=FINAL_TOPK_MIN_TEST_SAMPLES,
-                        )
-                        if split_status == "rebalanced":
-                            print(f"[INFO] Final split rebalance for {mlr_subset_label} cluster {eval_cfg.parent.name}: "
-                                  f"train={train_n}, test={test_n}")
-                        if skip_eval:
-                            print(f"[WARN] {mlr_subset_label} cluster variant {eval_cfg.parent.name} has insufficient test samples; skipping.")
-                            continue
+                        # --- Dedup: skip training if this feature set was already evaluated for this model ---
+                        try:
+                            _base_model_type = yaml.safe_load(open(base_cfg, encoding="utf-8")).get("model_type", "")
+                        except Exception:
+                            _base_model_type = ""
+                        _dedup_source = _eval_registry.get((mlr_feature_tag, _base_model_type))
 
-                        _set_eval_overrides(eval_cfg, run_baselines=run_baselines_in_final)
-                        eval_module.evaluate_single_config(
-                            str(eval_cfg), save_plots_override=not disable_eval_plots)
+                        if _dedup_source is not None:
+                            _src_dir, _src_row = _dedup_source
+                            _vc_data = yaml.safe_load(open(variant_cfg, encoding="utf-8"))
+                            _vc_fn = _strip_fs_prefix(str(_vc_data["data"]["forecast_name"]))
+                            _dest_dir = output_dir / Path(_vc_fn)
+                            _copy_eval_directory(_src_dir, _dest_dir)
+                            eval_cfg = (_dest_dir / f"config_evaluate_{_dest_dir.name}.yml").resolve()
+                            print(f"[DEDUP] {_base_model_type} on {mlr_subset_label}: "
+                                  f"copied from {_src_dir.name} (same features {mlr_feature_tag})")
+                        else:
+                            eval_cfg = _train_single_config(
+                                variant_cfg,
+                                dataset_plan.dataset_dir,
+                                disable_training_plots=disable_training_plots,
+                                disable_eval_plots=disable_eval_plots,
+                                suppress_training_logs=suppress_training_logs,
+                            )
+                            skip_eval, split_status, train_n, test_n = _ensure_min_test_samples_for_final(
+                                split_dir=eval_cfg.parent,
+                                min_test_samples=FINAL_TOPK_MIN_TEST_SAMPLES,
+                            )
+                            if split_status == "rebalanced":
+                                print(f"[INFO] Final split rebalance for {mlr_subset_label} cluster {eval_cfg.parent.name}: "
+                                      f"train={train_n}, test={test_n}")
+                            if skip_eval:
+                                print(f"[WARN] {mlr_subset_label} cluster variant {eval_cfg.parent.name} has insufficient test samples; skipping.")
+                                continue
+
+                            _set_eval_overrides(eval_cfg, run_baselines=run_baselines_in_final)
+                            eval_module.evaluate_single_config(
+                                str(eval_cfg), save_plots_override=not disable_eval_plots)
 
                         # Extract rows from evaluation_summary.csv (same logic as main loop)
                         summary_rows_mlr = []
@@ -3979,6 +4037,7 @@ def _evaluate_selected_subsets_all_models(
 
                             if baseline_id is None:
                                 rows.append(row_payload)
+                                _eval_registry.setdefault((mlr_feature_tag, model_name), (eval_cfg.parent, row_payload))
                             else:
                                 valid_score = n_test_valid if np.isfinite(n_test_valid) else float("-inf")
                                 eval_score = n_test_evals if np.isfinite(n_test_evals) else float("-inf")
@@ -4004,95 +4063,123 @@ def _evaluate_selected_subsets_all_models(
 
                 # Phase C: run ALL MLR model variants on this feature set
                 try:
-                    _mlr_variant_dirs = sorted(output_dir.glob(f"*_r{k01.row_count:03d}_{mlr_full_tag}*"))
-                    _mlr_split_dir = _mlr_variant_dirs[0] if _mlr_variant_dirs else _ref_vd
-                    _load_kw_mlr = dict(
-                        data_dir=_data_dir, sample_subdir=_sample_sub,
-                        forecast_name=_ref_dcfg.get("forecast_name", ""),
-                        input_columns=_input_cols, output_columns=_output_cols,
-                        input_rows=slice(_in_r1, _in_r2), output_rows=_out_rows,
-                        split_source_dir=_mlr_split_dir, input_aggregation=_in_agg,
-                    )
-                    _tr_mlr = eval_module.load_split_samples(**_load_kw_mlr, split_file="train_files.txt", fault_tolerant=True)
-                    _te_mlr = eval_module.load_split_samples(**_load_kw_mlr, split_file="test_files.txt", fault_tolerant=True)
-                    if len(_tr_mlr) >= 3 and len(_te_mlr) >= 1:
-                        for _mv in _MLR_VARIANTS:
-                            try:
-                                _preds, _tgts, _meta = _evaluate_mlr_pipeline(
-                                    _tr_mlr, _te_mlr, feature_names=_input_cols,
-                                    aggregation_mode=_mv["aggregation_mode"])
-                                _fm = np.all(np.isfinite(_preds), axis=1) & np.all(np.isfinite(_tgts), axis=1)
-                                if _fm.sum() >= 1:
-                                    _pf = _preds[_fm].flatten()
-                                    _tf = _tgts[_fm].flatten()
-                                    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-                                    _n_sel = sum(m.get("n_selected", 0) for m in _meta) / max(len(_meta), 1)
-                                    _mae = float(mean_absolute_error(_tf, _pf))
-                                    _rmse = float(np.sqrt(mean_squared_error(_tf, _pf)))
-                                    _r2 = float(r2_score(_tf, _pf))
-                                    _pr = float(np.corrcoef(_tf, _pf)[0, 1])
-                                    rows.append({
-                                        "dataset": dataset_plan.dataset_dir.name,
-                                        "target": target_name,
-                                        "subset_rank": mlr_rank,
-                                        "subset_label": mlr_subset_label,
-                                        "feature_tag": mlr_feature_tag,
-                                        "row_count": k01.row_count,
-                                        "n_features": _n_sel,
-                                        "objective_search": float("nan"),
-                                        "drop_rate_search": float("nan"),
-                                        "model": _mv["model_name"],
-                                        "gp_uncertainty_mode": "",
-                                        "n_samples": int(_fm.sum()),
-                                        "n_test_independent": int(_fm.sum()),
-                                        "mae": _mae,
-                                        "rmse": _rmse,
-                                        "r2": _r2,
-                                        "pearson_r": _pr,
-                                        "std_target": float(np.std(_tf, ddof=1)) if len(_tf) > 1 else float("nan"),
-                                        "n_test_valid": int(_fm.sum()),
-                                        "n_test_evals": int(_fm.sum()),
-                                        "input_dim": float(len(_input_cols)),
-                                        "target_dim": float(len(_output_cols)),
-                                    })
-                                    print(f"[INFO] {_mv['model_name']} row appended for {dataset_plan.dataset_dir.name}: "
-                                          f"R²={_r2:.3f}, subset={mlr_subset_label}")
-                                else:
-                                    _failure_reasons = [str(m.get("failure_reason", "")).strip() for m in _meta if str(m.get("failure_reason", "")).strip()]
-                                    _fallback_modes = [str(m.get("fallback_mode", "")).strip() for m in _meta if str(m.get("fallback_mode", "")).strip()]
-                                    print(
-                                        f"[WARN] {_mv['model_name']} produced no finite predictions for "
-                                        f"{dataset_plan.dataset_dir.name} on {mlr_subset_label}; "
-                                        f"failure_reasons={_failure_reasons or ['<none>']} "
-                                        f"fallback_modes={_fallback_modes or ['<none>']}"
+                    # Check which MLR variants need fresh evaluation vs dedup copy
+                    _mlr_to_evaluate: list[dict] = []
+                    _mlr_to_copy: list[tuple[dict, Path, dict]] = []  # (variant, source_dir, source_row)
+                    for _mv in _MLR_VARIANTS:
+                        _dedup_src = _eval_registry.get((mlr_feature_tag, _mv["model_name"]))
+                        if _dedup_src is not None:
+                            _mlr_to_copy.append((_mv, _dedup_src[0], _dedup_src[1]))
+                        else:
+                            _mlr_to_evaluate.append(_mv)
+
+                    # Copy dedup'd MLR variants (directory + adjusted row)
+                    for _mv, _src_dir, _src_row in _mlr_to_copy:
+                        _dest_mlr_dir = _mlr_artifact_dir(output_dir, mlr_subset_label, model_prefix=_mv["dir_prefix"])
+                        _copy_eval_directory(_src_dir, _dest_mlr_dir)
+                        _copied_row = dict(_src_row)
+                        _copied_row["subset_rank"] = mlr_rank
+                        _copied_row["subset_label"] = mlr_subset_label
+                        _copied_row["feature_tag"] = mlr_feature_tag
+                        rows.append(_copied_row)
+                        print(f"[DEDUP] {_mv['model_name']} on {mlr_subset_label}: "
+                              f"copied from {_src_dir.name} (same features {mlr_feature_tag})")
+
+                    # Evaluate remaining MLR variants that haven't been seen before
+                    if _mlr_to_evaluate:
+                        _mlr_variant_dirs = sorted(output_dir.glob(f"*_r{k01.row_count:03d}_{mlr_full_tag}*"))
+                        _mlr_split_dir = _mlr_variant_dirs[0] if _mlr_variant_dirs else _ref_vd
+                        _load_kw_mlr = dict(
+                            data_dir=_data_dir, sample_subdir=_sample_sub,
+                            forecast_name=_ref_dcfg.get("forecast_name", ""),
+                            input_columns=list(_spearman_cols), output_columns=_output_cols,
+                            input_rows=slice(_in_r1, _in_r2), output_rows=_out_rows,
+                            split_source_dir=_mlr_split_dir, input_aggregation=_in_agg,
+                        )
+                        _tr_mlr = eval_module.load_split_samples(**_load_kw_mlr, split_file="train_files.txt", fault_tolerant=True)
+                        _te_mlr = eval_module.load_split_samples(**_load_kw_mlr, split_file="test_files.txt", fault_tolerant=True)
+                        if len(_tr_mlr) >= 3 and len(_te_mlr) >= 1:
+                            for _mv in _mlr_to_evaluate:
+                                try:
+                                    _preds, _tgts, _meta = _evaluate_mlr_pipeline(
+                                        _tr_mlr, _te_mlr, feature_names=list(_spearman_cols),
+                                        aggregation_mode=_mv["aggregation_mode"])
+                                    _fm = np.all(np.isfinite(_preds), axis=1) & np.all(np.isfinite(_tgts), axis=1)
+                                    if _fm.sum() >= 1:
+                                        _pf = _preds[_fm].flatten()
+                                        _tf = _tgts[_fm].flatten()
+                                        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+                                        _n_sel = sum(m.get("n_selected", 0) for m in _meta) / max(len(_meta), 1)
+                                        _mae = float(mean_absolute_error(_tf, _pf))
+                                        _rmse = float(np.sqrt(mean_squared_error(_tf, _pf)))
+                                        _r2 = float(r2_score(_tf, _pf))
+                                        _pr = float(np.corrcoef(_tf, _pf)[0, 1])
+                                        _mlr_row = {
+                                            "dataset": dataset_plan.dataset_dir.name,
+                                            "target": target_name,
+                                            "subset_rank": mlr_rank,
+                                            "subset_label": mlr_subset_label,
+                                            "feature_tag": mlr_feature_tag,
+                                            "row_count": k01.row_count,
+                                            "n_features": _n_sel,
+                                            "objective_search": float("nan"),
+                                            "drop_rate_search": float("nan"),
+                                            "model": _mv["model_name"],
+                                            "gp_uncertainty_mode": "",
+                                            "n_samples": int(_fm.sum()),
+                                            "n_test_independent": int(_fm.sum()),
+                                            "mae": _mae,
+                                            "rmse": _rmse,
+                                            "r2": _r2,
+                                            "pearson_r": _pr,
+                                            "std_target": float(np.std(_tf, ddof=1)) if len(_tf) > 1 else float("nan"),
+                                            "n_test_valid": int(_fm.sum()),
+                                            "n_test_evals": int(_fm.sum()),
+                                            "input_dim": float(len(_spearman_cols)),
+                                            "target_dim": float(len(_output_cols)),
+                                        }
+                                        rows.append(_mlr_row)
+                                        print(f"[INFO] {_mv['model_name']} row appended for {dataset_plan.dataset_dir.name}: "
+                                              f"R²={_r2:.3f}, subset={mlr_subset_label}")
+                                    else:
+                                        _failure_reasons = [str(m.get("failure_reason", "")).strip() for m in _meta if str(m.get("failure_reason", "")).strip()]
+                                        _fallback_modes = [str(m.get("fallback_mode", "")).strip() for m in _meta if str(m.get("fallback_mode", "")).strip()]
+                                        print(
+                                            f"[WARN] {_mv['model_name']} produced no finite predictions for "
+                                            f"{dataset_plan.dataset_dir.name} on {mlr_subset_label}; "
+                                            f"failure_reasons={_failure_reasons or ['<none>']} "
+                                            f"fallback_modes={_fallback_modes or ['<none>']}"
+                                        )
+                                        _mlr_row = None
+                                    _mlr_dir = _write_mlr_artifacts(
+                                        output_dir=output_dir,
+                                        dataset_dir=dataset_plan.dataset_dir,
+                                        subset_label=mlr_subset_label,
+                                        data_dir=_data_dir,
+                                        sample_subdir=_sample_sub,
+                                        input_columns=list(_spearman_cols),
+                                        output_columns=_output_cols,
+                                        input_row_1=_in_r1,
+                                        input_row_2=_in_r2,
+                                        output_rows=_out_rows,
+                                        input_aggregation=_in_agg,
+                                        train_samples=_tr_mlr,
+                                        test_samples=_te_mlr,
+                                        preds=_preds,
+                                        targets=_tgts,
+                                        per_target_meta=_meta,
+                                        split_source_dir=_mlr_split_dir,
+                                        ref_cfg=_ref_cfg,
+                                        ref_cfg_path=_ref_ecfg,
+                                        ref_data_cfg=_ref_dcfg,
+                                        model_config_extra={"spearman_kept_columns": sorted(_spearman_cols)},
+                                        model_prefix=_mv["dir_prefix"],
                                     )
-                                _mlr_dir = _write_mlr_artifacts(
-                                    output_dir=output_dir,
-                                    dataset_dir=dataset_plan.dataset_dir,
-                                    subset_label=mlr_subset_label,
-                                    data_dir=_data_dir,
-                                    sample_subdir=_sample_sub,
-                                    input_columns=_input_cols,
-                                    output_columns=_output_cols,
-                                    input_row_1=_in_r1,
-                                    input_row_2=_in_r2,
-                                    output_rows=_out_rows,
-                                    input_aggregation=_in_agg,
-                                    train_samples=_tr_mlr,
-                                    test_samples=_te_mlr,
-                                    preds=_preds,
-                                    targets=_tgts,
-                                    per_target_meta=_meta,
-                                    split_source_dir=_mlr_split_dir,
-                                    ref_cfg=_ref_cfg,
-                                    ref_cfg_path=_ref_ecfg,
-                                    ref_data_cfg=_ref_dcfg,
-                                    model_config_extra={"spearman_kept_columns": sorted(_spearman_cols)},
-                                    model_prefix=_mv["dir_prefix"],
-                                )
-                                print(f"[INFO] {_mv['model_name']} artifacts written to {_mlr_dir}")
-                            except Exception as _mv_exc:
-                                print(f"[WARN] {_mv['model_name']} evaluation on {mlr_subset_label} failed: {_mv_exc}")
+                                    print(f"[INFO] {_mv['model_name']} artifacts written to {_mlr_dir}")
+                                    if _mlr_row is not None:
+                                        _eval_registry.setdefault((mlr_feature_tag, _mv["model_name"]), (_mlr_dir, _mlr_row))
+                                except Exception as _mv_exc:
+                                    print(f"[WARN] {_mv['model_name']} evaluation on {mlr_subset_label} failed: {_mv_exc}")
                 except Exception as _mlr_model_exc:
                     print(f"[WARN] MLR model evaluation on {mlr_subset_label} failed: {_mlr_model_exc}")
 

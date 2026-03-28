@@ -190,11 +190,18 @@ def _select_by_mutual_info(X, y, feature_idx, mi_quantile=0.25, random_state=0):
     return selected if selected else feature_idx
 
 
-def _select_by_lasso(X, y, feature_idx, random_state=0):
+def _select_by_lasso(X, y, feature_idx, random_state=0, alpha_scale=1.0):
     """Retain features with non-zero Lasso coefficients (CV-tuned alpha).
 
     If more than _MAX_VIF_FEATURES survive, keep those with the largest
     absolute coefficients so VIF remains tractable.
+
+    Parameters
+    ----------
+    alpha_scale : float
+        Multiplier applied to the CV-selected alpha before refitting.
+        Values < 1.0 reduce regularization and retain more features;
+        values > 1.0 increase regularization.  Default 1.0 (no change).
     """
     if len(feature_idx) <= 1:
         return feature_idx
@@ -210,7 +217,16 @@ def _select_by_lasso(X, y, feature_idx, random_state=0):
                         max_iter=20000, tol=5e-4)
         lasso.fit(X[mask], y[mask])
 
-    coef_abs = np.abs(lasso.coef_)
+        # Optionally reduce regularisation to keep more features.
+        if alpha_scale != 1.0 and lasso.alpha_ > 0:
+            from sklearn.linear_model import Lasso as _Lasso
+            scaled = _Lasso(alpha=lasso.alpha_ * alpha_scale,
+                            max_iter=20000, tol=5e-4)
+            scaled.fit(X[mask], y[mask])
+            coef_abs = np.abs(scaled.coef_)
+        else:
+            coef_abs = np.abs(lasso.coef_)
+
     nonzero_mask = coef_abs > 0
     selected = [(idx, c) for idx, keep, c in zip(feature_idx, nonzero_mask, coef_abs) if keep]
 
@@ -323,9 +339,10 @@ def _drop_near_duplicate_features(X, y, feature_idx, corr_threshold=0.9999):
 
 
 def select_features(X_train, y_train, feature_names,
-                    mi_quantile=0.25, vif_threshold=10.0, random_state=0,
+                    mi_quantile=0.10, vif_threshold=10.0, random_state=0,
                     use_mutual_info=True, use_lasso=True,
-                    deduplicate_threshold=0.9999):
+                    deduplicate_threshold=0.9999,
+                    lasso_alpha_scale=1.0):
     """Run the full feature selection pipeline on training data.
 
     Parameters
@@ -359,7 +376,8 @@ def select_features(X_train, y_train, feature_names,
     # Step 3: L1 / Lasso (caps at _MAX_VIF_FEATURES before VIF)
     if use_lasso:
         X_sub = X_train[:, idx]
-        idx = _select_by_lasso(X_sub, y_train, idx, random_state)
+        idx = _select_by_lasso(X_sub, y_train, idx, random_state,
+                               alpha_scale=lasso_alpha_scale)
         if not idx:
             return [], []
 
