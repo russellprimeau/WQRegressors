@@ -68,7 +68,7 @@ DEFAULT_EVAL_CONFIG = {
     "run_threshold_classification": False,
     "run_pure_classification": False,
     "run_baselines": False,
-    "num_samples": 200,
+    "num_samples": None,
     "debug_plot": False,
     "debug_examples": 10,
     "gap_hours": 1,
@@ -1734,7 +1734,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
             labels=plot_labels,
             forecast_name=data_cfg["forecast_name"],
             directory=data_cfg["data_dir"],
-            num_samples=eval_cfg.get("num_samples", 200),
+            num_samples=eval_cfg.get("num_samples"),
             sample_labels=None,
             split_files_by_pair=plot_split_files,
             collapse_error_points_by_pair=collapse_error_points_by_pair,
@@ -1746,7 +1746,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
         has_model_mc_distribution = _has_mc_replicate_distribution_for_uncertainty_plot(
             model_plot_pairs,
             model_plot_split_files,
-            row_limit=eval_cfg.get("num_samples", 200),
+            row_limit=eval_cfg.get("num_samples"),
         )
         # Keep uncertainty boxplots model-only and only when replicate distributions exist.
         # This matches predictions.csv semantics where mc_xxx columns appear only with MC replicate evaluations.
@@ -1757,7 +1757,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 model_plot_split_files,
                 directory=data_cfg["data_dir"],
                 forecast_name=data_cfg["forecast_name"],
-                num_samples=eval_cfg.get("num_samples", 200),
+                num_samples=eval_cfg.get("num_samples"),
                 sample_labels=None,
             )
         else:

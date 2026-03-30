@@ -476,7 +476,7 @@ DEFAULT_EVALUATION_CONFIG = {
     "run_threshold_classification": False,
     "run_pure_classification": False,
     "run_baselines": True,
-    "num_samples": 200,
+    "num_samples": None,
     "debug_plot": False,
     "debug_examples": 10,
     "gap_hours": 1,

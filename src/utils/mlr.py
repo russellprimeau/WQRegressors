@@ -69,9 +69,11 @@ def _extract_aligned_predictor_row(X, aggregation_mode="last"):
     if aggregation_mode == "last":
         return arr[-1, :].astype(float, copy=False)
     if aggregation_mode == "avg12":
-        return np.nanmean(arr[-12:, :], axis=0).astype(float, copy=False)
+        with np.errstate(all="ignore"):
+            return np.nanmean(arr[-12:, :], axis=0).astype(float, copy=False)
     if aggregation_mode == "avgall":
-        return np.nanmean(arr, axis=0).astype(float, copy=False)
+        with np.errstate(all="ignore"):
+            return np.nanmean(arr, axis=0).astype(float, copy=False)
     raise ValueError(f"Unknown aggregation_mode: {aggregation_mode!r}")
 
 def _prefilter_by_spearman(train_samples, target_idx, base_feature_names,
@@ -589,6 +591,7 @@ def evaluate_mlr(
     verbose=False,
     selection_config=None,
     aggregation_mode="last",
+    use_spearman_prefilter=True,
 ):
     """Multiple Linear Regression with independent feature selection.
 
@@ -628,16 +631,25 @@ def evaluate_mlr(
 
     for j in range(n_outputs):
         # --- Step 0: Spearman pre-filter on base columns ---
-        keep_cols, spearman_results = _prefilter_by_spearman(
-            train_samples, j, base_names,
-            aggregation_mode=aggregation_mode,
-        )
-
-        if verbose:
-            print(
-                f"[MLR] Spearman pre-filter: {len(keep_cols)}/{len(base_names)} "
-                f"base columns pass on the aligned predictor row (p<0.05, |ρ|>0.20)"
+        if use_spearman_prefilter:
+            keep_cols, spearman_results = _prefilter_by_spearman(
+                train_samples, j, base_names,
+                aggregation_mode=aggregation_mode,
             )
+
+            if verbose:
+                print(
+                    f"[MLR] Spearman pre-filter: {len(keep_cols)}/{len(base_names)} "
+                    f"base columns pass on the aligned predictor row (p<0.05, |ρ|>0.20)"
+                )
+        else:
+            keep_cols = list(range(len(base_names)))
+            spearman_results = {}
+            if verbose:
+                print(
+                    f"[MLR] Spearman pre-filter skipped: using all "
+                    f"{len(base_names)}/{len(base_names)} provided columns"
+                )
 
         def _extract_filtered(samples):
             """Return the aggregated predictor row for each sample, filtered to keep_cols."""
@@ -667,3 +679,22 @@ def evaluate_mlr(
         all_meta.append(meta_j)
 
     return predictions, y_test, all_meta
+
+
+def filter_predictable(predictions, targets, test_samples):
+    """Remove test samples where MLR produced NaN predictions.
+
+    After aggregation some samples may lack finite values for selected
+    features (e.g. sensor offline), causing ``fit_and_predict`` to leave
+    their predictions as NaN.  This mirrors GP/Transformer behaviour where
+    such samples are excluded at load time.
+
+    Returns (predictions, targets, test_samples, n_excluded).
+    """
+    mask = np.all(np.isfinite(predictions), axis=1)
+    n_excluded = int(np.sum(~mask))
+    if n_excluded > 0:
+        predictions = predictions[mask]
+        targets = targets[mask]
+        test_samples = [test_samples[i] for i in range(len(mask)) if mask[i]]
+    return predictions, targets, test_samples, n_excluded

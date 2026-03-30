@@ -518,7 +518,7 @@ def visualizer(
     labels=None,
     directory=None,
     forecast_name=None,
-    num_samples=200,
+    num_samples=None,
     sample_labels=None,
     split_files_by_pair=None,
     collapse_error_points_by_pair=None,
@@ -1140,7 +1140,7 @@ def boxplot_from_error_rows(error_rows_df, directory, forecast_name):
     plt.close()
 
 def classification_visualizer(*pred_target_pairs, labels=None, directory='.', forecast_name='Classifier',
-                              num_samples=200):
+                              num_samples=None):
     os.makedirs(os.path.join(directory, "forecasts", forecast_name, "classification"), exist_ok=True)
     sns.set_style("whitegrid")
     metrics = []
