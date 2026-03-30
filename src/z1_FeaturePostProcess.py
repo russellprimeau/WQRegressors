@@ -2262,6 +2262,25 @@ def _compile_feature_inclusion_heatmap(
             except Exception as exc:
                 print(f"[WARN] Could not read {csv_path.name} for {dataset_name}: {exc}")
 
+        # Fallback for MLR best rows: features are not in sweep CSVs, read from model_config.json
+        if not features_list:
+            _model_name = str(row.get("model", "")).lower()
+            if _model_name in {"mlr", "mlr_avg12", "mlr_avgall"}:
+                _subset_label = str(row.get("subset_label", ""))
+                _mlr_dir = _mlr_artifact_dir(out_dir, _subset_label, model_prefix=_model_name)
+                _mlr_cfg_path = _mlr_dir / "model_config.json"
+                if _mlr_cfg_path.exists():
+                    try:
+                        with open(_mlr_cfg_path, "r", encoding="utf-8") as _f:
+                            _mlr_cfg = json.load(_f)
+                        _per_target = _mlr_cfg.get("per_target_meta", [])
+                        if _per_target and _per_target[0].get("selected_features"):
+                            features_list = list(_per_target[0]["selected_features"])
+                        elif _mlr_cfg.get("input_columns"):
+                            features_list = list(_mlr_cfg["input_columns"])
+                    except Exception as exc:
+                        print(f"[WARN] Could not read MLR model_config.json for {dataset_name}: {exc}")
+
         if not features_list:
             print(f"[WARN] Could not resolve features for {dataset_name} tag={feature_tag}; skipping.")
             continue

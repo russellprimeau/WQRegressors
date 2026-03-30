@@ -102,6 +102,7 @@ import importlib.util
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import torch
 import yaml
 import e_Train as train_module
