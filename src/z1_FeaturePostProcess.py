@@ -155,32 +155,58 @@ def _exclude_baseline_metric_rows(df: "pd.DataFrame") -> "pd.DataFrame":
 _SHAPLEY_MERGE_LABEL_PREFIX = "shap_"
 
 
-def _merge_shapley_into_final_metrics(plan: "DatasetPlan", final_metrics_csv: Path) -> int:
-    """Append best Shapley sweep results into the Feature sweep final metrics CSV.
+def _recompute_min_skill_rmse(df: pd.DataFrame) -> pd.DataFrame:
+    """Recompute min_skill_rmse for all non-baseline rows in df.
 
-    Returns the number of rows merged.  Idempotent: any previously-merged
-    Shapley rows (identified by ``subset_label`` starting with *shap_*) are
-    removed before re-appending.
+    Uses best baseline RMSE per subset_rank as primary lookup, with a
+    subset_label fallback (stripping the shap_ prefix) for rows whose rank
+    has no matching baseline (e.g. MLR rows at novel ranks, offset Shapley ranks).
+    """
+    if not {"subset_rank", "rmse", "model"}.issubset(df.columns):
+        return df
+    _is_bl = df["model"].apply(_is_baseline_model_value)
+    _bl_by_rank = (
+        df[_is_bl].groupby("subset_rank")["rmse"].min().rename("_best_bl_rmse")
+    )
+    df = df.join(_bl_by_rank, on="subset_rank")
+    if "subset_label" in df.columns:
+        _label_norm = df["subset_label"].astype(str).str.removeprefix(_SHAPLEY_MERGE_LABEL_PREFIX)
+        _bl_by_label = (
+            df[_is_bl]
+            .groupby(df.loc[_is_bl, "subset_label"].astype(str))["rmse"]
+            .min()
+        )
+        _missing = df["_best_bl_rmse"].isna()
+        df.loc[_missing, "_best_bl_rmse"] = _label_norm[_missing].map(_bl_by_label)
+    _ml_rmse = pd.to_numeric(df["rmse"], errors="coerce")
+    _needs_skill = df["_best_bl_rmse"].notna() & (~_is_bl)
+    df.loc[_needs_skill, "min_skill_rmse"] = (
+        (df.loc[_needs_skill, "_best_bl_rmse"] - _ml_rmse[_needs_skill])
+        / df.loc[_needs_skill, "_best_bl_rmse"]
+    )
+    df.drop(columns=["_best_bl_rmse"], inplace=True)
+    return df
+
+
+def _merge_shapley_into_final_metrics(plan: "DatasetPlan", df: pd.DataFrame) -> pd.DataFrame:
+    """Append best Shapley sweep results into the Feature sweep final metrics DataFrame.
+
+    Returns the updated DataFrame.  Idempotent: any previously-merged Shapley rows
+    (identified by ``subset_label`` starting with *shap_*) are removed before re-appending.
+    Does not write to disk or redraw the plot — the caller handles that.
     """
     shapley_csv = plan.dataset_dir / "forecasts" / "Shapley_sweeps" / "feature_sweep_final_metrics.csv"
     if not shapley_csv.exists():
-        return 0
-    # Don't merge when postprocessing the Shapley namespace itself.
-    if shapley_csv.resolve() == final_metrics_csv.resolve():
-        return 0
+        return df
     try:
         df_shapley = pd.read_csv(shapley_csv)
     except Exception:
-        return 0
+        return df
     if df_shapley.empty:
-        return 0
-
-    try:
-        df_feat = pd.read_csv(final_metrics_csv)
-    except Exception:
-        return 0
+        return df
 
     # Remove any previously-merged Shapley rows (idempotency).
+    df_feat = df
     if "subset_label" in df_feat.columns:
         df_feat = df_feat[
             ~df_feat["subset_label"].astype(str).str.startswith(_SHAPLEY_MERGE_LABEL_PREFIX)
@@ -190,10 +216,10 @@ def _merge_shapley_into_final_metrics(plan: "DatasetPlan", final_metrics_csv: Pa
     if "model" in df_shapley.columns:
         df_shapley = df_shapley[~df_shapley["model"].apply(_is_baseline_model_value)].copy()
     if df_shapley.empty:
-        return 0
+        return df
 
     # Deduplicate: skip Shapley rows whose (feature_tag, model) already exists
-    # in the Feature sweep CSV (same feature set already evaluated in Stage 2).
+    # in the Feature sweep data (same feature set already evaluated in Stage 2).
     if "feature_tag" in df_feat.columns and "model" in df_feat.columns:
         existing_keys = set(
             zip(df_feat["feature_tag"].astype(str), df_feat["model"].astype(str))
@@ -204,7 +230,7 @@ def _merge_shapley_into_final_metrics(plan: "DatasetPlan", final_metrics_csv: Pa
         ]
         df_shapley = df_shapley[keep_mask].copy()
     if df_shapley.empty:
-        return 0
+        return df
 
     # Relabel to avoid colliding with Feature sweep subset_rank / subset_label.
     max_rank = 0
@@ -223,20 +249,11 @@ def _merge_shapley_into_final_metrics(plan: "DatasetPlan", final_metrics_csv: Pa
         )
 
     merged = pd.concat([df_feat, df_shapley], ignore_index=True)
-    merged.to_csv(final_metrics_csv, index=False)
-
-    # Regenerate the comparison plot with combined data.
-    try:
-        _plot_final_metrics_comparison(merged, final_metrics_csv.parent)
-    except Exception:
-        pass
-
     n_merged = len(df_shapley)
     print(
-        f"[INFO] Merged {n_merged} Shapley sweep result row(s) into "
-        f"{final_metrics_csv.name} for {plan.dataset_dir.name}"
+        f"[INFO] Merged {n_merged} Shapley sweep result row(s) for {plan.dataset_dir.name}"
     )
-    return n_merged
+    return merged
 
 
 def _build_perf_entry(
@@ -448,30 +465,165 @@ def _resolve_summary_plot_dirs(summaries_dir: Path) -> tuple[Path, Path, Path]:
     return combined_dir, individual_dir, evaluation_dir
 
 
+def _read_mlr_k_cluster_rows(sweep_dir: Path, df: pd.DataFrame) -> list[dict]:
+    """Recover per-k-cluster MLR rows from artifact directories not yet in df.
+
+    Globs for mlr*_k## directories (e.g. mlr_k01, mlr_avg12_k03) that have an
+    evaluation_summary.csv and config_evaluate_*.yml. Reads metrics from the
+    test-kind summary row and looks up subset_rank from existing df rows that
+    share the same feature_tag. Skips any (feature_tag, model) already in df.
+    """
+    import re as _re
+    _mlr_models = {"mlr", "mlr_avg12", "mlr_avgall"}
+    existing_keys: set[tuple[str, str]] = set()
+    if "feature_tag" in df.columns and "model" in df.columns:
+        existing_keys = set(
+            zip(df["feature_tag"].astype(str), df["model"].astype(str).str.lower())
+        )
+
+    # Build feature_tag → subset_rank lookup from non-MLR rows.
+    ftag_to_rank: dict[str, int] = {}
+    ftag_to_std: dict[str, float] = {}
+    ftag_to_dataset: dict[str, str] = {}
+    ftag_to_target: dict[str, str] = {}
+    ftag_to_rowcount: dict[str, object] = {}
+    if "feature_tag" in df.columns and "subset_rank" in df.columns:
+        non_mlr = df[~df["model"].astype(str).str.lower().isin(_mlr_models)]
+        for ft, grp in non_mlr.groupby("feature_tag"):
+            ranks = pd.to_numeric(grp["subset_rank"], errors="coerce").dropna()
+            if not ranks.empty:
+                ftag_to_rank[str(ft)] = int(ranks.min())
+            stds = pd.to_numeric(grp.get("std_target", pd.Series(dtype=float)), errors="coerce").dropna()
+            if not stds.empty:
+                ftag_to_std[str(ft)] = float(stds.iloc[0])
+            if "dataset" in grp.columns:
+                ftag_to_dataset[str(ft)] = str(grp["dataset"].iloc[0])
+            if "target" in grp.columns:
+                ftag_to_target[str(ft)] = str(grp["target"].iloc[0])
+            if "row_count" in grp.columns:
+                ftag_to_rowcount[str(ft)] = grp["row_count"].iloc[0]
+
+    rows: list[dict] = []
+    _dir_pattern = _re.compile(r"^(mlr(?:_avg12|_avgall)?)_k(\d{2})$")
+    for candidate in sorted(sweep_dir.iterdir()):
+        if not candidate.is_dir():
+            continue
+        m = _dir_pattern.match(candidate.name)
+        if m is None:
+            continue
+        model_name = m.group(1)
+        subset_label = f"k{m.group(2)}"
+
+        cfg_candidates = sorted(candidate.glob("config_evaluate_*.yml"))
+        if not cfg_candidates:
+            continue
+        try:
+            with open(cfg_candidates[0], "r", encoding="utf-8") as _f:
+                _cfg = yaml.safe_load(_f)
+        except Exception:
+            continue
+        _dcfg = _cfg.get("data", {})
+        input_columns = list(_dcfg.get("input_columns") or [])
+        output_columns = list(_dcfg.get("output_columns") or [])
+        if not input_columns:
+            continue
+
+        feature_tag = _feature_tag(tuple(sorted(input_columns)))
+        if (feature_tag, model_name) in existing_keys:
+            continue
+
+        subset_rank = ftag_to_rank.get(feature_tag)
+        if subset_rank is None:
+            subset_rank = int(m.group(2))
+
+        summary_csv = candidate / "evaluation_summary.csv"
+        if not summary_csv.exists():
+            continue
+        try:
+            _sumdf = pd.read_csv(summary_csv)
+        except Exception:
+            continue
+
+        # Prefer kind=="test", fall back to first non-baseline row.
+        _test_rows = _sumdf[_sumdf.get("kind", pd.Series(dtype=str)).astype(str).str.lower() == "test"] if "kind" in _sumdf.columns else pd.DataFrame()
+        if _test_rows.empty:
+            _non_bl = _sumdf[~_sumdf["label"].astype(str).apply(_is_baseline_model_value)] if "label" in _sumdf.columns else pd.DataFrame()
+            _test_rows = _non_bl if not _non_bl.empty else _sumdf
+
+        if _test_rows.empty:
+            continue
+        srow = _test_rows.iloc[0]
+
+        def _sfloat(key: str) -> float:
+            return float(pd.to_numeric(srow.get(key, float("nan")), errors="coerce"))
+
+        mae = _sfloat("mae")
+        rmse = _sfloat("rmse")
+        r2 = _sfloat("r2")
+        pearson_r = _sfloat("pearson_r")
+        n_test_independent = _sfloat("n_test_independent")
+        n_test_valid = _sfloat("n_test_valid")
+        n_samples = _sfloat("n_eval_points_finite") if "n_eval_points_finite" in srow.index else n_test_valid
+        n_features = _sfloat("input_dim") if "input_dim" in srow.index else float(len(input_columns))
+        target_dim = _sfloat("n_eval_outputs") if "n_eval_outputs" in srow.index else float(len(output_columns))
+
+        if not (np.isfinite(mae) and np.isfinite(rmse)):
+            continue
+
+        std_target = ftag_to_std.get(feature_tag, float("nan"))
+        nrmse = rmse / std_target if np.isfinite(std_target) and std_target > 0 else float("nan")
+
+        row: dict = {
+            "dataset": ftag_to_dataset.get(feature_tag, sweep_dir.parent.parent.name),
+            "target": ftag_to_target.get(feature_tag, output_columns[0] if output_columns else ""),
+            "subset_rank": subset_rank,
+            "subset_label": subset_label,
+            "feature_tag": feature_tag,
+            "row_count": ftag_to_rowcount.get(feature_tag, float("nan")),
+            "n_features": n_features,
+            "model": model_name,
+            "mae": mae,
+            "rmse": rmse,
+            "r2": r2,
+            "pearson_r": pearson_r,
+            "std_target": std_target,
+            "nrmse": nrmse,
+            "n_test_independent": n_test_independent,
+            "n_test_valid": n_test_valid,
+            "n_test_evals": n_test_valid,
+            "n_samples": n_samples,
+            "input_dim": float(len(input_columns)),
+            "target_dim": target_dim,
+            "n_eval_raw_segments": n_test_independent,
+        }
+        for col in df.columns:
+            if col not in row:
+                row[col] = float("nan")
+        rows.append(row)
+        print(f"[INFO] Recovered {model_name} {subset_label} row from {candidate.name}: "
+              f"R²={r2:.3f}, RMSE={rmse:.4f}")
+    return rows
+
+
 def _append_mlr_to_final_metrics(
     plan: "DatasetPlan",
-    final_metrics_csv: Path,
+    df: pd.DataFrame,
     best_row: "pd.Series",
     args: "argparse.Namespace",
-) -> None:
-    """Fit MLR on train data, evaluate on test data, append row to final_metrics CSV.
+) -> pd.DataFrame:
+    """Fit MLR on train data, evaluate on test data, return updated metrics DataFrame.
 
     Uses the same train/test split as the best ML model for the dataset.
     Feature selection (MI + L1 + VIF) is performed independently on training data.
     Also writes per-variant output artifacts (evaluation_summary.csv, predictions.csv,
     model_config.json, boxplot.png, predictions.png, metrics_summary.png) matching
     the standard output format of other data-driven models.
+    Does not write to disk or redraw the plot — the caller handles that.
     """
-    df = pd.read_csv(final_metrics_csv)
-    # Remove only the MLR *model* row (keep ML model rows for the MLR k-cluster
-    # that may have been created by the sweep pipeline).
-    if "model" in df.columns:
-        df = df[~df["model"].astype(str).str.lower().isin({"mlr", "mlr_avg12", "mlr_avgall"})]
-
     variant_dir, eval_cfg_path, match_status = _find_best_variant_eval_config(plan, best_row)
     if eval_cfg_path is None or not eval_cfg_path.exists():
         print(f"[WARN] Cannot compute MLR for {plan.dataset_dir.name}: no eval config ({match_status})")
-        return
+        return df
 
     cfg = eval_module.load_config(str(eval_cfg_path))
     config_dir = cfg["__config_dir"]
@@ -506,6 +658,19 @@ def _append_mlr_to_final_metrics(
         surrogate_cfg_path = _select_surrogate_config(plan.train_configs)
         surrogate_cfg = train_module.load_config(str(surrogate_cfg_path))
         input_columns = list(surrogate_cfg["data"]["input_columns"])
+
+    # Remove only the MLR rows for the feature set we are about to re-evaluate.
+    # MLR rows for other feature sets (e.g. per-k-cluster rows written by the sweep)
+    # must be preserved so they continue to appear in the CSV and summary plot.
+    if "model" in df.columns:
+        _mlr_model_mask = df["model"].astype(str).str.lower().isin({"mlr", "mlr_avg12", "mlr_avgall"})
+        if "feature_tag" in df.columns:
+            _mlr_ftag_pre = _feature_tag(tuple(sorted(input_columns)))
+            _same_ftag_mask = df["feature_tag"].astype(str) == _mlr_ftag_pre
+            df = df[~(_mlr_model_mask & _same_ftag_mask)].copy()
+        else:
+            df = df[~_mlr_model_mask].copy()
+
     mlr_selection_config = None
     mlr_use_spearman_prefilter = True
     if use_preselected_mlr_inputs:
@@ -538,7 +703,7 @@ def _append_mlr_to_final_metrics(
     if len(train_samples) < 3 or len(test_samples) < 1:
         print(f"[WARN] Insufficient samples for MLR ({plan.dataset_dir.name}): "
               f"train={len(train_samples)}, test={len(test_samples)}")
-        return
+        return df
 
     from utils.mlr import MLR_VARIANTS as _MLR_VARIANTS
 
@@ -660,9 +825,13 @@ def _append_mlr_to_final_metrics(
         )
         print(f"[INFO] Wrote {_v_name} artifacts to {mlr_dir}")
 
+    # Recover any per-k-cluster MLR rows written by the sweep but not yet in df.
+    sweep_dir = _forecast_sweeps_dir(plan.dataset_dir)
+    rows_to_append.extend(_read_mlr_k_cluster_rows(sweep_dir, df))
+
     if rows_to_append:
         df = pd.concat([df, pd.DataFrame(rows_to_append)], ignore_index=True)
-        df.to_csv(final_metrics_csv, index=False)
+    return df
 
 
 def _normalize_ml_model_display(val: str) -> str:
@@ -2238,48 +2407,17 @@ def _compile_feature_inclusion_heatmap(
         plan = dataset_to_plan.get(dataset_name)
         if plan is None:
             continue
-        row_count = int(row["row_count"])
-        feature_tag = str(row["feature_tag"])
-        out_dir = _forecast_sweeps_dir(plan.dataset_dir)
-
-        # Try feature_selected_subsets first, then feature_search_trace as fallback
+        feature_tag = str(row.get("feature_tag", ""))
         features_list: list[str] | None = None
-        for csv_name in [
-            f"feature_selected_subsets_r{row_count:03d}.csv",
-            f"feature_search_trace_r{row_count:03d}.csv",
-        ]:
-            csv_path = out_dir / csv_name
-            if not csv_path.exists():
-                continue
+        _, eval_cfg_path, _ = _find_best_variant_eval_config(plan, row)
+        if eval_cfg_path is not None and eval_cfg_path.exists():
             try:
-                df_sub = pd.read_csv(csv_path)
-                matched = df_sub[df_sub["feature_tag"].astype(str) == feature_tag]
-                if not matched.empty and "features" in matched.columns:
-                    raw = str(matched.iloc[0]["features"]).strip()
-                    if raw and raw.lower() != "nan":
-                        features_list = [f.strip() for f in raw.split("|") if f.strip()]
-                        break
+                cfg = train_module.load_config(str(eval_cfg_path))
+                cols = cfg.get("data", {}).get("input_columns", [])
+                if cols:
+                    features_list = list(cols)
             except Exception as exc:
-                print(f"[WARN] Could not read {csv_path.name} for {dataset_name}: {exc}")
-
-        # Fallback for MLR best rows: features are not in sweep CSVs, read from model_config.json
-        if not features_list:
-            _model_name = str(row.get("model", "")).lower()
-            if _model_name in {"mlr", "mlr_avg12", "mlr_avgall"}:
-                _subset_label = str(row.get("subset_label", ""))
-                _mlr_dir = _mlr_artifact_dir(out_dir, _subset_label, model_prefix=_model_name)
-                _mlr_cfg_path = _mlr_dir / "model_config.json"
-                if _mlr_cfg_path.exists():
-                    try:
-                        with open(_mlr_cfg_path, "r", encoding="utf-8") as _f:
-                            _mlr_cfg = json.load(_f)
-                        _per_target = _mlr_cfg.get("per_target_meta", [])
-                        if _per_target and _per_target[0].get("selected_features"):
-                            features_list = list(_per_target[0]["selected_features"])
-                        elif _mlr_cfg.get("input_columns"):
-                            features_list = list(_mlr_cfg["input_columns"])
-                    except Exception as exc:
-                        print(f"[WARN] Could not read MLR model_config.json for {dataset_name}: {exc}")
+                print(f"[WARN] Could not read eval config for {dataset_name}: {exc}")
 
         if not features_list:
             print(f"[WARN] Could not resolve features for {dataset_name} tag={feature_tag}; skipping.")
@@ -2651,30 +2789,23 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                             print(f"[WARN] Failed to write dataset evaluation summary for {plan.dataset_dir.name}: {exc}")
                             traceback.print_exc()
 
-                        # Compute MLR baseline and append to final_metrics CSV
+                        # Append MLR rows in-memory.
                         try:
-                            _append_mlr_to_final_metrics(plan, final_metrics_csv, best_row, args)
-                            # Re-generate final metrics comparison plot now that MLR row is included
-                            try:
-                                _updated_df = pd.read_csv(final_metrics_csv)
-                                if not _updated_df.empty:
-                                    _plot_final_metrics_comparison(_updated_df, output_dir)
-                            except Exception:
-                                pass
+                            df = _append_mlr_to_final_metrics(plan, df, best_row, args)
                         except Exception as exc:
                             print(f"[WARN] MLR computation failed for {plan.dataset_dir.name}: {exc}")
                             traceback.print_exc()
 
                         # Re-select best row after MLR append so evidence targets the true best model.
                         try:
-                            _post_mlr_df = _exclude_baseline_metric_rows(
+                            _post_mlr = _exclude_baseline_metric_rows(
                                 _filter_min_valid_independent(
-                                    _filter_valid_rows(pd.read_csv(final_metrics_csv)),
+                                    _filter_valid_rows(df),
                                     min_required=MIN_REQUIRED_VALID_INDEPENDENT,
                                 )
                             )
-                            if not _post_mlr_df.empty:
-                                best_row = _post_mlr_df.loc[_post_mlr_df['r2'].idxmax()]
+                            if not _post_mlr.empty:
+                                best_row = _post_mlr.loc[_post_mlr['r2'].idxmax()]
                         except Exception:
                             pass  # keep pre-MLR best_row as fallback
 
@@ -2690,7 +2821,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                             print(f"[WARN] Statistical evidence failed for {plan.dataset_dir.name}: {exc}")
                             traceback.print_exc()
 
-                        # Read/write rolling CV metrics only when explicitly requested.
+                        # Patch rolling CV metrics into the in-memory DataFrame.
                         if run_rolling_cv:
                             if cv_summary_path is not None and cv_summary_path.exists():
                                 try:
@@ -2725,7 +2856,6 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                                 print(f"[WARN] Rolling origin CV summary not available for {plan.dataset_dir.name}")
 
                             try:
-                                df_metrics = pd.read_csv(final_metrics_csv)
                                 for col in [
                                     'rolling_cv_r2',
                                     'rolling_cv_r2_median',
@@ -2734,97 +2864,77 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                                     'rolling_cv_rmse',
                                     'rolling_cv_mae',
                                 ]:
-                                    if col not in df_metrics.columns:
-                                        df_metrics[col] = float('nan')
+                                    if col not in df.columns:
+                                        df[col] = float('nan')
                                 row_mask = (
-                                    (df_metrics['feature_tag'] == best_row['feature_tag'])
-                                    & (df_metrics['row_count'] == int(best_row['row_count']))
-                                    & (df_metrics['model'] == best_row['model'])
+                                    (df['feature_tag'] == best_row['feature_tag'])
+                                    & (df['row_count'] == int(best_row['row_count']))
+                                    & (df['model'] == best_row['model'])
                                 )
                                 if row_mask.any():
-                                    df_metrics.loc[row_mask, 'rolling_cv_r2'] = rolling_cv_r2
-                                    df_metrics.loc[row_mask, 'rolling_cv_r2_median'] = rolling_cv_r2_median
-                                    df_metrics.loc[row_mask, 'rolling_cv_r2_last50'] = rolling_cv_r2_last50
-                                    df_metrics.loc[row_mask, 'rolling_cv_r2_pooled'] = rolling_cv_r2_pooled
-                                    df_metrics.loc[row_mask, 'rolling_cv_rmse'] = rolling_cv_rmse
-                                    df_metrics.loc[row_mask, 'rolling_cv_mae'] = rolling_cv_mae
-                                    print(f"[INFO] Wrote rolling CV results to feature_sweep_final_metrics.csv for {plan.dataset_dir.name}")
+                                    df.loc[row_mask, 'rolling_cv_r2'] = rolling_cv_r2
+                                    df.loc[row_mask, 'rolling_cv_r2_median'] = rolling_cv_r2_median
+                                    df.loc[row_mask, 'rolling_cv_r2_last50'] = rolling_cv_r2_last50
+                                    df.loc[row_mask, 'rolling_cv_r2_pooled'] = rolling_cv_r2_pooled
+                                    df.loc[row_mask, 'rolling_cv_rmse'] = rolling_cv_rmse
+                                    df.loc[row_mask, 'rolling_cv_mae'] = rolling_cv_mae
+                                    print(f"[INFO] Updated rolling CV results in-memory for {plan.dataset_dir.name}")
                                 else:
-                                    print(f"[WARN] Could not find matching row for rolling CV update in feature_sweep_final_metrics.csv for {plan.dataset_dir.name}")
-                                df_metrics.to_csv(final_metrics_csv, index=False)
+                                    print(f"[WARN] Could not find matching row for rolling CV update for {plan.dataset_dir.name}")
                             except Exception as exc:
-                                print(f"[WARN] Could not write rolling CV results to feature_sweep_final_metrics.csv for {plan.dataset_dir.name}: {exc}")
+                                print(f"[WARN] Could not update rolling CV results for {plan.dataset_dir.name}: {exc}")
 
-                        # Merge best Shapley sweep results so the final
-                        # comparison table and best-model selection see both stages.
+                        # Merge Shapley rows in-memory.
                         try:
-                            _merge_shapley_into_final_metrics(plan, final_metrics_csv)
+                            df = _merge_shapley_into_final_metrics(plan, df)
                         except Exception as exc:
                             print(f"[WARN] Shapley merge failed for {plan.dataset_dir.name}: {exc}")
 
-                        # Re-read updated metrics and append best model performance entry
+                        # Recompute min_skill_rmse once across all sources, write once, plot once.
+                        df = _recompute_min_skill_rmse(df)
+                        df.to_csv(final_metrics_csv, index=False)
+                        try:
+                            _plot_final_metrics_comparison(df, output_dir)
+                        except Exception as exc:
+                            print(f"[WARN] Could not generate final metrics comparison plot for {plan.dataset_dir.name}: {exc}")
+
+                        # Select final best row for the summary entry.
+                        best_updated = best_row
                         try:
                             valid_r2_2 = _exclude_baseline_metric_rows(
                                 _filter_min_valid_independent(
-                                    _filter_valid_rows(pd.read_csv(final_metrics_csv)),
+                                    _filter_valid_rows(df),
                                     min_required=MIN_REQUIRED_VALID_INDEPENDENT,
                                 )
                             )
                             if not valid_r2_2.empty:
                                 best_updated = valid_r2_2.loc[valid_r2_2['r2'].idxmax()]
-
-                                # If best model changed after Shapley merge,
-                                # recompute statistical evidence for the new best.
                                 _best_label = str(best_updated.get("subset_label", ""))
                                 if _best_label.startswith(_SHAPLEY_MERGE_LABEL_PREFIX):
                                     try:
                                         stat_evidence = _compute_statistical_evidence(plan, best_updated, args)
                                     except Exception as _se_exc:
                                         print(f"[WARN] Statistical evidence recompute failed for Shapley best in {plan.dataset_dir.name}: {_se_exc}")
-
-                                cv_r2_to_write = _safe_float(best_updated.get('rolling_cv_r2')) if run_rolling_cv else rolling_cv_r2
-                                cv_r2_median_to_write = _safe_float(best_updated.get('rolling_cv_r2_median')) if run_rolling_cv else rolling_cv_r2_median
-                                cv_r2_last50_to_write = _safe_float(best_updated.get('rolling_cv_r2_last50')) if run_rolling_cv else rolling_cv_r2_last50
-                                cv_r2_pooled_to_write = _safe_float(best_updated.get('rolling_cv_r2_pooled')) if run_rolling_cv else rolling_cv_r2_pooled
-                                cv_rmse_to_write = _safe_float(best_updated.get('rolling_cv_rmse')) if run_rolling_cv else rolling_cv_rmse
-                                cv_mae_to_write = _safe_float(best_updated.get('rolling_cv_mae')) if run_rolling_cv else rolling_cv_mae
-                                best_model_performance.append(_build_perf_entry(
-                                    plan.dataset_dir.name, best_updated,
-                                    rolling_cv_r2=cv_r2_to_write,
-                                    rolling_cv_r2_median=cv_r2_median_to_write,
-                                    rolling_cv_r2_last50=cv_r2_last50_to_write,
-                                    rolling_cv_r2_pooled=cv_r2_pooled_to_write,
-                                    rolling_cv_rmse=cv_rmse_to_write,
-                                    rolling_cv_mae=cv_mae_to_write,
-                                    rolling_cv_n_folds=rolling_cv_n_folds,
-                                    extra_metrics=stat_evidence,
-                                ))
-                            else:
-                                # Fallback: use pre-update values
-                                best_model_performance.append(_build_perf_entry(
-                                    plan.dataset_dir.name, best_row,
-                                    rolling_cv_r2=rolling_cv_r2,
-                                    rolling_cv_r2_median=rolling_cv_r2_median,
-                                    rolling_cv_r2_last50=rolling_cv_r2_last50,
-                                    rolling_cv_r2_pooled=rolling_cv_r2_pooled,
-                                    rolling_cv_rmse=rolling_cv_rmse,
-                                    rolling_cv_mae=rolling_cv_mae,
-                                    rolling_cv_n_folds=rolling_cv_n_folds,
-                                    extra_metrics=stat_evidence,
-                                ))
                         except Exception as exc:
-                            print(f"[WARN] Could not re-read updated metrics for {plan.dataset_dir.name}: {exc}")
-                            best_model_performance.append(_build_perf_entry(
-                                plan.dataset_dir.name, best_row,
-                                rolling_cv_r2=rolling_cv_r2,
-                                rolling_cv_r2_median=rolling_cv_r2_median,
-                                rolling_cv_r2_last50=rolling_cv_r2_last50,
-                                rolling_cv_r2_pooled=rolling_cv_r2_pooled,
-                                rolling_cv_rmse=rolling_cv_rmse,
-                                rolling_cv_mae=rolling_cv_mae,
-                                rolling_cv_n_folds=rolling_cv_n_folds,
-                                extra_metrics=stat_evidence,
-                            ))
+                            print(f"[WARN] Could not select final best row for {plan.dataset_dir.name}: {exc}")
+
+                        cv_r2_to_write = _safe_float(best_updated.get('rolling_cv_r2')) if run_rolling_cv else rolling_cv_r2
+                        cv_r2_median_to_write = _safe_float(best_updated.get('rolling_cv_r2_median')) if run_rolling_cv else rolling_cv_r2_median
+                        cv_r2_last50_to_write = _safe_float(best_updated.get('rolling_cv_r2_last50')) if run_rolling_cv else rolling_cv_r2_last50
+                        cv_r2_pooled_to_write = _safe_float(best_updated.get('rolling_cv_r2_pooled')) if run_rolling_cv else rolling_cv_r2_pooled
+                        cv_rmse_to_write = _safe_float(best_updated.get('rolling_cv_rmse')) if run_rolling_cv else rolling_cv_rmse
+                        cv_mae_to_write = _safe_float(best_updated.get('rolling_cv_mae')) if run_rolling_cv else rolling_cv_mae
+                        best_model_performance.append(_build_perf_entry(
+                            plan.dataset_dir.name, best_updated,
+                            rolling_cv_r2=cv_r2_to_write,
+                            rolling_cv_r2_median=cv_r2_median_to_write,
+                            rolling_cv_r2_last50=cv_r2_last50_to_write,
+                            rolling_cv_r2_pooled=cv_r2_pooled_to_write,
+                            rolling_cv_rmse=cv_rmse_to_write,
+                            rolling_cv_mae=cv_mae_to_write,
+                            rolling_cv_n_folds=rolling_cv_n_folds,
+                            extra_metrics=stat_evidence,
+                        ))
         except Exception as e:
             print(f"[WARN] Could not process best model performance for {plan.dataset_dir.name}: {e}")
             traceback.print_exc()

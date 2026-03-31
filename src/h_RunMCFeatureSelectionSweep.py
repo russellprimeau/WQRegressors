@@ -1710,8 +1710,9 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         df[metric] = pd.to_numeric(df[metric], errors="coerce")
 
     # Collapse potential duplicate rows (for example, baseline rows repeated per ML config).
+    _agg_cols = metric_cols + (["min_skill_rmse"] if "min_skill_rmse" in df.columns else [])
     grouped = (
-        df.groupby(["subset_rank", "model_norm"], as_index=False)[metric_cols]
+        df.groupby(["subset_rank", "model_norm"], as_index=False)[_agg_cols]
         .mean(numeric_only=True)
     )
 
@@ -1751,23 +1752,42 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
 
     # Build RMSE-based minimum skill pivot for cross-model ordering decisions.
     # min_skill = (rmse_best_baseline - rmse_model) / rmse_best_baseline
+    # Use the pre-computed min_skill_rmse column when present (avoids recomputation
+    # and handles rows at novel ranks that have no matching baseline in this DataFrame).
     _baseline_mask = grouped["model_norm"].apply(_is_baseline_model_value)
-    _baseline_rmse_by_rank = (
-        grouped[_baseline_mask]
-        .groupby("subset_rank")["rmse"]
-        .min()
-        .rename("_best_baseline_rmse")
-    )
-    _grouped_skill = grouped.join(_baseline_rmse_by_rank, on="subset_rank")
-    _skill_vals = np.where(
-        (~_baseline_mask) & (_grouped_skill["_best_baseline_rmse"] > 0),
-        (_grouped_skill["_best_baseline_rmse"] - _grouped_skill["rmse"]) / _grouped_skill["_best_baseline_rmse"],
-        np.nan,
-    )
-    _grouped_skill = _grouped_skill.copy()
-    _grouped_skill["_min_skill"] = _skill_vals
-    skill_pivot = _grouped_skill.pivot(index="subset_rank", columns="model_norm", values="_min_skill")
-    grouped["min_skill_rmse"] = _grouped_skill["_min_skill"].values
+    if "min_skill_rmse" in grouped.columns and grouped["min_skill_rmse"].notna().any():
+        grouped["min_skill_rmse"] = pd.to_numeric(grouped["min_skill_rmse"], errors="coerce")
+    else:
+        # Fallback: recompute from RMSE with rank-then-label baseline lookup.
+        _bl_mask_df = df["model_norm"].apply(_is_baseline_model_value)
+        _bl_rmse_by_rank = (
+            df[_bl_mask_df].groupby("subset_rank")["rmse"].min().rename("_best_baseline_rmse")
+        )
+        _grouped_skill = grouped.join(_bl_rmse_by_rank, on="subset_rank")
+        if "subset_label" in df.columns:
+            _shap_pfx = "shap_"
+            _bl_rmse_by_label = (
+                df[_bl_mask_df]
+                .groupby(df.loc[_bl_mask_df, "subset_label"].astype(str))["rmse"]
+                .min()
+            )
+            _rank_to_label = (
+                df[["subset_rank", "subset_label"]]
+                .drop_duplicates("subset_rank")
+                .set_index("subset_rank")["subset_label"]
+                .astype(str)
+                .str.removeprefix(_shap_pfx)
+            )
+            _missing = _grouped_skill["_best_baseline_rmse"].isna()
+            _grouped_skill.loc[_missing, "_best_baseline_rmse"] = (
+                _grouped_skill.loc[_missing, "subset_rank"].map(_rank_to_label).map(_bl_rmse_by_label)
+            )
+        grouped["min_skill_rmse"] = np.where(
+            (~_baseline_mask) & (_grouped_skill["_best_baseline_rmse"] > 0),
+            (_grouped_skill["_best_baseline_rmse"] - _grouped_skill["rmse"]) / _grouped_skill["_best_baseline_rmse"],
+            np.nan,
+        )
+    skill_pivot = grouped.pivot(index="subset_rank", columns="model_norm", values="min_skill_rmse")
 
     def _skill_for_rank_model(rank: int, model: str) -> float:
         if rank in skill_pivot.index and model in skill_pivot.columns:
@@ -2001,7 +2021,12 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
             )
 
     axes[-1].set_xticks(x)
-    axes[-1].set_xticklabels(cluster_labels, rotation=0)
+    axes[-1].set_xticklabels(
+        [lbl.replace("/", "/\n") for lbl in cluster_labels],
+        rotation=45,
+        ha="right",
+        rotation_mode="anchor",
+    )
     axes[-1].set_xlabel("Candidate Feature Subset")
     # Tighten horizontal margins to less than one cluster width.
     h_margin = cluster_width * 0.6
@@ -3910,6 +3935,12 @@ def _evaluate_selected_subsets_all_models(
             from utils.mlr import MLR_VARIANTS as _MLR_VARIANTS
             _k_tag = f"{cand.feature_tag}_k{rank:02d}"
             _k_variant_dirs = sorted(output_dir.glob(f"*_r{cand.row_count:03d}_{_k_tag}*"))
+            if not _k_variant_dirs:
+                # Fall back to the MLR artifact directory itself, which already contains
+                # train_files.txt / test_files.txt written earlier in this sweep run.
+                _mlr_fallback = output_dir / f"mlr_k{rank:02d}"
+                if _mlr_fallback.exists():
+                    _k_variant_dirs = [_mlr_fallback]
             _mlr_on_k_done = False
             for _vd in _k_variant_dirs:
                 _ecfg_path = _vd / f"config_evaluate_{_vd.name}.yml"
