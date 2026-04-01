@@ -1390,8 +1390,10 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         with torch.no_grad(), gpytorch.settings.fast_pred_var():
             pred_dist = likelihood(model(X_test))
             pred_mean = pred_dist.mean.detach().cpu().numpy()
+            pred_var  = pred_dist.variance.detach().cpu().numpy()
 
         pred_mean = pred_mean * y_std + y_mean
+        pred_var  = pred_var  * (y_std ** 2)
         rmse = float(np.sqrt(np.mean((pred_mean - y_test_col) ** 2)))
 
         output_train_losses.append(losses)
@@ -1410,6 +1412,7 @@ def train_gp_regressor_model(config, train_samples, test_samples):
             "stop_reason_text": stop_reason_text,
             "stop_epoch": int(stop_epoch),
             "best_epoch": None if best_epoch is None else int(best_epoch),
+            "pred_var_at_test": pred_var,
         })
 
         output_stop_summaries.append(

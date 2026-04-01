@@ -94,8 +94,8 @@ MIN_REQUIRED_VALID_INDEPENDENT = 5
 
 ML_COMPARISON_MODEL_TYPES = ['XGB', 'Trans.', 'GP', 'MLR', 'MLR12', 'MLRall']
 ML_COMPARISON_COLORS = {
-    'XGB': 'tab:blue', 'Trans.': 'tab:purple', 'GP': 'tab:olive',
-    'MLR': 'tab:red', 'MLR12': 'tab:pink', 'MLRall': 'tab:brown',
+    'GP': 'tab:blue', 'Trans.': 'tab:orange', 'XGB': 'tab:green',
+    'MLR': 'tab:red', 'MLR12': 'tab:purple', 'MLRall': 'tab:brown',
 }
 
 
@@ -966,11 +966,11 @@ def _plot_ml_model_comparison(
 
     comp_df = pd.DataFrame(records)
 
-    # Determine target order: sort by best R2 per dataset (descending)
-    best_r2_per_dataset = (
-        comp_df.groupby('dataset')['r2'].max().sort_values(ascending=False)
+    # Determine target order: sort by best skill_vs_best per dataset (descending)
+    best_skill_per_dataset = (
+        comp_df.groupby('dataset')['skill_vs_best'].max().sort_values(ascending=False)
     )
-    ordered_datasets = list(best_r2_per_dataset.index)
+    ordered_datasets = list(best_skill_per_dataset.index)
     # Deduplicated target labels in the same order
     seen: set = set()
     ordered_targets: list[tuple[str, str]] = []  # (dataset, target_label)
@@ -980,10 +980,22 @@ def _plot_ml_model_comparison(
             seen.add(ds)
             ordered_targets.append((ds, lbl))
 
+    # Determine within-cluster model order: sort by mean skill_vs_best (descending)
+    mean_skill_per_model = (
+        comp_df.groupby('model_display')['skill_vs_best']
+        .mean()
+        .reindex(ML_COMPARISON_MODEL_TYPES)
+        .fillna(-np.inf)
+        .sort_values(ascending=False)
+    )
+    ordered_model_types = list(mean_skill_per_model.index)
+
     n_targets = len(ordered_targets)
     x = np.arange(n_targets)
-    width = 0.22
-    n_models = len(ML_COMPARISON_MODEL_TYPES)
+    n_models = len(ordered_model_types)
+    # Each cluster spans n_models bars; keep total cluster width ≤ 0.85 units
+    # so adjacent clusters have visible gaps.
+    width = min(0.22, 0.85 / max(n_models, 1))
     offsets = np.array([(i - (n_models - 1) / 2) for i in range(n_models)])
     _FS = 12  # unified font size for all text elements
 
@@ -1001,15 +1013,15 @@ def _plot_ml_model_comparison(
     }
 
     for metric_key, ylabel, fmt, add_hline in metric_specs:
-        fig, ax = plt.subplots(figsize=(max(10, n_targets * 1.4), 6))
+        fig, ax = plt.subplots(figsize=(max(10, n_targets * (n_models * 0.35 + 0.5)), 6))
         # Build proxy Patch handles upfront so labels are always correct.
         legend_handles = [
             matplotlib.patches.Patch(facecolor=ML_COMPARISON_COLORS[m], label=m)
-            for m in ML_COMPARISON_MODEL_TYPES
+            for m in ordered_model_types
         ]
         pending_annotations = []
 
-        for mi, model_display in enumerate(ML_COMPARISON_MODEL_TYPES):
+        for mi, model_display in enumerate(ordered_model_types):
             color = ML_COMPARISON_COLORS[model_display]
             vals = []
             ns = []
@@ -1050,7 +1062,7 @@ def _plot_ml_model_comparison(
             _annotate_ml_bars(ax, bars, vals, ns, fmt)
 
         # Tight horizontal bounds: ~0.07 units of padding beyond the outermost bar edges.
-        cluster_half = 1.5 * width
+        cluster_half = (n_models - 1) / 2 * width + width / 2
         if n_targets > 0:
             ax.set_xlim(x[0] - cluster_half - 0.07, x[-1] + cluster_half + 0.07)
 
@@ -1070,7 +1082,7 @@ def _plot_ml_model_comparison(
             handles=legend_handles,
             loc='lower center',
             bbox_to_anchor=(0.5, 1.02),
-            ncol=len(ML_COMPARISON_MODEL_TYPES),
+            ncol=len(ordered_model_types),
             frameon=False,
             fontsize=_FS,
         )
@@ -1648,6 +1660,67 @@ def _interval_proxy_metrics(preds, targets, alpha: float = 0.1) -> dict:
     }
 
 
+def _gp_interval_metrics(pred_means, pred_stds, targets, alpha: float = 0.1) -> dict:
+    """Compute prediction interval metrics using GP predictive std directly.
+
+    Constructs symmetric intervals as mean ± z * std where z is the normal
+    quantile for the specified coverage (1 - alpha). Returns the same keys as
+    _interval_proxy_metrics except q_abs_resid (replaced by gp_z_score).
+    Returns NaN for all metrics when GP std is unavailable.
+    """
+    nan_result = {
+        "gp_picp": float("nan"),
+        "gp_nominal_coverage": float("nan"),
+        "gp_coverage_gap": float("nan"),
+        "gp_coverage_deficit": float("nan"),
+        "gp_mpiw": float("nan"),
+        "gp_nmpiw": float("nan"),
+        "gp_interval_score": float("nan"),
+        "gp_z_score": float("nan"),
+        "gp_n_points": 0,
+    }
+    if pred_stds is None:
+        return nan_result
+
+    pf = np.asarray(pred_means, dtype=float).reshape(-1)
+    sf = np.asarray(pred_stds,  dtype=float).reshape(-1)
+    tf = np.asarray(targets,    dtype=float).reshape(-1)
+    mask = np.isfinite(pf) & np.isfinite(sf) & (sf >= 0) & np.isfinite(tf)
+    if not np.any(mask):
+        return nan_result
+
+    alpha = float(min(max(alpha, 1e-6), 0.999999))
+    if scipy_stats is not None:
+        z = float(scipy_stats.norm.ppf(1.0 - alpha / 2))
+    else:
+        # Fallback: approximate z for common alpha values
+        z = float(math.sqrt(2) * math.erfc(alpha) if hasattr(math, "erfc") else 1.6449)
+
+    lower = pf[mask] - z * sf[mask]
+    upper = pf[mask] + z * sf[mask]
+    covered = (tf[mask] >= lower) & (tf[mask] <= upper)
+    picp = float(np.mean(covered)) if covered.size else float("nan")
+    nominal = float(1.0 - alpha)
+    gap = float(picp - nominal) if np.isfinite(picp) else float("nan")
+    deficit = float(max(0.0, nominal - picp)) if np.isfinite(picp) else float("nan")
+    mpiw = float(np.mean(upper - lower))
+    std_t = float(np.std(tf[mask], ddof=1)) if np.sum(mask) > 1 else float("nan")
+    nmpiw = float(mpiw / std_t) if np.isfinite(mpiw) and np.isfinite(std_t) and std_t > 0 else float("nan")
+    penalties = (2.0 / alpha) * ((lower - tf[mask]) * (tf[mask] < lower) + (tf[mask] - upper) * (tf[mask] > upper))
+    interval_score = float(np.mean((upper - lower) + penalties)) if penalties.size else float("nan")
+    return {
+        "gp_picp": picp,
+        "gp_nominal_coverage": nominal,
+        "gp_coverage_gap": gap,
+        "gp_coverage_deficit": deficit,
+        "gp_mpiw": mpiw,
+        "gp_nmpiw": nmpiw,
+        "gp_interval_score": interval_score,
+        "gp_z_score": z,
+        "gp_n_points": int(np.sum(mask)),
+    }
+
+
 def _bootstrap_grouped_skill(
     y_true,
     y_model,
@@ -1824,6 +1897,7 @@ def _collect_prediction_payload(eval_cfg_path: Path) -> dict:
             input_aggregation=input_aggregation,
         )
 
+    gp_pred_var = None
     if _is_mlr:
         from utils.mlr import evaluate_mlr as _eval_mlr, MLR_VARIANTS as _MLR_VARIANTS
         _agg_mode = "last"
@@ -1852,7 +1926,9 @@ def _collect_prediction_payload(eval_cfg_path: Path) -> dict:
         model = eval_module.load_model(model_type, data_cfg, split_cfg, model_name, model_config, device, train_samples, config_dir)
 
         if model_type == "gp_regressor":
-            pred_model = eval_module._predict_gp_bundle(model, X_test, device)
+            _gp_result = eval_module._predict_gp_bundle(model, X_test, device)
+            pred_model = _gp_result["mean"]
+            gp_pred_var = _gp_result["variance"]
         elif model_type == "transformer":
             pred_model = model(torch.tensor(X_test, dtype=torch.float32, device=device)).detach().cpu().numpy()
         elif model_type == "xgb_regressor":
@@ -1901,6 +1977,7 @@ def _collect_prediction_payload(eval_cfg_path: Path) -> dict:
         "y_test": _safe_as_2d(y_test),
         "X_test": X_test,
         "pred_model": _safe_as_2d(pred_model),
+        "gp_pred_var": gp_pred_var,
         "baseline_preds": baseline_preds,
         "split_files": split_files,
         "model_type": model_type,
@@ -2037,7 +2114,7 @@ def _compute_retraining_stability(
         # Inference on the same X_test as rep-0
         try:
             if model_type == "gp_regressor":
-                pred_r = _safe_as_2d(eval_module._predict_gp_bundle(rep_model, X_test, device))
+                pred_r = _safe_as_2d(eval_module._predict_gp_bundle(rep_model, X_test, device)["mean"])
             elif model_type == "transformer":
                 pred_r = _safe_as_2d(
                     rep_model(torch.tensor(X_test, dtype=torch.float32, device=device))
@@ -2226,6 +2303,7 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
         evidence["mc_uncertainty_vs_error_corr"] = float("nan")
 
     baseline_preds = payload["baseline_preds"]
+    gp_pred_var = payload.get("gp_pred_var")
     pval_records: list[tuple[str, str, float]] = []
     baseline_scores: list[int] = []
     interval_alpha = float(getattr(args, "interval_alpha", 0.1))
@@ -2238,6 +2316,16 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
     evidence["model_nmpiw"] = _safe_float(model_int["nmpiw"])
     evidence["model_interval_score"] = _safe_float(model_int["interval_score"])
     evidence["model_interval_is_diagnostic"] = True
+
+    # GP-distributional prediction intervals (only populated for GP models)
+    gp_pred_std = np.sqrt(np.maximum(gp_pred_var[:n_rows, :], 0.0)) if gp_pred_var is not None else None
+    gp_int = _gp_interval_metrics(pred_model, gp_pred_std, y_test, alpha=interval_alpha)
+    evidence["model_gp_picp"] = _safe_float(gp_int["gp_picp"])
+    evidence["model_gp_nominal_coverage"] = _safe_float(gp_int["gp_nominal_coverage"])
+    evidence["model_gp_coverage_gap"] = _safe_float(gp_int["gp_coverage_gap"])
+    evidence["model_gp_coverage_deficit"] = _safe_float(gp_int["gp_coverage_deficit"])
+    evidence["model_gp_nmpiw"] = _safe_float(gp_int["gp_nmpiw"])
+    evidence["model_gp_interval_score"] = _safe_float(gp_int["gp_interval_score"])
 
     for bname in BASELINE_ORDER:
         pred_b = _safe_as_2d(baseline_preds.get(bname, np.full_like(y_test, np.nan, dtype=float)))[:n_rows, :]

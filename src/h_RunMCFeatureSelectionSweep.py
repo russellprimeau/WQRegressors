@@ -4806,7 +4806,11 @@ def _ensure_k01_baselines(plan: DatasetPlan, final_metrics_csv: Path) -> None:
         return
 
     best_model_str = str(best_row.get("model", ""))
-    best_row_count = int(best_row["row_count"])
+    _rc = pd.to_numeric(best_row.get("row_count", float("nan")), errors="coerce")
+    if not np.isfinite(_rc):
+        print(f"[WARN] _ensure_k01_baselines: row_count is NaN for best row in {plan.dataset_dir.name}; skipping.")
+        return
+    best_row_count = int(_rc)
     best_feature_tag = str(best_row["feature_tag"])
 
     _mlr_model_names = {"mlr", "mlr_avg12", "mlr_avgall"}
@@ -4895,7 +4899,11 @@ def _write_dataset_evaluation_summary(plan: DatasetPlan, final_metrics_csv: Path
         return None
 
     best_model_type = str(best_row.get("model", ""))
-    best_row_count = int(best_row["row_count"])
+    _rc = pd.to_numeric(best_row.get("row_count", float("nan")), errors="coerce")
+    if not np.isfinite(_rc):
+        print(f"[WARN] _write_dataset_evaluation_summary: row_count is NaN for best row in {plan.dataset_dir.name}; skipping.")
+        return None
+    best_row_count = int(_rc)
     best_feature_tag = str(best_row["feature_tag"])
 
     _mlr_model_names_wr = {"mlr", "mlr_avg12", "mlr_avgall"}

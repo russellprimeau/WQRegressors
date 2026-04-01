@@ -364,6 +364,7 @@ def _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device, conf
 
 
 def _predict_gp_bundle(gp_bundle, X_np, device):
+    """Return dict with 'mean' [n, n_outputs] and 'variance' [n, n_outputs] arrays."""
     hyper_cfg = gp_bundle["hyperparameters"]
     input_mean = gp_bundle["input_mean"]
     input_std = gp_bundle["input_std"]
@@ -374,15 +375,22 @@ def _predict_gp_bundle(gp_bundle, X_np, device):
         X_used = X_np
 
     X_tensor = torch.tensor(X_used, dtype=torch.float32, device=device)
-    preds = []
+    preds_mean = []
+    preds_var = []
     for entry in gp_bundle["models"]:
         with torch.no_grad(), gpytorch.settings.fast_pred_var():
             pred_dist = entry["likelihood"](entry["model"](X_tensor))
             pred_mean = pred_dist.mean.detach().cpu().numpy()
+            pred_var  = pred_dist.variance.detach().cpu().numpy()
         pred_mean = pred_mean * entry["target_std"] + entry["target_mean"]
-        preds.append(pred_mean)
+        pred_var  = pred_var  * (entry["target_std"] ** 2)
+        preds_mean.append(pred_mean)
+        preds_var.append(pred_var)
 
-    return np.stack(preds, axis=1)
+    return {
+        "mean": np.stack(preds_mean, axis=1),
+        "variance": np.stack(preds_var, axis=1),
+    }
 
 
 def load_model(model_type, data_cfg, split_cfg, model_name, model_config, device, train_samples=None, config_dir=None):
@@ -1077,6 +1085,42 @@ def _group_independent_prediction_stats(preds, targets, split_files):
     return grouped_rows, int(n_cols)
 
 
+def _group_gp_var_by_sample(gp_var, split_files, n_outputs):
+    """Return dict mapping sample_file base ID -> mean predictive std (shape [n_outputs]).
+
+    gp_var is shape [n_rows, n_outputs]. Rows belonging to the same base sample
+    (MC replicates) are averaged in variance space before taking the sqrt.
+    Returns None if gp_var is None or empty.
+    """
+    if gp_var is None:
+        return None
+    gp_var = np.asarray(gp_var, dtype=float)
+    n_rows = gp_var.shape[0]
+    if n_rows == 0:
+        return None
+    if split_files:
+        n_rows = min(n_rows, len(split_files))
+        split_names = [Path(str(s)).name for s in split_files[:n_rows]]
+    else:
+        split_names = [f"sample_{i:06d}.csv" for i in range(n_rows)]
+
+    grouped = {}
+    order = []
+    for idx in range(n_rows):
+        key = _base_sample_id(split_names[idx])
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(gp_var[idx, :n_outputs])
+
+    result = {}
+    for key in order:
+        arr = np.asarray(grouped[key], dtype=float)  # [k, n_outputs]
+        mean_var = np.nanmean(arr, axis=0)            # average variance across replicates
+        result[key] = np.sqrt(np.maximum(mean_var, 0.0))
+    return result
+
+
 def _build_predictions_table(entries, gp_uncertainty_mode, include_mc_output_columns=True):
     rows_by_key = {}
     key_order = []
@@ -1084,8 +1128,10 @@ def _build_predictions_table(entries, gp_uncertainty_mode, include_mc_output_col
     target_columns = []
     mc_mean_columns = []
     mc_std_columns = []
+    gp_std_columns = []
     mc_replicate_ids = set()
     n_outputs_ref = None
+    has_gp_std = False
 
     for entry in entries:
         grouped_rows, n_outputs = _group_independent_prediction_stats(
@@ -1101,6 +1147,7 @@ def _build_predictions_table(entries, gp_uncertainty_mode, include_mc_output_col
             target_columns = _prediction_target_columns(n_outputs_ref)
             mc_mean_columns = _prediction_value_columns("mc_pred_mean", n_outputs_ref)
             mc_std_columns = _prediction_value_columns("mc_pred_std", n_outputs_ref)
+            gp_std_columns = _prediction_value_columns("gp_pred_std", n_outputs_ref)
         elif n_outputs != n_outputs_ref:
             # Keep a single stable schema across model/baseline entries.
             for row in grouped_rows:
@@ -1118,6 +1165,13 @@ def _build_predictions_table(entries, gp_uncertainty_mode, include_mc_output_col
 
         kind = str(entry.get("kind", "test"))
         include_mc_stats = bool(entry.get("include_mc_stats", False))
+        gp_std_by_sample = _group_gp_var_by_sample(
+            entry.get("gp_var"),
+            entry.get("split_files"),
+            n_outputs_ref,
+        )
+        if gp_std_by_sample:
+            has_gp_std = True
         if include_mc_stats:
             for grouped in grouped_rows:
                 for rep_id, _ in grouped.get("replicate_preds", []):
@@ -1159,6 +1213,13 @@ def _build_predictions_table(entries, gp_uncertainty_mode, include_mc_output_col
                 for col_idx, mc_col in enumerate(mc_std_columns):
                     row[mc_col] = float(grouped["pred_std"][col_idx])
 
+            if gp_std_by_sample is not None:
+                sample_std = gp_std_by_sample.get(grouped["sample_file"])
+                if sample_std is not None:
+                    for col_idx, gp_col in enumerate(gp_std_columns):
+                        if col_idx < len(sample_std):
+                            row[gp_col] = float(sample_std[col_idx])
+
     rows = [rows_by_key[key] for key in key_order]
     ordered_columns = [
         "kind",
@@ -1175,6 +1236,8 @@ def _build_predictions_table(entries, gp_uncertainty_mode, include_mc_output_col
         ordered_columns.extend(_prediction_mc_columns(mc_replicate_ids, n_outputs_ref if n_outputs_ref is not None else 0))
         ordered_columns.extend(mc_mean_columns)
         ordered_columns.extend(mc_std_columns)
+    if has_gp_std:
+        ordered_columns.extend(gp_std_columns)
 
     return rows, ordered_columns
 
@@ -1200,11 +1263,15 @@ def _build_boxplot_error_rows_from_predictions(
     predictions_rows,
     model_label=None,
     baseline_labels=None,
+    gp_boxplot_seed=0,
 ):
     """Build long-form boxplot rows from predictions-table semantics.
 
     Output columns: Dataset, Error, Kind.
     - ML model uses mc replicate columns (if present), otherwise model column.
+    - For GP models with gp_pred_std_* columns and no MC replicates, synthetic
+      samples are drawn from Normal(mean, std) using the mc_n_replicates count
+      (or 10 if unavailable) to produce a comparable distribution.
     - Baselines always use their own prediction columns.
     - All row kinds are retained (train/test/combined/etc.).
     """
@@ -1236,22 +1303,59 @@ def _build_boxplot_error_rows_from_predictions(
 
     out_frames = []
 
-    def _append_errors(dataset_label, pred_series, target_series):
+    def _append_errors(dataset_label, pred_series, target_series, kind_override=None):
         pred_vals = pd.to_numeric(pred_series, errors="coerce")
         target_vals = pd.to_numeric(target_series, errors="coerce")
         err_vals = pred_vals - target_vals
         finite_mask = np.isfinite(err_vals.to_numpy(dtype=float))
         if not np.any(finite_mask):
             return
+        k_series = kind_override if kind_override is not None else kind_series.to_numpy()[finite_mask]
         out_frames.append(
             pd.DataFrame(
                 {
                     "Dataset": [str(dataset_label)] * int(np.sum(finite_mask)),
                     "Error": err_vals.to_numpy(dtype=float)[finite_mask],
-                    "Kind": kind_series.to_numpy()[finite_mask],
+                    "Kind": k_series,
                 }
             )
         )
+
+    def _append_gp_synth_errors(dataset_label, mean_series, std_series, target_series, n_samples_series):
+        """Synthesize Normal(mean, std) samples and compute errors against target."""
+        rng = np.random.default_rng(gp_boxplot_seed)
+        mean_arr = pd.to_numeric(mean_series, errors="coerce").to_numpy(dtype=float)
+        std_arr  = pd.to_numeric(std_series,  errors="coerce").to_numpy(dtype=float)
+        tgt_arr  = pd.to_numeric(target_series, errors="coerce").to_numpy(dtype=float)
+        n_rows = len(mean_arr)
+        synth_errors = []
+        synth_kinds = []
+        for i in range(n_rows):
+            if not (np.isfinite(mean_arr[i]) and np.isfinite(std_arr[i]) and np.isfinite(tgt_arr[i])):
+                continue
+            n_s = int(n_samples_series.iloc[i]) if np.isfinite(n_samples_series.iloc[i]) else 10
+            n_s = max(1, n_s)
+            samples = rng.normal(mean_arr[i], std_arr[i], size=n_s)
+            errors = samples - tgt_arr[i]
+            synth_errors.extend(errors.tolist())
+            synth_kinds.extend([kind_series.iloc[i]] * n_s)
+        if not synth_errors:
+            return
+        out_frames.append(
+            pd.DataFrame(
+                {
+                    "Dataset": [str(dataset_label)] * len(synth_errors),
+                    "Error": synth_errors,
+                    "Kind": synth_kinds,
+                }
+            )
+        )
+
+    # Determine n_samples_series from mc_n_replicates column, defaulting to 10
+    if "mc_n_replicates" in df.columns:
+        n_samples_series = pd.to_numeric(df["mc_n_replicates"], errors="coerce").fillna(10)
+    else:
+        n_samples_series = pd.Series([10] * len(df))
 
     for output_idx, target_col in target_specs:
         target_vals = df[target_col]
@@ -1259,14 +1363,19 @@ def _build_boxplot_error_rows_from_predictions(
         if output_idx is None:
             mc_cols = sorted([c for c in df.columns if re.fullmatch(r"mc_\d{3}", str(c))])
             model_col = str(model_label) if model_label else None
+            gp_std_col = "gp_pred_std" if "gp_pred_std" in df.columns else None
         else:
             mc_cols = sorted([c for c in df.columns if re.fullmatch(rf"mc_\d{{3}}_{output_idx}", str(c))])
             model_col = f"{model_label}_{output_idx}" if model_label else None
+            gp_std_col_candidate = f"gp_pred_std_{output_idx}"
+            gp_std_col = gp_std_col_candidate if gp_std_col_candidate in df.columns else None
 
         if model_col and model_col in df.columns:
             if mc_cols:
                 for mc_col in mc_cols:
                     _append_errors(model_col, df[mc_col], target_vals)
+            elif gp_std_col is not None:
+                _append_gp_synth_errors(model_col, df[model_col], df[gp_std_col], target_vals, n_samples_series)
             else:
                 _append_errors(model_col, df[model_col], target_vals)
 
@@ -1537,12 +1646,19 @@ def evaluate_single_config(config_path, save_plots_override=None):
         preds_train = None
         preds_test = None
         preds_all = None
+        gp_var_train = gp_var_test = gp_var_all = None
         if model_type == "gp_regressor":
             if X_train is not None:
-                preds_train = _predict_gp_bundle(model, X_train, device)
-            preds_test = _predict_gp_bundle(model, X_test, device)
+                _gp_train = _predict_gp_bundle(model, X_train, device)
+                preds_train = _gp_train["mean"]
+                gp_var_train = _gp_train["variance"]
+            _gp_test = _predict_gp_bundle(model, X_test, device)
+            preds_test = _gp_test["mean"]
+            gp_var_test = _gp_test["variance"]
             if include_combined_metrics:
-                preds_all = _predict_gp_bundle(model, X_all, device)
+                _gp_all = _predict_gp_bundle(model, X_all, device)
+                preds_all = _gp_all["mean"]
+                gp_var_all = _gp_all["variance"]
         elif model_type == "transformer":
             if X_train is not None:
                 preds_train = model(torch.tensor(X_train, dtype=torch.float32, device=device)).detach().cpu().numpy()
@@ -1574,6 +1690,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
                     "targets": y_train,
                     "split_files": (train_split_files or []),
                     "include_mc_stats": include_mc_stats_in_predictions,
+                    "gp_var": gp_var_train,
                 }
             )
         if preds_test is not None:
@@ -1594,6 +1711,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
                     "targets": y_test,
                     "split_files": model_split_files,
                     "include_mc_stats": include_mc_stats_in_predictions,
+                    "gp_var": gp_var_test,
                 }
             )
         if preds_all is not None:
@@ -1614,6 +1732,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
                     "targets": y_all,
                     "split_files": eval_split_files,
                     "include_mc_stats": include_mc_stats_in_predictions,
+                    "gp_var": gp_var_all,
                 }
             )
     # Add per-set metrics to summary_rows for CSV output.
