@@ -412,3 +412,24 @@ def _build_feature_uncertainty_bundle(data_cfg, hyper_cfg, config_dir, verbose=T
         "summary_dir": str(summary_dir),
         "source_details": source_details,
     }
+
+
+def select_best_model_row(df: "pd.DataFrame") -> "pd.Series":
+    """Return the best-model row from a pre-filtered metrics DataFrame.
+
+    Selection criterion (applied in order):
+    1. Among rows with r2 > 0, pick the one with the highest min_skill_rmse.
+    2. If no row has r2 > 0 (or min_skill_rmse is absent), fall back to
+       the row with the highest r2.
+
+    The caller is responsible for pre-filtering: baseline rows, rows with
+    non-finite r2, and any minimum-sample-count requirements should be
+    removed before calling this function.
+    """
+    r2_vals = pd.to_numeric(df["r2"], errors="coerce")
+    if "min_skill_rmse" in df.columns:
+        skill_vals = pd.to_numeric(df["min_skill_rmse"], errors="coerce")
+        valid_mask = skill_vals.notna() & (r2_vals > 0)
+        if valid_mask.any():
+            return df.loc[skill_vals[valid_mask].idxmax()]
+    return df.loc[r2_vals.idxmax()]

@@ -65,7 +65,7 @@ from d_RunResample import (
     _normalize_once,
     _load_and_prepare_sensor_uncertainties,
 )
-from utils.config_utils import load_config
+from utils.config_utils import load_config, select_best_model_row
 
 PREFERRED_LOOKAHEADS = [0, 1, 2, 6, 12, 24, 48, 96, 120, 167]
 
@@ -141,19 +141,9 @@ def find_best_configs(data_root, dataset_prefix):
         ml_rows = metrics_df[~is_baseline].copy()
         if ml_rows.empty:
             continue
-        if 'min_skill_rmse' in ml_rows.columns:
-            skill_vals = pd.to_numeric(ml_rows['min_skill_rmse'], errors='coerce')
-            valid = ml_rows[skill_vals.notna()]
-            if not valid.empty:
-                best = valid.loc[skill_vals[skill_vals.notna()].idxmax()]
-            elif 'r2' in ml_rows.columns:
-                best = ml_rows.loc[pd.to_numeric(ml_rows['r2'], errors='coerce').idxmax()]
-            else:
-                continue
-        elif 'r2' in ml_rows.columns:
-            best = ml_rows.loc[pd.to_numeric(ml_rows['r2'], errors='coerce').idxmax()]
-        else:
+        if 'r2' not in ml_rows.columns:
             continue
+        best = select_best_model_row(ml_rows)
         # Find config file for this subset and model
         model_name = str(best['model'])
 
@@ -424,13 +414,19 @@ def _write_horizon_baselines(
     *,
     horizon_dir: Path,
     base_config_path: Path,
+    eval_config_path: 'Path | None' = None,
     model_key: str,
     test_samples,
     test_split_files: list[str],
 ) -> bool:
     """Compute Naive/Seasonal/Linear baselines and write horizon_dir/baseline_summary.csv.
 
-    Uses the evaluation section of base_config_path (historic_path, window_hours, etc.).
+    Uses data fields from base_config_path (output_columns, output_rows, sample_subdir)
+    and evaluation fields (historic_path, window_hours, etc.) from eval_config_path when
+    provided, otherwise falls back to base_config_path.  For non-MLR models, pass the
+    rep_000 eval config as eval_config_path since it carries historic_path while the
+    training config does not.
+
     Returns True on success, False if baselines could not be computed.
     """
     import h_RunMCFeatureSelectionSweep as _h
@@ -441,16 +437,27 @@ def _write_horizon_baselines(
     data_cfg = base_cfg.get('data', {})
     output_columns = list(data_cfg['output_columns'])
     output_rows = list(data_cfg['output_rows'])
-    input_aggregation = str(data_cfg.get('input_aggregation', 'last'))
     sample_subdir = str(data_cfg.get('sample_subdir', 'samples'))
+
+    # For evaluation params (historic_path etc.), prefer eval_config_path if given.
+    if eval_config_path is not None:
+        with open(eval_config_path, 'r', encoding='utf-8') as f:
+            eval_cfg_doc = yaml.safe_load(f)
+        ref_cfg = eval_cfg_doc
+        ref_cfg_path = eval_config_path
+        ref_data_cfg = eval_cfg_doc.get('data', data_cfg)
+    else:
+        ref_cfg = base_cfg
+        ref_cfg_path = base_config_path
+        ref_data_cfg = data_cfg
 
     baseline_rows, _, _ = _h._append_mlr_baseline_outputs(
         [],
         [],
-        ref_cfg=base_cfg,
-        ref_cfg_path=base_config_path,
-        ref_data_cfg=data_cfg,
-        data_dir=str(horizon_dir),
+        ref_cfg=ref_cfg,
+        ref_cfg_path=ref_cfg_path,
+        ref_data_cfg=ref_data_cfg,
+        data_dir=str(horizon_dir.resolve()),
         sample_subdir=sample_subdir,
         output_columns=output_columns,
         output_rows=output_rows,
@@ -686,7 +693,17 @@ def run_horizon_sweep(
             # --- Write baselines once per horizon (after all reps, using last test split) ---
             # For non-MLR models, load the test split from rep_000 to run baselines.
             baseline_csv = horizon_dir / 'baseline_summary.csv'
-            if not baseline_csv.exists():
+            _baseline_valid = False
+            if baseline_csv.exists():
+                try:
+                    _bl_check = pd.read_csv(baseline_csv)
+                    _baseline_valid = (
+                        'rmse' in _bl_check.columns
+                        and _bl_check['rmse'].notna().any()
+                    )
+                except Exception:
+                    pass
+            if not _baseline_valid:
                 _bl_written = False
                 if model_key in _MLR_MODEL_NAMES:
                     # Re-derive test_samples from the shared samples directory for baseline use.
@@ -724,40 +741,47 @@ def run_horizon_sweep(
                     except Exception as exc:
                         print(f"  [WARN] Baseline split failed for horizon {horizon}hr: {exc}")
                 else:
-                    # For XGB/GP/Transformer, run f_Evaluate with run_baselines=True,
-                    # run_regression=False on rep_000's eval config.
-                    # Write the patched config beside the source config so all relative
-                    # paths (data_dir, split files) resolve correctly from the same directory.
+                    # For XGB/GP/Transformer: load test samples from rep_000's split and
+                    # call _write_horizon_baselines directly.  The rep_000 eval config
+                    # carries historic_path; the training config does not.
+                    from utils.training import splitter as _splitter
                     rep0_dir = horizon_dir / 'forecasts' / 'rep_000'
                     rep0_eval_cfg = rep0_dir / 'config_evaluate_rep_000.yml'
                     if rep0_eval_cfg.exists():
-                        with open(rep0_eval_cfg, 'r', encoding='utf-8') as _f:
-                            _eval_cfg = yaml.safe_load(_f)
-                        _eval_cfg.setdefault('evaluation', {})['run_baselines'] = True
-                        _eval_cfg['evaluation']['run_regression'] = False
-                        _bl_cfg_path = rep0_dir / 'config_baseline_eval.yml'
-                        with open(_bl_cfg_path, 'w', encoding='utf-8') as _f:
-                            yaml.dump(_eval_cfg, _f, sort_keys=False)
                         try:
-                            subprocess.run(
-                                [sys.executable, 'src/f_Evaluate.py', '--config', str(_bl_cfg_path)],
-                                check=True, capture_output=True,
+                            with open(rep0_eval_cfg, 'r', encoding='utf-8') as _f:
+                                _rep0_cfg = yaml.safe_load(_f)
+                            _rep0_data = _rep0_cfg.get('data', {})
+                            _in_r1 = int(_rep0_data.get('input_row_1', 0))
+                            _in_r2 = int(_rep0_data.get('input_row_2', sample_length - 1))
+                            _out_cols = list(_rep0_data.get('output_columns', [target]))
+                            _out_rows = list(_rep0_data.get('output_rows', [_in_r2]))
+                            _inp_cols = list(_rep0_data.get('input_columns', predictor_cols))
+                            _sample_subdir = str(_rep0_data.get('sample_subdir', 'samples'))
+                            _, _test_samples = _splitter(
+                                str(horizon_dir.resolve()),
+                                'rep_000',
+                                _inp_cols,
+                                slice(_in_r1, _in_r2),
+                                _out_cols,
+                                _out_rows,
+                                fault_tolerant=True,
+                                reuse_split=True,
+                                split_source=rep0_dir,
+                                sample_subdir=_sample_subdir,
+                                input_aggregation='none',
                             )
-                            # f_Evaluate appends baseline rows to rep_000's evaluation_summary.csv;
-                            # extract only those rows and write to horizon_dir/baseline_summary.csv.
-                            _bl_eval_csv = rep0_dir / 'evaluation_summary.csv'
-                            if _bl_eval_csv.exists():
-                                _bl_df = pd.read_csv(_bl_eval_csv)
-                                if 'kind' in _bl_df.columns:
-                                    _bl_rows = _bl_df[_bl_df['kind'] == 'baseline']
-                                    if not _bl_rows.empty:
-                                        _bl_rows.to_csv(baseline_csv, index=False)
-                                        _bl_written = True
-                        except subprocess.CalledProcessError as exc:
-                            print(f"  [WARN] Baseline evaluation failed for horizon {horizon}hr: "
-                                  f"{exc.stderr.decode(errors='replace') if exc.stderr else ''}")
-                        finally:
-                            _bl_cfg_path.unlink(missing_ok=True)
+                            _test_split_files = [str(s[2]) for s in _test_samples]
+                            _bl_written = _write_horizon_baselines(
+                                horizon_dir=horizon_dir,
+                                base_config_path=base_config,
+                                eval_config_path=rep0_eval_cfg,
+                                model_key=model_key,
+                                test_samples=_test_samples,
+                                test_split_files=_test_split_files,
+                            )
+                        except Exception as exc:
+                            print(f"  [WARN] Baseline load failed for horizon {horizon}hr: {exc}")
                 if not _bl_written:
                     print(f"  [WARN] Could not write baseline_summary.csv for horizon {horizon}hr")
 

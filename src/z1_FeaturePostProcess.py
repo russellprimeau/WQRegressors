@@ -67,6 +67,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from utils.training import load_samples, group_samples_by_segment, _filter_samples_by_nan_tolerance
+from utils.config_utils import select_best_model_row
 from utils.names import clean_target_label
 from utils.mlr import evaluate_mlr as _evaluate_mlr
 from h_RunMCFeatureSelectionSweep import build_parser, discover_mc_dataset_plans, _derive_target_name, _select_surrogate_config, _parse_row_counts, _available_row_counts_for_postprocess, _regenerate_saved_outputs_for_row, _load_feature_stats_artifacts_with_source, _compile_multi_target_comparison, _resolve_dataset_inclusion, _run_rolling_origin_cv, _ensure_k01_baselines, _write_dataset_evaluation_summary, _forecast_sweeps_dir, _plot_final_metrics_comparison, _feature_tag, _mlr_artifact_dir, _write_mlr_artifacts, _run_mlr_variants_on_existing_split
@@ -2845,7 +2846,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                             f"({MIN_REQUIRED_VALID_INDEPENDENT}) for {plan.dataset_dir.name}; skipping rolling CV."
                         )
                     else:
-                        best_row = valid_r2.loc[valid_r2['r2'].idxmax()]
+                        best_row = select_best_model_row(valid_r2)
 
                         rolling_cv_r2 = rolling_cv_r2_median = rolling_cv_r2_last50 = rolling_cv_r2_pooled = float('nan')
                         rolling_cv_rmse = rolling_cv_mae = rolling_cv_n_folds = float('nan')
@@ -2893,7 +2894,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                                 )
                             )
                             if not _post_mlr.empty:
-                                best_row = _post_mlr.loc[_post_mlr['r2'].idxmax()]
+                                best_row = select_best_model_row(_post_mlr)
                         except Exception:
                             pass  # keep pre-MLR best_row as fallback
 
@@ -2978,6 +2979,22 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                         except Exception as exc:
                             print(f"[WARN] Shapley merge failed for {plan.dataset_dir.name}: {exc}")
 
+                        # Backfill NaN std_target using the first non-NaN value from the same
+                        # subset_rank. Fixes MLR rows whose std_target was not populated correctly
+                        # in the Shapley sweep CSV before being merged here.
+                        if "std_target" in df.columns and "subset_rank" in df.columns:
+                            _std_vals = pd.to_numeric(df["std_target"], errors="coerce")
+                            _std_by_rank = (
+                                df[_std_vals.notna()]
+                                .groupby("subset_rank")["std_target"]
+                                .first()
+                            )
+                            _nan_mask = _std_vals.isna()
+                            if _nan_mask.any():
+                                df.loc[_nan_mask, "std_target"] = (
+                                    df.loc[_nan_mask, "subset_rank"].map(_std_by_rank)
+                                )
+
                         # Recompute min_skill_rmse once across all sources, write once, plot once.
                         df = _recompute_min_skill_rmse(df)
                         df.to_csv(final_metrics_csv, index=False)
@@ -2996,7 +3013,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                                 )
                             )
                             if not valid_r2_2.empty:
-                                best_updated = valid_r2_2.loc[valid_r2_2['r2'].idxmax()]
+                                best_updated = select_best_model_row(valid_r2_2)
                                 _best_label = str(best_updated.get("subset_label", ""))
                                 if _best_label.startswith(_SHAPLEY_MERGE_LABEL_PREFIX):
                                     try:
