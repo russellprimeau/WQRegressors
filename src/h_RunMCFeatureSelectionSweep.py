@@ -4477,20 +4477,17 @@ def _evaluate_selected_subsets_all_models(
 
     final_df = pd.DataFrame(rows)
 
-    # Backfill NaN std_target using the first non-NaN value from the same subset_rank.
-    # This corrects dedup-copied MLR rows whose std_target was not populated correctly.
-    if "std_target" in final_df.columns and "subset_rank" in final_df.columns:
-        _std_vals = pd.to_numeric(final_df["std_target"], errors="coerce")
-        _std_by_rank = (
-            final_df[_std_vals.notna()]
-            .groupby("subset_rank")["std_target"]
-            .first()
-        )
-        _nan_mask = _std_vals.isna()
-        if _nan_mask.any():
-            final_df.loc[_nan_mask, "std_target"] = (
-                final_df.loc[_nan_mask, "subset_rank"].map(_std_by_rank)
-            )
+    # Backfill NaN std_target and row_count using the first non-NaN value from the same
+    # subset_rank. This corrects dedup-copied MLR rows whose values were not populated correctly.
+    if "subset_rank" in final_df.columns:
+        for _col in ("std_target", "row_count"):
+            if _col not in final_df.columns:
+                continue
+            _vals = pd.to_numeric(final_df[_col], errors="coerce")
+            _by_rank = final_df[_vals.notna()].groupby("subset_rank")[_col].first()
+            _nan_mask = _vals.isna()
+            if _nan_mask.any():
+                final_df.loc[_nan_mask, _col] = final_df.loc[_nan_mask, "subset_rank"].map(_by_rank)
 
     # Compute RMSE-based minimum skill for each ML model row.
     if not final_df.empty and {"subset_rank", "rmse", "model"}.issubset(final_df.columns):

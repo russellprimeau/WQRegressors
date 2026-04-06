@@ -274,6 +274,34 @@ _MLR_AGG_MODE = {'mlr': 'last', 'mlr_avg12': 'avg12', 'mlr_avgall': 'avgall'}
 _MLR_SUBSET_LABEL = {'mlr': 's01', 'mlr_avg12': 'm01', 'mlr_avgall': 'l01'}
 
 
+def _find_eval_config_with_historic(dataset_dir: Path) -> 'Path | None':
+    """Return the first eval config under *dataset_dir* that contains historic_path.
+
+    Search order:
+      1. Any config_evaluate_*.yml directly under forecasts/feature_sweeps/<subdir>/
+      2. Any config_evaluate_*.yml anywhere under the dataset directory (fallback)
+
+    This is used for MLR models, which never produce a per-horizon eval config but
+    need historic_path to compute Naive/Seasonal/Linear baselines.
+    """
+    feature_sweeps = dataset_dir / 'forecasts' / 'feature_sweeps'
+    candidates: list[Path] = []
+    if feature_sweeps.is_dir():
+        candidates.extend(sorted(feature_sweeps.rglob('config_evaluate_*.yml')))
+    # Generic fallback
+    candidates.extend(p for p in sorted(dataset_dir.rglob('config_evaluate_*.yml'))
+                      if p not in candidates)
+    for cfg_path in candidates:
+        try:
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                doc = yaml.safe_load(f)
+            if doc.get('evaluation', {}).get('historic_path'):
+                return cfg_path
+        except Exception:
+            continue
+    return None
+
+
 def _run_mlr_horizon_rep(
     *,
     horizon_dir: Path,
@@ -451,8 +479,9 @@ def _write_horizon_baselines(
         ref_cfg_path = base_config_path
         ref_data_cfg = data_cfg
 
-    baseline_rows, _, _ = _h._append_mlr_baseline_outputs(
-        [],
+    summary_rows: list[dict] = []
+    _h._append_mlr_baseline_outputs(
+        summary_rows,
         [],
         ref_cfg=ref_cfg,
         ref_cfg_path=ref_cfg_path,
@@ -466,11 +495,11 @@ def _write_horizon_baselines(
         test_split_files=test_split_files,
     )
 
-    if not baseline_rows:
+    if not summary_rows:
         print(f"  [WARN] No baseline rows produced for {horizon_dir.name}")
         return False
 
-    eval_module._write_summary_csv(baseline_rows, horizon_dir / 'baseline_summary.csv')
+    eval_module._write_summary_csv(summary_rows, horizon_dir / 'baseline_summary.csv')
     return True
 
 
@@ -713,11 +742,21 @@ def run_horizon_sweep(
                     _in_r2 = int(_data_cfg.get('input_row_2', sample_length - 1))
                     _out_cols = list(_data_cfg.get('output_columns', [target]))
                     _out_rows = list(_data_cfg.get('output_rows', [_in_r2]))
+                    # Use the input columns from rep_000's model_config.json rather than the
+                    # full predictor_cols list: some datasets have all-NaN sensor columns that
+                    # the MLR skips via fault_tolerant but that cause the splitter to reject
+                    # all samples when included.
+                    _rep0_model_cfg = horizon_dir / 'forecasts' / 'rep_000' / 'model_config.json'
+                    if _rep0_model_cfg.exists():
+                        with open(_rep0_model_cfg, 'r', encoding='utf-8') as _f:
+                            _mlr_cols = json.load(_f).get('input_columns', predictor_cols)
+                    else:
+                        _mlr_cols = predictor_cols
                     try:
                         _, _test_samples = _splitter(
                             str(horizon_dir),
                             'baseline_split',
-                            predictor_cols,
+                            _mlr_cols,
                             slice(_in_r1, _in_r2),
                             _out_cols,
                             _out_rows,
@@ -731,9 +770,11 @@ def run_horizon_sweep(
                             min_test_independent=5,
                         )
                         _test_split_files = [str(s[2]) for s in _test_samples]
+                        _mlr_eval_cfg = _find_eval_config_with_historic(dataset_dir)
                         _bl_written = _write_horizon_baselines(
                             horizon_dir=horizon_dir,
                             base_config_path=base_config,
+                            eval_config_path=_mlr_eval_cfg,
                             model_key=model_key,
                             test_samples=_test_samples,
                             test_split_files=_test_split_files,

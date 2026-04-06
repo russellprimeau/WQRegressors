@@ -1259,10 +1259,11 @@ def _sample_names_from_loaded_samples(samples) -> list[str]:
 
 def _find_best_variant_eval_config(plan: DatasetPlan, row: "pd.Series") -> "tuple[Path | None, Path | None, str]":
     try:
-        row_count = int(row.get("row_count"))
-        feature_tag = str(row.get("feature_tag", ""))
+        _rc = row.get("row_count")
+        row_count = int(_rc) if _rc is not None and pd.notna(_rc) else None
     except Exception:
-        return None, None, "invalid_best_row"
+        row_count = None
+    feature_tag = str(row.get("feature_tag", ""))
 
     model_key = _normalize_model_key(str(row.get("model", "")))
     output_dir = _forecast_sweeps_dir(plan.dataset_dir)
@@ -2586,8 +2587,8 @@ def _compile_feature_inclusion_heatmap(
     }
     target_rank = {t: idx for idx, t in enumerate(targets)}
 
-    multi_target_features = [f for f in all_features if presence_count.get(f, 0) > 1]
-    single_target_features = [f for f in all_features if presence_count.get(f, 0) == 1]
+    multi_target_features = [f for f in all_features if not f.endswith("_state")]
+    single_target_features = [f for f in all_features if f.endswith("_state")]
 
     multi_target_features.sort(key=lambda f: (-presence_count.get(f, 0), f))
 
@@ -2979,21 +2980,18 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                         except Exception as exc:
                             print(f"[WARN] Shapley merge failed for {plan.dataset_dir.name}: {exc}")
 
-                        # Backfill NaN std_target using the first non-NaN value from the same
-                        # subset_rank. Fixes MLR rows whose std_target was not populated correctly
-                        # in the Shapley sweep CSV before being merged here.
-                        if "std_target" in df.columns and "subset_rank" in df.columns:
-                            _std_vals = pd.to_numeric(df["std_target"], errors="coerce")
-                            _std_by_rank = (
-                                df[_std_vals.notna()]
-                                .groupby("subset_rank")["std_target"]
-                                .first()
-                            )
-                            _nan_mask = _std_vals.isna()
-                            if _nan_mask.any():
-                                df.loc[_nan_mask, "std_target"] = (
-                                    df.loc[_nan_mask, "subset_rank"].map(_std_by_rank)
-                                )
+                        # Backfill NaN std_target and row_count using the first non-NaN value
+                        # from the same subset_rank. Fixes MLR rows whose values were not
+                        # populated correctly in the Shapley sweep CSV before being merged here.
+                        if "subset_rank" in df.columns:
+                            for _col in ("std_target", "row_count"):
+                                if _col not in df.columns:
+                                    continue
+                                _vals = pd.to_numeric(df[_col], errors="coerce")
+                                _by_rank = df[_vals.notna()].groupby("subset_rank")[_col].first()
+                                _nan_mask = _vals.isna()
+                                if _nan_mask.any():
+                                    df.loc[_nan_mask, _col] = df.loc[_nan_mask, "subset_rank"].map(_by_rank)
 
                         # Recompute min_skill_rmse once across all sources, write once, plot once.
                         df = _recompute_min_skill_rmse(df)
