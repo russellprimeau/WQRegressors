@@ -150,7 +150,31 @@
       "Bash(find c:UsersMasterDocumentsGitHubWQRegressorsdataoutputCV14MC_Arsenic__µg_L__resforecastsfeature_sweeps -maxdepth 1 -type d -name *k01*)",
       "Bash(find c:/Users/Master/Documents/GitHub/WQRegressors/data/output/CV14/MC_Arsenic__µg_L__res -name *.log -type f)",
       "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(json.dumps\\({k:v for k,v in d.items\\(\\) if k in [''''input_columns'''',''''output_columns'''',''''feature_tag'''',''''subset_label'''',''''input_row_1'''',''''input_row_2'''',''''output_rows'''']}, indent=2\\)\\)\")",
-      "Bash(grep -r \"pred.*variance\\\\|gp.*variance\\\\|uncertainty.*gp\\\\|gp.*uncertainty\" src/ --include=*.py)"
+      "Bash(grep -r \"pred.*variance\\\\|gp.*variance\\\\|uncertainty.*gp\\\\|gp.*uncertainty\" src/ --include=*.py)",
+      "Bash(find \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/regression/MC_exArsenic_\\(µg_L\\)_res\" -type d)",
+      "Bash(wc -l \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/regression/MC_exArsenic_\\(µg_L\\)_res/forecasts/feature_sweeps/feature_sweep_final_metrics.csv\")",
+      "Bash(head -30 \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/regression/MC_exArsenic_\\(µg_L\\)_res/forecasts/feature_sweeps/feature_sweep_final_metrics.csv\")",
+      "Bash(for file:*)",
+      "Bash(do echo:*)",
+      "Bash(grep -E '^$|NaN|nan')",
+      "Bash(head -1 \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/regression/MC_exArsenic_\\(µg_L\\)_res/forecasts/feature_sweeps/feature_sweep_final_metrics.csv\")",
+      "Bash(head -1 \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/regression/MC_exArsenic_\\(µg_L\\)_res/forecasts/Shapley_sweeps/feature_sweep_final_metrics.csv\")",
+      "Bash(find c:/Users/Master/Documents/GitHub/WQRegressors/data/output/CV14/MC_Lead__µg_L__res/forecasts/feature_sweeps/configs -name *.yml)",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors -type f -name *MLR* -o -name *mlr*)",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/data/output -name config_evaluate*mlr*)",
+      "Bash(xargs head:*)",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/data/output -name \"feature_sweep_final_metrics.csv\" -exec grep -l \"mlr\" {})",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/data/output/CV11_horizons -path */horizons/horizon_*/rep_*/forecasts/*/evaluation_summary.csv)",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/data/output/CV11_horizons/MC_Arsenic* -path */forecasts/*/evaluation_summary.csv -print)",
+      "Bash(ls /c/Users/Master/Documents/GitHub/WQRegressors/data/output/CV11_horizons/MC_Arsenic__µg_L__res/horizons/horizon_*/)",
+      "Bash(for ds:*)",
+      "Bash(do)",
+      "Bash(echo \"=== $ds ===\")",
+      "Read(//c/Users/Master/Documents/GitHub/WQRegressors/data/output/CV14/$ds/horizons/horizon_000hr/rep_000/**)",
+      "Bash(done)",
+      "Bash(python src/z2_HorizonPostProcess.py --data-root data/output/CV14 --dataset-prefix MC)",
+      "Bash(find c:UsersMasterDocumentsGitHubWQRegressorsdataoutput -type d -name horizons*)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/k_RunHorizonSweep.py''\\).read\\(\\)\\); print\\(''k OK''\\)\")"
     ]
   }
 }

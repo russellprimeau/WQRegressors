@@ -43,7 +43,7 @@ CLI arguments:
 Examples:
 python src/z2_HorizonPostProcess.py
 python src/z2_HorizonPostProcess.py --data-root data/output/regression
-python src/z2_HorizonPostProcess.py --data-root data/output/CV11_horizons --dataset-prefix MC
+python src/z2_HorizonPostProcess.py --data-root data/output/CV14 --dataset-prefix MC
 """
 from __future__ import annotations
 import argparse
@@ -86,18 +86,12 @@ _SERIES_COLORS = [
 def _find_horizon_forecast_dirs(dataset_dir: Path) -> list[tuple[int, int, Path]]:
     """Discover ``(horizon, replicate, forecast_dir)`` tuples under *dataset_dir*/horizons/.
 
-    Supports two on-disk layouts:
+    Expected layout (k_RunHorizonSweep new layout)::
 
-    **Shared-samples layout** (k_RunHorizonSweep with data_dir=horizon_dir)::
-
-        horizons/horizon_NNNhr/forecasts/horizon_NNNhr_rep_RRR/
-
-    **Per-replicate layout** (original k_RunHorizonSweep)::
-
-        horizons/horizon_NNNhr/rep_RRR/forecasts/horizon_NNNhr_rep_RRR/
+        horizons/NNNhr/forecasts/rep_RRR/
     """
-    _horizon_re = re.compile(r"^horizon_(\d+)hr$")
-    _rep_re = re.compile(r"_rep_(\d+)$")
+    _horizon_re = re.compile(r"^(\d+)hr$")
+    _rep_re = re.compile(r"^rep_(\d+)$")
     hits: list[tuple[int, int, Path]] = []
     horizons_root = dataset_dir / "horizons"
     if not horizons_root.is_dir():
@@ -107,27 +101,13 @@ def _find_horizon_forecast_dirs(dataset_dir: Path) -> list[tuple[int, int, Path]
         if not m_h:
             continue
         horizon = int(m_h.group(1))
-        # Shared-samples layout: horizon_dir/forecasts/horizon_NNNhr_rep_RRR/
         forecasts_root = h_dir / "forecasts"
-        if forecasts_root.is_dir():
-            for fc_dir in sorted(forecasts_root.iterdir()):
-                m_r = _rep_re.search(fc_dir.name)
-                if m_r and fc_dir.is_dir():
-                    hits.append((horizon, int(m_r.group(1)), fc_dir))
-        # Per-replicate layout: horizon_dir/rep_RRR/forecasts/horizon_NNNhr_rep_RRR/
-        for rep_dir in sorted(h_dir.iterdir()):
-            if not rep_dir.is_dir() or not rep_dir.name.startswith("rep_"):
-                continue
-            rep_fc_root = rep_dir / "forecasts"
-            if not rep_fc_root.is_dir():
-                continue
-            for fc_dir in sorted(rep_fc_root.iterdir()):
-                m_r = _rep_re.search(fc_dir.name)
-                if m_r and fc_dir.is_dir():
-                    # Avoid duplicates when both layouts coexist
-                    entry = (horizon, int(m_r.group(1)), fc_dir)
-                    if entry not in hits:
-                        hits.append(entry)
+        if not forecasts_root.is_dir():
+            continue
+        for fc_dir in sorted(forecasts_root.iterdir()):
+            m_r = _rep_re.match(fc_dir.name)
+            if m_r and fc_dir.is_dir():
+                hits.append((horizon, int(m_r.group(1)), fc_dir))
     return hits
 
 
@@ -220,30 +200,19 @@ def _clean_label(dataset_name: str, prefix: str) -> str:
 
 
 def _load_baseline_rmses(dataset_dir: Path, horizon_hr: int, replicate: int) -> dict[str, float]:
-    """Return ``{baseline_label: rmse}`` from the evaluation_summary.csv for one horizon/replicate.
+    """Return ``{baseline_label: rmse}`` from ``baseline_summary.csv`` for one horizon.
 
-    Returns an empty dict when the file is absent or unreadable.
-    Searches both the shared-samples layout (``horizon_dir/forecasts/rep_name/``)
-    and the per-replicate layout (``horizon_dir/rep_NNN/forecasts/rep_name/``).
+    Baselines are shared across replicates; the *replicate* parameter is accepted
+    for interface compatibility but ignored.  Returns an empty dict when the file
+    is absent or unreadable.
     """
-    rep_name = f"horizon_{horizon_hr:03d}hr_rep_{replicate:03d}"
-    h_dir = dataset_dir / "horizons" / f"horizon_{horizon_hr:03d}hr"
-    candidates = [
-        h_dir / "forecasts" / rep_name / "evaluation_summary.csv",
-        h_dir / f"rep_{replicate:03d}" / "forecasts" / rep_name / "evaluation_summary.csv",
-    ]
-    csv_path = None
-    for c in candidates:
-        if c.exists():
-            csv_path = c
-            break
-    if csv_path is None:
+    baseline_csv = dataset_dir / "horizons" / f"{horizon_hr:03d}hr" / "baseline_summary.csv"
+    if not baseline_csv.exists():
         return {}
     try:
-        df = pd.read_csv(csv_path)
+        df = pd.read_csv(baseline_csv)
         if "rmse" not in df.columns:
             return {}
-        # Accept rows whose kind == "baseline" or whose label contains a known baseline name
         _known = {"naive", "seasonal", "linear"}
         if "kind" in df.columns:
             mask = df["kind"].str.lower() == "baseline"

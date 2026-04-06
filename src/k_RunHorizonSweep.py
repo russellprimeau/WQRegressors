@@ -2,22 +2,26 @@
 Horizon sweep script: For each dataset, take the best-performing model/config (from
 feature_sweeps), then for each horizon N call d_RunResample.split(gap_rows=N) to generate
 a fresh set of samples where the predictor window ends N hours before the target, retrain
-and evaluate the model, and save metrics/plots to forecasts/lookahead_sweeps/.
+and evaluate the model, and save metrics/plots to horizons/lookahead_sweeps/.
 
-Each horizon's samples and model outputs are written to isolated replicate subdirectories:
+Layout written per horizon:
 
-    <dataset_dir>/horizons/horizon_NNNhr/
-        rep_000/
-            samples/                        – raw sample CSVs (gap_rows=N, seed+0)
-            mc_replicates/                  – uncertainty-perturbed replicates
-            config_<model>_01.yml           – training config for this replicate
-            forecasts/horizon_NNNhr_rep_000/
-                evaluation_summary.csv      – per-set metrics for this replicate
-        rep_001/
-            ...
+    <dataset_dir>/horizons/NNNhr/
+        samples/                    – raw sample CSVs (gap_rows=N), shared across replicates
+        mc_replicates/              – uncertainty-perturbed replicates, shared across replicates
+        config.yml                  – training config for the best model type only
+        baseline_summary.csv        – Naive/Seasonal/Linear metrics, written once per horizon
+        forecasts/
+            rep_000/
+                evaluation_summary.csv   – model test row only
+                model.json / model.pt    – model artifact
+                config_evaluate_rep_000.yml
+            rep_001/
+                ...
 
-With --replicates M each horizon is run M times using seeds random_seed+0 … random_seed+M-1,
-producing a distribution of forecasts that captures model and MC-perturbation variability.
+With --replicates M each horizon trains M times; variation comes from per-replicate
+training seeds (random_seed + rep_idx injected into the training config), not from
+re-resampling.  Deterministic model types (MLR) are automatically collapsed to 1 replicate.
 
 Aggregate metrics (all replicates, all horizons) are written to:
 
@@ -26,7 +30,7 @@ Aggregate metrics (all replicates, all horizons) are written to:
         rmse_vs_lookahead.png
         r2_vs_lookahead.png
 
-Use z2_horizon_post.py to produce cross-dataset comparison figures with uncertainty bands.
+Use z2_HorizonPostProcess.py to produce cross-dataset comparison figures.
 
 CLI arguments:
     --data-root PATH        Root directory containing MC_* dataset subdirectories.
@@ -38,13 +42,12 @@ CLI arguments:
                             lists, and Monte Carlo settings.  Required.
     --horizons INT [INT …]  Space-separated list of horizon values (hours) to sweep.
                             Default: 0 1 2 6 12 24 48 96 120 167
-    --replicates M          Number of times to resample, train, and evaluate each horizon.
-                            Each replicate uses a different random seed (random_seed + idx).
+    --replicates M          Number of times to train and evaluate each horizon.
                             Default: 1
 
 Examples:
 python src/k_RunHorizonSweep.py --resample-config data/output/sampling/resample_config.yml
-python src/k_RunHorizonSweep.py --data-root data/output/CV4 --dataset-prefix MC --resample-config data/output/sampling/resample_config.yml --horizons 0 6 12 24 480 6 12 24 48 96 168 336 --replicates 10
+python src/k_RunHorizonSweep.py --data-root data/output/CV14 --dataset-prefix MC --resample-config data/output/sampling/resample_config.yml --horizons 0 6 12 24 48 96 168 336 --replicates 7
 
 """
 
@@ -66,6 +69,14 @@ from utils.config_utils import load_config
 
 PREFERRED_LOOKAHEADS = [0, 1, 2, 6, 12, 24, 48, 96, 120, 167]
 
+_BASELINE_MODEL_NAMES = {'naive', 'seasonal', 'linear'}
+
+_MLR_MODEL_NAMES = {'mlr', 'mlr_avg12', 'mlr_avgall'}
+
+# Deterministic models produce identical predictions for identical inputs — no benefit
+# to multiple replicates.  The sweep automatically collapses to 1 replicate for these.
+_DETERMINISTIC_MODEL_KEYS = _MLR_MODEL_NAMES
+
 _MODEL_TYPE_TO_KEY = {
     'xgb_regressor': 'xgb',
     'xgb_classifier': 'xgb',
@@ -75,12 +86,24 @@ _MODEL_TYPE_TO_KEY = {
     'XGBRegressor': 'xgb',
     'Transformer': 'transformer',
     'GPRegressor': 'gp',
+    # MLR variants
+    'mlr':        'mlr',
+    'mlr_avg12':  'mlr_avg12',
+    'mlr_avgall': 'mlr_avgall',
 }
 
 _MODEL_KEY_TO_CONFIG_NAME = {
     'xgb': 'config_xgb_01.yml',
     'transformer': 'config_transformer_01.yml',
     'gp': 'config_gp_01.yml',
+}
+
+# Per-replicate seed field injected into training config for each model type.
+# These map model_key → hyperparameter key that controls randomness.
+_MODEL_KEY_TO_SEED_FIELD = {
+    'xgb': 'random_state',
+    'gp':  'uncertain_kernel_mc_seed',
+    'transformer': 'random_state',
 }
 
 
@@ -112,36 +135,93 @@ def find_best_configs(data_root, dataset_prefix):
         if not metrics_file.exists():
             continue
         metrics_df = pd.read_csv(metrics_file)
-        if metrics_df.empty or 'r2' not in metrics_df.columns:
+        if metrics_df.empty or 'rmse' not in metrics_df.columns:
             continue
-        best_idx = metrics_df['r2'].idxmax()
-        best = metrics_df.iloc[best_idx]
+        is_baseline = metrics_df['model'].astype(str).str.strip().str.lower().isin(_BASELINE_MODEL_NAMES)
+        ml_rows = metrics_df[~is_baseline].copy()
+        if ml_rows.empty:
+            continue
+        if 'min_skill_rmse' in ml_rows.columns:
+            skill_vals = pd.to_numeric(ml_rows['min_skill_rmse'], errors='coerce')
+            valid = ml_rows[skill_vals.notna()]
+            if not valid.empty:
+                best = valid.loc[skill_vals[skill_vals.notna()].idxmax()]
+            elif 'r2' in ml_rows.columns:
+                best = ml_rows.loc[pd.to_numeric(ml_rows['r2'], errors='coerce').idxmax()]
+            else:
+                continue
+        elif 'r2' in ml_rows.columns:
+            best = ml_rows.loc[pd.to_numeric(ml_rows['r2'], errors='coerce').idxmax()]
+        else:
+            continue
         # Find config file for this subset and model
-        configs_dir = sweep_dir / 'configs'
+        model_name = str(best['model'])
+
+        # MLR variants: configs live in feature_sweeps/{model_name}_{subset_label}/ or,
+        # for rows merged from the Shapley sweep, in Shapley_sweeps/{model_name}_{subset_label}/
+        if model_name in _MLR_MODEL_NAMES:
+            subset_label = str(best.get('subset_label', 's01')).strip().lower()
+            _SHAP_PFX = 'shap_'
+            if subset_label.startswith(_SHAP_PFX):
+                mlr_search_dir = dataset_dir / 'forecasts' / 'Shapley_sweeps'
+                subset_label = subset_label[len(_SHAP_PFX):]
+            else:
+                mlr_search_dir = sweep_dir
+            mlr_artifact_dir = mlr_search_dir / f'{model_name}_{subset_label}'
+            config_path = mlr_artifact_dir / f'config_evaluate_{mlr_artifact_dir.name}.yml'
+            if not config_path.exists():
+                print(f"  [WARN] MLR eval config not found: {config_path}. Skipping {dataset_dir.name}.")
+                continue
+            best_configs.append((dataset_dir, config_path, best, mlr_artifact_dir))
+            continue
+
         model_map = {
             'Transformer': 'transformer_01',
             'XGBRegressor': 'xgb_01',
             'GPRegressor': 'gp_01',
+            'gp_regressor': 'gp_01',
+            'xgb_regressor': 'xgb_01',
+            'xgb_classifier': 'xgb_01',
+            'transformer': 'transformer_01',
         }
-        model_name = str(best['model'])
         mapped_model_name = model_map.get(model_name, model_name.lower())
+
+        # Rows merged from the Shapley sweep have a 'shap_' prefix on subset_label;
+        # their configs live in Shapley_sweeps/configs/ rather than feature_sweeps/configs/.
+        subset_label_raw = str(best.get('subset_label', '')).strip().lower()
+        _SHAP_PFX = 'shap_'
+        if subset_label_raw.startswith(_SHAP_PFX):
+            configs_dir = dataset_dir / 'forecasts' / 'Shapley_sweeps' / 'configs'
+            sweep_namespace = dataset_dir / 'forecasts' / 'Shapley_sweeps'
+        else:
+            configs_dir = sweep_dir / 'configs'
+            sweep_namespace = sweep_dir
+
         config_path = None
-        for cfg in configs_dir.glob(f"*{mapped_model_name}*r{int(best['row_count']):03d}_{best['feature_tag']}*.yml"):
-            config_path = cfg
-            break
+        row_count_raw = best['row_count']
+        row_count_known = pd.notna(row_count_raw)
+        if row_count_known:
+            row_count_str = f"r{int(row_count_raw):03d}_"
+            for cfg in configs_dir.glob(f"*{mapped_model_name}*{row_count_str}{best['feature_tag']}*.yml"):
+                config_path = cfg
+                break
+            if config_path is None:
+                for cfg in configs_dir.glob(f"*{row_count_str}{best['feature_tag']}*.yml"):
+                    config_path = cfg
+                    break
         if config_path is None:
-            # fallback: match by feature_tag and row_count only
-            for cfg in configs_dir.glob(f"*r{int(best['row_count']):03d}_{best['feature_tag']}*.yml"):
+            # fallback: match by feature_tag only (covers NaN row_count or unmatched patterns)
+            for cfg in configs_dir.glob(f"*{mapped_model_name}*{best['feature_tag']}*.yml"):
                 config_path = cfg
                 break
         if config_path is None:
             continue
         model_dir_name = model_map.get(model_name, model_name.lower())
-        row_count_val = int(best['row_count'])
+        row_count_val = int(row_count_raw) if row_count_known else 0
         feature_tag = str(best['feature_tag'])
         subset_rank_val = int(best['subset_rank'])
         subset_rank_str = f"k{subset_rank_val:02d}"
-        forecast_dir = dataset_dir / 'forecasts' / 'feature_sweeps' / f"{model_dir_name}_r{row_count_val}_{feature_tag}_{subset_rank_str}"
+        forecast_dir = sweep_namespace / f"{model_dir_name}_r{row_count_val}_{feature_tag}_{subset_rank_str}"
         best_configs.append((dataset_dir, config_path, best, forecast_dir))
     return best_configs
 
@@ -200,6 +280,193 @@ def _select_horizon_config(config_paths: list, model_key: str) -> Path | None:
     return Path(config_paths[0]) if config_paths else None
 
 
+_MLR_AGG_MODE = {'mlr': 'last', 'mlr_avg12': 'avg12', 'mlr_avgall': 'avgall'}
+_MLR_SUBSET_LABEL = {'mlr': 's01', 'mlr_avg12': 'm01', 'mlr_avgall': 'l01'}
+
+
+def _run_mlr_horizon_rep(
+    *,
+    horizon_dir: Path,
+    rep_name: str,
+    base_config_path: Path,
+    model_key: str,
+) -> 'Path | None':
+    """Fit and evaluate one MLR replicate.  Returns the rep output dir Path on success.
+
+    Samples are read from horizon_dir/samples/ (shared across all reps).
+    Output is written to horizon_dir/forecasts/rep_NNN/.
+    Baseline rows are NOT written here — they are written once per horizon by
+    _write_horizon_baselines().
+    """
+    import h_RunMCFeatureSelectionSweep as _h
+
+    with open(base_config_path, 'r', encoding='utf-8') as f:
+        base_cfg = yaml.safe_load(f)
+    data_cfg = base_cfg.get('data', {})
+
+    input_columns = list(data_cfg['input_columns'])
+    output_columns = list(data_cfg['output_columns'])
+    input_row_1 = int(data_cfg['input_row_1'])
+    input_row_2 = int(data_cfg['input_row_2'])
+    output_rows = list(data_cfg['output_rows'])
+    input_aggregation = str(data_cfg.get('input_aggregation', 'last'))
+
+    sample_dir = horizon_dir / 'samples'
+    if not sample_dir.exists():
+        print(f"  [WARN] MLR: samples dir not found: {sample_dir}")
+        return None
+
+    from utils.training import splitter
+    input_rows = slice(input_row_1, input_row_2)
+    try:
+        train_samples, test_samples = splitter(
+            str(horizon_dir),
+            rep_name,
+            input_columns,
+            input_rows,
+            output_columns,
+            output_rows,
+            fault_tolerant=True,
+            reuse_split=False,
+            split_type='temporal',
+            test_size=0.3,
+            random_state=42,
+            sample_subdir='samples',
+            input_aggregation='none',   # MLR applies its own aggregation internally
+            min_test_independent=5,
+        )
+    except Exception as exc:
+        print(f"  [ERROR] MLR split failed for {rep_name}: {exc}")
+        return None
+
+    if len(train_samples) < 3 or len(test_samples) < 1:
+        print(f"  [SKIP] MLR {rep_name}: insufficient samples "
+              f"(train={len(train_samples)}, test={len(test_samples)})")
+        return None
+
+    aggregation_mode = _MLR_AGG_MODE.get(model_key, 'last')
+    subset_label = _MLR_SUBSET_LABEL.get(model_key, 's01')
+
+    try:
+        preds, targets, train_samples, test_samples, meta, _ = \
+            _h._evaluate_mlr_with_rebalance(
+                train_samples=train_samples,
+                test_samples=test_samples,
+                feature_names=input_columns,
+                selection_config=None,
+                aggregation_mode=aggregation_mode,
+                min_test_independent=5,
+                model_name=f'MLR {rep_name}',
+                use_spearman_prefilter=True,
+            )
+    except Exception as exc:
+        print(f"  [ERROR] MLR evaluation failed for {rep_name}: {exc}")
+        return None
+
+    forecasts_dir = horizon_dir / 'forecasts'
+    forecasts_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write model-only evaluation_summary.csv (no baseline rows — those go to
+    # baseline_summary.csv at the horizon level via _write_horizon_baselines).
+    import f_Evaluate as eval_module
+    rep_dir = forecasts_dir / rep_name
+    rep_dir.mkdir(parents=True, exist_ok=True)
+
+    test_split_files = [str(s[2]) for s in test_samples]
+    train_split_files = [str(s[2]) for s in train_samples]
+    _model_label = model_key.upper().replace('_', '-')
+    summary_row = eval_module._compute_regression_summary(
+        f'{_model_label} (test)',
+        preds,
+        targets,
+        len(test_samples),
+        metadata={'kind': 'test', 'gp_uncertainty_mode': 'not_gp'},
+        split_files=test_split_files,
+    )
+    summary_row['n_train_samples'] = len(train_samples)
+    summary_row['n_test_samples'] = len(test_samples)
+    summary_row['input_dim'] = len(input_columns)
+    summary_row['target_dim'] = len(output_columns)
+    summary_row['data_dir'] = str(horizon_dir)
+    eval_module._write_summary_csv([summary_row], rep_dir / 'evaluation_summary.csv')
+
+    # Write split files and model config so the rep dir is self-describing.
+    (rep_dir / 'train_files.txt').write_text(
+        '\n'.join(train_split_files) + ('\n' if train_split_files else ''), encoding='utf-8')
+    (rep_dir / 'test_files.txt').write_text(
+        '\n'.join(test_split_files) + ('\n' if test_split_files else ''), encoding='utf-8')
+
+    model_config = {
+        'model_type': model_key,
+        'subset_label': subset_label,
+        'input_columns': input_columns,
+        'output_columns': output_columns,
+        'per_target_meta': [
+            {
+                'target_index': i,
+                'target_name': output_columns[i] if i < len(output_columns) else f'target_{i}',
+                'selected_features': m.get('selected_features', []),
+                'n_selected': m.get('n_selected', 0),
+                'coefficients': m.get('coefficients', []),
+                'intercept': m.get('intercept', None),
+                'n_train_valid': m.get('n_train', 0),
+            }
+            for i, m in enumerate(meta)
+        ],
+    }
+    with open(rep_dir / 'model_config.json', 'w', encoding='utf-8') as f:
+        json.dump(model_config, f, indent=2, default=str)
+
+    return rep_dir
+
+
+def _write_horizon_baselines(
+    *,
+    horizon_dir: Path,
+    base_config_path: Path,
+    model_key: str,
+    test_samples,
+    test_split_files: list[str],
+) -> bool:
+    """Compute Naive/Seasonal/Linear baselines and write horizon_dir/baseline_summary.csv.
+
+    Uses the evaluation section of base_config_path (historic_path, window_hours, etc.).
+    Returns True on success, False if baselines could not be computed.
+    """
+    import h_RunMCFeatureSelectionSweep as _h
+    import f_Evaluate as eval_module
+
+    with open(base_config_path, 'r', encoding='utf-8') as f:
+        base_cfg = yaml.safe_load(f)
+    data_cfg = base_cfg.get('data', {})
+    output_columns = list(data_cfg['output_columns'])
+    output_rows = list(data_cfg['output_rows'])
+    input_aggregation = str(data_cfg.get('input_aggregation', 'last'))
+    sample_subdir = str(data_cfg.get('sample_subdir', 'samples'))
+
+    baseline_rows, _, _ = _h._append_mlr_baseline_outputs(
+        [],
+        [],
+        ref_cfg=base_cfg,
+        ref_cfg_path=base_config_path,
+        ref_data_cfg=data_cfg,
+        data_dir=str(horizon_dir),
+        sample_subdir=sample_subdir,
+        output_columns=output_columns,
+        output_rows=output_rows,
+        forecast_name='',
+        test_samples=test_samples,
+        test_split_files=test_split_files,
+    )
+
+    if not baseline_rows:
+        print(f"  [WARN] No baseline rows produced for {horizon_dir.name}")
+        return False
+
+    eval_module._write_summary_csv(baseline_rows, horizon_dir / 'baseline_summary.csv')
+    return True
+
+
 def run_horizon_sweep(
     data_root,
     dataset_prefix,
@@ -243,6 +510,13 @@ def run_horizon_sweep(
 
         model_key = _model_name_to_key(str(best_row['model']))
 
+        # Deterministic models produce identical results for every replicate — collapse to 1.
+        if model_key in _DETERMINISTIC_MODEL_KEYS and n_replicates > 1:
+            print(f"  [INFO] {model_key} is deterministic — collapsing {n_replicates} replicates to 1.")
+            effective_replicates = 1
+        else:
+            effective_replicates = n_replicates
+
         # --- Normalization: reuse existing params for consistency across horizons ---
         norm_params = _load_normalization_params(dataset_dir)
         if norm_params is not None:
@@ -273,104 +547,132 @@ def run_horizon_sweep(
         if not lookaheads:
             print(f"  [WARN] No horizons to sweep. Skipping.")
             continue
-        print(f"  [INFO] sample_length={sample_length}; horizon schedule={lookaheads}; replicates={n_replicates}")
+        print(f"  [INFO] sample_length={sample_length}; horizons={lookaheads}; "
+              f"replicates={effective_replicates}; model={model_key}")
 
         # --- Base hyperparameter overrides from best model ---
-        base_overrides = _extract_model_overrides(base_config)
+        if model_key not in _MLR_MODEL_NAMES:
+            base_overrides = _extract_model_overrides(base_config)
+        else:
+            base_overrides = {}
 
-        # --- Sweep horizons × replicates ---
+        # --- Sweep horizons ---
         metrics = []
         for horizon in lookaheads:
-            horizon_label = f'horizon_{horizon:03d}hr'
+            horizon_label = f'{horizon:03d}hr'
             horizon_dir = dataset_dir / 'horizons' / horizon_label
 
-            for rep_idx in range(n_replicates):
-                rep_label = f'rep_{rep_idx:03d}'
-                rep_dir = horizon_dir / rep_label
-                rep_name = f'{horizon_label}_{rep_label}'
+            # --- Resample once per horizon (shared across all replicates) ---
+            # forecast_name/dir are not meaningful at the horizon level; they will be
+            # overridden per-replicate in the config before training.
+            training_cfg_defaults_horizon = {}
+            for k, v in base_overrides.items():
+                training_cfg_defaults_horizon[k] = dict(v)
+
+            print(f"  [RESAMPLE] Horizon {horizon}hr (seed={random_seed})")
+            try:
+                result = resample_split(
+                    df_norm,
+                    str(horizon_dir),
+                    [target],
+                    sample_length,
+                    nan_tol=0.8,
+                    to_normalize=[],
+                    fault_tolerant=True,
+                    predictor_cols=predictor_cols,
+                    use_uncertainty_perturbation=use_uncertainty_perturbation,
+                    n_mc_replicates=n_mc_replicates,
+                    random_seed=random_seed,
+                    pre_normalized=True,
+                    normalization_params=normalization_params,
+                    sensor_uncertainties=shared_sensor_uncertainties,
+                    verbose=False,
+                    gap_rows=horizon,
+                    training_config_defaults=training_cfg_defaults_horizon,
+                )
+            except Exception as exc:
+                print(f"  [ERROR] Resampling failed for horizon {horizon}hr: {exc}")
+                continue
+
+            if result['n_samples'] == 0:
+                print(f"  [SKIP] Horizon {horizon}hr: no samples generated.")
+                continue
+
+            # Keep only the config matching the best model; delete the other two.
+            for cfg_path in result['config_paths']:
+                p = Path(cfg_path)
+                if p.name != _MODEL_KEY_TO_CONFIG_NAME.get(model_key, ''):
+                    p.unlink(missing_ok=True)
+                else:
+                    # Rename to the canonical single-config name.
+                    target_path = horizon_dir / 'config.yml'
+                    p.rename(target_path)
+
+            # --- Per-replicate training ---
+            for rep_idx in range(effective_replicates):
+                rep_name = f'rep_{rep_idx:03d}'
                 rep_seed = random_seed + rep_idx
-                forecast_dir_abs = str((rep_dir / 'forecasts' / rep_name).resolve())
+                rep_dir_abs = str((horizon_dir / 'forecasts' / rep_name).resolve())
 
-                # Per-replicate training_config_defaults: inject forecast_name and forecast_dir.
-                # forecast_dir (absolute) is included so f_Evaluate.py resolves test_files.txt
-                # correctly even when falling back to the training config instead of the eval config.
-                training_cfg_defaults = {}
-                for k, v in base_overrides.items():
-                    training_cfg_defaults[k] = dict(v)
-                    training_cfg_defaults[k]['data'] = {
-                        'forecast_name': rep_name,
-                        'forecast_dir': forecast_dir_abs,
-                    }
-
-                print(f"  [RESAMPLE] Horizon {horizon}hr rep {rep_idx} (seed={rep_seed})")
-                try:
-                    result = resample_split(
-                        df_norm,
-                        str(rep_dir),
-                        [target],
-                        sample_length,
-                        nan_tol=0.8,
-                        to_normalize=[],
-                        fault_tolerant=True,
-                        predictor_cols=predictor_cols,
-                        use_uncertainty_perturbation=use_uncertainty_perturbation,
-                        n_mc_replicates=n_mc_replicates,
-                        random_seed=rep_seed,
-                        pre_normalized=True,
-                        normalization_params=normalization_params,
-                        sensor_uncertainties=shared_sensor_uncertainties,
-                        verbose=False,
-                        gap_rows=horizon,
-                        training_config_defaults=training_cfg_defaults,
+                if model_key in _MLR_MODEL_NAMES:
+                    print(f"  [MLR] Horizon {horizon}hr rep {rep_idx}")
+                    rep_dir = _run_mlr_horizon_rep(
+                        horizon_dir=horizon_dir,
+                        rep_name=rep_name,
+                        base_config_path=base_config,
+                        model_key=model_key,
                     )
-                except Exception as exc:
-                    print(f"  [ERROR] Resampling failed for horizon {horizon}hr rep {rep_idx}: {exc}")
-                    continue
+                    if rep_dir is None:
+                        continue
+                    eval_csv = rep_dir / 'evaluation_summary.csv'
+                else:
+                    # --- XGB / Transformer / GP branch ---
+                    horizon_cfg = horizon_dir / 'config.yml'
+                    if not horizon_cfg.exists():
+                        print(f"  [SKIP] Horizon {horizon}hr rep {rep_idx}: config.yml missing.")
+                        continue
 
-                if result['n_samples'] == 0:
-                    print(f"  [SKIP] Horizon {horizon}hr rep {rep_idx}: no samples generated.")
-                    continue
+                    # Patch per-replicate values: forecast_name, forecast_dir, training seed.
+                    with open(horizon_cfg, 'r', encoding='utf-8') as _f:
+                        _cfg = yaml.safe_load(_f)
+                    _cfg.setdefault('data', {})['forecast_name'] = rep_name
+                    _cfg['data']['forecast_dir'] = rep_dir_abs
+                    _cfg['data']['data_dir'] = str(horizon_dir.resolve())
+                    # Inject per-replicate seed for training variance.
+                    seed_field = _MODEL_KEY_TO_SEED_FIELD.get(model_key)
+                    if seed_field:
+                        _cfg.setdefault('hyperparameters', {})[seed_field] = rep_seed
+                    # Disable baselines in f_Evaluate — they are written once per horizon below.
+                    _cfg.setdefault('evaluation', {})['run_baselines'] = False
+                    with open(horizon_cfg, 'w', encoding='utf-8') as _f:
+                        yaml.dump(_cfg, _f, sort_keys=False)
 
-                horizon_cfg = _select_horizon_config(result['config_paths'], model_key)
-                if horizon_cfg is None:
-                    print(f"  [SKIP] Horizon {horizon}hr rep {rep_idx}: could not find config for model_key={model_key}.")
-                    continue
+                    # Train
+                    train_cmd = [sys.executable, 'src/e_Train.py', '--config', str(horizon_cfg)]
+                    print(f"  [TRAIN] Horizon {horizon}hr rep {rep_idx} (seed={rep_seed})")
+                    try:
+                        subprocess.run(train_cmd, check=True, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.PIPE)
+                    except subprocess.CalledProcessError as exc:
+                        print(f"  [ERROR] Training failed for horizon {horizon}hr rep {rep_idx}:")
+                        print(exc.stderr.decode(errors='replace'))
+                        continue
 
-                # Patch forecast_name and forecast_dir directly in the config file.
-                # d_RunResample.split() hardcodes 'xgb_01' as the forecast_name arg; the
-                # training_config_defaults override is not reliable when the rep dir already
-                # contains a config from a prior run. Writing here guarantees the correct values.
-                with open(horizon_cfg, 'r', encoding='utf-8') as _f:
-                    _cfg = yaml.safe_load(_f)
-                _cfg.setdefault('data', {})['forecast_name'] = rep_name
-                _cfg['data']['forecast_dir'] = forecast_dir_abs
-                with open(horizon_cfg, 'w', encoding='utf-8') as _f:
-                    yaml.dump(_cfg, _f, sort_keys=False)
+                    # Evaluate using the eval config written by e_Train.py.
+                    eval_cfg_path = horizon_dir / 'forecasts' / rep_name / f'config_evaluate_{rep_name}.yml'
+                    eval_config_arg = str(eval_cfg_path) if eval_cfg_path.exists() else str(horizon_cfg)
+                    eval_cmd = [sys.executable, 'src/f_Evaluate.py', '--config', eval_config_arg]
+                    print(f"  [EVAL] Horizon {horizon}hr rep {rep_idx}")
+                    try:
+                        subprocess.run(eval_cmd, check=True, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.PIPE)
+                    except subprocess.CalledProcessError as exc:
+                        print(f"  [ERROR] Evaluation failed for horizon {horizon}hr rep {rep_idx}:")
+                        print(exc.stderr.decode(errors='replace'))
+                        continue
 
-                # Train
-                train_cmd = [sys.executable, 'src/e_Train.py', '--config', str(horizon_cfg)]
-                print(f"  [TRAIN] Horizon {horizon}hr rep {rep_idx}")
-                try:
-                    subprocess.run(train_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                except subprocess.CalledProcessError as exc:
-                    print(f"  [ERROR] Training failed for horizon {horizon}hr rep {rep_idx}:")
-                    print(exc.stderr.decode(errors='replace'))
-                    continue
+                    eval_csv = horizon_dir / 'forecasts' / rep_name / 'evaluation_summary.csv'
 
-                # Evaluate — prefer the eval config written by e_Train.py (paths resolved correctly).
-                # e_Train.py names it config_evaluate_<forecast_name>.yml (line 651 of e_Train.py).
-                eval_cfg_path = rep_dir / 'forecasts' / rep_name / f'config_evaluate_{rep_name}.yml'
-                eval_config_arg = str(eval_cfg_path) if eval_cfg_path.exists() else str(horizon_cfg)
-                eval_cmd = [sys.executable, 'src/f_Evaluate.py', '--config', eval_config_arg]
-                print(f"  [EVAL] Horizon {horizon}hr rep {rep_idx}")
-                try:
-                    subprocess.run(eval_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                except subprocess.CalledProcessError as exc:
-                    print(f"  [ERROR] Evaluation failed for horizon {horizon}hr rep {rep_idx}:")
-                    print(exc.stderr.decode(errors='replace'))
-                    continue
-
-                eval_csv = rep_dir / 'forecasts' / rep_name / 'evaluation_summary.csv'
                 if eval_csv.exists():
                     df_eval = pd.read_csv(eval_csv)
                     df_eval['horizon'] = horizon
@@ -381,7 +683,85 @@ def run_horizon_sweep(
                 else:
                     print(f"  [WARN] evaluation_summary.csv not found: {eval_csv}")
 
-        # --- Save metrics and plots ---
+            # --- Write baselines once per horizon (after all reps, using last test split) ---
+            # For non-MLR models, load the test split from rep_000 to run baselines.
+            baseline_csv = horizon_dir / 'baseline_summary.csv'
+            if not baseline_csv.exists():
+                _bl_written = False
+                if model_key in _MLR_MODEL_NAMES:
+                    # Re-derive test_samples from the shared samples directory for baseline use.
+                    from utils.training import splitter as _splitter
+                    _data_cfg = base_cfg_yaml.get('data', {})
+                    _in_r1 = int(_data_cfg.get('input_row_1', 0))
+                    _in_r2 = int(_data_cfg.get('input_row_2', sample_length - 1))
+                    _out_cols = list(_data_cfg.get('output_columns', [target]))
+                    _out_rows = list(_data_cfg.get('output_rows', [_in_r2]))
+                    try:
+                        _, _test_samples = _splitter(
+                            str(horizon_dir),
+                            'baseline_split',
+                            predictor_cols,
+                            slice(_in_r1, _in_r2),
+                            _out_cols,
+                            _out_rows,
+                            fault_tolerant=True,
+                            reuse_split=False,
+                            split_type='temporal',
+                            test_size=0.3,
+                            random_state=42,
+                            sample_subdir='samples',
+                            input_aggregation='none',
+                            min_test_independent=5,
+                        )
+                        _test_split_files = [str(s[2]) for s in _test_samples]
+                        _bl_written = _write_horizon_baselines(
+                            horizon_dir=horizon_dir,
+                            base_config_path=base_config,
+                            model_key=model_key,
+                            test_samples=_test_samples,
+                            test_split_files=_test_split_files,
+                        )
+                    except Exception as exc:
+                        print(f"  [WARN] Baseline split failed for horizon {horizon}hr: {exc}")
+                else:
+                    # For XGB/GP/Transformer, run f_Evaluate with run_baselines=True,
+                    # run_regression=False on rep_000's eval config.
+                    # Write the patched config beside the source config so all relative
+                    # paths (data_dir, split files) resolve correctly from the same directory.
+                    rep0_dir = horizon_dir / 'forecasts' / 'rep_000'
+                    rep0_eval_cfg = rep0_dir / 'config_evaluate_rep_000.yml'
+                    if rep0_eval_cfg.exists():
+                        with open(rep0_eval_cfg, 'r', encoding='utf-8') as _f:
+                            _eval_cfg = yaml.safe_load(_f)
+                        _eval_cfg.setdefault('evaluation', {})['run_baselines'] = True
+                        _eval_cfg['evaluation']['run_regression'] = False
+                        _bl_cfg_path = rep0_dir / 'config_baseline_eval.yml'
+                        with open(_bl_cfg_path, 'w', encoding='utf-8') as _f:
+                            yaml.dump(_eval_cfg, _f, sort_keys=False)
+                        try:
+                            subprocess.run(
+                                [sys.executable, 'src/f_Evaluate.py', '--config', str(_bl_cfg_path)],
+                                check=True, capture_output=True,
+                            )
+                            # f_Evaluate appends baseline rows to rep_000's evaluation_summary.csv;
+                            # extract only those rows and write to horizon_dir/baseline_summary.csv.
+                            _bl_eval_csv = rep0_dir / 'evaluation_summary.csv'
+                            if _bl_eval_csv.exists():
+                                _bl_df = pd.read_csv(_bl_eval_csv)
+                                if 'kind' in _bl_df.columns:
+                                    _bl_rows = _bl_df[_bl_df['kind'] == 'baseline']
+                                    if not _bl_rows.empty:
+                                        _bl_rows.to_csv(baseline_csv, index=False)
+                                        _bl_written = True
+                        except subprocess.CalledProcessError as exc:
+                            print(f"  [WARN] Baseline evaluation failed for horizon {horizon}hr: "
+                                  f"{exc.stderr.decode(errors='replace') if exc.stderr else ''}")
+                        finally:
+                            _bl_cfg_path.unlink(missing_ok=True)
+                if not _bl_written:
+                    print(f"  [WARN] Could not write baseline_summary.csv for horizon {horizon}hr")
+
+        # --- Save aggregate metrics and plots ---
         if metrics:
             import matplotlib.pyplot as plt
 
@@ -408,7 +788,7 @@ def run_horizon_sweep(
             sweep_dir.mkdir(parents=True, exist_ok=True)
             all_metrics.to_csv(sweep_dir / 'lookahead_metrics.csv', index=False)
 
-            # Per-dataset summary plots: individual replicates as scatter + mean line
+            # Per-dataset summary plots
             has_reps = 'replicate' in all_metrics.columns and all_metrics['replicate'].nunique() > 1
             mean_metrics = all_metrics.groupby('horizon')[['rmse', 'r2']].mean().reset_index()
 
@@ -465,7 +845,8 @@ if __name__ == '__main__':
         type=int,
         default=1,
         metavar='M',
-        help='Number of times to resample, train, and evaluate each horizon (default: 1).',
+        help='Number of times to train and evaluate each horizon (default: 1). '
+             'Deterministic model types (MLR) are automatically collapsed to 1.',
     )
     args = parser.parse_args()
     run_horizon_sweep(
