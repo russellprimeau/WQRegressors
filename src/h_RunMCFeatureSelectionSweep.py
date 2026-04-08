@@ -3441,13 +3441,14 @@ def _compile_multi_target_comparison(
             single_scores,
             f"Single-target Features",
         )
-        ax_top.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
-        ax_bottom.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
+        _wrapped_ylabel = textwrap.fill(str(summary_axis_label), width=20)
+        ax_top.set_ylabel(_wrapped_ylabel, fontsize=bar_axis_label_font)
+        ax_bottom.set_ylabel(_wrapped_ylabel, fontsize=bar_axis_label_font)
         ax_bottom.set_xlabel("")
     else:
         fig, ax = plt.subplots(figsize=(max(15, len(top_features) * 0.58), 6.5), constrained_layout=True)
         _draw_group_bars(ax, top_features, summed_scores, "Feature Importance (summed target-wise z-score)")
-        ax.set_ylabel(str(summary_axis_label), fontsize=bar_axis_label_font)
+        ax.set_ylabel(textwrap.fill(str(summary_axis_label), width=20), fontsize=bar_axis_label_font)
         ax.set_xlabel("")
 
     bar_path = summaries_dir / "multi_target_importance_bars.png"

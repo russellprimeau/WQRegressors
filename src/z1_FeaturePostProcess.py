@@ -2634,6 +2634,11 @@ def _compile_feature_inclusion_heatmap(
 
     n_targets = len(targets)
     heat_h = max(4, (n_targets + 1) * 0.38)
+    # Shift vmin below zero so that 0-cells map to the near-white tail of the colormap,
+    # clearly distinct from any non-zero value, while the Total row retains a full gradient.
+    _heat_vmin = -0.5
+    _heat_vmax = max(n_targets, 1)
+    _cell_w = 0.32  # inches per cell (square)
 
     if multi_idx and single_idx:
         yticklabels_with_total = yticklabels + ["Total"]
@@ -2647,17 +2652,17 @@ def _compile_feature_inclusion_heatmap(
         xticklabels_with_sep = multi_target_features + [""] + single_target_features
 
         n_total_cols = combined_matrix.shape[1]
-        heat_w = max(14, n_total_cols * 0.85)
+        heat_w = max(6, n_total_cols * _cell_w + 3.5)  # +3.5 for y-labels & colorbar
         fig, ax = plt.subplots(figsize=(heat_w, heat_h), constrained_layout=True)
 
         sns.heatmap(
             combined_matrix, ax=ax,
-            cmap="YlGn", vmin=0, vmax=max(n_targets, 1),
+            cmap="YlGn", vmin=_heat_vmin, vmax=_heat_vmax,
             annot=False,
             cbar_kws={"label": "Number of targets including predictor", "pad": 0.01},
             xticklabels=xticklabels_with_sep,
             yticklabels=yticklabels_with_total,
-            linewidths=0.5, linecolor="#eeeeee", square=False,
+            linewidths=0.5, linecolor="#eeeeee", square=True,
         )
         _annotate_inclusion_cells(ax, combined_matrix, heat_font)
 
@@ -2674,18 +2679,19 @@ def _compile_feature_inclusion_heatmap(
         matrix_with_total = np.vstack([matrix, total_row[None, :]])
         yticklabels_with_total = yticklabels + ["Total"]
         n_total_features = max(len(all_features), 1)
+        heat_w = max(6, n_total_features * _cell_w + 3.5)
         fig, ax = plt.subplots(
-            figsize=(max(13, n_total_features * 0.85), heat_h),
+            figsize=(heat_w, heat_h),
             constrained_layout=True,
         )
         sns.heatmap(
             matrix_with_total, ax=ax,
-            cmap="YlGn", vmin=0, vmax=max(n_targets, 1),
+            cmap="YlGn", vmin=_heat_vmin, vmax=_heat_vmax,
             annot=False,
             cbar_kws={"label": "Number of targets including predictor", "pad": 0.01},
             xticklabels=all_features,
             yticklabels=yticklabels_with_total,
-            linewidths=0.5, linecolor="#eeeeee", square=False,
+            linewidths=0.5, linecolor="#eeeeee", square=True,
         )
         _annotate_inclusion_cells(ax, matrix_with_total, heat_font)
         ax.set_xticklabels(all_features, rotation=45, ha="right", fontsize=heat_font)

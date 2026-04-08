@@ -83,16 +83,23 @@ _SERIES_COLORS = [
 ]
 
 
-def _find_horizon_forecast_dirs(dataset_dir: Path) -> list[tuple[int, int, Path]]:
-    """Discover ``(horizon, replicate, forecast_dir)`` tuples under *dataset_dir*/horizons/.
+def _find_horizon_forecast_dirs(dataset_dir: Path) -> list[tuple[int, int, Path, "str | None"]]:
+    """Discover ``(horizon, replicate, forecast_dir, model_class)`` tuples under *dataset_dir*/horizons/.
 
-    Expected layout (k_RunHorizonSweep new layout)::
+    Searches the following layouts (most-specific first):
 
-        horizons/NNNhr/forecasts/rep_RRR/
+    * New per-class layout::
+
+        horizons/NNNhr/ml/forecasts/rep_RRR/
+        horizons/NNNhr/mlr/forecasts/rep_RRR/
+
+    * Legacy flat layout (pre-migration)::
+
+        horizons/NNNhr/forecasts/rep_RRR/     (model_class=None)
     """
     _horizon_re = re.compile(r"^(\d+)hr$")
     _rep_re = re.compile(r"^rep_(\d+)$")
-    hits: list[tuple[int, int, Path]] = []
+    hits: list[tuple[int, int, Path, "str | None"]] = []
     horizons_root = dataset_dir / "horizons"
     if not horizons_root.is_dir():
         return hits
@@ -101,13 +108,26 @@ def _find_horizon_forecast_dirs(dataset_dir: Path) -> list[tuple[int, int, Path]
         if not m_h:
             continue
         horizon = int(m_h.group(1))
-        forecasts_root = h_dir / "forecasts"
-        if not forecasts_root.is_dir():
-            continue
-        for fc_dir in sorted(forecasts_root.iterdir()):
-            m_r = _rep_re.match(fc_dir.name)
-            if m_r and fc_dir.is_dir():
-                hits.append((horizon, int(m_r.group(1)), fc_dir))
+        found_class_dirs = False
+        # New layout: ml/ and mlr/ subdirectories
+        for model_class in ("ml", "mlr"):
+            class_dir = h_dir / model_class
+            forecasts_root = class_dir / "forecasts"
+            if not forecasts_root.is_dir():
+                continue
+            found_class_dirs = True
+            for fc_dir in sorted(forecasts_root.iterdir()):
+                m_r = _rep_re.match(fc_dir.name)
+                if m_r and fc_dir.is_dir():
+                    hits.append((horizon, int(m_r.group(1)), fc_dir, model_class))
+        # Legacy flat layout — only if no class subdirs found
+        if not found_class_dirs:
+            forecasts_root = h_dir / "forecasts"
+            if forecasts_root.is_dir():
+                for fc_dir in sorted(forecasts_root.iterdir()):
+                    m_r = _rep_re.match(fc_dir.name)
+                    if m_r and fc_dir.is_dir():
+                        hits.append((horizon, int(m_r.group(1)), fc_dir, None))
     return hits
 
 
@@ -117,7 +137,7 @@ def _run_pending_evaluations(dataset_dir: Path) -> int:
     Returns the number of evaluations successfully completed.
     """
     completed = 0
-    for horizon, rep_idx, fc_dir in _find_horizon_forecast_dirs(dataset_dir):
+    for horizon, rep_idx, fc_dir, _mc in _find_horizon_forecast_dirs(dataset_dir):
         summary_csv = fc_dir / "evaluation_summary.csv"
         if summary_csv.exists():
             continue
@@ -155,7 +175,7 @@ def _reconstruct_lookahead_metrics(dataset_dir: Path) -> pd.DataFrame | None:
     columns derived from the directory structure.
     """
     frames: list[pd.DataFrame] = []
-    for horizon, rep_idx, fc_dir in _find_horizon_forecast_dirs(dataset_dir):
+    for horizon, rep_idx, fc_dir, model_class in _find_horizon_forecast_dirs(dataset_dir):
         summary_csv = fc_dir / "evaluation_summary.csv"
         if not summary_csv.exists():
             continue
@@ -171,6 +191,26 @@ def _reconstruct_lookahead_metrics(dataset_dir: Path) -> pd.DataFrame | None:
         df = df.drop(columns=[c for c in ("label", "kind") if c in df.columns], errors="ignore")
         df["horizon"] = horizon
         df["replicate"] = rep_idx
+        # model_class and model_name — try model_config.json in the rep dir first.
+        _mc = model_class  # may be None for legacy flat layout
+        _mn: "str | None" = None
+        model_cfg_path = fc_dir / "model_config.json"
+        if model_cfg_path.exists():
+            try:
+                import json as _json
+                with open(model_cfg_path, "r", encoding="utf-8") as _fh:
+                    _mcfg = _json.load(_fh)
+                _mt = str(_mcfg.get("model_type", "")).strip().lower()
+                if _mt:
+                    _mn = _mt
+                    if _mc is None:
+                        _mc = "mlr" if _mt in {"mlr", "mlr_avg12", "mlr_avgall"} else "ml"
+            except Exception:
+                pass
+        if _mc is not None:
+            df["model_class"] = _mc
+        if _mn is not None:
+            df["model_name"] = _mn
         # Derive input_rows from the eval config if available
         eval_cfgs = list(fc_dir.glob("config_evaluate_*.yml"))
         if eval_cfgs:
@@ -188,8 +228,8 @@ def _reconstruct_lookahead_metrics(dataset_dir: Path) -> pd.DataFrame | None:
     if not frames:
         return None
     result = pd.concat(frames, ignore_index=True)
-    # Put horizon and replicate first
-    front = [c for c in ("horizon", "replicate") if c in result.columns]
+    # Put model_class, model_name, horizon, replicate first
+    front = [c for c in ("model_class", "model_name", "horizon", "replicate") if c in result.columns]
     rest = [c for c in result.columns if c not in front]
     return result[front + rest]
 
@@ -199,15 +239,35 @@ def _clean_label(dataset_name: str, prefix: str) -> str:
     return clean_target_label(dataset_name, prefix)
 
 
-def _load_baseline_rmses(dataset_dir: Path, horizon_hr: int, replicate: int) -> dict[str, float]:
+def _load_baseline_rmses(
+    dataset_dir: Path,
+    horizon_hr: int,
+    replicate: int,
+    model_class: "str | None" = None,
+) -> dict[str, float]:
     """Return ``{baseline_label: rmse}`` from ``baseline_summary.csv`` for one horizon.
 
     Baselines are shared across replicates; the *replicate* parameter is accepted
-    for interface compatibility but ignored.  Returns an empty dict when the file
-    is absent or unreadable.
+    for interface compatibility but ignored.
+
+    Search order:
+      1. ``horizons/NNNhr/{model_class}/baseline_summary.csv``  (new per-class layout)
+      2. ``horizons/NNNhr/baseline_summary.csv``                (legacy flat layout)
+
+    Returns an empty dict when no file is found or readable.
     """
-    baseline_csv = dataset_dir / "horizons" / f"{horizon_hr:03d}hr" / "baseline_summary.csv"
-    if not baseline_csv.exists():
+    h_label = f"{horizon_hr:03d}hr"
+    candidates: list[Path] = []
+    if model_class is not None:
+        candidates.append(dataset_dir / "horizons" / h_label / model_class / "baseline_summary.csv")
+    # Always fall back to flat layout
+    candidates.append(dataset_dir / "horizons" / h_label / "baseline_summary.csv")
+    baseline_csv: "Path | None" = None
+    for c in candidates:
+        if c.exists():
+            baseline_csv = c
+            break
+    if baseline_csv is None:
         return {}
     try:
         df = pd.read_csv(baseline_csv)
@@ -342,15 +402,15 @@ def _bar_fmt(v: float) -> str:
 
 
 def _annotate_bars(ax: plt.Axes, fontsize: int = 9) -> None:
-    """Annotate each bar patch with its numeric value (rotated 90°)."""
+    """Annotate each bar patch with its numeric value (rotated 90°), anchored at y=0."""
     for rect in ax.patches:
         h = rect.get_height()
         if not np.isfinite(h) or h == 0:
             continue
         x = rect.get_x() + rect.get_width() / 2
         va = "bottom" if h >= 0 else "top"
-        ax.text(x, h, _bar_fmt(h), ha="center", va=va, fontsize=fontsize,
-                rotation=90, clip_on=False)
+        ax.text(x, 0, _bar_fmt(h), ha="center", va=va, fontsize=fontsize,
+                rotation=90, clip_on=True)
 
 
 def _plot_rate_bar(
@@ -399,7 +459,7 @@ def _plot_rate_bar(
     _annotate_bars(ax)
     _ylo, _yhi = ax.get_ylim()
     _span = _yhi - _ylo
-    ax.set_ylim(_ylo - 0.12 * _span, _yhi + 0.2 * _span)
+    ax.set_ylim(_ylo - 0.12 * _span, _yhi + 0.20 * _span)
 
     fig.tight_layout()
     out = summaries_dir / filename
@@ -456,43 +516,47 @@ def _plot_rates(rate_df: pd.DataFrame, summaries_dir: Path, show_std: bool = Tru
     return out
 
 
-def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std: bool = True) -> int:
-    datasets = _discover_datasets(data_root, prefix)
-    if not datasets:
-        print(f"[WARN] No datasets with lookahead metrics found under {data_root}.")
-        return 1
+def _build_records(
+    datasets: list[tuple[str, Path, Path]],
+    prefix: str,
+    model_class_filter: "str | None",
+    show_std: bool,
+) -> list[tuple[str, pd.DataFrame]]:
+    """Load and enrich metrics for each dataset, filtered by model_class.
 
-    print(f"[INFO] Found {len(datasets)} dataset(s) with lookahead metrics.")
-    summaries_dir.mkdir(parents=True, exist_ok=True)
+    *model_class_filter*: 'ml', 'mlr', or None (accept all rows).
 
-    # Each record: (label, dataframe-with-nrmse-column)
+    Returns a list of (clean_label, enriched_df) pairs with nrmse and skill columns added.
+    Rows where model_class column exists and does not match *model_class_filter* are dropped.
+    """
     records: list[tuple[str, pd.DataFrame]] = []
     for name, dataset_dir, csv_path in datasets:
         try:
             df = pd.read_csv(csv_path)
-            # Normalise column name: k_RunHorizonSweep uses "horizon",
-            # legacy k_lookahead_sweep used "lookahead".
             if "horizon" in df.columns and "lookahead" not in df.columns:
                 df = df.rename(columns={"horizon": "lookahead"})
             df = df.sort_values("lookahead").reset_index(drop=True)
-            std_target = _load_std_target(dataset_dir)
-            if std_target is not None:
-                df["nrmse"] = df["rmse"] / std_target
-                std_note = f"std_target={std_target:.4g}"
-            else:
-                df["nrmse"] = float("nan")
-                std_note = "std_target not found – nRMSE will be NaN"
 
-            # Skill vs. each baseline — requires per-horizon evaluation_summary.csv.
-            # Cache lookups so each (horizon, replicate) pair is read at most once.
+            # Filter by model_class if requested and column is present.
+            if model_class_filter is not None and "model_class" in df.columns:
+                df = df[df["model_class"] == model_class_filter].copy()
+            if df.empty:
+                continue
+
+            std_target = _load_std_target(dataset_dir)
+            df["nrmse"] = df["rmse"] / std_target if std_target is not None else float("nan")
+
+            # Skill vs. baselines — keyed by (horizon, replicate, model_class).
             rep_col = "replicate" if "replicate" in df.columns else None
-            _baseline_cache: dict[tuple[int, int], dict[str, float]] = {}
+            mc_col = "model_class" if "model_class" in df.columns else None
+            _baseline_cache: dict[tuple, dict[str, float]] = {}
             for _, _row in df.iterrows():
                 _h = int(_row["lookahead"])
                 _r = int(_row[rep_col]) if rep_col else 0
-                _key = (_h, _r)
+                _mc = str(_row[mc_col]) if mc_col else None
+                _key = (_h, _r, _mc)
                 if _key not in _baseline_cache:
-                    _baseline_cache[_key] = _load_baseline_rmses(dataset_dir, _h, _r)
+                    _baseline_cache[_key] = _load_baseline_rmses(dataset_dir, _h, _r, _mc)
 
             def _skill(model_rmse: float, baseline_rmse: float) -> float:
                 if np.isfinite(model_rmse) and np.isfinite(baseline_rmse) and baseline_rmse > 0:
@@ -502,7 +566,8 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std
             def _get_skills(row: pd.Series) -> pd.Series:
                 h = int(row["lookahead"])
                 r = int(row[rep_col]) if rep_col else 0
-                bl = _baseline_cache.get((h, r), {})
+                mc = str(row[mc_col]) if mc_col else None
+                bl = _baseline_cache.get((h, r, mc), {})
                 m = float(row["rmse"])
                 return pd.Series({
                     "skill_v_naive":    _skill(m, bl.get("naive",    float("nan"))),
@@ -522,32 +587,121 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std
             records.append((label, df))
             n_horizons = df["lookahead"].nunique()
             n_reps = df["replicate"].nunique() if "replicate" in df.columns else 1
-            print(f"[INFO]  {name}: {n_horizons} horizons × {n_reps} replicate(s), {std_note}")
+            std_note = f"std_target={std_target:.4g}" if std_target is not None else "std_target not found"
+            mc_note = f" [{model_class_filter}]" if model_class_filter else ""
+            print(f"[INFO]  {name}{mc_note}: {n_horizons} horizons × {n_reps} replicate(s), {std_note}")
         except Exception:
             print(f"[WARN] Could not load {csv_path}:")
             traceback.print_exc()
+    return records
 
+
+def _pick_best_records(
+    records_ml: list[tuple[str, pd.DataFrame]],
+    records_mlr: list[tuple[str, pd.DataFrame]],
+) -> list[tuple[str, pd.DataFrame]]:
+    """Return one record per label: whichever model_class has higher initial_skill at min horizon.
+
+    For labels that appear in only one class, that class's record is used.
+    Falls back to lower mean RMSE when skill is NaN for both.
+    """
+    ml_map = {lbl: df for lbl, df in records_ml}
+    mlr_map = {lbl: df for lbl, df in records_mlr}
+    all_labels = list(dict.fromkeys([lbl for lbl, _ in records_ml] + [lbl for lbl, _ in records_mlr]))
+    best: list[tuple[str, pd.DataFrame]] = []
+    for lbl in all_labels:
+        ml_df = ml_map.get(lbl)
+        mlr_df = mlr_map.get(lbl)
+        if ml_df is None:
+            best.append((lbl, mlr_df))
+            continue
+        if mlr_df is None:
+            best.append((lbl, ml_df))
+            continue
+        # Compare initial skill at minimum horizon
+        def _initial_skill(df: pd.DataFrame) -> float:
+            if "skill_v_best_baseline" not in df.columns:
+                return float("nan")
+            min_h = df["lookahead"].min()
+            vals = df.loc[df["lookahead"] == min_h, "skill_v_best_baseline"].dropna()
+            return float(vals.mean()) if not vals.empty else float("nan")
+
+        s_ml = _initial_skill(ml_df)
+        s_mlr = _initial_skill(mlr_df)
+        if np.isfinite(s_ml) and np.isfinite(s_mlr):
+            best.append((lbl, ml_df if s_ml >= s_mlr else mlr_df))
+        elif np.isfinite(s_ml):
+            best.append((lbl, ml_df))
+        elif np.isfinite(s_mlr):
+            best.append((lbl, mlr_df))
+        else:
+            # Fall back to lower mean RMSE
+            rmse_ml = float(ml_df["rmse"].mean()) if "rmse" in ml_df.columns else float("inf")
+            rmse_mlr = float(mlr_df["rmse"].mean()) if "rmse" in mlr_df.columns else float("inf")
+            best.append((lbl, ml_df if rmse_ml <= rmse_mlr else mlr_df))
+    return best
+
+
+def _write_aggregate_csv(records: list[tuple[str, pd.DataFrame]], out_path: Path) -> None:
+    """Write lookahead_aggregate.csv for the given records list."""
+    _drop_suffix = "_replicate"
+    _front_cols = [
+        "dataset", "model_class", "model_name", "lookahead", "replicate",
+        "mae", "rmse", "nrmse", "r2", "pearson_r",
+        "skill_v_naive", "skill_v_seasonal", "skill_v_linear", "skill_v_best_baseline",
+    ]
+    agg_frames = []
+    for lbl, df in records:
+        frame = df.copy()
+        frame = frame.drop(columns=[c for c in frame.columns if c.endswith(_drop_suffix)],
+                           errors="ignore")
+        frame.insert(0, "dataset", lbl)
+        _numeric_means = (
+            frame.groupby("lookahead", sort=True)
+                 .mean(numeric_only=True)
+                 .reset_index()
+        )
+        _numeric_means["dataset"]   = lbl
+        _numeric_means["replicate"] = "mean"
+        frame = pd.concat([frame, _numeric_means], ignore_index=True)
+        agg_frames.append(frame)
+    agg_df = pd.concat(agg_frames, ignore_index=True)
+    _rest_cols = [c for c in agg_df.columns if c not in _front_cols]
+    agg_df = agg_df[[c for c in _front_cols if c in agg_df.columns] + _rest_cols]
+    agg_df.to_csv(out_path, index=False)
+
+
+def _generate_all_figures(
+    records: list[tuple[str, pd.DataFrame]],
+    out_dir: Path,
+    show_std: bool = True,
+    all_x: "list | None" = None,
+    tag: str = "",
+) -> None:
+    """Generate the standard 7-figure + 2-CSV set for a single records list.
+
+    *all_x*: shared x-axis tick values; computed from *records* if not provided.
+    *tag*: short string for log messages (e.g. 'best', 'ml', 'mlr').
+    """
     if not records:
-        print("[WARN] No data loaded; aborting.")
-        return 1
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pfx = f"[{tag}] " if tag else ""
 
-    # Collect all x-values across datasets for consistent tick marks
-    all_x = sorted({v for _, df in records for v in df["lookahead"].dropna().tolist()})
+    if all_x is None:
+        all_x = sorted({v for _, df in records for v in df["lookahead"].dropna().tolist()})
 
-    # Detect whether any dataset has multiple replicates (drives σ-band and legend content).
-    # Suppressed entirely when show_std=False.
     any_replicates = show_std and any(
         "replicate" in df.columns and df["replicate"].nunique() > 1
         for _, df in records
     )
 
-    # Layout constants matching b_ExploreData.py Target_timeseries style
     _FIG_WIDTH  = 13.0
     _ROW_HEIGHT = 0.88
     _MIN_FIG_H  = 2.8
     _HSPACE     = 0.08
-    _TOP_IN     = 0.45   # inches reserved at top — must exceed legend height (~0.35 in) + gap
-    _BOTTOM_IN  = 0.90   # inches reserved at bottom (staggered tick labels + supxlabel)
+    _TOP_IN     = 0.45
+    _BOTTOM_IN  = 0.90
 
     def _make_figure(
         metric: str,
@@ -555,8 +709,8 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std
         filename: str,
         hline_zero: bool = False,
         any_replicates: bool = False,
-        ylim: tuple | None = None,
-        yticks: list | None = None,
+        ylim: "tuple | None" = None,
+        yticks: "list | None" = None,
     ) -> Path:
         n_rows = len(records)
         fig_h = max(_MIN_FIG_H, _ROW_HEIGHT * n_rows)
@@ -582,21 +736,12 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std
                 x = grp["lookahead"]
                 mu = grp["mean"]
                 sigma = grp["std"].fillna(0)
-                # Mean line (solid with markers)
-                ax.plot(x, mu, marker="o", markersize=4, linewidth=1.5,
-                        color=color, zorder=3)
-                # ±1σ — dashed, matching b_ExploreData.py Surface_timeseries_uncertainty style
-                ax.plot(x, mu + sigma,     linestyle="--", linewidth=0.8, alpha=0.7,
-                        color=color, zorder=2)
-                ax.plot(x, mu - sigma,     linestyle="--", linewidth=0.8, alpha=0.7,
-                        color=color, zorder=2)
-                # ±2σ — dotted
-                ax.plot(x, mu + 2 * sigma, linestyle=":",  linewidth=0.6, alpha=0.55,
-                        color=color, zorder=1)
-                ax.plot(x, mu - 2 * sigma, linestyle=":",  linewidth=0.6, alpha=0.55,
-                        color=color, zorder=1)
+                ax.plot(x, mu, marker="o", markersize=4, linewidth=1.5, color=color, zorder=3)
+                ax.plot(x, mu + sigma, linestyle="--", linewidth=0.8, alpha=0.7, color=color, zorder=2)
+                ax.plot(x, mu - sigma, linestyle="--", linewidth=0.8, alpha=0.7, color=color, zorder=2)
+                ax.plot(x, mu + 2 * sigma, linestyle=":", linewidth=0.6, alpha=0.55, color=color, zorder=1)
+                ax.plot(x, mu - 2 * sigma, linestyle=":", linewidth=0.6, alpha=0.55, color=color, zorder=1)
             else:
-                # Single replicate or legacy CSV without replicate column
                 plot_df = (
                     df.groupby("lookahead")[metric].mean().reset_index()
                     if "replicate" in df.columns else df
@@ -605,8 +750,7 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std
                         marker="o", markersize=4, linewidth=1.5, color=color)
 
             wrapped = "\n".join(textwrap.wrap(label, width=15))
-            ax.set_ylabel(wrapped, rotation=0, ha="right", va="center",
-                          fontsize=15, labelpad=8)
+            ax.set_ylabel(wrapped, rotation=0, ha="right", va="center", fontsize=15, labelpad=8)
             ax.grid(axis="both", alpha=0.3)
             if yticks is not None:
                 ax.set_yticks(yticks)
@@ -619,8 +763,6 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std
             if i < n_rows - 1:
                 ax.tick_params(axis="x", which="both", labelbottom=False)
 
-        # X-axis: staggered tick labels on bottom subplot only.
-        # get_xaxis_transform(): x in data coords, y in axes fraction (negative = below axis).
         axes[-1].set_xticks(all_x)
         axes[-1].set_xticklabels([])
         trans = axes[-1].get_xaxis_transform()
@@ -629,45 +771,28 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std
             axes[-1].text(val, y_offset, str(int(val)), transform=trans,
                           ha="center", va="top", fontsize=10)
 
-        # Margins — computed here so axes height is known for xlabel labelpad.
         top_frac    = max(0.86, min(0.995, 1.0 - (_TOP_IN    / fig_h)))
         bottom_frac = max(0.08, min(0.30,          _BOTTOM_IN / fig_h))
-        fig.subplots_adjust(
-            left=0.18, right=0.995,
-            top=top_frac, bottom=bottom_frac,
-            hspace=_HSPACE,
-        )
-
-        # X-axis label — positioned below the deepest stagger text.
-        # The stagger sits at -0.12 axes fraction; convert to points to derive labelpad.
+        fig.subplots_adjust(left=0.18, right=0.995, top=top_frac, bottom=bottom_frac, hspace=_HSPACE)
         _axes_h_frac = (top_frac - bottom_frac) / (n_rows + max(n_rows - 1, 0) * _HSPACE)
         _axes_h_pts  = _axes_h_frac * fig_h * 72
         _xlabel_pad  = max(18, int(0.12 * _axes_h_pts + 15))
         axes[-1].set_xlabel("Forecast horizon (hours)", fontsize=15, labelpad=_xlabel_pad)
 
-        # Single figure-level legend above top subplot with generic black lines
         legend_handles = [
             plt.Line2D([0], [0], color="black", linewidth=1.5,
-                       marker="o", markersize=4, label=f"Mean {ylabel}"),
+                       marker="o", markersize=4, label="Mean"),
         ]
         if any_replicates:
             legend_handles += [
-                plt.Line2D([0], [0], color="black", linestyle="--",
-                           linewidth=0.8, alpha=0.7,  label="±1σ"),
-                plt.Line2D([0], [0], color="black", linestyle=":",
-                           linewidth=0.6, alpha=0.55, label="±2σ"),
+                plt.Line2D([0], [0], color="black", linestyle="--", linewidth=0.8, alpha=0.7, label="±1σ"),
+                plt.Line2D([0], [0], color="black", linestyle=":", linewidth=0.6, alpha=0.55, label="±2σ"),
             ]
-        fig.legend(
-            handles=legend_handles,
-            loc="upper center",
-            bbox_to_anchor=(0.5, 1.03),
-            ncol=len(legend_handles),
-            framealpha=0.85,
-            fontsize=15,
-            borderaxespad=0.12,
-        )
+        fig.legend(handles=legend_handles, loc="lower center", bbox_to_anchor=(0.5, 1.0),
+                   bbox_transform=axes[0].transAxes,
+                   ncol=len(legend_handles), framealpha=0.85, fontsize=15, borderaxespad=0.12)
 
-        out = summaries_dir / filename
+        out = out_dir / filename
         fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.02)
         plt.close(fig)
         return out
@@ -675,115 +800,346 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std
     r2_path = _make_figure("r2", "R²", "lookahead_r2_comparison.png",
                            hline_zero=True, any_replicates=any_replicates,
                            ylim=(-1.2, 1.2), yticks=[-1, 0, 1])
-    print(f"[INFO] Wrote R² figure:    {r2_path}")
+    print(f"[INFO] {pfx}Wrote R²:    {r2_path}")
 
-    # Shared nRMSE y-axis limits: global min/max across all datasets and replicates.
-    _nrmse_all = pd.concat(
-        [df["nrmse"] for _, df in records if "nrmse" in df.columns],
-        ignore_index=True,
-    ).dropna()
+    _nrmse_all = pd.concat([df["nrmse"] for _, df in records if "nrmse" in df.columns],
+                           ignore_index=True).dropna()
     if not _nrmse_all.empty:
         _nrmse_min, _nrmse_max = float(_nrmse_all.min()), float(_nrmse_all.max())
-        _nrmse_margin = 0.1 * (_nrmse_max - _nrmse_min)
-        nrmse_ylim = (_nrmse_min - _nrmse_margin, _nrmse_max + _nrmse_margin)
+        _margin = 0.1 * (_nrmse_max - _nrmse_min)
+        nrmse_ylim: "tuple | None" = (_nrmse_min - _margin, _nrmse_max + _margin)
     else:
         nrmse_ylim = None
-
     nrmse_path = _make_figure("nrmse", "nRMSE (RMSE / σ_target)", "lookahead_nrmse_comparison.png",
                               any_replicates=any_replicates, ylim=nrmse_ylim)
-    print(f"[INFO] Wrote nRMSE figure: {nrmse_path}")
+    print(f"[INFO] {pfx}Wrote nRMSE: {nrmse_path}")
 
-    # Skill vs. best-baseline figure
     _skill_all = pd.concat(
         [df["skill_v_best_baseline"] for _, df in records if "skill_v_best_baseline" in df.columns],
-        ignore_index=True,
-    ).dropna()
+        ignore_index=True).dropna()
     if not _skill_all.empty:
         _s_min, _s_max = float(_skill_all.min()), float(_skill_all.max())
         _s_margin = max(0.05, 0.1 * (_s_max - _s_min))
-        skill_ylim: tuple | None = (max(-2.0, _s_min - _s_margin), min(1.05, _s_max + _s_margin))
+        skill_ylim: "tuple | None" = (max(-2.0, _s_min - _s_margin), min(1.05, _s_max + _s_margin))
     else:
         skill_ylim = None
+    skill_path = _make_figure("skill_v_best_baseline", "Skill vs. Best Baseline",
+                              "lookahead_skill_comparison.png", hline_zero=True,
+                              any_replicates=any_replicates, ylim=skill_ylim)
+    print(f"[INFO] {pfx}Wrote skill: {skill_path}")
 
-    skill_path = _make_figure(
-        "skill_v_best_baseline",
-        "Skill vs. Best Baseline",
-        "lookahead_skill_comparison.png",
-        hline_zero=True,
-        any_replicates=any_replicates,
-        ylim=skill_ylim,
-    )
-    print(f"[INFO] Wrote skill figure:  {skill_path}")
-
-    # Aggregate CSV — all datasets × horizons × replicates in one table
-    _drop_suffix = "_replicate"   # these columns repeat per-replicate values; redundant here
-    _front_cols = [
-        "dataset", "lookahead", "replicate",
-        "mae", "rmse", "nrmse", "r2", "pearson_r",
-        "skill_v_naive", "skill_v_seasonal", "skill_v_linear", "skill_v_best_baseline",
-    ]
-    agg_frames = []
-    for lbl, df in records:
-        frame = df.copy()
-        # Drop redundant *_replicate aggregate columns
-        frame = frame.drop(columns=[c for c in frame.columns if c.endswith(_drop_suffix)],
-                           errors="ignore")
-        frame.insert(0, "dataset", lbl)
-        # Append a replicate=mean row for each lookahead value
-        _numeric_means = (
-            frame.groupby("lookahead", sort=True)
-                 .mean(numeric_only=True)
-                 .reset_index()
-        )
-        _numeric_means["dataset"]   = lbl
-        _numeric_means["replicate"] = "mean"
-        frame = pd.concat([frame, _numeric_means], ignore_index=True)
-        agg_frames.append(frame)
-    agg_df = pd.concat(agg_frames, ignore_index=True)
-    # Reorder: metric/skill columns first, then remaining metadata
-    _rest_cols = [c for c in agg_df.columns if c not in _front_cols]
-    agg_df = agg_df[[c for c in _front_cols if c in agg_df.columns] + _rest_cols]
-    agg_path = summaries_dir / "lookahead_aggregate.csv"
-    agg_df.to_csv(agg_path, index=False)
-    print(f"[INFO] Wrote aggregate CSV: {agg_path}")
+    agg_path = out_dir / "lookahead_aggregate.csv"
+    _write_aggregate_csv(records, agg_path)
+    print(f"[INFO] {pfx}Wrote aggregate CSV: {agg_path}")
 
     rate_df = _rate_table(records)
-    rate_path = summaries_dir / "lookahead_rates.csv"
+    rate_path = out_dir / "lookahead_rates.csv"
     rate_df.to_csv(rate_path, index=False)
-    print(f"[INFO] Wrote rates CSV:     {rate_path}")
+    print(f"[INFO] {pfx}Wrote rates CSV: {rate_path}")
 
-    rates_path = _plot_rates(rate_df, summaries_dir, show_std=show_std)
-    print(f"[INFO] Wrote rates figure:  {rates_path}")
+    rates_path = _plot_rates(rate_df, out_dir, show_std=show_std)
+    print(f"[INFO] {pfx}Wrote rates bar: {rates_path}")
 
     skill_bar_path = _plot_rate_bar(
         rate_df, "skill_rate", "Skill avg. rate of change (/hr)",
-        "lookahead_skill_rate_bar.png", summaries_dir,
+        "lookahead_skill_rate_bar.png", out_dir,
         ascending=True, color=_SERIES_COLORS[1],
         std_col="std_skill_rate" if show_std else None,
         std_label="σ(skill) rate (/hr)",
     )
-    print(f"[INFO] Wrote skill rate bar: {skill_bar_path}")
+    print(f"[INFO] {pfx}Wrote skill rate bar: {skill_bar_path}")
 
     r2_bar_path = _plot_rate_bar(
         rate_df, "r2_rate", "$R^2$ avg. rate of change (/hr)",
-        "lookahead_r2_rate_bar.png", summaries_dir,
+        "lookahead_r2_rate_bar.png", out_dir,
         ascending=True, color=_SERIES_COLORS[2],
         std_col="std_r2_rate" if show_std else None,
         std_label="σ(R²) rate (/hr)",
     )
-    print(f"[INFO] Wrote R² rate bar:   {r2_bar_path}")
+    print(f"[INFO] {pfx}Wrote R² rate bar: {r2_bar_path}")
 
-    # Time-to-zero-skill: initial skill / skill rate (hours at which linear
-    # extrapolation of skill reaches 0).  Larger positive values mean the model
-    # retains useful skill over a longer forecast horizon.
-    rate_df["time_to_zero_skill"] = rate_df["initial_skill"] / (-24*rate_df["skill_rate"])
+    rate_df["time_to_zero_skill"] = rate_df["initial_skill"] / (-24 * rate_df["skill_rate"])
     tzs_path = _plot_rate_bar(
-        rate_df, "time_to_zero_skill",
-        "Forecast Horizon (days)",
-        "lookahead_time_to_zero_skill.png", summaries_dir,
+        rate_df, "time_to_zero_skill", "Forecast Horizon (days)",
+        "lookahead_time_to_zero_skill.png", out_dir,
         ascending=False, color=_SERIES_COLORS[1],
     )
-    print(f"[INFO] Wrote time-to-zero-skill bar: {tzs_path}")
+    print(f"[INFO] {pfx}Wrote time-to-zero-skill: {tzs_path}")
+
+
+def _generate_combined_figures(
+    records_ml: list[tuple[str, pd.DataFrame]],
+    records_mlr: list[tuple[str, pd.DataFrame]],
+    out_dir: Path,
+    show_std: bool = True,
+    all_x: "list | None" = None,
+) -> None:
+    """Generate combined figures with ML (solid) and MLR (dashed) series on same axes.
+
+    One subplot per target label. If a target has no MLR data, that subplot shows
+    only the ML series (and vice versa).  Labels that have neither are hidden.
+    Combined aggregate CSV and rates CSV include model_class column.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ml_map  = {lbl: df for lbl, df in records_ml}
+    mlr_map = {lbl: df for lbl, df in records_mlr}
+    all_labels = list(dict.fromkeys(
+        [lbl for lbl, _ in records_ml] + [lbl for lbl, _ in records_mlr]
+    ))
+    # Only include labels that have at least one of ML or MLR.
+    active_labels = [lbl for lbl in all_labels if ml_map.get(lbl) is not None or mlr_map.get(lbl) is not None]
+    if not active_labels:
+        return
+
+    if all_x is None:
+        all_series = list(records_ml) + list(records_mlr)
+        all_x = sorted({v for _, df in all_series for v in df["lookahead"].dropna().tolist()})
+
+    _FIG_WIDTH  = 13.0
+    _ROW_HEIGHT = 0.88
+    _MIN_FIG_H  = 2.8
+    _HSPACE     = 0.08
+    _TOP_IN     = 0.55   # slightly more room for legend (ML/MLR entries)
+    _BOTTOM_IN  = 0.90
+
+    _ML_LS  = "-"    # solid for ML
+    _MLR_LS = "--"   # dashed for MLR
+
+    def _make_combined_figure(
+        metric: str,
+        ylabel: str,
+        filename: str,
+        hline_zero: bool = False,
+        ylim: "tuple | None" = None,
+        yticks: "list | None" = None,
+    ) -> Path:
+        n_rows = len(active_labels)
+        fig_h = max(_MIN_FIG_H, _ROW_HEIGHT * n_rows)
+        fig, axes = plt.subplots(
+            n_rows, 1, sharex=True,
+            figsize=(_FIG_WIDTH, fig_h),
+            gridspec_kw={"hspace": _HSPACE},
+        )
+        if n_rows == 1:
+            axes = [axes]
+
+        for i, label in enumerate(active_labels):
+            ax = axes[i]
+            color = _SERIES_COLORS[i % len(_SERIES_COLORS)]
+            has_any = False
+
+            for df_map, ls, class_name in [(ml_map, _ML_LS, "ML"), (mlr_map, _MLR_LS, "MLR")]:
+                df = df_map.get(label)
+                if df is None or metric not in df.columns or df[metric].isnull().all():
+                    continue
+                has_any = True
+                plot_df = df.groupby("lookahead")[metric].mean().reset_index()
+                ax.plot(plot_df["lookahead"], plot_df[metric],
+                        marker="o" if ls == _ML_LS else None,
+                        markersize=4, linewidth=1.5,
+                        color=color, linestyle=ls, zorder=3)
+
+            if not has_any:
+                ax.set_visible(False)
+                continue
+
+            wrapped = "\n".join(textwrap.wrap(label, width=15))
+            ax.set_ylabel(wrapped, rotation=0, ha="right", va="center", fontsize=15, labelpad=8)
+            ax.grid(axis="both", alpha=0.3)
+            if yticks is not None:
+                ax.set_yticks(yticks)
+            else:
+                ax.yaxis.set_major_locator(MaxNLocator(nbins=3))
+            if ylim is not None:
+                ax.set_ylim(*ylim)
+            if hline_zero:
+                ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+            if i < n_rows - 1:
+                ax.tick_params(axis="x", which="both", labelbottom=False)
+
+        axes[-1].set_xticks(all_x)
+        axes[-1].set_xticklabels([])
+        trans = axes[-1].get_xaxis_transform()
+        for j, val in enumerate(all_x):
+            y_offset = -0.1 if j % 2 == 0 else -0.12
+            axes[-1].text(val, y_offset, str(int(val)), transform=trans,
+                          ha="center", va="top", fontsize=10)
+
+        top_frac    = max(0.86, min(0.995, 1.0 - (_TOP_IN    / fig_h)))
+        bottom_frac = max(0.08, min(0.30,          _BOTTOM_IN / fig_h))
+        fig.subplots_adjust(left=0.18, right=0.995, top=top_frac, bottom=bottom_frac, hspace=_HSPACE)
+        _axes_h_frac = (top_frac - bottom_frac) / (n_rows + max(n_rows - 1, 0) * _HSPACE)
+        _axes_h_pts  = _axes_h_frac * fig_h * 72
+        _xlabel_pad  = max(18, int(0.12 * _axes_h_pts + 15))
+        axes[-1].set_xlabel("Forecast horizon (hours)", fontsize=15, labelpad=_xlabel_pad)
+
+        legend_handles = [
+            plt.Line2D([0], [0], color="black", linewidth=1.5, linestyle=_ML_LS,
+                       marker="o", markersize=4, label="Machine Learning"),
+            plt.Line2D([0], [0], color="black", linewidth=1.5, linestyle=_MLR_LS,
+                       label="Multiple Linear Regression"),
+        ]
+        fig.legend(handles=legend_handles, loc="lower center", bbox_to_anchor=(0.5, 1.0),
+                   bbox_transform=axes[0].transAxes,
+                   ncol=2, framealpha=0.85, fontsize=15, borderaxespad=0.12)
+
+        out = out_dir / filename
+        fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.02)
+        plt.close(fig)
+        return out
+
+    r2_path = _make_combined_figure("r2", "R²", "lookahead_r2_comparison.png",
+                                    hline_zero=True, ylim=(-1.2, 1.2), yticks=[-1, 0, 1])
+    print(f"[INFO] [combined] Wrote R²: {r2_path}")
+
+    all_nrmse = pd.concat(
+        [df["nrmse"] for _, df in list(records_ml) + list(records_mlr) if "nrmse" in df.columns],
+        ignore_index=True).dropna()
+    if not all_nrmse.empty:
+        _n_min, _n_max = float(all_nrmse.min()), float(all_nrmse.max())
+        _n_margin = 0.1 * (_n_max - _n_min)
+        nrmse_ylim: "tuple | None" = (_n_min - _n_margin, _n_max + _n_margin)
+    else:
+        nrmse_ylim = None
+    nrmse_path = _make_combined_figure("nrmse", "nRMSE", "lookahead_nrmse_comparison.png",
+                                       ylim=nrmse_ylim)
+    print(f"[INFO] [combined] Wrote nRMSE: {nrmse_path}")
+
+    all_skill = pd.concat(
+        [df["skill_v_best_baseline"] for _, df in list(records_ml) + list(records_mlr)
+         if "skill_v_best_baseline" in df.columns],
+        ignore_index=True).dropna()
+    if not all_skill.empty:
+        _s_min, _s_max = float(all_skill.min()), float(all_skill.max())
+        _s_margin = max(0.05, 0.1 * (_s_max - _s_min))
+        skill_ylim: "tuple | None" = (max(-2.0, _s_min - _s_margin), min(1.05, _s_max + _s_margin))
+    else:
+        skill_ylim = None
+    skill_path = _make_combined_figure("skill_v_best_baseline", "Skill", "lookahead_skill_comparison.png",
+                                       hline_zero=True, ylim=skill_ylim)
+    print(f"[INFO] [combined] Wrote skill: {skill_path}")
+
+    # Combined aggregate CSV
+    combined_records = [(lbl, df) for lbl, df in records_ml] + [(lbl, df) for lbl, df in records_mlr]
+    agg_path = out_dir / "lookahead_aggregate.csv"
+    _write_aggregate_csv(combined_records, agg_path)
+    print(f"[INFO] [combined] Wrote aggregate CSV: {agg_path}")
+
+    # Combined rates CSV (two rows per dataset: ML and MLR)
+    rate_df_ml  = _rate_table(records_ml)
+    rate_df_mlr = _rate_table(records_mlr)
+    if not rate_df_ml.empty:
+        rate_df_ml["model_class"] = "ml"
+    if not rate_df_mlr.empty:
+        rate_df_mlr["model_class"] = "mlr"
+    combined_rate_df = pd.concat([rate_df_ml, rate_df_mlr], ignore_index=True)
+    rate_path = out_dir / "lookahead_rates.csv"
+    combined_rate_df.to_csv(rate_path, index=False)
+    print(f"[INFO] [combined] Wrote rates CSV: {rate_path}")
+
+    # Bar charts — one clustered pair of bars per dataset (ML blue, MLR orange)
+    # Use rate_df_ml and rate_df_mlr aligned by dataset label.
+    def _plot_combined_rate_bar(col: str, ylabel: str, filename: str, ascending: bool = False) -> None:
+        all_datasets = list(dict.fromkeys(
+            list(rate_df_ml["dataset"]) + list(rate_df_mlr["dataset"])
+        ))
+        ml_vals  = rate_df_ml.set_index("dataset")[col] if not rate_df_ml.empty else pd.Series(dtype=float)
+        mlr_vals = rate_df_mlr.set_index("dataset")[col] if not rate_df_mlr.empty else pd.Series(dtype=float)
+        # Order by ML value (NaN last)
+        order = sorted(all_datasets, key=lambda d: (
+            not np.isfinite(ml_vals.get(d, float("nan"))), ml_vals.get(d, float("nan"))
+        ), reverse=not ascending)
+        n = len(order)
+        x = np.arange(n)
+        bar_w = 0.42
+        fig_w = max(6.0, 0.9 * n + 1.5)
+        fig, ax = plt.subplots(figsize=(fig_w, 4.5))
+        ax.bar(x - bar_w / 2, [ml_vals.get(d, float("nan")) for d in order],
+               width=bar_w, color=_SERIES_COLORS[0], label="Machine Learning")
+        ax.bar(x + bar_w / 2, [mlr_vals.get(d, float("nan")) for d in order],
+               width=bar_w, color=_SERIES_COLORS[5], label="Multiple Linear Regression")
+        ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(order, rotation=45, ha="right", fontsize=14)
+        ax.tick_params(axis="y", labelsize=14)
+        ax.set_ylabel(textwrap.fill(ylabel, width=20), fontsize=14)
+        ax.set_xlim(-0.5, n - 0.5)
+        ax.grid(axis="y", alpha=0.3)
+        ax.legend(fontsize=11, framealpha=0.85)
+        _annotate_bars(ax)
+        _ylo, _yhi = ax.get_ylim()
+        _span = _yhi - _ylo
+        ax.set_ylim(_ylo - 0.12 * _span, _yhi + 0.20 * _span)
+        fig.tight_layout()
+        out = out_dir / filename
+        fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.02)
+        plt.close(fig)
+        print(f"[INFO] [combined] Wrote {filename}: {out}")
+
+    _plot_combined_rate_bar("nrmse_rate", "nRMSE avg. rate of change (/hr)",
+                            "lookahead_rates_bar.png", ascending=False)
+    _plot_combined_rate_bar("skill_rate", "Skill avg. rate of change (/hr)",
+                            "lookahead_skill_rate_bar.png", ascending=True)
+    _plot_combined_rate_bar("r2_rate", "$R^2$ avg. rate of change (/hr)",
+                            "lookahead_r2_rate_bar.png", ascending=True)
+
+    # Time-to-zero-skill combined
+    for _rdf in [rate_df_ml, rate_df_mlr]:
+        _rdf["time_to_zero_skill"] = _rdf["initial_skill"] / (-24 * _rdf["skill_rate"])
+    _plot_combined_rate_bar("time_to_zero_skill", "Forecast Horizon (days)",
+                            "lookahead_time_to_zero_skill.png", ascending=False)
+
+
+def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std: bool = True) -> int:
+    datasets = _discover_datasets(data_root, prefix)
+    if not datasets:
+        print(f"[WARN] No datasets with lookahead metrics found under {data_root}.")
+        return 1
+
+    print(f"[INFO] Found {len(datasets)} dataset(s) with lookahead metrics.")
+    summaries_dir.mkdir(parents=True, exist_ok=True)
+
+    # Shared x-axis tick values across all classes and datasets
+    all_x_set: set[float] = set()
+    for _, _, csv_path in datasets:
+        try:
+            _df = pd.read_csv(csv_path)
+            col = "horizon" if "horizon" in _df.columns else "lookahead"
+            if col in _df.columns:
+                all_x_set.update(_df[col].dropna().tolist())
+        except Exception:
+            pass
+    all_x = sorted(all_x_set)
+
+    print("[INFO] Building ML records...")
+    records_ml   = _build_records(datasets, prefix, model_class_filter="ml",   show_std=show_std)
+    print("[INFO] Building MLR records...")
+    records_mlr  = _build_records(datasets, prefix, model_class_filter="mlr",  show_std=show_std)
+    print("[INFO] Building combined (all) records for 'best' selection...")
+    records_all  = _build_records(datasets, prefix, model_class_filter=None,   show_std=show_std)
+
+    # 'best' = one record per label, whichever model_class has better initial_skill
+    if records_ml or records_mlr:
+        records_best = _pick_best_records(records_ml, records_mlr)
+    else:
+        records_best = records_all
+
+    print(f"\n[INFO] Generating best/ figures ({len(records_best)} dataset(s))...")
+    _generate_all_figures(records_best, summaries_dir / "best", show_std=show_std, all_x=all_x, tag="best")
+
+    print(f"\n[INFO] Generating ml/ figures ({len(records_ml)} dataset(s))...")
+    _generate_all_figures(records_ml, summaries_dir / "ml", show_std=show_std, all_x=all_x, tag="ml")
+
+    print(f"\n[INFO] Generating mlr/ figures ({len(records_mlr)} dataset(s))...")
+    _generate_all_figures(records_mlr, summaries_dir / "mlr", show_std=show_std, all_x=all_x, tag="mlr")
+
+    if records_ml and records_mlr:
+        print(f"\n[INFO] Generating combined/ figures...")
+        _generate_combined_figures(records_ml, records_mlr, summaries_dir / "combined",
+                                   show_std=show_std, all_x=all_x)
+    else:
+        print("[INFO] Skipping combined/ figures — fewer than 2 model classes have data.")
 
     return 0
 

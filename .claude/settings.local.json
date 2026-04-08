@@ -190,7 +190,10 @@
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z2_repair_baselines.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(.venv/Scripts/python src/z2_repair_baselines.py --data-root data/output/CV14 --dataset-prefix MC)",
       "Bash(.venv/Scripts/python src/z2_HorizonPostProcess.py --data-root data/output/CV14 --dataset-prefix MC)",
-      "Bash(grep -l \"historic_path\" \"c:/Users/Master/Documents/GitHub/WQRegressors/data/output/CV14/MC_Chromium__µg_L__res/\"*.yml)"
+      "Bash(grep -l \"historic_path\" \"c:/Users/Master/Documents/GitHub/WQRegressors/data/output/CV14/MC_Chromium__µg_L__res/\"*.yml)",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z2_HorizonPostProcess.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(xargs grep:*)",
+      "Bash(grep -l \"mc_replicates\" \"c:\\\\Users\\\\Master\\\\Documents\\\\GitHub\\\\WQRegressors\\\\data\\\\output\\\\CV14\\\\MC_Zinc__µg_L__res\\\\forecasts\\\\feature_sweeps\"/*/*.yml)"
     ]
   }
 }
