@@ -4,7 +4,7 @@ different horizons.
 Then, split the dataset into files for each equivalent sample.
 
 Example:
-python src/d_RunResample.py --config data/output/sampling/resample_config.yml
+python src/d_RunResample.py --config data/input/splitting/resample_config.yml
 '''
 
 import os
@@ -603,6 +603,198 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
     return str(config_path)
 
 
+def generate_recurrent_transformer_config_template(
+    output_dir, forecast_name, input_columns, state_column, sample_length, overrides=None
+):
+    """
+    Generate a template configuration file for e_TrainRecurrent.py (RecurrentTransformer).
+
+    :param output_dir: Output directory where config will be saved
+    :param forecast_name: Name of the forecast/dataset
+    :param input_columns: List of input column names (must include state_column)
+    :param state_column: Column used as both an input feature and the prediction target
+    :param sample_length: Length of each sample (number of rows)
+    :return: Path to the generated config file
+
+    Notes:
+    - input_row_2 is sample_length (all rows), not sample_length - 1.
+      The leakage guard (zeroing state_column in the last row) is applied
+      inside RecurrentTimeSeriesDataset, not at the data-loading level.
+    - Uses sample_subdir='samples' (unperturbed baseline); MC replicates are
+      not needed for recurrent models.
+    - Run with e_TrainRecurrent.py, not e_Train.py.
+    """
+    config = {
+        'model_type': 'recurrent_transformer',
+        'model_name': 'model_recurrent_transformer_01',
+        'device': 'cuda',
+        'matplotlib_backend': 'Agg',
+        'data': {
+            'data_dir': '.',
+            'sample_subdir': 'samples',
+            'forecast_name': forecast_name,
+            'input_columns': input_columns,
+            'state_column': state_column,
+            'input_row_1': 0,
+            'input_row_2': sample_length,
+            'output_columns': [state_column],
+            'output_rows': [sample_length - 1],
+        },
+        'data_split': {
+            'random_state': 42,
+            'test_size': 0.3,
+            'reuse_split': False,
+            'split_source': None,
+            'split_type': 'temporal',
+            'fault_tolerant': False,
+            'nan_tolerance': 0.0,
+        },
+        'hyperparameters': {
+            'num_epochs': 100,
+            'batch_size': 16,
+            'learning_rate': 0.001,
+            'patience': 20,
+            'model_dim': 64,
+            'num_heads': 4,
+            'num_layers': 2,
+            'dropout': 0.1,
+            'cv_tuning': {
+                'enabled': True,
+                'n_folds': 5,
+                'n_trials': 20,
+                'cv_epochs': 50,
+                'cv_patience': 10,
+                'param_space': {
+                    'model_dim': [64, 128, 256],
+                    'num_heads': [2, 4, 8],
+                    'num_layers': {'low': 2, 'high': 6, 'type': 'int'},
+                    'dropout': {'low': 0.05, 'high': 0.4},
+                    'learning_rate': {'low': 0.0005, 'high': 0.05, 'log': True},
+                    'batch_size': [8, 16, 32],
+                },
+            },
+        },
+        '_comments': {
+            'model_type': "Run with e_TrainRecurrent.py, not e_Train.py",
+            'state_column': "Column used as both input feature and prediction target (last row value)",
+            'input_row_2': f"Includes all {sample_length} rows; leakage guard applied inside RecurrentTimeSeriesDataset",
+            'output_rows': f"[{sample_length - 1}] — last row index (0-based) is the target",
+            'sample_subdir': "Uses unperturbed baseline samples; MC replicates not needed for recurrent models",
+            'fault_tolerant': "False — recurrent models require complete data without NaN in inputs",
+        },
+    }
+
+    if overrides:
+        config['hyperparameters'].update(overrides.get('hyperparameters', {}))
+        for key in ('model_type', 'model_name', 'device', 'matplotlib_backend'):
+            if key in overrides:
+                config[key] = overrides[key]
+        if 'data' in overrides:
+            config['data'].update(overrides['data'])
+        if 'data_split' in overrides:
+            config['data_split'].update(overrides['data_split'])
+
+    config_path = Path(output_dir) / 'config_recurrent_transformer_01.yml'
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    return str(config_path)
+
+
+def generate_lstm_config_template(
+    output_dir, forecast_name, input_columns, state_column, sample_length, overrides=None
+):
+    """
+    Generate a template configuration file for e_TrainRecurrent.py (LSTM).
+
+    :param output_dir: Output directory where config will be saved
+    :param forecast_name: Name of the forecast/dataset
+    :param input_columns: List of input column names (must include state_column)
+    :param state_column: Column used as both an input feature and the prediction target
+    :param sample_length: Length of each sample (number of rows)
+    :return: Path to the generated config file
+
+    Notes:
+    - Same structural differences from existing models as recurrent_transformer.
+    - LSTM-specific hyperparameters: hidden_dim instead of model_dim/num_heads.
+    - Run with e_TrainRecurrent.py, not e_Train.py.
+    """
+    config = {
+        'model_type': 'lstm',
+        'model_name': 'model_lstm_01',
+        'device': 'cuda',
+        'matplotlib_backend': 'Agg',
+        'data': {
+            'data_dir': '.',
+            'sample_subdir': 'samples',
+            'forecast_name': forecast_name,
+            'input_columns': input_columns,
+            'state_column': state_column,
+            'input_row_1': 0,
+            'input_row_2': sample_length,
+            'output_columns': [state_column],
+            'output_rows': [sample_length - 1],
+        },
+        'data_split': {
+            'random_state': 42,
+            'test_size': 0.3,
+            'reuse_split': False,
+            'split_source': None,
+            'split_type': 'temporal',
+            'fault_tolerant': False,
+            'nan_tolerance': 0.0,
+        },
+        'hyperparameters': {
+            'num_epochs': 100,
+            'batch_size': 16,
+            'learning_rate': 0.001,
+            'patience': 20,
+            'hidden_dim': 64,
+            'num_layers': 2,
+            'dropout': 0.1,
+            'cv_tuning': {
+                'enabled': True,
+                'n_folds': 5,
+                'n_trials': 20,
+                'cv_epochs': 50,
+                'cv_patience': 10,
+                'param_space': {
+                    'hidden_dim': [32, 64, 128, 256],
+                    'num_layers': {'low': 1, 'high': 4, 'type': 'int'},
+                    'dropout': {'low': 0.0, 'high': 0.5},
+                    'learning_rate': {'low': 0.0005, 'high': 0.05, 'log': True},
+                    'batch_size': [8, 16, 32],
+                },
+            },
+        },
+        '_comments': {
+            'model_type': "Run with e_TrainRecurrent.py, not e_Train.py",
+            'state_column': "Column used as both input feature and prediction target (last row value)",
+            'input_row_2': f"Includes all {sample_length} rows; leakage guard applied inside RecurrentTimeSeriesDataset",
+            'output_rows': f"[{sample_length - 1}] — last row index (0-based) is the target",
+            'sample_subdir': "Uses unperturbed baseline samples; MC replicates not needed for recurrent models",
+            'fault_tolerant': "False — recurrent models require complete data without NaN in inputs",
+            'hidden_dim': "LSTM hidden state size (replaces model_dim/num_heads from Transformer config)",
+        },
+    }
+
+    if overrides:
+        config['hyperparameters'].update(overrides.get('hyperparameters', {}))
+        for key in ('model_type', 'model_name', 'device', 'matplotlib_backend'):
+            if key in overrides:
+                config[key] = overrides[key]
+        if 'data' in overrides:
+            config['data'].update(overrides['data'])
+        if 'data_split' in overrides:
+            config['data_split'].update(overrides['data_split'])
+
+    config_path = Path(output_dir) / 'config_lstm_01.yml'
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    return str(config_path)
+
+
 def load_sensor_uncertainty_summary(sensor_name, corrections_dir):
     """
     Load sensor uncertainty summary for Monte Carlo sampling.
@@ -984,12 +1176,42 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
             length,
             overrides=training_config_defaults.get('gp', {}),
         )
+        state_col = next((c for c in predictor_cols if c.endswith("_state")), None)
+        if state_col is None:
+            if verbose:
+                print("[INFO] No _state column found in predictor_cols; skipping recurrent model configs.")
+            recurrent_transformer_config_path = None
+            lstm_config_path = None
+        else:
+            recurrent_transformer_config_path = generate_recurrent_transformer_config_template(
+                output_dir,
+                'recurrent_transformer_01',
+                predictor_cols,
+                state_col,
+                length,
+                overrides=training_config_defaults.get('recurrent_transformer', {}),
+            )
+            lstm_config_path = generate_lstm_config_template(
+                output_dir,
+                'lstm_01',
+                predictor_cols,
+                state_col,
+                length,
+                overrides=training_config_defaults.get('lstm', {}),
+            )
+        all_config_paths = [
+            p for p in [
+                xgb_config_path, transformer_config_path, gp_config_path,
+                recurrent_transformer_config_path, lstm_config_path,
+            ]
+            if p is not None
+        ]
         return {
             "sample_set_name": Path(output_dir).name,
             "target_columns": list(target_columns),
             "predictor_columns": list(predictor_cols),
             "n_samples": sample_count,
-            "config_paths": [xgb_config_path, transformer_config_path, gp_config_path],
+            "config_paths": all_config_paths,
         }
 
     # Target rows: every row from index (min_rows_needed - 1) onward is a candidate.
@@ -1073,12 +1295,42 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
         length,
         overrides=training_config_defaults.get('gp', {}),
     )
+    state_col = next((c for c in predictor_cols if c.endswith("_state")), None)
+    if state_col is None:
+        if verbose:
+            print("[INFO] No _state column found in predictor_cols; skipping recurrent model configs.")
+        recurrent_transformer_config_path = None
+        lstm_config_path = None
+    else:
+        recurrent_transformer_config_path = generate_recurrent_transformer_config_template(
+            output_dir,
+            'recurrent_transformer_01',
+            predictor_cols,
+            state_col,
+            length,
+            overrides=training_config_defaults.get('recurrent_transformer', {}),
+        )
+        lstm_config_path = generate_lstm_config_template(
+            output_dir,
+            'lstm_01',
+            predictor_cols,
+            state_col,
+            length,
+            overrides=training_config_defaults.get('lstm', {}),
+        )
+    all_config_paths = [
+        p for p in [
+            xgb_config_path, transformer_config_path, gp_config_path,
+            recurrent_transformer_config_path, lstm_config_path,
+        ]
+        if p is not None
+    ]
     return {
         "sample_set_name": Path(output_dir).name,
         "target_columns": list(target_columns),
         "predictor_columns": list(predictor_cols),
         "n_samples": n_samples,
-        "config_paths": [xgb_config_path, transformer_config_path, gp_config_path],
+        "config_paths": all_config_paths,
     }
 
 

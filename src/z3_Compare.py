@@ -42,9 +42,9 @@ CLI arguments:
                          when --output is an absolute path).
 
 Examples:
-python src/z3_Compare.py --root data/output/CV9 --root data/output/profileless
-python src/z3_Compare.py --root data/output/CV9 --label "With profiles" --root data/output/profileless --label "No profiles" --stat skill_vs_naive --sort
-python src/z3_Compare.py --root data/output/CV9 --root data/output/CV8 --stat r2 --output results/r2_comparison.png
+python src/z3_Compare.py --root data/output/CV14 --root data/output/profileless
+python src/z3_Compare.py --root data/output/CV14 --label "With profiles" --root data/output/CV15profileless --label "No profiles" --stat skill_vs_best_baseline --sort --output data/output/comparisons/profile/skill_vs_best_baseline.png
+python src/z3_Compare.py --root data/output/CV14 --label "With state" --root data/output/CV16statelessless --label "No state" --stat skill_vs_best_baseline --sort --output data/output/comparisons/state/skill_vs_best_baseline.png
 """
 from __future__ import annotations
 

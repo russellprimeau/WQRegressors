@@ -193,7 +193,20 @@
       "Bash(grep -l \"historic_path\" \"c:/Users/Master/Documents/GitHub/WQRegressors/data/output/CV14/MC_Chromium__µg_L__res/\"*.yml)",
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z2_HorizonPostProcess.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(xargs grep:*)",
-      "Bash(grep -l \"mc_replicates\" \"c:\\\\Users\\\\Master\\\\Documents\\\\GitHub\\\\WQRegressors\\\\data\\\\output\\\\CV14\\\\MC_Zinc__µg_L__res\\\\forecasts\\\\feature_sweeps\"/*/*.yml)"
+      "Bash(grep -l \"mc_replicates\" \"c:\\\\Users\\\\Master\\\\Documents\\\\GitHub\\\\WQRegressors\\\\data\\\\output\\\\CV14\\\\MC_Zinc__µg_L__res\\\\forecasts\\\\feature_sweeps\"/*/*.yml)",
+      "Bash(grep -v '^[0.,-]*$')",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/fill_gaps_mlr.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(.venv/Scripts/python src/fill_gaps_mlr.py)",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/plot_mlr_fill_timeseries.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(.venv/Scripts/python src/plot_mlr_fill_timeseries.py)",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/plot_mlr_fill_timeseries.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(find /c/Users/Master/Documents/GitHub/WQRegressors/src -name \"*.py\" -exec grep -l \"def load_and_split_data\" {} \\\\;)",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/utils/recurrent_models.py'\\).read\\(\\)\\); print\\('recurrent_models.py OK'\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/e_TrainRecurrent.py'\\).read\\(\\)\\); print\\('e_TrainRecurrent.py OK'\\)\")",
+      "Bash(grep -r \"recurrent_transformer\\\\|lstm\\\\|generate_recurrent\\\\|generate_lstm\" /c/Users/Master/Documents/GitHub/WQRegressors/src/*.py)",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/d_RunResample.py'\\).read\\(\\)\\); print\\('d_RunResample.py OK'\\)\")",
+      "Bash(python -c \"import sys,csv; rows=list\\(csv.DictReader\\(sys.stdin\\)\\); preds=[float\\(r['prediction']\\) for r in rows]; tgts=[float\\(r['target']\\) for r in rows]; print\\(f'LSTM train: pred range [{min\\(preds\\):.4f}, {max\\(preds\\):.4f}], target range [{min\\(tgts\\):.4f}, {max\\(tgts\\):.4f}]'\\)\")",
+      "Bash(python -c \"import sys,csv; rows=list\\(csv.DictReader\\(sys.stdin\\)\\); preds=[float\\(r['prediction']\\) for r in rows]; tgts=[float\\(r['target']\\) for r in rows]; print\\(f'Transformer train: pred range [{min\\(preds\\):.4f}, {max\\(preds\\):.4f}], target range [{min\\(tgts\\):.4f}, {max\\(tgts\\):.4f}]'\\)\")"
     ]
   }
 }
