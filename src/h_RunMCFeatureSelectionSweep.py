@@ -1398,12 +1398,21 @@ def _run_mlr_variants_on_existing_split(
             )
             continue
 
-        spearman_kept = []
+        # Use the final post-selection feature set (selected_features from per-target meta),
+        # falling back to Spearman-kept columns then all input features if unavailable.
+        # This ensures different MLR variants only share a feature_tag if they genuinely
+        # selected the same predictors (post-MI/Lasso/VIF), not just the same Spearman pool.
+        selected_names: list[str] = []
         for meta_row in meta:
-            spearman_kept = meta_row.get("spearman_kept_columns", [])
-            if spearman_kept:
+            selected_names = meta_row.get("selected_features") or []
+            if selected_names:
                 break
-        effective_feature_names = list(spearman_kept) if spearman_kept else list(feature_names)
+        if not selected_names:
+            for meta_row in meta:
+                selected_names = meta_row.get("spearman_kept_columns") or []
+                if selected_names:
+                    break
+        effective_feature_names = list(selected_names) if selected_names else list(feature_names)
         feature_tag = _feature_tag(tuple(sorted(effective_feature_names)))
 
         results.append(
@@ -1673,7 +1682,24 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     # be plotted once, with a combined label like "k01/s01/l01").
     _combined_rank_labels: dict[int, str] = {}
     if "feature_tag" in df.columns:
-        _ft_primary = df.groupby("feature_tag")["subset_rank"].min().to_dict()
+        # Each feature_tag claims its minimum rank.  If two different feature_tags
+        # would claim the same minimum rank, bump the later one to an unoccupied rank
+        # so that they remain distinct clusters rather than silently overwriting each other.
+        _ft_min_raw = df.groupby("feature_tag")["subset_rank"].min().to_dict()
+        _assigned_ranks: dict[int, str] = {}   # rank -> feature_tag that owns it
+        _next_free = int(df["subset_rank"].max()) + 1
+        _ft_primary: dict[str, int] = {}
+        for ft, raw_min in sorted(_ft_min_raw.items(), key=lambda kv: kv[1]):
+            rank = int(raw_min)
+            if rank not in _assigned_ranks:
+                _assigned_ranks[rank] = ft
+                _ft_primary[ft] = rank
+            else:
+                # Collision: give this feature_tag the next free rank.
+                _ft_primary[ft] = _next_free
+                _assigned_ranks[_next_free] = ft
+                _next_free += 1
+
         _ft_labels: dict[str, str] = {}
         for ft in df["feature_tag"].dropna().unique():
             labels = sorted(
@@ -1682,7 +1708,7 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
             _ft_labels[ft] = "/".join(labels) if labels else ft
         df["subset_rank"] = df["feature_tag"].map(_ft_primary).fillna(df["subset_rank"]).astype(int)
         _combined_rank_labels = {
-            int(_ft_primary[ft]): _ft_labels[ft] for ft in _ft_primary
+            _ft_primary[ft]: _ft_labels[ft] for ft in _ft_primary
         }
 
     def _normalize_plot_model(raw: object) -> str:

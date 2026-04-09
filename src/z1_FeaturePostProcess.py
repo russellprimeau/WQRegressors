@@ -233,6 +233,20 @@ def _merge_shapley_into_final_metrics(plan: "DatasetPlan", df: pd.DataFrame) -> 
     if df_shapley.empty:
         return df
 
+    # Normalise target name in Shapley rows to match the feature sweep canonical target.
+    # Shapley MLR rows store the raw output_column name (e.g. "Chromium (µg/L)_res")
+    # while ML rows store the _derive_target_name() sanitised form.  Using the first
+    # non-null target value from df_feat as the canonical name is reliable because all
+    # ML model rows in df_feat share the same sanitised target.
+    if "target" in df_feat.columns and "target" in df_shapley.columns:
+        _canonical_targets = df_feat["target"].dropna().unique()
+        if len(_canonical_targets) == 1:
+            df_shapley["target"] = _canonical_targets[0]
+        elif len(_canonical_targets) > 1:
+            # Multiple target names in the feature sweep — pick the most common one.
+            _canonical_target = df_feat["target"].dropna().mode().iloc[0]
+            df_shapley["target"] = _canonical_target
+
     # Relabel to avoid colliding with Feature sweep subset_rank / subset_label.
     max_rank = 0
     if "subset_rank" in df_feat.columns:
@@ -241,8 +255,9 @@ def _merge_shapley_into_final_metrics(plan: "DatasetPlan", df: pd.DataFrame) -> 
             max_rank = int(numeric_ranks.max())
 
     if "subset_label" in df_shapley.columns:
-        df_shapley["subset_label"] = (
-            _SHAPLEY_MERGE_LABEL_PREFIX + df_shapley["subset_label"].astype(str)
+        df_shapley["subset_label"] = df_shapley["subset_label"].astype(str).apply(
+            lambda lbl: lbl if lbl.startswith(_SHAPLEY_MERGE_LABEL_PREFIX)
+            else _SHAPLEY_MERGE_LABEL_PREFIX + lbl
         )
     if "subset_rank" in df_shapley.columns:
         df_shapley["subset_rank"] = (
@@ -274,6 +289,7 @@ def _build_perf_entry(
         'dataset': dataset_name,
         'model': str(row.get('model', '')),
         'subset_rank': _safe_float(row.get('subset_rank', float('nan'))),
+        'subset_label': str(row.get('subset_label', '')),
         'row_count': _safe_float(row.get('row_count', float('nan'))),
         'feature_tag': str(row.get('feature_tag', '')),
         'nrmse': _safe_float(row.get('nrmse', float('nan'))),
@@ -529,7 +545,27 @@ def _read_mlr_k_cluster_rows(sweep_dir: Path, df: pd.DataFrame) -> list[dict]:
         if not input_columns:
             continue
 
-        feature_tag = _feature_tag(tuple(sorted(input_columns)))
+        # Use final selected features from model_config.json (post-MI/Lasso/VIF) when
+        # available, falling back to spearman_kept_columns then input_columns.
+        _model_cfg_path = candidate / "model_config.json"
+        _sel_cols: list[str] = []
+        if _model_cfg_path.exists():
+            try:
+                with open(_model_cfg_path, encoding="utf-8") as _mf:
+                    _mc = json.load(_mf)
+                for _tm in _mc.get("per_target_meta", []):
+                    _sel_cols = _tm.get("selected_features") or []
+                    if _sel_cols:
+                        break
+                if not _sel_cols:
+                    for _tm in _mc.get("per_target_meta", []):
+                        _sel_cols = _tm.get("spearman_kept_columns") or []
+                        if _sel_cols:
+                            break
+            except Exception:
+                pass
+        effective_input_columns = list(_sel_cols) if _sel_cols else input_columns
+        feature_tag = _feature_tag(tuple(sorted(effective_input_columns)))
         if (feature_tag, model_name) in existing_keys:
             continue
 
@@ -660,17 +696,13 @@ def _append_mlr_to_final_metrics(
         surrogate_cfg = train_module.load_config(str(surrogate_cfg_path))
         input_columns = list(surrogate_cfg["data"]["input_columns"])
 
-    # Remove only the MLR rows for the feature set we are about to re-evaluate.
-    # MLR rows for other feature sets (e.g. per-k-cluster rows written by the sweep)
-    # must be preserved so they continue to appear in the CSV and summary plot.
+    # Remove only the s01/m01/l01 MLR rows (the variants we are about to re-evaluate).
+    # MLR rows for other feature clusters (k## rows written by the main sweep) must be
+    # preserved so they continue to appear in the CSV and summary plot.
     if "model" in df.columns:
         _mlr_model_mask = df["model"].astype(str).str.lower().isin({"mlr", "mlr_avg12", "mlr_avgall"})
-        if "feature_tag" in df.columns:
-            _mlr_ftag_pre = _feature_tag(tuple(sorted(input_columns)))
-            _same_ftag_mask = df["feature_tag"].astype(str) == _mlr_ftag_pre
-            df = df[~(_mlr_model_mask & _same_ftag_mask)].copy()
-        else:
-            df = df[~_mlr_model_mask].copy()
+        _variant_label_mask = df["subset_label"].astype(str).isin({"s01", "m01", "l01"}) if "subset_label" in df.columns else _mlr_model_mask
+        df = df[~(_mlr_model_mask & _variant_label_mask)].copy()
 
     mlr_selection_config = None
     mlr_use_spearman_prefilter = True
@@ -2223,9 +2255,9 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
     evidence: dict[str, float | str | int | bool] = {}
     variant_dir, eval_cfg_path, resolve_status = _find_best_variant_eval_config(plan, best_row)
     evidence["evidence_variant_resolution"] = str(resolve_status)
+    evidence["evidence_variant_dir"] = str(variant_dir) if variant_dir is not None else ""
     if resolve_status == "fallback_variant_mismatch":
         evidence["evidence_status"] = "variant_mismatch"
-        evidence["evidence_variant_dir"] = str(variant_dir) if variant_dir is not None else ""
         return evidence
     if eval_cfg_path is None or not eval_cfg_path.exists():
         evidence["evidence_status"] = "missing_eval_config"
@@ -2499,7 +2531,19 @@ def _compile_feature_inclusion_heatmap(
             continue
         feature_tag = str(row.get("feature_tag", ""))
         features_list: list[str] | None = None
-        _, eval_cfg_path, _ = _find_best_variant_eval_config(plan, row)
+
+        # Prefer the variant dir recorded directly in the perf entry (set at selection time).
+        # Fall back to the filesystem search only if that field is absent or empty.
+        stored_variant_dir = str(row.get("evidence_variant_dir", "")).strip()
+        eval_cfg_path: Path | None = None
+        if stored_variant_dir:
+            vdir = Path(stored_variant_dir)
+            cfgs = sorted(vdir.glob("config_evaluate_*.yml"))
+            if cfgs:
+                eval_cfg_path = cfgs[0]
+        if eval_cfg_path is None or not eval_cfg_path.exists():
+            _, eval_cfg_path, _ = _find_best_variant_eval_config(plan, row)
+
         if eval_cfg_path is not None and eval_cfg_path.exists():
             try:
                 cfg = train_module.load_config(str(eval_cfg_path))
@@ -2843,9 +2887,16 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             if final_metrics_csv.exists():
                 df = pd.read_csv(final_metrics_csv)
                 if not df.empty:
+                    # Filter to the canonical target name for this dataset before any
+                    # selection — the CSV may contain rows with inconsistent target strings
+                    # (e.g. raw output_column names from MLR vs sanitised names from ML).
+                    _df_for_selection = df[df["target"].astype(str) == target_name].copy() if "target" in df.columns else df
+                    if _df_for_selection.empty:
+                        _df_for_selection = df  # fall back to unfiltered if nothing matches
+                        print(f"[WARN] No rows match target_name={target_name!r} in {final_metrics_csv.name}; using all rows for selection.")
                     # Select best row across all models/subsets by R2
                     valid_r2 = _exclude_baseline_metric_rows(
-                        _filter_min_valid_independent(_filter_valid_rows(df), min_required=MIN_REQUIRED_VALID_INDEPENDENT)
+                        _filter_min_valid_independent(_filter_valid_rows(_df_for_selection), min_required=MIN_REQUIRED_VALID_INDEPENDENT)
                     )
                     if valid_r2.empty:
                         print(
@@ -2894,9 +2945,12 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
                         # Re-select best row after MLR append so evidence targets the true best model.
                         try:
+                            _df_post = df[df["target"].astype(str) == target_name].copy() if "target" in df.columns else df
+                            if _df_post.empty:
+                                _df_post = df
                             _post_mlr = _exclude_baseline_metric_rows(
                                 _filter_min_valid_independent(
-                                    _filter_valid_rows(df),
+                                    _filter_valid_rows(_df_post),
                                     min_required=MIN_REQUIRED_VALID_INDEPENDENT,
                                 )
                             )
@@ -3010,9 +3064,12 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                         # Select final best row for the summary entry.
                         best_updated = best_row
                         try:
+                            _df_final = df[df["target"].astype(str) == target_name].copy() if "target" in df.columns else df
+                            if _df_final.empty:
+                                _df_final = df
                             valid_r2_2 = _exclude_baseline_metric_rows(
                                 _filter_min_valid_independent(
-                                    _filter_valid_rows(df),
+                                    _filter_valid_rows(_df_final),
                                     min_required=MIN_REQUIRED_VALID_INDEPENDENT,
                                 )
                             )

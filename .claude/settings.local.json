@@ -206,7 +206,18 @@
       "Bash(grep -r \"recurrent_transformer\\\\|lstm\\\\|generate_recurrent\\\\|generate_lstm\" /c/Users/Master/Documents/GitHub/WQRegressors/src/*.py)",
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/d_RunResample.py'\\).read\\(\\)\\); print\\('d_RunResample.py OK'\\)\")",
       "Bash(python -c \"import sys,csv; rows=list\\(csv.DictReader\\(sys.stdin\\)\\); preds=[float\\(r['prediction']\\) for r in rows]; tgts=[float\\(r['target']\\) for r in rows]; print\\(f'LSTM train: pred range [{min\\(preds\\):.4f}, {max\\(preds\\):.4f}], target range [{min\\(tgts\\):.4f}, {max\\(tgts\\):.4f}]'\\)\")",
-      "Bash(python -c \"import sys,csv; rows=list\\(csv.DictReader\\(sys.stdin\\)\\); preds=[float\\(r['prediction']\\) for r in rows]; tgts=[float\\(r['target']\\) for r in rows]; print\\(f'Transformer train: pred range [{min\\(preds\\):.4f}, {max\\(preds\\):.4f}], target range [{min\\(tgts\\):.4f}, {max\\(tgts\\):.4f}]'\\)\")"
+      "Bash(python -c \"import sys,csv; rows=list\\(csv.DictReader\\(sys.stdin\\)\\); preds=[float\\(r['prediction']\\) for r in rows]; tgts=[float\\(r['target']\\) for r in rows]; print\\(f'Transformer train: pred range [{min\\(preds\\):.4f}, {max\\(preds\\):.4f}], target range [{min\\(tgts\\):.4f}, {max\\(tgts\\):.4f}]'\\)\")",
+      "Bash(.venv/Scripts/python src/z2_PredictionTimeseries.py --help)",
+      "Bash(.venv/Scripts/python src/z2_PredictionTimeseries.py --path data/output/CV14 --sweep-namespace feature_sweeps --limit-datasets 1 --dataset-prefix MC_Arsenic)",
+      "Bash(.venv/Scripts/python src/z2_PredictionTimeseries.py --path data/output/CV14 --sweep-namespace feature_sweeps --limit-datasets 1 --dataset-prefix MC_Color)",
+      "Bash(.venv/Scripts/python src/z2_PredictionTimeseries.py --path data/output/CV14 --sweep-namespace feature_sweeps --limit-datasets 1 --dataset-prefix MC_Copper)",
+      "Bash(.venv/Scripts/python src/z2_PredictionTimeseries.py --path data/output/CV14 --sweep-namespace feature_sweeps --limit-datasets 1 --dataset-prefix MC_Nickel)",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z2_PredictionTimeseries.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(.venv/Scripts/python src/z2_PredictionTimeseries.py --path data/output/CV14 --sweep-namespace feature_sweeps)",
+      "Bash(.venv/Scripts/python src/z2_PredictionTimeseries.py --path data/output/CV14 --sweep-namespace feature_sweeps --limit-datasets 1 --dataset-prefix MC_Chromium)",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z1_FeaturePostProcess.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(ls -d \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/CV14/MC_Chromium__µg_L__res/forecasts/feature_sweeps/\"*_s01)",
+      "Bash(grep -E \"\\(src/|scripts/|\\\\.py$\\)\")"
     ]
   }
 }
