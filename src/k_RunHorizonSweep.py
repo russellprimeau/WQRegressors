@@ -587,6 +587,9 @@ def _run_mlr_horizon_rep(
         'subset_label': subset_label,
         'input_columns': input_columns,
         'output_columns': output_columns,
+        'input_row_1': input_row_1,
+        'input_row_2': input_row_2,
+        'output_rows': output_rows,
         'per_target_meta': [
             {
                 'target_index': i,

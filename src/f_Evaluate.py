@@ -561,11 +561,14 @@ def _compute_flat_metrics(pred_arr: np.ndarray, target_arr: np.ndarray) -> dict:
     else:
         pearson_r = np.nan
 
+    std_target = float(np.std(target_vals)) if finite_count > 0 else np.nan
+
     return {
         "mae": mae,
         "rmse": rmse,
         "r2": r2,
         "pearson_r": pearson_r,
+        "std_target": std_target,
         "n_eval_points_finite": finite_count,
     }
 
@@ -860,6 +863,7 @@ def _compute_regression_summary(label, preds, targets, num_samples, metadata=Non
         "rmse": float(ind_metrics["rmse"]),
         "r2": float(ind_metrics["r2"]),
         "pearson_r": float(ind_metrics["pearson_r"]),
+        "std_target": float(ind_metrics["std_target"]),
         # Replicate-population diagnostic metrics.
         "mae_replicate": float(rep_metrics["mae"]),
         "rmse_replicate": float(rep_metrics["rmse"]),
@@ -935,6 +939,7 @@ def _write_summary_csv(rows, output_path):
         "rmse",
         "r2",
         "pearson_r",
+        "std_target",
         "mae_replicate",
         "rmse_replicate",
         "r2_replicate",

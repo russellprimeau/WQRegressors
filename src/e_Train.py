@@ -605,15 +605,18 @@ def _preferred_eval_path_for_key(key: str, data_root: Path) -> Path | None:
         candidates = [
             root / "Consolidated_sparse.csv",
             root.parent / "regression" / "Consolidated_sparse.csv",
+            root.parent.parent / "regression" / "Consolidated_sparse.csv",
         ]
     elif key == "normalization_path":
         candidates = [
             root.parent / "sensors" / "normalization.json",
+            root.parent.parent / "sensors" / "normalization.json",
             Path(NORMALIZATION_OUTPUT_PATH),
         ]
     elif key == "thresholds_path":
         candidates = [
             root.parent.parent / "input" / "Limits.csv",
+            root.parent.parent.parent / "input" / "Limits.csv",
         ]
     else:
         return None
@@ -681,7 +684,17 @@ def write_evaluation_config(config):
         evaluation_cfg["run_regression"] = False
         evaluation_cfg["run_pure_classification"] = True
 
-    data_root = Path(data_cfg["data_dir"]).resolve().parent
+    # data_root is the dataset root — the directory that holds forecasts/, horizons/, etc.
+    # When data_dir points inside a horizons/ subtree (e.g. horizons/000hr/ml/), walk up
+    # past the horizons/ ancestor so that relative reference paths (historic_path etc.)
+    # are computed from the correct base.
+    _data_dir_abs = Path(data_cfg["data_dir"]).resolve()
+    data_root = _data_dir_abs.parent
+    for _part in _data_dir_abs.parts:
+        if _part.lower() == "horizons":
+            # dataset root is the parent of the horizons/ directory
+            data_root = Path(*_data_dir_abs.parts[:_data_dir_abs.parts.index(_part)])
+            break
     # Preserve explicit normalization path from user config; otherwise prefer active data root.
     if "normalization_path" not in config.get("evaluation", {}):
         preferred_norm = _preferred_eval_path_for_key("normalization_path", data_root)

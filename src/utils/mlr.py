@@ -69,10 +69,12 @@ def _extract_aligned_predictor_row(X, aggregation_mode="last"):
     if aggregation_mode == "last":
         return arr[-1, :].astype(float, copy=False)
     if aggregation_mode == "avg12":
-        with np.errstate(all="ignore"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
             return np.nanmean(arr[-12:, :], axis=0).astype(float, copy=False)
     if aggregation_mode == "avgall":
-        with np.errstate(all="ignore"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
             return np.nanmean(arr, axis=0).astype(float, copy=False)
     raise ValueError(f"Unknown aggregation_mode: {aggregation_mode!r}")
 

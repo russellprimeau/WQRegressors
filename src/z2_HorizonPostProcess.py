@@ -39,17 +39,33 @@ CLI arguments:
                             Default: data/output/regression
     --dataset-prefix STR    Only include datasets whose name starts with this
                             prefix.  Default: MC
+    --evaluate-all          Compute statistics over all samples (train + test) instead
+                            of the test set only.  For each horizon/replicate that
+                            lacks combined-set metrics, f_Evaluate.py is re-run with
+                            evaluate_all=true against the saved model weights — no
+                            retraining is performed.  Results are written alongside
+                            lookahead_metrics.csv as _combined_metrics.csv; the normal
+                            lookahead_metrics.csv is left unchanged.
+
+                            nRMSE uses std_target from the combined row
+                            (written by f_Evaluate.py). Skill scores use
+                            combined_baseline_summary.csv, produced by re-running
+                            the Naive/Seasonal/Linear baselines on the combined
+                            sample set — so both metrics are correctly normalised
+                            for the combined evaluation.
 
 Examples:
 python src/z2_HorizonPostProcess.py
 python src/z2_HorizonPostProcess.py --data-root data/output/regression
 python src/z2_HorizonPostProcess.py --data-root data/output/CV14 --dataset-prefix MC
+python src/z2_HorizonPostProcess.py --data-root data/output/CV14 --dataset-prefix MC --evaluate-all
 """
 from __future__ import annotations
 import argparse
 import re
 import subprocess
 import sys
+import tempfile
 import textwrap
 import traceback
 from pathlib import Path
@@ -167,27 +183,375 @@ def _run_pending_evaluations(dataset_dir: Path) -> int:
     return completed
 
 
-def _reconstruct_lookahead_metrics(dataset_dir: Path) -> pd.DataFrame | None:
+def _ensure_combined_metrics_mlr(fc_dir: Path) -> bool:
+    """Compute combined (train+test) metrics for an MLR replicate directory.
+
+    MLR reps have no ``config_evaluate_*.yml`` and no saved model weights.  Instead
+    they store ``model_config.json`` (model_type, input_columns, output_columns),
+    ``train_files.txt``, ``test_files.txt``, and derive the data-dimension config
+    from ``config.yml`` at the class-directory level (``fc_dir.parent.parent``).
+
+    The MLR model is re-fit on the original train samples and then evaluated on all
+    samples (train+test combined).  A ``kind="combined"`` row is appended to
+    ``evaluation_summary.csv``.  Combined baseline rows are also written to
+    ``combined_baseline_summary.csv`` at the class directory level using
+    ``_append_mlr_baseline_outputs`` from ``h_RunMCFeatureSelectionSweep``.
+
+    Returns True on success, False on failure.
+    """
+    import json as _json
+
+    summary_csv = fc_dir / "evaluation_summary.csv"
+    model_cfg_path = fc_dir / "model_config.json"
+    train_txt = fc_dir / "train_files.txt"
+    test_txt = fc_dir / "test_files.txt"
+
+    if not model_cfg_path.exists():
+        print(f"  [WARN] MLR combined: model_config.json not found in {fc_dir}")
+        return False
+    if not train_txt.exists() or not test_txt.exists():
+        print(f"  [WARN] MLR combined: train_files.txt / test_files.txt not found in {fc_dir}")
+        return False
+
+    try:
+        with open(model_cfg_path, "r", encoding="utf-8") as fh:
+            mcfg = _json.load(fh)
+    except Exception as exc:
+        print(f"  [WARN] MLR combined: could not read model_config.json: {exc}")
+        return False
+
+    model_type = str(mcfg.get("model_type", "mlr")).strip().lower()
+    if model_type not in {"mlr", "mlr_avg12", "mlr_avgall"}:
+        print(f"  [WARN] MLR combined: unexpected model_type '{model_type}' in {fc_dir}")
+        return False
+
+    input_columns = list(mcfg.get("input_columns", []))
+    output_columns = list(mcfg.get("output_columns", []))
+    if not input_columns or not output_columns:
+        print(f"  [WARN] MLR combined: empty input/output columns in model_config.json")
+        return False
+
+    _MLR_AGG_MODE = {"mlr": "last", "mlr_avg12": "avg12", "mlr_avgall": "avgall"}
+    aggregation_mode = _MLR_AGG_MODE.get(model_type, "last")
+
+    # fc_dir = horizons/NNNhr/mlr/forecasts/rep_NNN/
+    class_dir = fc_dir.parent.parent
+
+    # Derive input_row_1 / input_row_2 / output_rows.  New artifacts store these
+    # in model_config.json; older ones do not.  For older artifacts, read the row
+    # count directly from a sample CSV: samples always span rows 0..N-1 where row
+    # N-1 is the output row.
+    input_row_1 = mcfg.get("input_row_1")
+    input_row_2 = mcfg.get("input_row_2")
+    output_rows = mcfg.get("output_rows")
+
+    if input_row_1 is None or input_row_2 is None or output_rows is None:
+        sample_dir = class_dir / "samples"
+        _sample_files = sorted(sample_dir.glob("*.csv")) if sample_dir.is_dir() else []
+        if not _sample_files:
+            print(f"  [WARN] MLR combined: cannot determine row config — no samples in {sample_dir}")
+            return False
+        try:
+            _n_rows = sum(1 for _ in open(_sample_files[0], encoding="utf-8")) - 1  # subtract header
+        except Exception as exc:
+            print(f"  [WARN] MLR combined: could not read sample file: {exc}")
+            return False
+        input_row_1 = 0
+        input_row_2 = _n_rows - 1
+        output_rows = [_n_rows - 1]
+
+    input_row_1 = int(input_row_1)
+    input_row_2 = int(input_row_2)
+    output_rows = list(output_rows)
+    input_rows = slice(input_row_1, input_row_2)
+    base_cfg: dict = {}
+
+    # Inject absolute paths for baseline evaluation into base_cfg so that
+    # merge_eval_config in _append_mlr_baseline_outputs does not fall back to
+    # DEFAULT_EVAL_CONFIG's relative defaults, which resolve incorrectly from
+    # the class dir.  These files are at fixed locations relative to the project root.
+    _project_root = Path(__file__).resolve().parent.parent
+    _historic_abs = _project_root / "data" / "output" / "regression" / "Consolidated_sparse.csv"
+    base_cfg.setdefault("evaluation", {})["historic_path"] = str(_historic_abs)
+
+    # Load samples
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from utils.training import load_samples as _load_samples
+        from utils.mlr import evaluate_mlr as _eval_mlr
+        import f_Evaluate as eval_module
+    except Exception as exc:
+        print(f"  [WARN] MLR combined: import failed: {exc}")
+        return False
+
+    sample_dir = class_dir / "samples"
+    if not sample_dir.is_dir():
+        print(f"  [WARN] MLR combined: samples dir not found: {sample_dir}")
+        return False
+
+    try:
+        train_samples = _load_samples(
+            sample_dir, input_columns=input_columns, output_columns=output_columns,
+            input_rows=input_rows, output_rows=output_rows,
+            source=train_txt, fault_tolerant=True, input_aggregation="none",
+        )
+        test_samples = _load_samples(
+            sample_dir, input_columns=input_columns, output_columns=output_columns,
+            input_rows=input_rows, output_rows=output_rows,
+            source=test_txt, fault_tolerant=True, input_aggregation="none",
+        )
+    except Exception as exc:
+        print(f"  [WARN] MLR combined: sample loading failed: {exc}")
+        return False
+
+    if len(train_samples) < 2:
+        print(f"  [WARN] MLR combined: too few train samples ({len(train_samples)}) in {fc_dir}")
+        return False
+
+    all_samples = train_samples + test_samples
+    if len(all_samples) < 2:
+        print(f"  [WARN] MLR combined: no samples loaded for {fc_dir}")
+        return False
+
+    # Fit on train, predict on all (no rebalancing — combined evaluation is read-only)
+    try:
+        preds, targets, _ = _eval_mlr(
+            train_samples=train_samples,
+            test_samples=all_samples,
+            feature_names=input_columns,
+            selection_config=None,
+            aggregation_mode=aggregation_mode,
+            use_spearman_prefilter=True,
+        )
+    except Exception as exc:
+        print(f"  [WARN] MLR combined: evaluate_mlr failed: {exc}")
+        return False
+
+    all_split_files = [str(s[2]) for s in all_samples]
+    _model_label = model_type.upper().replace("_", "-")
+    combined_row = eval_module._compute_regression_summary(
+        f"{_model_label} (combined)",
+        preds,
+        targets,
+        len(all_samples),
+        metadata={"kind": "combined", "gp_uncertainty_mode": "not_gp"},
+        split_files=all_split_files,
+    )
+    combined_row["n_train_samples"] = len(train_samples)
+    combined_row["n_test_samples"] = len(test_samples)
+    combined_row["input_dim"] = len(input_columns)
+    combined_row["target_dim"] = len(output_columns)
+    combined_row["data_dir"] = str(class_dir)
+
+    # Append combined row to evaluation_summary.csv (preserve existing rows)
+    try:
+        if summary_csv.exists():
+            existing_df = pd.read_csv(summary_csv)
+            # Remove any stale combined rows before appending
+            if "kind" in existing_df.columns:
+                existing_df = existing_df[existing_df["kind"] != "combined"]
+            existing_rows = existing_df.to_dict(orient="records")
+        else:
+            existing_rows = []
+        eval_module._write_summary_csv(existing_rows + [combined_row], summary_csv)
+    except Exception as exc:
+        print(f"  [WARN] MLR combined: could not write evaluation_summary.csv: {exc}")
+        return False
+
+    # Write combined_baseline_summary.csv at class level if not already present.
+    combined_bl_csv = class_dir / "combined_baseline_summary.csv"
+    if not combined_bl_csv.exists():
+        try:
+            import h_RunMCFeatureSelectionSweep as _h
+            # Build a minimal ref_cfg carrying only the fields _append_mlr_baseline_outputs
+            # needs.  base_cfg may be empty for older artifacts that had no config_*.yml.
+            _ref_cfg = {"evaluation": {"historic_path": base_cfg.get("evaluation", {}).get("historic_path", "")}}
+            _ref_data_cfg = {"output_rows": output_rows, "output_columns": output_columns}
+            # _append_mlr_baseline_outputs requires a real path for _resolve_path_from_config;
+            # supply the project root so any remaining relative paths resolve correctly.
+            _ref_cfg_path = Path(__file__).resolve().parent.parent / "src" / "z2_HorizonPostProcess.py"
+            baseline_rows: list[dict] = []
+            _h._append_mlr_baseline_outputs(
+                baseline_rows,
+                [],
+                ref_cfg=_ref_cfg,
+                ref_cfg_path=_ref_cfg_path,
+                ref_data_cfg=_ref_data_cfg,
+                data_dir=str(class_dir.resolve()),
+                sample_subdir="samples",
+                output_columns=output_columns,
+                output_rows=output_rows,
+                forecast_name="",
+                test_samples=all_samples,
+                test_split_files=all_split_files,
+            )
+            if baseline_rows:
+                eval_module._write_summary_csv(baseline_rows, combined_bl_csv)
+        except Exception as exc:
+            print(f"  [WARN] MLR combined: could not write combined_baseline_summary.csv: {exc}")
+
+    return True
+
+
+def _ensure_combined_metrics(fc_dir: Path) -> bool:
+    """Ensure ``evaluation_summary.csv`` in *fc_dir* contains a ``combined`` row.
+
+    If a ``combined`` row is already present, returns True immediately.  Otherwise,
+    locates the ``config_evaluate_*.yml`` in *fc_dir*, writes a temporary copy with
+    ``evaluate_all: true`` and ``run_baselines: true``, runs ``f_Evaluate.py
+    --no-plots`` against it, then removes the temporary config.
+
+    For ML models (XGB, GP, Transformer): reads the eval config, re-runs
+    ``f_Evaluate.py --no-plots`` with ``evaluate_all: true`` and
+    ``run_baselines: true``.  After a successful re-run, the baseline rows
+    (``kind="baseline"``) are extracted and cached as
+    ``combined_baseline_summary.csv`` at the model-class directory level
+    (``horizons/NNNhr/{model_class}/``).
+
+    For MLR reps (no ``config_evaluate_*.yml``): delegates to
+    ``_ensure_combined_metrics_mlr``, which re-fits on train samples and
+    evaluates on all samples inline.
+
+    Returns True when a ``combined`` row is present after the attempt, False on
+    failure.
+    """
+    summary_csv = fc_dir / "evaluation_summary.csv"
+    # Check whether combined row already exists.
+    if summary_csv.exists():
+        try:
+            df = pd.read_csv(summary_csv)
+            kind_col = "kind" if "kind" in df.columns else ("label" if "label" in df.columns else None)
+            if kind_col == "kind" and (df["kind"] == "combined").any():
+                return True
+            if kind_col == "label" and df["label"].str.contains("combined", case=False, na=False).any():
+                return True
+        except Exception:
+            pass
+
+    eval_cfgs = list(fc_dir.glob("config_evaluate_*.yml"))
+    if not eval_cfgs:
+        # MLR reps have no eval config — use inline MLR combined evaluation.
+        return _ensure_combined_metrics_mlr(fc_dir)
+    eval_cfg_path = eval_cfgs[0]
+    try:
+        with open(eval_cfg_path, "r", encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh)
+        cfg.setdefault("evaluation", {})["evaluate_all"] = True
+        cfg["evaluation"]["run_baselines"] = True
+        # Overwrite the three reference paths with their fixed absolute locations.
+        # Configs written by older e_Train.py versions may have the wrong number of
+        # '..' levels; computing from the project root avoids any relative-path
+        # ambiguity.
+        _project_root = Path(__file__).resolve().parent.parent
+        _eval_section = cfg.setdefault("evaluation", {})
+        _eval_section["historic_path"]      = str(_project_root / "data" / "output" / "regression" / "Consolidated_sparse.csv")
+        _eval_section["normalization_path"] = str(_project_root / "data" / "output" / "sensors"     / "normalization.json")
+        _eval_section["thresholds_path"]    = str(_project_root / "data" / "input"                  / "Limits.csv")
+        _data_section = cfg.get("data", {})
+        _dval = _data_section.get("data_dir")
+        if _dval and not Path(_dval).is_absolute():
+            _data_section["data_dir"] = str((fc_dir / _dval).resolve())
+        # Write a temporary config in the same directory so any remaining relative
+        # paths (split files, etc.) still resolve correctly.
+        tmp_fd, tmp_path_str = tempfile.mkstemp(
+            suffix=".yml", prefix="_tmp_evalall_", dir=fc_dir
+        )
+        tmp_path = Path(tmp_path_str)
+        try:
+            with open(tmp_fd, "w", encoding="utf-8") as fh:
+                yaml.dump(cfg, fh, allow_unicode=True, default_flow_style=False)
+            result = subprocess.run(
+                [sys.executable, "src/f_Evaluate.py", "--config", str(tmp_path),
+                 "--no-plots"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            if result.returncode != 0:
+                stderr_text = result.stderr.decode(errors="replace") if result.stderr else ""
+                print(f"  [WARN] evaluate_all re-run failed for {fc_dir.name}:")
+                for line in stderr_text.strip().splitlines()[-3:]:
+                    print(f"         {line}")
+                return False
+            # Cache combined baseline RMSEs at the class level so that
+            # _load_baseline_rmses can find them in subsequent post-process runs.
+            # fc_dir = horizons/NNNhr/{model_class}/forecasts/rep_NNN/
+            class_dir = fc_dir.parent.parent
+            combined_bl_csv = class_dir / "combined_baseline_summary.csv"
+            if not combined_bl_csv.exists():
+                try:
+                    _df = pd.read_csv(summary_csv)
+                    if "kind" in _df.columns:
+                        _bl = _df[_df["kind"] == "baseline"]
+                        if not _bl.empty:
+                            _bl.to_csv(combined_bl_csv, index=False)
+                except Exception:
+                    pass
+        finally:
+            tmp_path.unlink(missing_ok=True)
+    except Exception as exc:
+        print(f"  [WARN] _ensure_combined_metrics failed for {fc_dir}: {exc}")
+        return False
+
+    # Verify
+    if summary_csv.exists():
+        try:
+            df = pd.read_csv(summary_csv)
+            if "kind" in df.columns and (df["kind"] == "combined").any():
+                return True
+            if "label" in df.columns and df["label"].str.contains("combined", case=False, na=False).any():
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _reconstruct_lookahead_metrics(
+    dataset_dir: Path,
+    evaluate_all: bool = False,
+) -> pd.DataFrame | None:
     """Build a ``lookahead_metrics.csv``-equivalent DataFrame by scanning evaluation_summary.csv files.
 
     Mimics the filtering logic in ``k_RunHorizonSweep.py``: keeps only test-set
-    rows, drops the ``label``/``kind`` columns, and adds ``horizon`` / ``replicate``
-    columns derived from the directory structure.
+    rows (or ``combined`` rows when *evaluate_all* is True), drops the
+    ``label``/``kind`` columns, and adds ``horizon`` / ``replicate`` columns
+    derived from the directory structure.
+
+    When *evaluate_all* is True and a rep dir lacks a ``combined`` row,
+    ``_ensure_combined_metrics`` is called.  For ML models this re-runs
+    ``f_Evaluate.py`` with ``evaluate_all: true``; for MLR reps it re-fits
+    and evaluates inline.  Falls back to the test row only if that fails.
     """
     frames: list[pd.DataFrame] = []
     for horizon, rep_idx, fc_dir, model_class in _find_horizon_forecast_dirs(dataset_dir):
         summary_csv = fc_dir / "evaluation_summary.csv"
         if not summary_csv.exists():
             continue
+        # When evaluate_all is requested, ensure combined rows exist (re-running
+        # f_Evaluate.py against the saved model if needed).
+        if evaluate_all:
+            ok = _ensure_combined_metrics(fc_dir)
+            if ok is False:
+                print(f"  [WARN] Could not obtain combined metrics for {fc_dir}; falling back to test rows.")
         try:
             df = pd.read_csv(summary_csv)
         except Exception:
             continue
-        # Filter to test rows (same logic as k_RunHorizonSweep.py)
-        if "kind" in df.columns:
-            df = df[df["kind"] == "test"]
-        elif "label" in df.columns:
-            df = df[df["label"].str.contains("test", case=False, na=False)]
+        # Filter to combined rows when evaluate_all is set; fall back to test rows
+        # if no combined row is available.
+        if evaluate_all:
+            if "kind" in df.columns:
+                combined = df[df["kind"] == "combined"]
+                df = combined if not combined.empty else df[df["kind"] == "test"]
+            elif "label" in df.columns:
+                combined = df[df["label"].str.contains("combined", case=False, na=False)]
+                df = combined if not combined.empty else df[df["label"].str.contains("test", case=False, na=False)]
+        else:
+            # Default: test rows only (original behaviour)
+            if "kind" in df.columns:
+                df = df[df["kind"] == "test"]
+            elif "label" in df.columns:
+                df = df[df["label"].str.contains("test", case=False, na=False)]
         df = df.drop(columns=[c for c in ("label", "kind") if c in df.columns], errors="ignore")
         df["horizon"] = horizon
         df["replicate"] = rep_idx
@@ -244,20 +608,36 @@ def _load_baseline_rmses(
     horizon_hr: int,
     replicate: int,
     model_class: "str | None" = None,
+    evaluate_all: bool = False,
 ) -> dict[str, float]:
-    """Return ``{baseline_label: rmse}`` from ``baseline_summary.csv`` for one horizon.
+    """Return ``{baseline_label: rmse}`` from a baseline summary CSV for one horizon.
 
     Baselines are shared across replicates; the *replicate* parameter is accepted
     for interface compatibility but ignored.
 
-    Search order:
-      1. ``horizons/NNNhr/{model_class}/baseline_summary.csv``  (new per-class layout)
-      2. ``horizons/NNNhr/baseline_summary.csv``                (legacy flat layout)
+    When *evaluate_all* is True, ``combined_baseline_summary.csv`` (written by
+    ``_ensure_combined_metrics``) is checked first.  This file contains baseline
+    metrics computed over the combined train+test sample set, giving correct skill
+    scores when the model is also evaluated over all samples.
+
+    Search order when *evaluate_all* is True:
+      1. ``horizons/NNNhr/{model_class}/combined_baseline_summary.csv``
+      2. ``horizons/NNNhr/combined_baseline_summary.csv``
+      3. ``horizons/NNNhr/{model_class}/baseline_summary.csv``
+      4. ``horizons/NNNhr/baseline_summary.csv``
+
+    Search order when *evaluate_all* is False (default):
+      1. ``horizons/NNNhr/{model_class}/baseline_summary.csv``
+      2. ``horizons/NNNhr/baseline_summary.csv``
 
     Returns an empty dict when no file is found or readable.
     """
     h_label = f"{horizon_hr:03d}hr"
     candidates: list[Path] = []
+    if evaluate_all:
+        if model_class is not None:
+            candidates.append(dataset_dir / "horizons" / h_label / model_class / "combined_baseline_summary.csv")
+        candidates.append(dataset_dir / "horizons" / h_label / "combined_baseline_summary.csv")
     if model_class is not None:
         candidates.append(dataset_dir / "horizons" / h_label / model_class / "baseline_summary.csv")
     # Always fall back to flat layout
@@ -352,7 +732,11 @@ def _rate_table(records: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _discover_datasets(data_root: Path, prefix: str) -> list[tuple[str, Path, Path]]:
+def _discover_datasets(
+    data_root: Path,
+    prefix: str,
+    evaluate_all: bool = False,
+) -> list[tuple[str, Path, Path]]:
     """Return ``(dataset_name, dataset_dir, lookahead_metrics_path)`` for every qualifying dataset.
 
     When ``lookahead_metrics.csv`` is missing (e.g. because the evaluation step
@@ -362,6 +746,11 @@ def _discover_datasets(data_root: Path, prefix: str) -> list[tuple[str, Path, Pa
        ``evaluation_summary.csv`` is absent.
     2. Reconstructs ``lookahead_metrics.csv`` from the per-horizon
        ``evaluation_summary.csv`` files found on disk.
+
+    When *evaluate_all* is True the reconstruction step uses combined (train+test)
+    rows, triggering re-evaluation against saved models where needed.  The cached
+    ``lookahead_metrics.csv`` is bypassed so that combined rows are always freshly
+    reconstructed from ``evaluation_summary.csv``.
     """
     hits: list[tuple[str, Path, Path]] = []
     if not data_root.exists():
@@ -371,22 +760,39 @@ def _discover_datasets(data_root: Path, prefix: str) -> list[tuple[str, Path, Pa
         if not child.is_dir() or not child.name.startswith(prefix):
             continue
         metrics_csv = child / "horizons" / "lookahead_sweeps" / "lookahead_metrics.csv"
-        if metrics_csv.exists():
+
+        # When evaluate_all is requested, always reconstruct from per-rep summaries
+        # so combined rows are used regardless of whether a cached CSV exists.
+        if not evaluate_all and metrics_csv.exists():
             hits.append((child.name, child, metrics_csv))
             continue
 
-        # --- Fallback: run pending evaluations and reconstruct metrics ---
+        # --- Fallback / evaluate_all: run pending evaluations and reconstruct metrics ---
         n_completed = _run_pending_evaluations(child)
         if n_completed:
             print(f"[INFO] Completed {n_completed} pending evaluation(s) for {child.name}")
-        reconstructed = _reconstruct_lookahead_metrics(child)
+        reconstructed = _reconstruct_lookahead_metrics(child, evaluate_all=evaluate_all)
         if reconstructed is not None and not reconstructed.empty:
-            sweep_dir = child / "horizons" / "lookahead_sweeps"
-            sweep_dir.mkdir(parents=True, exist_ok=True)
-            reconstructed.to_csv(metrics_csv, index=False)
-            print(f"[INFO] Reconstructed lookahead_metrics.csv for {child.name} "
+            if not evaluate_all:
+                # Cache only when not in evaluate_all mode (combined rows are not
+                # written by k_RunHorizonSweep.py, so the cached CSV would be stale
+                # on the next normal run).
+                sweep_dir = child / "horizons" / "lookahead_sweeps"
+                sweep_dir.mkdir(parents=True, exist_ok=True)
+                reconstructed.to_csv(metrics_csv, index=False)
+            mode_note = " [combined]" if evaluate_all else ""
+            print(f"[INFO] Reconstructed lookahead_metrics{mode_note} for {child.name} "
                   f"({len(reconstructed)} rows)")
-            hits.append((child.name, child, metrics_csv))
+            # Use a temporary in-memory path token for evaluate_all (caller reads from
+            # dataset_dir, not from this path, in that mode).
+            hits.append((child.name, child, metrics_csv if not evaluate_all
+                         else child / "horizons" / "lookahead_sweeps" / "_combined_metrics.csv"))
+            if evaluate_all:
+                # Write the combined reconstruction to a separate file so it doesn't
+                # overwrite the normal lookahead_metrics.csv.
+                _combined_path = child / "horizons" / "lookahead_sweeps" / "_combined_metrics.csv"
+                _combined_path.parent.mkdir(parents=True, exist_ok=True)
+                reconstructed.to_csv(_combined_path, index=False)
         else:
             print(f"[SKIP] No lookahead_metrics.csv for {child.name}")
     return hits
@@ -521,10 +927,24 @@ def _build_records(
     prefix: str,
     model_class_filter: "str | None",
     show_std: bool,
+    evaluate_all: bool = False,
 ) -> list[tuple[str, pd.DataFrame]]:
     """Load and enrich metrics for each dataset, filtered by model_class.
 
     *model_class_filter*: 'ml', 'mlr', or None (accept all rows).
+    *evaluate_all*: when True, ``combined`` (train+test) rows are preferred over
+        ``test``-only rows when computing statistics.  When reading from
+        ``_combined_metrics.csv`` (produced by ``_discover_datasets`` in evaluate_all
+        mode) the ``kind`` column has already been dropped by
+        ``_reconstruct_lookahead_metrics``, so the kind filter below is a no-op in
+        that path; it remains active when the CSV retains a ``kind`` column (e.g.
+        future formats or direct reads of ``evaluation_summary.csv``).
+
+        ``nrmse`` uses ``std_target`` from the combined row when the column is
+        present (written by ``f_Evaluate.py`` as of the current version), falling
+        back to ``sqrt(1 - r2)`` for older CSVs.  Skill scores use
+        ``combined_baseline_summary.csv`` (written by ``_ensure_combined_metrics``)
+        so baselines are also evaluated on the combined sample set.
 
     Returns a list of (clean_label, enriched_df) pairs with nrmse and skill columns added.
     Rows where model_class column exists and does not match *model_class_filter* are dropped.
@@ -543,8 +963,37 @@ def _build_records(
             if df.empty:
                 continue
 
+            # Filter rows by kind: prefer combined (train+test) when evaluate_all is
+            # set; fall back to test if no combined rows are present.
+            if evaluate_all and "kind" in df.columns:
+                combined = df[df["kind"] == "combined"]
+                df = combined if not combined.empty else df[df["kind"] == "test"]
+            elif "kind" in df.columns:
+                df = df[df["kind"] == "test"]
+            if df.empty:
+                continue
+
             std_target = _load_std_target(dataset_dir)
-            df["nrmse"] = df["rmse"] / std_target if std_target is not None else float("nan")
+            if evaluate_all and "std_target" in df.columns:
+                # Use std_target written directly into evaluation_summary.csv by
+                # f_Evaluate.py — the correct denominator for the combined sample set.
+                # Falls back to the algebraic derivation for older CSVs that predate
+                # the std_target column.
+                df["nrmse"] = df.apply(
+                    lambda row: float(row["rmse"]) / float(row["std_target"])
+                    if (np.isfinite(float(row.get("std_target", float("nan"))))
+                        and float(row["std_target"]) > 0)
+                    else float("nan"),
+                    axis=1,
+                )
+            elif evaluate_all:
+                # Older CSVs without std_target: derive algebraically from r2.
+                # nrmse = rmse / std  and  r2 = 1 - rmse²/std²  →  nrmse = sqrt(1 - r2)
+                df["nrmse"] = df["r2"].apply(
+                    lambda r2: np.sqrt(max(0.0, 1.0 - r2)) if np.isfinite(r2) else float("nan")
+                )
+            else:
+                df["nrmse"] = df["rmse"] / std_target if std_target is not None else float("nan")
 
             # Skill vs. baselines — keyed by (horizon, replicate, model_class).
             rep_col = "replicate" if "replicate" in df.columns else None
@@ -556,7 +1005,8 @@ def _build_records(
                 _mc = str(_row[mc_col]) if mc_col else None
                 _key = (_h, _r, _mc)
                 if _key not in _baseline_cache:
-                    _baseline_cache[_key] = _load_baseline_rmses(dataset_dir, _h, _r, _mc)
+                    _baseline_cache[_key] = _load_baseline_rmses(dataset_dir, _h, _r, _mc,
+                                                                  evaluate_all=evaluate_all)
 
             def _skill(model_rmse: float, baseline_rmse: float) -> float:
                 if np.isfinite(model_rmse) and np.isfinite(baseline_rmse) and baseline_rmse > 0:
@@ -1091,8 +1541,14 @@ def _generate_combined_figures(
                             "lookahead_time_to_zero_skill.png", ascending=False)
 
 
-def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std: bool = True) -> int:
-    datasets = _discover_datasets(data_root, prefix)
+def generate_figures(
+    data_root: Path,
+    prefix: str,
+    summaries_dir: Path,
+    show_std: bool = True,
+    evaluate_all: bool = False,
+) -> int:
+    datasets = _discover_datasets(data_root, prefix, evaluate_all=evaluate_all)
     if not datasets:
         print(f"[WARN] No datasets with lookahead metrics found under {data_root}.")
         return 1
@@ -1113,11 +1569,11 @@ def generate_figures(data_root: Path, prefix: str, summaries_dir: Path, show_std
     all_x = sorted(all_x_set)
 
     print("[INFO] Building ML records...")
-    records_ml   = _build_records(datasets, prefix, model_class_filter="ml",   show_std=show_std)
+    records_ml   = _build_records(datasets, prefix, model_class_filter="ml",   show_std=show_std, evaluate_all=evaluate_all)
     print("[INFO] Building MLR records...")
-    records_mlr  = _build_records(datasets, prefix, model_class_filter="mlr",  show_std=show_std)
+    records_mlr  = _build_records(datasets, prefix, model_class_filter="mlr",  show_std=show_std, evaluate_all=evaluate_all)
     print("[INFO] Building combined (all) records for 'best' selection...")
-    records_all  = _build_records(datasets, prefix, model_class_filter=None,   show_std=show_std)
+    records_all  = _build_records(datasets, prefix, model_class_filter=None,   show_std=show_std, evaluate_all=evaluate_all)
 
     # 'best' = one record per label, whichever model_class has better initial_skill
     if records_ml or records_mlr:
@@ -1171,6 +1627,19 @@ def build_parser() -> argparse.ArgumentParser:
             "that use different model types."
         ),
     )
+    parser.add_argument(
+        "--evaluate-all",
+        action="store_true",
+        help=(
+            "Compute statistics over all samples (train + test) instead of the test set "
+            "only.  For each horizon/replicate that lacks combined-set metrics, "
+            "f_Evaluate.py is re-run with evaluate_all=true against the saved model "
+            "weights and sample files — no retraining is performed.  Results are "
+            "written to _combined_metrics.csv alongside lookahead_metrics.csv and are "
+            "used only for the figures produced in this run; the normal "
+            "lookahead_metrics.csv is left unchanged."
+        ),
+    )
     return parser
 
 
@@ -1183,11 +1652,14 @@ def main() -> int:
     summaries_dir = (data_root / "summaries" / "horizons").resolve()
     print(f"[INFO] data_root : {data_root}")
     print(f"[INFO] summaries : {summaries_dir}")
+    if args.evaluate_all:
+        print("[INFO] --evaluate-all: statistics will be computed over train + test samples.")
     return generate_figures(
         data_root=data_root,
         prefix=args.dataset_prefix,
         summaries_dir=summaries_dir,
         show_std=args.std,
+        evaluate_all=args.evaluate_all,
     )
 
 

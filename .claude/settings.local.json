@@ -217,7 +217,13 @@
       "Bash(.venv/Scripts/python src/z2_PredictionTimeseries.py --path data/output/CV14 --sweep-namespace feature_sweeps --limit-datasets 1 --dataset-prefix MC_Chromium)",
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z1_FeaturePostProcess.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(ls -d \"/c/Users/Master/Documents/GitHub/WQRegressors/data/output/CV14/MC_Chromium__µg_L__res/forecasts/feature_sweeps/\"*_s01)",
-      "Bash(grep -E \"\\(src/|scripts/|\\\\.py$\\)\")"
+      "Bash(grep -E \"\\(src/|scripts/|\\\\.py$\\)\")",
+      "Bash(grep -n \"_compute_regression_summary\\(\" c:/Users/Master/Documents/GitHub/WQRegressors/src/*.py c:/Users/Master/Documents/GitHub/WQRegressors/src/utils/*.py)",
+      "Bash(grep -n \"_write_summary_csv\\(\" c:/Users/Master/Documents/GitHub/WQRegressors/src/*.py c:/Users/Master/Documents/GitHub/WQRegressors/src/utils/*.py)",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z2_HorizonPostProcess.py'\\).read\\(\\)\\); print\\('z2 OK'\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/e_Train.py'\\).read\\(\\)\\); print\\('e_Train OK'\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/utils/mlr.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/utils/mlr.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }
