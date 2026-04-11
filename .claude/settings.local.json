@@ -233,7 +233,15 @@
       "Bash(grep -rn \"_res\\\\|residual\" /c/Users/Master/Documents/GitHub/WQRegressors/src/*.py)",
       "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); keys=[k for k in d if 'pH' in k]; print\\(json.dumps\\({k:d[k] for k in keys}, indent=2\\)\\)\")",
       "Bash(.venv/Scripts/python src/z3_ParticleFilter.py --run-name pf_vs_cv14 --cv-dir data/output/CV14 --no-figure)",
-      "Bash(.venv/Scripts/python src/z3_ParticleFilter.py --run-name pf_vs_cv14 --cv-dir data/output/CV14)"
+      "Bash(.venv/Scripts/python src/z3_ParticleFilter.py --run-name pf_vs_cv14 --cv-dir data/output/CV14)",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z3_ParticleFilter.py'\\).read\\(\\)\\); print\\('✓ File parses successfully'\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z3_ParticleFilter.py'\\).read\\(\\)\\); print\\('OK - File parses successfully'\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z3_ParticleFilter.py', encoding='utf-8'\\).read\\(\\)\\); print\\('z3_ParticleFilter OK'\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z3_ParticleFilterPostProcess.py', encoding='utf-8'\\).read\\(\\)\\); print\\('z3_ParticleFilterPostProcess OK'\\)\")",
+      "Bash(.venv/Scripts/python src/z3_ParticleFilterPostProcess.py --help)",
+      "Bash(.venv/Scripts/python src/z3_ParticleFilterPostProcess.py --run-dir data/output/pf_mlr --cv-dir data/output/CV14)",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z3_ParticleFilter.py'\\).read\\(\\)\\); print\\('z3_ParticleFilter OK'\\); ast.parse\\(open\\('src/z3_ParticleFilterPostProcess.py'\\).read\\(\\)\\); print\\('z3_ParticleFilterPostProcess OK'\\)\")",
+      "Bash(.venv/Scripts/python src/z3_ParticleFilterPostProcess.py --run-dir data/output/pf_ml --cv-dir data/output/CV14)"
     ]
   }
 }

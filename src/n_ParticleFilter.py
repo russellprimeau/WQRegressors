@@ -5,9 +5,9 @@ the first 70% of observed samples, then runs a sequential bootstrap particle
 filter across the full timeseries.
 
 The MLR predicts absolute target values from the high-frequency sensor
-predictors at each timestep. The particle filter blends those MLR priors with
-the carried-forward posterior state, injects Gaussian process noise, and
-updates particle weights whenever a sparse lab measurement arrives.
+predictors at each timestep. The particle filter converts those level
+predictions into implied per-step state corrections, injects Gaussian process
+noise, and updates particle weights whenever a sparse lab measurement arrives.
 
 By default, the two uncertainty terms are estimated separately:
   - Process noise (sigma_Q) is inferred from Monte Carlo perturbations of the
@@ -56,20 +56,6 @@ Outputs
       The original <target>_state column is preserved by default; use
       --overwrite-state-output to also replace it with the PF state estimate.
 
-  pf_jump_detail.csv
-      One row per observation update (all targets combined).  Columns:
-      target, row_idx, timestamp, z (observed value), prior_mean,
-      prior_std, error (prior_mean - z), abs_error, z_score.
-      Captures the filter state immediately before each measurement
-      update, characterising how far off the running estimate was at
-      the moment each new measurement arrived.
-
-  pf_jump_stats.csv
-      One row per target.  Summary statistics of the jump errors:
-      n_updates, mean_error, std_error, mae, rmse, median_error,
-      median_abs_error, p10/p90 of signed and absolute errors,
-      mean_abs_z_score, frac_within_1sigma, frac_within_2sigma.
-
   pf_tuning_detail.csv  (only when --tune-filter is supplied)
       One row per target. Columns include target, best_sigma_q,
       best_meas_std, best_prior_blend, and the cross-validated score
@@ -92,12 +78,6 @@ Outputs
       One subplot per target: continuous posterior mean line with ±1σ
       shaded band, scatter of actual measured values, and horizontal legal
       limit lines (red upper, green lower).
-
-  pf_jump_stats.png
-      One row of three panels per target:
-        1. Histogram of signed errors (prior_mean − z) with mean and ±1σ
-        2. Signed error vs. time (scatter)
-        3. |error| vs. prior σ scatter with y=x reference (calibration)
 
   pf_comparison_rmse.png  (only when --cv-dir is supplied)
   pf_comparison_nrmse.png
@@ -173,9 +153,10 @@ CLI arguments
       uses Monte Carlo sensor-uncertainty propagation rather than residuals.
 
   --prior-blend W
-      Weight in [0, 1] that pulls each particle toward the MLR prior
-      prediction at every timestep.  0 keeps a pure carried-forward state
-      (no prior injection); 1 fully resets to the MLR prior.
+      Weight in [0, 1] controlling how much of the MLR-implied correction
+      is applied at each timestep.  0 keeps a pure carried-forward state
+      (no model correction); 1 applies the full correction to the MLR
+      prediction in one step.
       When omitted, a conservative value is inferred automatically from
       the train-only MLR skill and residual noise.
       Default: auto-inferred per target.
@@ -275,9 +256,11 @@ implementing those two methods; run_particle_filter() is unchanged.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import textwrap
+import time
 import warnings
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -295,7 +278,7 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(__file__))
 
-from fill_gaps_mlr import (
+from utils.fill_gaps_mlr import (
     TARGET_COLUMNS,
     TRAIN_FRACTION,
     MIN_OBSERVED,
@@ -314,12 +297,12 @@ from utils.mlr import fit_and_predict
 from utils.limits import load_limits_records, map_limits_to_columns
 from utils.config_utils import select_best_model_row
 from utils.evaluation import visualizer, boxplot_from_error_rows
-from plot_mlr_fill_timeseries import (
+from utils.plot_mlr_fill_timeseries import (
     _strip_common_affixes,
     _safe_series_colors,
     _limit_bounds,
 )
-from z2_PredictionTimeseries import (
+from o_PredictionTimeseries import (
     _load_model_bundle,
     _predict_all_rows,
     _denormalize_value,
@@ -334,6 +317,7 @@ _DEFAULT_INPUT      = str(_REPO_ROOT / "data" / "output" / "regression" / "Conso
 _DEFAULT_OUTPUT_DIR = str(_REPO_ROOT / "data" / "output" / "regression")
 _ML_PROCESS_MODELS = {"xgb_regressor", "gp_regressor", "transformer"}
 _SAVED_MLR_PROCESS_MODELS = {"mlr", "mlr_avg12", "mlr_avgall"}
+_MLR_CACHE_VERSION = 1
 
 
 # ---------------------------------------------------------------------------
@@ -384,13 +368,18 @@ class ObservationModel(Protocol):
 class MLRProcessModel:
     """Process model using a pre-fitted MLR (absolute value prediction).
 
-    At each timestep the model returns the OLS prediction from the current
-    high-frequency sensor predictors.  Each particle is then drawn as:
+    At each timestep the model returns the OLS level prediction from the
+    current high-frequency sensor predictors. The filter then interprets that
+    level as an implied incremental correction from the current state:
 
-        x_particle[t] = mu_MLR(t) + N(0, sigma_Q^2)
+        x_particle[t] = x_particle[t-1]
+                        + alpha * (yhat_MLR(t) - x_particle[t-1])
+                        + N(0, sigma_Q^2)
 
-    When mu_MLR(t) is NaN (missing sensor data), the filter falls back to
-    additive random-walk propagation.
+    where ``alpha = prior_blend`` and ``yhat_MLR(t)`` is still the absolute
+    target-level prediction from the fitted regression. When ``yhat_MLR(t)``
+    is NaN (missing sensor data), the filter falls back to additive
+    random-walk propagation.
 
     Parameters
     ----------
@@ -410,8 +399,10 @@ class MLRProcessModel:
         fit_result: dict,
         noise_std_override: float | None = None,
         precomputed_preds: np.ndarray | None = None,
+        cached_sensor_term: np.ndarray | None = None,
     ):
         self._precomputed = precomputed_preds
+        self._cached_sensor_term = cached_sensor_term
 
         meta = fit_result["meta"]
         self._selected_features: list[str] = list(meta["selected_features"])
@@ -424,6 +415,14 @@ class MLRProcessModel:
         self._active_cols: list[str] = _active_predictor_columns()
         self._state_feature_name = f"{target_col}_state (lag={self._state_offset})"
         self._uses_state_feature = self._state_feature_name in self._selected_features
+        self._state_coef = 0.0
+        if self._uses_state_feature:
+            try:
+                state_pos = self._selected_features.index(self._state_feature_name)
+                if 0 <= state_pos < len(self._coef):
+                    self._state_coef = float(self._coef[state_pos])
+            except ValueError:
+                self._state_coef = 0.0
 
         # Raw sparse _state series from the input CSV. This seeds the lagged-state
         # predictor until the filter has generated enough posterior history to use
@@ -495,6 +494,15 @@ class MLRProcessModel:
         if self._precomputed is not None and not self._uses_state_feature:
             val = self._precomputed[row_idx]
             return float(val) if np.isfinite(val) else np.nan
+
+        if self._cached_sensor_term is not None and self._uses_state_feature:
+            sensor_term = self._cached_sensor_term[row_idx]
+            if not np.isfinite(sensor_term):
+                return np.nan
+            lagged_val = self._resolve_lagged_state_value(row_idx, state_history)
+            if not np.isfinite(lagged_val):
+                return np.nan
+            return float(self._intercept + sensor_term + self._state_coef * lagged_val)
 
         # --- Row-by-row fallback ---
         X_win = _build_window(
@@ -716,12 +724,14 @@ def _suggest_prior_blend(
     measurement_noise_var: float,
     y_train: np.ndarray,
 ) -> float:
-    """Return a conservative train-only blend weight for the MLR prior.
+    """Return a conservative train-only correction fraction for the MLR signal.
 
     The weight is intentionally capped well below 0.5 so that the carried
     posterior remains dominant unless the MLR is both strong and low-noise.
-    Holdout/evaluation metrics are intentionally excluded here to avoid
-    using future information inside the online filter.
+    Interpreted in the state update, this is the fraction of the model-implied
+    one-step correction applied at each timestep. Holdout/evaluation metrics
+    are intentionally excluded here to avoid using future information inside
+    the online filter.
     """
     finite_y = np.asarray(y_train, dtype=float)
     finite_y = finite_y[np.isfinite(finite_y)]
@@ -737,8 +747,9 @@ def _suggest_prior_blend(
     noise_var = float(measurement_noise_var) if np.isfinite(measurement_noise_var) else signal_var
     reliability = signal_var / (signal_var + max(noise_var, 1e-12))
 
-    # Range: [0.05, 0.35]. A poor/noisy MLR gets a minimal nudge; a strong
-    # low-noise MLR can pull harder, but still does not dominate the posterior.
+    # Range: [0.05, 0.35]. A poor/noisy MLR gets a minimal correction; a strong
+    # low-noise MLR can move the state farther per step, but still does not
+    # dominate the posterior.
     blend = 0.05 + 0.30 * skill * reliability
     return float(np.clip(blend, 0.05, 0.35))
 
@@ -1038,24 +1049,32 @@ def fit_mlr_for_target(
 
 
 # ---------------------------------------------------------------------------
-# Vectorised MLR inference over all rows
+# Vectorised MLR inference and cache over all rows
 # ---------------------------------------------------------------------------
 
-def _precompute_mlr_predictions(
+def _mlr_cache_path(output_dir: Path, target_col: str) -> Path:
+    """Return the per-target binary cache path for fresh MLR process inputs."""
+    cache_dir = output_dir / "mlr_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{_sanitise_for_dirname(target_col)}_mlr_process_cache.npz"
+
+
+def _build_mlr_row_cache(
     df: pd.DataFrame,
     target_col: str,
     fit_result: dict,
     active_cols: list[str],
-) -> np.ndarray:
-    """Build the MLR deterministic prediction at every row of df.
+    progress_label: str | None = None,
+    progress_every: int = 5000,
+) -> dict[str, np.ndarray | float | int]:
+    """Build reusable per-row MLR process inputs for every row of df.
 
-    Mirrors the all-rows loop in plot_mlr_fill_timeseries._build_mlr_estimates
-    but uses the pre-fitted coefficients from fit_result rather than
-    calling fit_and_predict() again.
-
-    Returns
-    -------
-    ndarray [n_rows] with NaN where any selected predictor is NaN.
+    Returns a dict containing:
+      precomputed_preds : deterministic prediction using the raw lagged-state
+          column from the input CSV
+      sensor_term : per-row contribution from non-state selected features
+      uses_state_feature : int flag
+      state_coef : coefficient of the lagged-state feature (0 when unused)
     """
     mode           = fit_result["mode"]
     state_offset   = fit_result["state_offset"]
@@ -1071,13 +1090,23 @@ def _precompute_mlr_predictions(
         if state_col in df.columns else None
     )
 
-    # Map selected feature names to column indices in the extended feature list
-    sel_idx = []
-    for fn in selected_features:
+    state_feature_name = f"{target_col}_state (lag={state_offset})"
+    sensor_sel_idx: list[int] = []
+    sensor_coef: list[float] = []
+    state_coef = 0.0
+    for pos, fn in enumerate(selected_features):
+        if pos >= len(coef):
+            break
+        if fn == state_feature_name:
+            state_coef = float(coef[pos])
+            continue
         try:
-            sel_idx.append(feature_names_ext.index(fn))
+            ext_idx = feature_names_ext.index(fn)
         except ValueError:
-            pass  # feature not in extended list — skip
+            continue
+        if ext_idx < len(active_cols):
+            sensor_sel_idx.append(ext_idx)
+            sensor_coef.append(float(coef[pos]))
 
     obs_mask = df[target_col].notna() & df[target_col].apply(
         lambda v: np.isfinite(float(v)) if pd.notna(v) else False
@@ -1087,6 +1116,11 @@ def _precompute_mlr_predictions(
     n_rows = len(df)
     last_obs_iloc = None
     agg_rows = []
+
+    t0 = time.perf_counter()
+    label = progress_label or target_col
+    progress_every = max(1, int(progress_every))
+    sensor_coef_arr = np.asarray(sensor_coef, dtype=float)
 
     for iloc_idx in range(n_rows):
         if mode == "last":
@@ -1108,23 +1142,135 @@ def _precompute_mlr_predictions(
             )
             if state_series is not None else np.nan
         )
-        row_full = np.append(agg_sensor, lagged_val)
-        agg_rows.append(row_full)
+        agg_rows.append(np.append(agg_sensor, lagged_val))
 
         if obs_mask.iat[iloc_idx]:
             last_obs_iloc = iloc_idx
 
+        rows_done = iloc_idx + 1
+        if rows_done == n_rows or (rows_done % progress_every) == 0:
+            elapsed = time.perf_counter() - t0
+            rate = rows_done / elapsed if elapsed > 0 else np.nan
+            pct = 100.0 * rows_done / n_rows if n_rows > 0 else 100.0
+            print(
+                f"    [{label}] Precompute progress: {rows_done}/{n_rows} "
+                f"rows ({pct:.1f}%), elapsed {elapsed:.1f}s, "
+                f"rate {rate:.0f} rows/s"
+            )
+
     X_all_rows = np.array(agg_rows, dtype=float)   # (n_rows, n_ext_features)
 
-    preds = np.full(n_rows, np.nan, dtype=float)
-    if not sel_idx:
-        preds[:] = intercept
-        return preds
+    raw_lagged_state = X_all_rows[:, len(active_cols)]
 
-    X_sel = X_all_rows[:, sel_idx]                  # (n_rows, n_selected)
-    finite_mask = np.all(np.isfinite(X_sel), axis=1)
-    preds[finite_mask] = intercept + X_sel[finite_mask] @ coef
-    return preds
+    sensor_term = np.zeros(n_rows, dtype=float)
+    sensor_finite_mask = np.ones(n_rows, dtype=bool)
+    if sensor_sel_idx:
+        X_sensor_sel = X_all_rows[:, sensor_sel_idx]
+        sensor_finite_mask = np.all(np.isfinite(X_sensor_sel), axis=1)
+        sensor_term[:] = np.nan
+        sensor_term[sensor_finite_mask] = X_sensor_sel[sensor_finite_mask] @ sensor_coef_arr
+
+    preds = np.full(n_rows, np.nan, dtype=float)
+    uses_state_feature = int(state_feature_name in selected_features)
+    if not selected_features:
+        preds[:] = intercept
+    elif uses_state_feature:
+        valid_mask = sensor_finite_mask & np.isfinite(raw_lagged_state)
+        preds[valid_mask] = (
+            intercept
+            + sensor_term[valid_mask]
+            + state_coef * raw_lagged_state[valid_mask]
+        )
+    else:
+        valid_mask = sensor_finite_mask
+        preds[valid_mask] = intercept + sensor_term[valid_mask]
+
+    return {
+        "precomputed_preds": preds,
+        "sensor_term": sensor_term,
+        "raw_lagged_state": raw_lagged_state,
+        "uses_state_feature": uses_state_feature,
+        "state_coef": float(state_coef),
+        "intercept": float(intercept),
+        "n_rows": int(n_rows),
+        "state_offset": int(state_offset),
+    }
+
+
+def _load_or_build_mlr_row_cache(
+    df: pd.DataFrame,
+    target_col: str,
+    fit_result: dict,
+    active_cols: list[str],
+    output_dir: Path,
+    progress_every: int = 5000,
+) -> dict[str, np.ndarray | float | int]:
+    """Load a reusable per-target MLR row cache, rebuilding if stale or absent."""
+    cache_path = _mlr_cache_path(output_dir, target_col)
+    meta = fit_result["meta"]
+    cache_selected = np.asarray(list(meta.get("selected_features", [])), dtype=str)
+    cache_coeffs = np.asarray(meta.get("coefficients", []), dtype=float)
+    cache_intercept = float(meta.get("intercept", np.nan))
+    state_offset = int(fit_result["state_offset"])
+    mode = str(fit_result["mode"])
+
+    if cache_path.exists():
+        try:
+            with np.load(cache_path, allow_pickle=False) as cached:
+                cached_selected = cached["selected_features"].astype(str)
+                cached_coeffs = cached["coefficients"].astype(float)
+                valid = (
+                    int(cached["cache_version"]) == _MLR_CACHE_VERSION
+                    and int(cached["n_rows"]) == len(df)
+                    and str(cached["mode"]) == mode
+                    and int(cached["state_offset"]) == state_offset
+                    and np.array_equal(cached_selected, cache_selected)
+                    and cached_coeffs.shape == cache_coeffs.shape
+                    and np.allclose(cached_coeffs, cache_coeffs, equal_nan=True)
+                    and np.isclose(float(cached["intercept"]), cache_intercept, equal_nan=True)
+                )
+                if valid:
+                    print(f"  Loading cached MLR row terms from: {cache_path}")
+                    return {
+                        "precomputed_preds": cached["precomputed_preds"],
+                        "sensor_term": cached["sensor_term"],
+                        "raw_lagged_state": cached["raw_lagged_state"],
+                        "uses_state_feature": int(cached["uses_state_feature"]),
+                        "state_coef": float(cached["state_coef"]),
+                        "intercept": float(cached["intercept"]),
+                        "n_rows": int(cached["n_rows"]),
+                        "state_offset": int(cached["state_offset"]),
+                    }
+                print(f"  Cached MLR row terms stale for '{target_col}', rebuilding ...")
+        except Exception as exc:
+            print(f"  [WARN] Failed to load MLR cache for '{target_col}': {exc}. Rebuilding ...")
+
+    print(f"  Pre-computing MLR row terms at all {len(df)} rows ...")
+    row_cache = _build_mlr_row_cache(
+        df=df,
+        target_col=target_col,
+        fit_result=fit_result,
+        active_cols=active_cols,
+        progress_label=target_col,
+        progress_every=progress_every,
+    )
+    np.savez_compressed(
+        cache_path,
+        cache_version=np.array(_MLR_CACHE_VERSION, dtype=np.int64),
+        n_rows=np.array(len(df), dtype=np.int64),
+        mode=np.array(mode),
+        state_offset=np.array(state_offset, dtype=np.int64),
+        intercept=np.array(cache_intercept, dtype=float),
+        coefficients=cache_coeffs,
+        selected_features=cache_selected,
+        precomputed_preds=np.asarray(row_cache["precomputed_preds"], dtype=float),
+        sensor_term=np.asarray(row_cache["sensor_term"], dtype=float),
+        raw_lagged_state=np.asarray(row_cache["raw_lagged_state"], dtype=float),
+        uses_state_feature=np.array(int(row_cache["uses_state_feature"]), dtype=np.int64),
+        state_coef=np.array(float(row_cache["state_coef"]), dtype=float),
+    )
+    print(f"  Cached MLR row terms written to: {cache_path}")
+    return row_cache
 
 
 def build_ml_gap_process_model_for_target(
@@ -1402,6 +1548,9 @@ def run_particle_filter(
     n_particles: int,
     prior_blend: float,
     rng: np.random.Generator,
+    progress_label: str | None = None,
+    progress_every: int = 5000,
+    enable_progress: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     """Run a bootstrap particle filter for one target over all rows of df.
 
@@ -1412,7 +1561,8 @@ def run_particle_filter(
     process_model : implements ProcessModel protocol.
     obs_model : implements ObservationModel protocol.
     n_particles : number of particles N.
-    prior_blend : float in [0, 1]; weight pulling particles toward the MLR prior.
+    prior_blend : float in [0, 1]; fraction of the MLR-implied one-step
+        correction applied to each particle.
     rng : random generator.
 
     Returns
@@ -1440,6 +1590,8 @@ def run_particle_filter(
     pf_mean = np.full(n_rows, np.nan, dtype=float)
     pf_std  = np.full(n_rows, np.nan, dtype=float)
     update_records: list[dict] = []
+    progress_every = max(1, int(progress_every))
+    label = progress_label or target_col
 
     target_series = pd.to_numeric(df[target_col], errors="coerce")
     obs_values = target_series.values  # fast array access
@@ -1489,27 +1641,34 @@ def run_particle_filter(
     # ------------------------------------------------------------------
     # Main sequential filter loop
     # ------------------------------------------------------------------
-    for row_idx in range(first_obs_iloc + 1, n_rows):
+    t0 = time.perf_counter()
+    loop_start = first_obs_iloc + 1
+    loop_total = max(0, n_rows - loop_start)
+
+    for row_idx in range(loop_start, n_rows):
 
         # 1. Propagation
-        mu_t = process_model.predict(df, row_idx, state_history=pf_mean)
-        if np.isfinite(mu_t):
-            # Blend the previous posterior particles toward the MLR prior so
-            # that dense predictors guide the state without fully erasing the
-            # last measurement update.
+        yhat_t = process_model.predict(df, row_idx, state_history=pf_mean)
+        if np.isfinite(yhat_t):
+            # Apply the model-implied one-step correction from each particle's
+            # current state toward the MLR level prediction. This is
+            # algebraically equivalent to the previous level-space blend:
+            #   x_t = (1-alpha) * x_{t-1} + alpha * yhat_t + eps
+            # but makes the state-dynamics interpretation explicit.
+            implied_delta = yhat_t - particles
             particles = (
-                (1.0 - prior_blend) * particles
-                + prior_blend * mu_t
+                particles
+                + prior_blend * implied_delta
                 + rng.normal(0.0, sigma_q, N)
             )
         else:
-            # No predictor data: carry forward with pure Gaussian diffusion
+            # No predictor data: carry forward with pure Gaussian diffusion.
             particles = particles + rng.normal(0.0, sigma_q, N)
 
         # 2. Observation update (if a measurement is available)
         z = obs_values[row_idx]
         if np.isfinite(z):
-            # Capture prior (pre-update) statistics for jump analysis
+            # Capture prior (pre-update) statistics
             prior_mu  = float(np.dot(weights, particles))
             prior_sig = float(np.sqrt(np.dot(weights, (particles - prior_mu) ** 2)))
             err = prior_mu - float(z)
@@ -1546,6 +1705,17 @@ def run_particle_filter(
         pf_std[row_idx]  = float(
             np.sqrt(np.dot(weights, (particles - mu) ** 2))
         )
+
+        rows_done = row_idx - loop_start + 1
+        if enable_progress and loop_total > 0 and (row_idx == n_rows - 1 or (rows_done % progress_every) == 0):
+            elapsed = time.perf_counter() - t0
+            rate = rows_done / elapsed if elapsed > 0 else np.nan
+            pct = 100.0 * rows_done / loop_total
+            print(
+                f"    [{label}] Filter progress: {rows_done}/{loop_total} "
+                f"rows ({pct:.1f}%), elapsed {elapsed:.1f}s, "
+                f"rate {rate:.0f} rows/s, updates={len(update_records)}"
+            )
 
     return pf_mean, pf_std, update_records
 
@@ -1703,11 +1873,29 @@ def tune_filter_hyperparameters_for_target(
     meas_std_candidates = _candidate_values_around_default(meas_std_default, scale_mult, 1e-6)
 
     tried_rows: list[dict] = []
+    candidate_counter = 0
+    # Phase 4 local refinement uses 5 blend scales x 5 sigma scales x 5 meas_std scales = 125 candidates
+    # (after deduplication, typically 4-5 unique values per dimension, but we use the nominal count)
+    phase4_nominal_candidates = 5 * 5 * 5
+    total_candidates = (
+        1
+        + len(blend_candidates)
+        + len(sigma_candidates) * len(meas_std_candidates)
+        + phase4_nominal_candidates
+    )
 
     def _evaluate_candidate(sig_q: float, meas_std: float, blend: float) -> dict:
+        nonlocal candidate_counter
+        candidate_counter += 1
+        print(
+            f"    [Tuning {target_col}] Candidate {candidate_counter}/{total_candidates}: "
+            f"sigma_Q={float(sig_q):.4g}, sqrt_R={float(meas_std):.4g}, "
+            f"prior_blend={float(blend):.3f}"
+        )
         proc = NoiseOverrideProcessModel(process_model, sig_q)
         obs = GaussianObservationModel(measurement_noise_var=float(meas_std) ** 2)
         rng_local = np.random.default_rng(int(seed))
+        t_eval = time.perf_counter()
         _, _, records = run_particle_filter(
             df=df,
             target_col=target_col,
@@ -1716,8 +1904,11 @@ def tune_filter_hyperparameters_for_target(
             n_particles=n_particles,
             prior_blend=blend,
             rng=rng_local,
+            progress_label=f"{target_col} tuning",
+            enable_progress=False,
         )
         metrics = _compute_tuning_metrics(records, scored_ilocs)
+        elapsed = time.perf_counter() - t_eval
         row = {
             "target": target_col,
             "sigma_q": float(sig_q),
@@ -1733,6 +1924,10 @@ def tune_filter_hyperparameters_for_target(
             "n_folds": len(folds),
         }
         tried_rows.append(row)
+        print(
+            f"      score={metrics['score']:.4g}, rmse={metrics['rmse']:.4g}, "
+            f"n_scored={metrics['n_scored']}, elapsed={elapsed:.1f}s"
+        )
         return row
 
     best = _evaluate_candidate(default_sigma_q, meas_std_default, default_prior_blend)
@@ -1783,67 +1978,6 @@ def tune_filter_hyperparameters_for_target(
         "tuning_n_folds": len(folds),
     }
     return result, tried_rows
-
-
-# ---------------------------------------------------------------------------
-# Output helpers
-# ---------------------------------------------------------------------------
-
-def _compute_jump_stats(update_records: list[dict]) -> dict:
-    """Summarise pre-update prediction errors across all observation updates.
-
-    Parameters
-    ----------
-    update_records : list of dicts returned by run_particle_filter() —
-        one entry per observation row (excluding the initialisation row).
-
-    Returns
-    -------
-    dict with keys:
-        n_updates       — number of observation updates recorded
-        mean_error      — mean signed error (prior_mean - z); bias indicator
-        std_error       — std of signed errors; spread indicator
-        mae             — mean absolute error
-        rmse            — root mean squared error
-        median_error    — median signed error
-        median_abs_error — median absolute error
-        p10_error / p90_error — 10th/90th percentiles of signed error
-        p10_abs / p90_abs     — 10th/90th percentiles of |error|
-        mean_z_score    — mean |z-score| (how many prior-σ off was the filter)
-        frac_within_1sigma — fraction of updates where |z_score| <= 1
-        frac_within_2sigma — fraction of updates where |z_score| <= 2
-    """
-    if not update_records:
-        return {"n_updates": 0}
-
-    errors   = np.array([r["error"]     for r in update_records], dtype=float)
-    abs_errs = np.array([r["abs_error"] for r in update_records], dtype=float)
-    zscores  = np.array([r["z_score"]   for r in update_records], dtype=float)
-
-    finite_e = errors[np.isfinite(errors)]
-    finite_a = abs_errs[np.isfinite(abs_errs)]
-    finite_z = zscores[np.isfinite(zscores)]
-
-    def _safe(fn, arr, fallback=np.nan):
-        return float(fn(arr)) if len(arr) > 0 else fallback
-
-    stats: dict = {
-        "n_updates":          len(update_records),
-        "mean_error":         _safe(np.mean,   finite_e),
-        "std_error":          _safe(np.std,    finite_e),
-        "mae":                _safe(np.mean,   finite_a),
-        "rmse":               _safe(lambda a: np.sqrt(np.mean(a ** 2)), finite_e),
-        "median_error":       _safe(np.median, finite_e),
-        "median_abs_error":   _safe(np.median, finite_a),
-        "p10_error":          _safe(lambda a: np.percentile(a, 10), finite_e),
-        "p90_error":          _safe(lambda a: np.percentile(a, 90), finite_e),
-        "p10_abs":            _safe(lambda a: np.percentile(a, 10), finite_a),
-        "p90_abs":            _safe(lambda a: np.percentile(a, 90), finite_a),
-        "mean_abs_z_score":   _safe(lambda a: np.mean(np.abs(a)), finite_z),
-        "frac_within_1sigma": _safe(lambda a: np.mean(np.abs(a) <= 1.0), finite_z),
-        "frac_within_2sigma": _safe(lambda a: np.mean(np.abs(a) <= 2.0), finite_z),
-    }
-    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -1930,6 +2064,8 @@ def _compute_evaluation_rows(
     df: pd.DataFrame,
     norm_bounds: dict,
     eval_row_indices: set[int] | None = None,
+    eval_samples: list[tuple[int, str]] | None = None,
+    eval_sample_context: dict[str, dict[str, float]] | None = None,
 ) -> list[dict]:
     """Build evaluation_summary.csv rows for the particle filter predictions.
 
@@ -1956,11 +2092,27 @@ def _compute_evaluation_rows(
     """
     from scipy.stats import pearsonr as _pearsonr
 
-    if eval_row_indices is not None:
+    eval_sample_context = eval_sample_context or {}
+
+    if eval_samples is not None:
+        records_by_row = {
+            int(r.get("row_idx", -1)): r
+            for r in update_records
+        }
+        ordered_pairs = [
+            (records_by_row[row_idx], sample_file)
+            for row_idx, sample_file in eval_samples
+            if row_idx in records_by_row
+        ]
+        update_records = [rec for rec, _sample_file in ordered_pairs]
+    elif eval_row_indices is not None:
         update_records = [
             r for r in update_records
             if int(r.get("row_idx", -1)) in eval_row_indices
         ]
+        ordered_pairs = [(rec, f"pf_row_{int(rec.get('row_idx', -1)):05d}.csv") for rec in update_records]
+    else:
+        ordered_pairs = [(rec, f"pf_row_{int(rec.get('row_idx', -1)):05d}.csv") for rec in update_records]
 
     if not update_records:
         return []
@@ -2034,24 +2186,27 @@ def _compute_evaluation_rows(
         res_max  = float(res_bounds.get("max", 1.0))
         res_span = res_max - res_min
         if res_span > 0:
-            # Forward-fill the _state column to get the most recent prior
-            # measurement at each update row (same as how _res is computed
-            # in preprocessing.add_res).
             state_ff = pd.to_numeric(df[state_col], errors="coerce").ffill().values
 
             pred_res_norm = np.full(len(update_records), np.nan)
             true_res_norm = np.full(len(update_records), np.nan)
 
-            for k, rec in enumerate(update_records):
+            for k, (rec, sample_file) in enumerate(ordered_pairs):
                 ri = rec["row_idx"]
-                # state at the previous timestep (before this observation)
-                prev_state = state_ff[ri - 1] if ri > 0 else np.nan
-                if not np.isfinite(prev_state):
+                sample_ctx = eval_sample_context.get(sample_file, {})
+                state_val = float(sample_ctx.get("state_raw", np.nan))
+                if not np.isfinite(state_val):
+                    state_val = state_ff[ri] if 0 <= ri < len(state_ff) else np.nan
+                if not np.isfinite(state_val):
                     continue
-                pred_res = rec["prior_mean"] - prev_state
-                true_res = rec["z"]          - prev_state
-                pred_res_norm[k] = pred_res / res_span
-                true_res_norm[k] = true_res / res_span
+                pred_res = rec["prior_mean"] - state_val
+                pred_res_norm[k] = (pred_res - res_min) / res_span
+                target_norm = float(sample_ctx.get("target_norm", np.nan))
+                if np.isfinite(target_norm):
+                    true_res_norm[k] = target_norm
+                else:
+                    true_res = rec["z"] - state_val
+                    true_res_norm[k] = (true_res - res_min) / res_span
 
             mae_n, rmse_n, r2_n, pr_n = _metrics(true_res_norm, pred_res_norm)
             mask_n = np.isfinite(pred_res_norm) & np.isfinite(true_res_norm)
@@ -2124,6 +2279,9 @@ def _build_pf_predictions_rows(
     df: pd.DataFrame,
     norm_bounds: dict,
     eval_row_indices: set[int] | None = None,
+    eval_samples: list[tuple[int, str]] | None = None,
+    baseline_predictions: dict[str, dict[str, float]] | None = None,
+    eval_sample_context: dict[str, dict[str, float]] | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Build PF predictions.csv rows in normalized _res units.
 
@@ -2134,12 +2292,31 @@ def _build_pf_predictions_rows(
 
     del _write_predictions_csv  # suppress lint-style unused warning
 
-    if eval_row_indices is not None:
-        update_records = [
-            r for r in update_records
-            if int(r.get("row_idx", -1)) in eval_row_indices
+    baseline_predictions = baseline_predictions or {}
+    eval_sample_context = eval_sample_context or {}
+
+    if eval_samples is not None:
+        records_by_row = {
+            int(r.get("row_idx", -1)): r
+            for r in update_records
+        }
+        selected_records: list[tuple[dict, str]] = [
+            (records_by_row[row_idx], sample_file)
+            for row_idx, sample_file in eval_samples
+            if row_idx in records_by_row
         ]
-    if not update_records:
+    else:
+        if eval_row_indices is not None:
+            update_records = [
+                r for r in update_records
+                if int(r.get("row_idx", -1)) in eval_row_indices
+            ]
+        selected_records = []
+        for rec in update_records:
+            row_idx = int(rec.get("row_idx", -1))
+            selected_records.append((rec, f"pf_row_{row_idx:05d}.csv"))
+
+    if not selected_records:
         return [], []
 
     res_col = f"{target_col}_res"
@@ -2158,24 +2335,30 @@ def _build_pf_predictions_rows(
 
     rows: list[dict] = []
     split_files: list[str] = []
-    for rec in update_records:
+    for rec, sample_file in selected_records:
         row_idx = int(rec.get("row_idx", -1))
-        if row_idx <= 0 or row_idx >= len(state_ff):
+        if row_idx < 0 or row_idx >= len(state_ff):
             continue
-        prev_state = state_ff[row_idx - 1]
+        sample_ctx = eval_sample_context.get(sample_file, {})
+        state_val = float(sample_ctx.get("state_raw", np.nan))
+        if not np.isfinite(state_val):
+            state_val = state_ff[row_idx]
         pred_abs = float(rec.get("prior_mean", np.nan))
         true_abs = float(rec.get("z", np.nan))
-        if not (np.isfinite(prev_state) and np.isfinite(pred_abs) and np.isfinite(true_abs)):
+        if not (np.isfinite(state_val) and np.isfinite(pred_abs) and np.isfinite(true_abs)):
             continue
 
-        pred_res_norm = (pred_abs - prev_state) / res_span
-        true_res_norm = (true_abs - prev_state) / res_span
+        pred_res_norm = ((pred_abs - state_val) - res_min) / res_span
+        target_norm = float(sample_ctx.get("target_norm", np.nan))
+        if np.isfinite(target_norm):
+            true_res_norm = target_norm
+        else:
+            true_res_norm = ((true_abs - state_val) - res_min) / res_span
         if not (np.isfinite(pred_res_norm) and np.isfinite(true_res_norm)):
             continue
 
-        sample_file = f"pf_row_{row_idx:05d}.csv"
         split_files.append(sample_file)
-        rows.append({
+        row = {
             "kind": "test",
             "sample_file": sample_file,
             "gp_uncertainty_mode": "not_gp",
@@ -2186,14 +2369,155 @@ def _build_pf_predictions_rows(
             "pf_prior_std_abs": float(rec.get("prior_std", np.nan)),
             "timestamp": rec.get("timestamp"),
             "row_idx": row_idx,
-        })
+        }
+        for baseline_label, baseline_value in baseline_predictions.get(sample_file, {}).items():
+            if baseline_label == "target":
+                row["target"] = baseline_value
+            else:
+                row[baseline_label] = baseline_value
+        rows.append(row)
 
     return rows, split_files
+
+
+def _load_cv_test_context(
+    cv_dir: Path,
+    target_col: str,
+    df: pd.DataFrame,
+) -> dict[str, object] | None:
+    """Return CV test-split mapping and baseline artifacts for a target."""
+    dataset_dir = _dataset_dir_for_target(cv_dir, target_col)
+    if dataset_dir is None:
+        return None
+
+    test_file_candidates = sorted(dataset_dir.glob("forecasts/**/test_files.txt"))
+    if not test_file_candidates:
+        return None
+    test_files_path = test_file_candidates[0]
+    try:
+        sample_files = [
+            line.strip()
+            for line in test_files_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except Exception:
+        return None
+    if not sample_files:
+        return None
+
+    timestamps = pd.to_datetime(df.get("TIMESTAMP"), errors="coerce")
+    row_idx_by_timestamp: dict[pd.Timestamp, int] = {}
+    for idx, ts in enumerate(timestamps):
+        if pd.notna(ts) and ts not in row_idx_by_timestamp:
+            row_idx_by_timestamp[ts] = int(idx)
+
+    eval_samples: list[tuple[int, str]] = []
+    for sample_file in sample_files:
+        sample_path = dataset_dir / "samples" / Path(sample_file).name
+        if not sample_path.exists():
+            continue
+        try:
+            sample_df = pd.read_csv(sample_path, usecols=["TIMESTAMP"])
+        except Exception:
+            continue
+        if sample_df.empty:
+            continue
+        ts = pd.to_datetime(sample_df["TIMESTAMP"].iloc[-1], errors="coerce")
+        if pd.isna(ts):
+            continue
+        row_idx = row_idx_by_timestamp.get(ts)
+        if row_idx is None:
+            continue
+        eval_samples.append((int(row_idx), Path(sample_file).name))
+
+    baseline_summary_rows: list[dict] = []
+    summary_csv = dataset_dir / "evaluation_summary.csv"
+    if summary_csv.exists():
+        try:
+            summary_df = pd.read_csv(summary_csv)
+            if not summary_df.empty and "label" in summary_df.columns:
+                mask = summary_df["label"].astype(str).str.lower().isin({"naive", "seasonal", "linear"})
+                baseline_summary_rows = summary_df.loc[mask].to_dict(orient="records")
+        except Exception:
+            baseline_summary_rows = []
+
+    baseline_predictions: dict[str, dict[str, float]] = {}
+    eval_sample_context: dict[str, dict[str, float]] = {}
+    norm_json_path = dataset_dir / "normalization.json"
+    try:
+        norm_lookup = json.loads(norm_json_path.read_text(encoding="utf-8")) if norm_json_path.exists() else {}
+    except Exception:
+        norm_lookup = {}
+    prediction_candidates = sorted(dataset_dir.glob("forecasts/**/predictions.csv"))
+    for pred_path in prediction_candidates:
+        try:
+            pred_df = pd.read_csv(pred_path)
+        except Exception:
+            continue
+        needed_cols = {"sample_file", "target", "Naive", "Seasonal", "Linear"}
+        if not needed_cols.issubset(pred_df.columns):
+            continue
+        pred_df = pred_df[pred_df["sample_file"].astype(str).isin(sample_files)].copy()
+        if pred_df.empty:
+            continue
+        baseline_predictions = {
+            str(row["sample_file"]): {
+                "target": float(pd.to_numeric(row.get("target"), errors="coerce")),
+                "Naive": float(pd.to_numeric(row.get("Naive"), errors="coerce")),
+                "Seasonal": float(pd.to_numeric(row.get("Seasonal"), errors="coerce")),
+                "Linear": float(pd.to_numeric(row.get("Linear"), errors="coerce")),
+            }
+            for _, row in pred_df.iterrows()
+        }
+        break
+
+    for row_idx, sample_file in eval_samples:
+        sample_path = dataset_dir / "samples" / sample_file
+        if not sample_path.exists():
+            continue
+        try:
+            sample_df = pd.read_csv(sample_path)
+        except Exception:
+            continue
+        if sample_df.empty:
+            continue
+        last_row = sample_df.iloc[-1]
+        state_candidates = [c for c in sample_df.columns if str(c).endswith("_state")]
+        res_candidates = [c for c in sample_df.columns if str(c).endswith("_res")]
+        state_raw = np.nan
+        if state_candidates:
+            state_col = str(state_candidates[-1])
+            state_norm = float(pd.to_numeric(last_row.get(state_col), errors="coerce"))
+            state_bounds = norm_lookup.get(state_col)
+            if np.isfinite(state_norm) and isinstance(state_bounds, dict):
+                state_min = float(state_bounds.get("min", np.nan))
+                state_max = float(state_bounds.get("max", np.nan))
+                if np.isfinite(state_min) and np.isfinite(state_max):
+                    state_raw = state_norm * (state_max - state_min) + state_min
+        target_norm = np.nan
+        if sample_file in baseline_predictions:
+            target_norm = float(pd.to_numeric(baseline_predictions[sample_file].get("target"), errors="coerce"))
+        elif res_candidates:
+            target_norm = float(pd.to_numeric(last_row.get(res_candidates[-1]), errors="coerce"))
+        eval_sample_context[sample_file] = {
+            "row_idx": float(row_idx),
+            "state_raw": state_raw,
+            "target_norm": target_norm,
+        }
+
+    return {
+        "dataset_dir": dataset_dir,
+        "eval_samples": eval_samples,
+        "baseline_summary_rows": baseline_summary_rows,
+        "baseline_predictions": baseline_predictions,
+        "eval_sample_context": eval_sample_context,
+    }
 
 
 def _write_pf_forecast_artifacts(
     *,
     cv_dir: Path,
+    run_output_dir: Path,
     target_col: str,
     df: pd.DataFrame,
     update_records: list[dict],
@@ -2203,19 +2527,18 @@ def _write_pf_forecast_artifacts(
     run_name: str | None,
     tuned: bool,
     make_plots: bool,
+    eval_samples: list[tuple[int, str]] | None = None,
+    baseline_predictions: dict[str, dict[str, float]] | None = None,
+    eval_sample_context: dict[str, dict[str, float]] | None = None,
 ) -> Path | None:
-    """Write PF evaluation artifacts under the target dataset forecast dir."""
-    dataset_dir = _dataset_dir_for_target(cv_dir, target_col)
-    if dataset_dir is None:
-        print(f"  [WARN] Could not locate dataset directory for '{target_col}'; skipping PF forecast artifacts.")
-        return None
-
+    """Write PF evaluation artifacts under the current run output directory."""
     forecast_name = _pf_forecast_name(
         process_model=process_model,
         run_name=run_name,
         tuned=tuned,
     )
-    forecast_dir = dataset_dir / "forecasts" / forecast_name
+    target_dir = run_output_dir / _sanitise_for_dirname(target_col)
+    forecast_dir = target_dir / "forecasts" / forecast_name
     forecast_dir.mkdir(parents=True, exist_ok=True)
 
     eval_summary_path = forecast_dir / "evaluation_summary.csv"
@@ -2228,6 +2551,9 @@ def _write_pf_forecast_artifacts(
         df=df,
         norm_bounds=norm_bounds,
         eval_row_indices=eval_row_indices,
+        eval_samples=eval_samples,
+        baseline_predictions=baseline_predictions,
+        eval_sample_context=eval_sample_context,
     )
     if not pred_rows:
         print(f"  [WARN] No PF prediction rows available for '{target_col}'; skipping predictions.csv/plots.")
@@ -2246,6 +2572,9 @@ def _write_pf_forecast_artifacts(
         "metric_contract_version",
         "target",
         "Particle Filter",
+        "Naive",
+        "Seasonal",
+        "Linear",
         "pf_prior_std_abs",
         "timestamp",
         "row_idx",
@@ -2256,144 +2585,42 @@ def _write_pf_forecast_artifacts(
     if make_plots:
         pred_arr = np.array([[float(r["Particle Filter"])] for r in pred_rows], dtype=float)
         target_arr = np.array([[float(r["target"])] for r in pred_rows], dtype=float)
+        plot_pairs: list[tuple[np.ndarray, np.ndarray]] = [(pred_arr, target_arr)]
+        plot_labels: list[str] = ["Particle Filter"]
+        plot_split_files: list[list[str]] = [split_files]
+        collapse_error_points: list[bool] = [False]
+
+        for baseline_label in ("Naive", "Seasonal", "Linear"):
+            if any(baseline_label in r for r in pred_rows):
+                baseline_arr = np.array(
+                    [[float(r.get(baseline_label, np.nan))] for r in pred_rows],
+                    dtype=float,
+                )
+                plot_pairs.append((baseline_arr, target_arr))
+                plot_labels.append(baseline_label)
+                plot_split_files.append(split_files)
+                collapse_error_points.append(True)
+
         visualizer(
-            (pred_arr, target_arr),
-            labels=["Particle Filter"],
-            directory=str(dataset_dir),
+            *plot_pairs,
+            labels=plot_labels,
+            directory=str(target_dir),
             forecast_name=forecast_name,
-            split_files_by_pair=[split_files],
-            collapse_error_points_by_pair=[False],
+            split_files_by_pair=plot_split_files,
+            collapse_error_points_by_pair=collapse_error_points,
         )
         boxplot_rows = _build_boxplot_error_rows_from_predictions(
             pred_rows,
             model_label="Particle Filter",
-            baseline_labels=[],
+            baseline_labels=["Naive", "Seasonal", "Linear"],
         )
         boxplot_from_error_rows(
             boxplot_rows,
-            directory=str(dataset_dir),
+            directory=str(target_dir),
             forecast_name=forecast_name,
         )
 
     return forecast_dir
-
-
-# ---------------------------------------------------------------------------
-# Jump-statistics figure
-# ---------------------------------------------------------------------------
-
-def _plot_jump_stats(
-    all_update_records: dict[str, list[dict]],
-    out_path: Path,
-) -> None:
-    """Three-panel jump-statistics figure, one row of panels per target.
-
-    Panels (left to right):
-      1. Histogram of signed errors (prior_mean - z) with mean and ±1σ marked
-      2. Signed error vs. time (scatter)
-      3. |error| vs. prior_std scatter with y=x reference line
-
-    Parameters
-    ----------
-    all_update_records : {target_col: [update_record, ...]}
-    out_path : full path for the saved PNG
-    """
-    target_cols = [t for t, recs in all_update_records.items() if recs]
-    if not target_cols:
-        print("[WARN] No update records to plot for jump stats.")
-        return
-
-    n_targets = len(target_cols)
-    fig_width  = 15.0
-    row_height = 3.2
-    fig_height = max(3.2, row_height * n_targets)
-    font_size  = 8
-
-    fig, axes_grid = plt.subplots(
-        n_targets, 3,
-        figsize=(fig_width, fig_height),
-        squeeze=False,
-    )
-
-    raw_labels  = list(target_cols)
-    stripped    = _strip_common_affixes(raw_labels)
-    palette     = _safe_series_colors(n_targets)
-
-    for i, (target_col, label) in enumerate(zip(target_cols, stripped)):
-        records = all_update_records[target_col]
-        color   = palette[i]
-
-        errors    = np.array([r["error"]     for r in records], dtype=float)
-        abs_errs  = np.array([r["abs_error"] for r in records], dtype=float)
-        prior_std = np.array([r["prior_std"] for r in records], dtype=float)
-        ts_raw    = [r["timestamp"] for r in records]
-
-        try:
-            timestamps = pd.to_datetime(ts_raw, errors="coerce")
-        except Exception:
-            timestamps = pd.array([None] * len(errors))
-
-        fin = np.isfinite(errors)
-
-        ax_hist, ax_time, ax_cal = axes_grid[i]
-
-        # --- Panel 1: error histogram ---
-        if fin.any():
-            mu_e  = float(np.nanmean(errors[fin]))
-            sig_e = float(np.nanstd(errors[fin]))
-            ax_hist.hist(errors[fin], bins=min(20, max(5, fin.sum() // 2)),
-                         color=color, alpha=0.7, edgecolor="white", linewidth=0.4)
-            ax_hist.axvline(mu_e,           color="black",  linewidth=1.2, linestyle="-",
-                            label=f"mean={mu_e:.3g}")
-            ax_hist.axvline(mu_e + sig_e,   color="black",  linewidth=0.8, linestyle="--")
-            ax_hist.axvline(mu_e - sig_e,   color="black",  linewidth=0.8, linestyle="--")
-            ax_hist.axvline(0,              color="#888888", linewidth=0.7, linestyle=":")
-            ax_hist.legend(fontsize=font_size - 1, loc="upper right")
-        ax_hist.set_ylabel(label, rotation=0, ha="right", va="center",
-                           fontsize=font_size + 1, labelpad=6)
-        ax_hist.set_xlabel("error (prior − z)" if i == n_targets - 1 else "",
-                           fontsize=font_size)
-        ax_hist.tick_params(labelsize=font_size)
-        ax_hist.grid(axis="y", linestyle="--", alpha=0.3, linewidth=0.4)
-        if i == 0:
-            ax_hist.set_title("Error distribution", fontsize=font_size + 1)
-
-        # --- Panel 2: error vs. time ---
-        ts_valid = [(t, e) for t, e in zip(timestamps, errors)
-                    if t is not None and pd.notna(t) and np.isfinite(e)]
-        if ts_valid:
-            ts_arr, e_arr = zip(*ts_valid)
-            ax_time.scatter(ts_arr, e_arr, s=14, color=color, alpha=0.7,
-                            edgecolors="none", zorder=2)
-            ax_time.axhline(0, color="#888888", linewidth=0.7, linestyle=":")
-            ax_time.tick_params(axis="x", labelsize=font_size - 1, rotation=20)
-        ax_time.set_xlabel("time" if i == n_targets - 1 else "", fontsize=font_size)
-        ax_time.tick_params(labelsize=font_size)
-        ax_time.grid(axis="y", linestyle="--", alpha=0.3, linewidth=0.4)
-        if i == 0:
-            ax_time.set_title("Error vs. time", fontsize=font_size + 1)
-
-        # --- Panel 3: |error| vs. prior_std (calibration) ---
-        cal_mask = np.isfinite(abs_errs) & np.isfinite(prior_std) & (prior_std > 0)
-        if cal_mask.any():
-            ax_cal.scatter(prior_std[cal_mask], abs_errs[cal_mask],
-                           s=14, color=color, alpha=0.7, edgecolors="none", zorder=2)
-            lim = max(float(prior_std[cal_mask].max()), float(abs_errs[cal_mask].max()))
-            ax_cal.plot([0, lim], [0, lim], color="#888888", linewidth=0.8,
-                        linestyle="--", zorder=1, label="y = x")
-            ax_cal.legend(fontsize=font_size - 1, loc="upper left")
-        ax_cal.set_xlabel("prior σ" if i == n_targets - 1 else "", fontsize=font_size)
-        ax_cal.set_ylabel("|error|" if i == 0 else "", fontsize=font_size)
-        ax_cal.tick_params(labelsize=font_size)
-        ax_cal.grid(linestyle="--", alpha=0.3, linewidth=0.4)
-        if i == 0:
-            ax_cal.set_title("|error| vs. prior σ", fontsize=font_size + 1)
-
-    fig.tight_layout(pad=0.8)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=180, bbox_inches="tight", pad_inches=0.04)
-    plt.close(fig)
-    print(f"Jump stats figure written to: {out_path}")
 
 
 def _write_mlr_model_log(log_rows: list[dict], output_path: Path) -> None:
@@ -2423,6 +2650,78 @@ def _write_mlr_model_log(log_rows: list[dict], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df_log.to_csv(output_path, index=False)
     print(f"MLR model log written to: {output_path}")
+
+
+def _target_observation_window(
+    df: pd.DataFrame,
+    target_cols: list[str],
+    ts: pd.Series,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Return shared x-limits from the full target observation window."""
+    obs_ts_parts: list[pd.Series] = []
+    for col in target_cols:
+        observed = pd.to_numeric(df[col], errors="coerce")
+        obs_mask = observed.notna() & ts.notna()
+        if obs_mask.any():
+            obs_ts_parts.append(ts[obs_mask])
+
+    if obs_ts_parts:
+        obs_ts = (
+            pd.Index(pd.concat(obs_ts_parts, ignore_index=True))
+            .dropna()
+            .unique()
+            .sort_values()
+        )
+        start_date = pd.Timestamp(obs_ts[0])
+        end_date = pd.Timestamp(obs_ts[-1])
+        if len(obs_ts) > 1:
+            obs_deltas = pd.Series(obs_ts).diff().dropna()
+            positive_deltas = obs_deltas[obs_deltas > pd.Timedelta(0)]
+            margin = (
+                positive_deltas.median()
+                if len(positive_deltas)
+                else pd.Timedelta(days=1)
+            )
+        else:
+            margin = pd.Timedelta(days=1)
+        return start_date - margin, end_date + margin
+
+    ts_valid = ts[ts.notna()]
+    if len(ts_valid):
+        return pd.Timestamp(ts_valid.min()), pd.Timestamp(ts_valid.max())
+    return pd.Timestamp("2021-12-15"), pd.Timestamp("2025-03-01")
+
+
+def _set_axis_ylim_from_observations(
+    ax: plt.Axes,
+    observed_values: np.ndarray,
+    fallback_arrays: tuple[np.ndarray, ...] = (),
+) -> None:
+    """Set y-limits from observed values, with a fallback to plotted series."""
+    finite_measured = np.asarray(observed_values, dtype=float)
+    finite_measured = finite_measured[np.isfinite(finite_measured)]
+
+    if finite_measured.size:
+        y_low = float(finite_measured.min())
+        y_high = float(finite_measured.max())
+    else:
+        all_vals: list[float] = []
+        for arr in fallback_arrays:
+            arr = np.asarray(arr, dtype=float)
+            fin = arr[np.isfinite(arr)]
+            if fin.size:
+                all_vals.extend([float(fin.min()), float(fin.max())])
+        if not all_vals:
+            return
+        y_low, y_high = min(all_vals), max(all_vals)
+
+    y_span = y_high - y_low
+    if y_span <= 0:
+        ref = max(abs(y_low), abs(y_high), 1.0)
+        y_pad = 0.12 * ref
+    else:
+        y_pad = 0.08 * y_span
+    ax.set_ylim(y_low - y_pad, y_high + y_pad)
 
 
 def _plot_pf_timeseries(
@@ -2490,9 +2789,7 @@ def _plot_pf_timeseries(
     )
     axes = [axes_raw] if n_rows == 1 else list(axes_raw)
 
-    ts_valid = ts[ts.notna()]
-    start_date = ts_valid.min() if len(ts_valid) else pd.Timestamp("2021-12-15")
-    end_date   = ts_valid.max() if len(ts_valid) else pd.Timestamp("2025-03-01")
+    start_date, end_date = _target_observation_window(df, target_cols, ts)
     quarter_ticks = pd.date_range(start=start_date, end=end_date, freq="QS-JAN")
 
     for i, (ax, col, label) in enumerate(zip(axes, target_cols, wrapped_labels)):
@@ -2578,30 +2875,15 @@ def _plot_pf_timeseries(
         # Y-axis range should reflect the measured values only, so extreme
         # predictions do not flatten the useful visual scale around the target.
         measured_vals = observed.values[obs_mask] if obs_mask.any() else np.array([])
-        finite_measured = measured_vals[np.isfinite(measured_vals)]
-        if finite_measured.size:
-            y_low = float(finite_measured.min())
-            y_high = float(finite_measured.max())
-            y_span = y_high - y_low
-            if y_span <= 0:
-                y_pad = 0.12 * max(abs(y_low), 1.0)
-            else:
-                y_pad = max(0.08 * y_span, 0.03 * max(abs(y_low), abs(y_high), 1.0))
-            ax.set_ylim(y_low - y_pad, y_high + y_pad)
-        elif finite.any():
-            all_vals = []
-            for arr in (mean_arr[finite], mean_arr[finite] + std_arr[finite], mean_arr[finite] - std_arr[finite]):
-                fin = arr[np.isfinite(arr)]
-                if fin.size:
-                    all_vals.extend([float(fin.min()), float(fin.max())])
-            if all_vals:
-                y_low, y_high = min(all_vals), max(all_vals)
-                y_span = y_high - y_low
-                if y_span <= 0:
-                    y_pad = 0.12 * max(abs(y_low), 1.0)
-                else:
-                    y_pad = max(0.08 * y_span, 0.03 * max(abs(y_low), abs(y_high), 1.0))
-                ax.set_ylim(y_low - y_pad, y_high + y_pad)
+        _set_axis_ylim_from_observations(
+            ax,
+            measured_vals,
+            fallback_arrays=(
+                mean_arr[finite],
+                mean_arr[finite] + std_arr[finite],
+                mean_arr[finite] - std_arr[finite],
+            ),
+        )
 
         ax.set_ylabel(label, rotation=0, ha="right", va="center",
                       fontsize=y_label_font_size, labelpad=y_label_pad)
@@ -2854,6 +3136,17 @@ def _plot_model_comparison(
             else:
                 pf_skill = np.nan
 
+            # Use the same sample-count column preference as ML bars so the
+            # two label styles match: prefer n_test_valid, fall back to
+            # n_test_independent.
+            pf_n = np.nan
+            for cand in ('n_test_valid', 'n_test_independent'):
+                if cand in pf_row.columns:
+                    v = pd.to_numeric(pf_row[cand].iloc[0], errors='coerce')
+                    if np.isfinite(v):
+                        pf_n = float(v)
+                        break
+
             records.append({
                 'target':        target_col,
                 'model_display': _PF_DISPLAY,
@@ -2861,7 +3154,7 @@ def _plot_model_comparison(
                 'nrmse':         pf_nrmse,
                 'r2':            pf_r2,
                 'skill_vs_best': pf_skill,
-                'n_samples':     np.nan,
+                'n_samples':     pf_n,
             })
 
     if not records:
@@ -2972,20 +3265,46 @@ def _plot_model_comparison(
             else:
                 ax.set_ylim(bottom=max(ymin_cur, -1.0))
 
-        # Annotate bars with value and sample count
+        # Annotate bars with value and sample count. Labels are always
+        # placed inside the visible axis area: bars whose top is above
+        # the ymax (or below ymin for negative bars) get their labels
+        # clamped to the visible edge so nothing is dropped.
         for bars, vals, ns, fmt_str in pending_annotations:
             ymin_ax, ymax_ax = ax.get_ylim()
+            yspan = float(ymax_ax - ymin_ax) if np.isfinite(ymax_ax - ymin_ax) and (ymax_ax - ymin_ax) > 0 else 1.0
+            pad = 0.01 * yspan
             for bar, val, n in zip(bars, vals, ns):
-                h = bar.get_height()
-                bar_top = bar.get_y() + h
-                if not (ymin_ax <= bar_top <= ymax_ax):
+                if not np.isfinite(val):
                     continue
+                h = bar.get_height()
                 n_str = f", n={int(n)}" if np.isfinite(n) else ""
+                label = f"{val:{fmt_str}}{n_str}"
+                if h >= 0:
+                    # Positive bar: prefer just above the bar top.
+                    y_txt = h + pad
+                    va = 'bottom'
+                    if y_txt > (ymax_ax - pad):
+                        # Bar extends past (or near) the top edge - clamp inside.
+                        y_txt = ymax_ax - pad
+                        va = 'top'
+                    elif y_txt < (ymin_ax + pad):
+                        y_txt = ymin_ax + pad
+                        va = 'bottom'
+                else:
+                    # Negative bar: prefer just below the bar bottom.
+                    y_txt = h - pad
+                    va = 'top'
+                    if y_txt < (ymin_ax + pad):
+                        y_txt = ymin_ax + pad
+                        va = 'bottom'
+                    elif y_txt > (ymax_ax - pad):
+                        y_txt = ymax_ax - pad
+                        va = 'top'
                 ax.text(
                     bar.get_x() + bar.get_width() / 2,
-                    bar_top + 0.008 * (ymax_ax - ymin_ax),
-                    f"{val:{fmt_str}}{n_str}",
-                    ha='center', va='bottom', fontsize=7,
+                    y_txt,
+                    label,
+                    ha='center', va=va, fontsize=7,
                     rotation=90, clip_on=True,
                 )
 
@@ -3116,9 +3435,7 @@ def _plot_comparison_timeseries(
     )
     axes = [axes_raw] if n_rows == 1 else list(axes_raw)
 
-    ts_valid   = ts_merged[ts_merged.notna()]
-    start_date = ts_valid.min() if len(ts_valid) else pd.Timestamp("2021-12-15")
-    end_date   = ts_valid.max() if len(ts_valid) else pd.Timestamp("2025-03-01")
+    start_date, end_date = _target_observation_window(df, target_cols, ts_pf)
     quarter_ticks = pd.date_range(start=start_date, end=end_date, freq="QS-JAN")
 
     # Colour for existing-model line — neutral to avoid clashing with targets
@@ -3182,29 +3499,18 @@ def _plot_comparison_timeseries(
                 alpha=0.95, zorder=2.5,
             )
 
-        # Y-axis range with padding — include both PF and existing-model extents
-        all_vals: list[float] = []
-        for arr in (
+        fallback_arrays = [
             mean_arr[finite_pf],
             mean_arr[finite_pf] + std_arr[finite_pf],
             mean_arr[finite_pf] - std_arr[finite_pf],
-            observed.values[obs_mask] if obs_mask.any() else np.array([]),
-        ):
-            fin = arr[np.isfinite(arr)]
-            if fin.size:
-                all_vals.extend([float(fin.min()), float(fin.max())])
+        ]
         if recon_col in merged.columns:
-            recon_fin = recon[np.isfinite(recon)]
-            if recon_fin.size:
-                all_vals.extend([float(recon_fin.min()), float(recon_fin.max())])
-        if all_vals:
-            y_low, y_high = min(all_vals), max(all_vals)
-            y_span = y_high - y_low
-            if y_span <= 0:
-                y_pad = 0.12 * max(abs(y_low), 1.0)
-            else:
-                y_pad = max(0.08 * y_span, 0.03 * max(abs(y_low), abs(y_high), 1.0))
-            ax.set_ylim(y_low - y_pad, y_high + y_pad)
+            fallback_arrays.append(recon[np.isfinite(recon)])
+        _set_axis_ylim_from_observations(
+            ax,
+            observed.values[obs_mask] if obs_mask.any() else np.array([]),
+            fallback_arrays=tuple(fallback_arrays),
+        )
 
         ax.set_ylabel(label, rotation=0, ha="right", va="center",
                       fontsize=y_label_font_size, labelpad=y_label_pad)
@@ -3305,8 +3611,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prior-blend", type=float, default=None,
         metavar="W",
-        help="Weight in [0, 1] pulling particles toward the MLR prior at each step. "
-             "0 keeps a pure carried-forward state; 1 resets fully to the MLR prior. "
+        help="Weight in [0, 1] controlling how much of the MLR-implied correction "
+             "is applied at each step. 0 keeps a pure carried-forward state; "
+             "1 applies the full correction to the MLR prediction in one step. "
              "Default: conservative auto value inferred from train-only MLR skill and residual noise.",
     )
     parser.add_argument(
@@ -3340,11 +3647,10 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Path to a CV output directory (e.g. data/output/CV14).  "
              "When supplied, the script locates each target's normalization.json "
-             "there, produces an evaluation_summary.csv in the run-name output "
-             "directory (in the same 26-column format as f_Evaluate.py), and "
-             "writes jump-stat figures.  Metrics are produced in both absolute "
-             "physical units and normalised _res units for direct comparison with "
-             "existing pipeline results.",
+             "there and produces an evaluation_summary.csv in the run-name output "
+             "directory (in the same 26-column format as f_Evaluate.py).  "
+             "Metrics are produced in both absolute physical units and normalised "
+             "_res units for direct comparison with existing pipeline results.",
     )
     parser.add_argument(
         "--predictions-csv", default=None,
@@ -3420,6 +3726,35 @@ def main() -> None:
         output_dir = base_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Dump run metadata so z3_ParticleFilterPostProcess can reconstruct the
+    # forecast_name and re-find artifacts without scanning the filesystem.
+    forecast_name = _pf_forecast_name(
+        process_model=args.process_model,
+        run_name=args.run_name,
+        tuned=bool(args.tune_filter),
+    )
+    run_metadata = {
+        "run_name":       args.run_name,
+        "process_model":  args.process_model,
+        "tuned":          bool(args.tune_filter),
+        "forecast_name":  forecast_name,
+        "cv_dir":         str(args.cv_dir) if args.cv_dir else None,
+        "input_csv":      str(args.input),
+        "output_dir":     str(output_dir),
+        "n_particles":    int(args.n_particles),
+        "seed":           int(args.seed),
+        "process_noise_override":     args.process_noise,
+        "measurement_noise_override": args.measurement_noise,
+        "prior_blend_override":       args.prior_blend,
+    }
+    try:
+        (output_dir / "pf_run_metadata.json").write_text(
+            json.dumps(run_metadata, indent=2, default=str),
+            encoding="utf-8",
+        )
+    except Exception as _exc:
+        print(f"[WARN] Could not write pf_run_metadata.json: {_exc}")
+
     print(f"Loading {args.input} ...")
     df = pd.read_csv(args.input, parse_dates=["TIMESTAMP"], low_memory=False)
     df = df.reset_index(drop=True)
@@ -3453,17 +3788,19 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Phase 1: build process/observation models per target
     # ------------------------------------------------------------------
+    total_targets = len(targets_to_run)
     print(f"\n--- Phase 1: Process-model setup ({args.process_model}) ---")
-    for target_col in targets_to_run:
+    for target_idx, target_col in enumerate(targets_to_run, start=1):
         if target_col not in df.columns:
             print(f"[WARN] '{target_col}' not in CSV, skipping.")
             continue
 
+        target_label = f"{target_col} [{target_idx}/{total_targets}]"
         if args.process_model == "mlr":
-            print(f"\n[{target_col}] Fitting MLR ...")
+            print(f"\n[{target_label}] Fitting MLR ...")
             fit_result = fit_mlr_for_target(df, target_col, active_cols, rng)
         elif args.process_model == "best_ml_gap_residual":
-            print(f"\n[{target_col}] Loading best saved ML gap-residual model ...")
+            print(f"\n[{target_label}] Loading best saved ML gap-residual model ...")
             fit_result = build_ml_gap_process_model_for_target(
                 df=df,
                 target_col=target_col,
@@ -3471,7 +3808,7 @@ def main() -> None:
                 process_noise_override=args.process_noise,
             )
         else:
-            print(f"\n[{target_col}] Loading best saved MLR gap-residual model ...")
+            print(f"\n[{target_label}] Loading best saved MLR gap-residual model ...")
             fit_result = build_mlr_gap_process_model_for_target(
                 df=df,
                 target_col=target_col,
@@ -3538,15 +3875,21 @@ def main() -> None:
             print("  [WARN] Intercept-only MLR fallback selected for this target.")
 
         if args.process_model == "mlr":
-            # Pre-compute MLR predictions at every row for a fast filter loop
-            print(f"  Pre-computing MLR predictions at all {len(df)} rows ...")
-            mlr_preds_all = _precompute_mlr_predictions(df, target_col, fit_result, active_cols)
+            row_cache = _load_or_build_mlr_row_cache(
+                df=df,
+                target_col=target_col,
+                fit_result=fit_result,
+                active_cols=active_cols,
+                output_dir=output_dir,
+                progress_every=5000,
+            )
             proc_model = MLRProcessModel(
                 df=df,
                 target_col=target_col,
                 fit_result=fit_result,
                 noise_std_override=proc_noise_std,
-                precomputed_preds=mlr_preds_all,
+                precomputed_preds=np.asarray(row_cache["precomputed_preds"], dtype=float),
+                cached_sensor_term=np.asarray(row_cache["sensor_term"], dtype=float),
             )
         else:
             proc_model = fit_result["proc_model"]
@@ -3658,8 +4001,10 @@ def main() -> None:
     pf_results: dict[str, dict] = {}
     all_update_records: dict[str, list[dict]] = {}
 
-    for target_col, models in model_store.items():
-        print(f"\n[{target_col}] Running filter ({args.n_particles} particles) ...")
+    total_model_targets = len(model_store)
+    for target_idx, (target_col, models) in enumerate(model_store.items(), start=1):
+        target_label = f"{target_col} [{target_idx}/{total_model_targets}]"
+        print(f"\n[{target_label}] Running filter ({args.n_particles} particles) ...")
         pf_mean, pf_std, update_records = run_particle_filter(
             df=df,
             target_col=target_col,
@@ -3668,15 +4013,13 @@ def main() -> None:
             n_particles=args.n_particles,
             prior_blend=models["prior_blend"],
             rng=rng,
+            progress_label=target_label,
         )
         finite_count = int(np.isfinite(pf_mean).sum())
-        jump = _compute_jump_stats(update_records)
         print(
             f"  Done - {finite_count}/{len(df)} rows have finite estimates  "
             f"(mean range: [{np.nanmin(pf_mean):.4g}, {np.nanmax(pf_mean):.4g}])  |  "
-            f"jump MAE={jump.get('mae', np.nan):.4g}, "
-            f"RMSE={jump.get('rmse', np.nan):.4g}, "
-            f"within 1sigma={jump.get('frac_within_1sigma', np.nan):.1%}"
+            f"{len(update_records)} observation updates"
         )
         pf_results[target_col] = {"pf_mean": pf_mean, "pf_std": pf_std}
         all_update_records[target_col] = update_records
@@ -3703,34 +4046,12 @@ def main() -> None:
     print(f"\nParticle filter CSV written to: {out_csv}")
 
     # ------------------------------------------------------------------
-    # Phase 4: jump statistics CSVs
-    # ------------------------------------------------------------------
-
-    # Per-update detail: one row per observation update per target
-    detail_rows = []
-    for target_col, records in all_update_records.items():
-        for rec in records:
-            detail_rows.append({"target": target_col, **rec})
-    detail_path = output_dir / "pf_jump_detail.csv"
-    pd.DataFrame(detail_rows).to_csv(detail_path, index=False)
-    print(f"Jump detail written to: {detail_path}")
-
-    # Per-target summary: one row per target
-    summary_rows = []
-    for target_col, records in all_update_records.items():
-        stats = _compute_jump_stats(records)
-        summary_rows.append({"target": target_col, **stats})
-    summary_path = output_dir / "pf_jump_stats.csv"
-    pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
-    print(f"Jump summary written to: {summary_path}")
-
-    # ------------------------------------------------------------------
-    # Phase 5: evaluation_summary.csv (when --cv-dir supplied)
+    # Phase 4: evaluation_summary.csv (when --cv-dir supplied)
     # ------------------------------------------------------------------
     cv_dir = Path(args.cv_dir) if args.cv_dir else None
 
     if cv_dir is not None:
-        print(f"\n--- Phase 5: Evaluation summary (cv-dir: {cv_dir}) ---")
+        print(f"\n--- Phase 4: Evaluation summary (cv-dir: {cv_dir}) ---")
         eval_rows_all: list[dict] = []
 
         for target_col, records in all_update_records.items():
@@ -3740,16 +4061,36 @@ def main() -> None:
                       f"skipping evaluation summary rows for this target.")
                 continue
 
+            cv_test_ctx = _load_cv_test_context(cv_dir, target_col, df)
+            eval_samples = None
+            eval_indices = holdout_ilocs_by_target.get(target_col, set())
+            baseline_summary_rows: list[dict] = []
+            baseline_predictions: dict[str, dict[str, float]] = {}
+            eval_sample_context: dict[str, dict[str, float]] = {}
+            if cv_test_ctx is not None:
+                eval_samples = list(cv_test_ctx.get("eval_samples", []) or [])
+                if eval_samples:
+                    eval_indices = {row_idx for row_idx, _sample_file in eval_samples}
+                baseline_summary_rows = list(cv_test_ctx.get("baseline_summary_rows", []) or [])
+                baseline_predictions = dict(cv_test_ctx.get("baseline_predictions", {}) or {})
+                eval_sample_context = dict(cv_test_ctx.get("eval_sample_context", {}) or {})
+
             rows = _compute_evaluation_rows(
                 target_col,
                 records,
                 df,
                 norm_bounds,
-                eval_row_indices=holdout_ilocs_by_target.get(target_col, set()),
+                eval_row_indices=eval_indices,
+                eval_samples=eval_samples,
+                eval_sample_context=eval_sample_context,
             )
             if not rows:
                 print(f"  [WARN] No evaluation rows available for '{target_col}'; skipping PF forecast artifact export.")
                 continue
+            for baseline_row in baseline_summary_rows:
+                row = dict(baseline_row)
+                row["target"] = target_col
+                rows.append(row)
             for row in rows:
                 row["data_dir"] = str(cv_dir)
             eval_rows_all.extend(rows)
@@ -3761,15 +4102,19 @@ def main() -> None:
 
             forecast_dir = _write_pf_forecast_artifacts(
                 cv_dir=cv_dir,
+                run_output_dir=output_dir,
                 target_col=target_col,
                 df=df,
                 update_records=records,
                 eval_rows=rows,
-                eval_row_indices=holdout_ilocs_by_target.get(target_col, set()),
+                eval_row_indices=eval_indices,
                 process_model=args.process_model,
                 run_name=args.run_name,
                 tuned=args.tune_filter,
                 make_plots=not args.no_figure,
+                eval_samples=eval_samples,
+                baseline_predictions=baseline_predictions,
+                eval_sample_context=eval_sample_context,
             )
             if forecast_dir is not None:
                 print(f"  PF forecast artifacts written under: {forecast_dir}")
@@ -3789,16 +4134,12 @@ def main() -> None:
             )
 
     # ------------------------------------------------------------------
-    # Phase 6: figures
+    # Phase 5: figures
     # ------------------------------------------------------------------
     if not args.no_figure:
         print("\nGenerating timeseries figure ...")
         fig_path = output_dir / "Target_timeseries_pf.png"
         _plot_pf_timeseries(df, pf_results, fig_path)
-
-        print("Generating jump stats figure ...")
-        jump_fig_path = output_dir / "pf_jump_stats.png"
-        _plot_jump_stats(all_update_records, jump_fig_path)
 
         if args.predictions_csv is not None:
             pred_csv_path = Path(args.predictions_csv)
