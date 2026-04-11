@@ -365,23 +365,10 @@ def plot_mlr_fill_timeseries(repo_root: Path) -> None:
 
         # --- Observed values (raw target column) ---
         observed = pd.to_numeric(df[col], errors="coerce")
+        obs_mask = observed.notna()
 
         # --- MLR estimate (in-memory predictions only; no _state fallback) ---
         estimate = mlr_estimates.get(col)
-
-        # Determine y-axis range from both series together
-        y_low  = None
-        y_high = None
-        for ser in (observed, estimate):
-            if ser is None:
-                continue
-            vals = ser.to_numpy(dtype=float)
-            finite = vals[np.isfinite(vals)]
-            if finite.size > 0:
-                lo = float(np.min(finite))
-                hi = float(np.max(finite))
-                y_low  = lo if y_low  is None else min(y_low,  lo)
-                y_high = hi if y_high is None else max(y_high, hi)
 
         # --- Limit lines (before scatter so they sit behind data) ---
         if col in all_limit_specs:
@@ -391,17 +378,40 @@ def plot_mlr_fill_timeseries(repo_root: Path) -> None:
             if lower_limit is not None:
                 ax.axhline(y=lower_limit, color="#2ca02c", linewidth=0.7, linestyle="-", zorder=1.2)
 
-        # --- Line: MLR _state estimates ---
+        # --- Line: MLR estimates, broken at each measurement row after the first ---
         if estimate is not None and estimate.notna().any():
-            ax.plot(
-                estimate.index, estimate.values,
-                linestyle="-", linewidth=0.7,
-                color=color, alpha=0.65,
-                zorder=1.5, label="MLR estimate",
-            )
+            est_vals = estimate.to_numpy(dtype=float)
+            segment_mask = np.isfinite(est_vals)
+            obs_ilocs = np.flatnonzero(obs_mask.to_numpy(dtype=bool))
+            if obs_ilocs.size > 1:
+                segment_mask[obs_ilocs[1:]] = False
+
+            seg_start = None
+            for row_idx in range(len(segment_mask)):
+                if bool(segment_mask[row_idx]):
+                    if seg_start is None:
+                        seg_start = row_idx
+                    continue
+                if seg_start is None:
+                    continue
+                seg_slice = slice(seg_start, row_idx)
+                ax.plot(
+                    estimate.index[seg_slice], est_vals[seg_slice],
+                    linestyle="-", linewidth=0.7,
+                    color=color, alpha=0.65,
+                    zorder=1.5, label="MLR estimate" if seg_start == 0 else None,
+                )
+                seg_start = None
+            if seg_start is not None:
+                seg_slice = slice(seg_start, len(segment_mask))
+                ax.plot(
+                    estimate.index[seg_slice], est_vals[seg_slice],
+                    linestyle="-", linewidth=0.7,
+                    color=color, alpha=0.65,
+                    zorder=1.5, label="MLR estimate" if seg_start == 0 else None,
+                )
 
         # --- Scatter: observed measured values ---
-        obs_mask = observed.notna()
         if obs_mask.any():
             ax.plot(
                 observed.index[obs_mask], observed.values[obs_mask],
@@ -411,7 +421,21 @@ def plot_mlr_fill_timeseries(repo_root: Path) -> None:
                 alpha=0.95, zorder=2.5, label="Measured",
             )
 
-        # Y-axis limits with padding
+        # Y-axis limits with padding, based on measurements only. If a target
+        # has no measured values, fall back to the estimate range.
+        y_low = y_high = None
+        observed_vals = observed.to_numpy(dtype=float)
+        finite_obs = observed_vals[np.isfinite(observed_vals)]
+        if finite_obs.size > 0:
+            y_low = float(np.min(finite_obs))
+            y_high = float(np.max(finite_obs))
+        elif estimate is not None:
+            est_vals = estimate.to_numpy(dtype=float)
+            finite_est = est_vals[np.isfinite(est_vals)]
+            if finite_est.size > 0:
+                y_low = float(np.min(finite_est))
+                y_high = float(np.max(finite_est))
+
         if y_low is not None and y_high is not None:
             y_span = y_high - y_low
             if y_span <= 0:

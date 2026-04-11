@@ -223,7 +223,17 @@
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z2_HorizonPostProcess.py'\\).read\\(\\)\\); print\\('z2 OK'\\)\")",
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/e_Train.py'\\).read\\(\\)\\); print\\('e_Train OK'\\)\")",
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/utils/mlr.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
-      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/utils/mlr.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/utils/mlr.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(awk '{print $NF}')",
+      "Bash(wc -l /c/Users/Master/Documents/GitHub/WQRegressors/src/utils/*.py)",
+      "Bash(awk -F',' '$8 ~ /_state$|_state;/ && $8 !~ /;/ {print NR\": \"$1\" \"$2\" | \"$8}' \"c:\\\\Users\\\\Master\\\\Documents\\\\GitHub\\\\WQRegressors\\\\data\\\\output\\\\regression\\\\mlr_model_summary.csv\")",
+      "Bash(grep -E \",[^,]*_state \\\\\\(lag=[0-9]+\\\\\\)$\" \"c:\\\\Users\\\\Master\\\\Documents\\\\GitHub\\\\WQRegressors\\\\data\\\\output\\\\regression\\\\mlr_model_summary.csv\")",
+      "Bash(python \"C:/Users/Master/Documents/GitHub/WQRegressors/src/fill_gaps_mlr.py\" --help)",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z3_ParticleFilter.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(grep -rn \"_res\\\\|residual\" /c/Users/Master/Documents/GitHub/WQRegressors/src/*.py)",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); keys=[k for k in d if 'pH' in k]; print\\(json.dumps\\({k:d[k] for k in keys}, indent=2\\)\\)\")",
+      "Bash(.venv/Scripts/python src/z3_ParticleFilter.py --run-name pf_vs_cv14 --cv-dir data/output/CV14 --no-figure)",
+      "Bash(.venv/Scripts/python src/z3_ParticleFilter.py --run-name pf_vs_cv14 --cv-dir data/output/CV14)"
     ]
   }
 }
