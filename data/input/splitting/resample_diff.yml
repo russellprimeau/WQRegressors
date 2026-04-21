@@ -1,0 +1,149 @@
+# d_RunResample.py configuration example
+# Run with:  python src/d_RunResample.py --config data/output/sampling/resample_config_example.yml
+#
+# All file paths below are resolved relative to this config file's directory.
+
+# ── Input data ────────────────────────────────────────────────────────────────
+input_csv: "../../output/regression/Consolidated_sparse.csv"
+
+# ── Output ────────────────────────────────────────────────────────────────────
+# Base directory under which one subdirectory per target will be created.
+output_dir: "../../output/CV19"
+
+# Name pattern for each per-target subdirectory.
+# {target_slug} is replaced by the target column name with non-word chars → '_'.
+set_name_template: "MC_{target_slug}"
+
+# ── Target columns ────────────────────────────────────────────────────────────
+# List base names without suffix; see auto_target_suffixes below.
+target_columns:
+  - Color
+  - Turbidity (FNU)
+  - pH
+  - E.coli (CFU/100mL)
+  - Intestinal enterococci (CFU/100mL)
+  - Colony Count 22°C (CFU/mL)
+  - Total coliforms 37°C (CFU/100mL)
+  - Arsenic (µg/L)
+  - Lead (µg/L)
+  - Cadmium (µg/L)
+  - Copper filtered (mg/L)
+  - Chromium (µg/L)
+  - Nickel (µg/L)
+  - Zinc (µg/L)
+
+# Suffix options applied to every name in target_columns:
+#   diff:  append _diff to form the fixed-interval output column (e.g. pH_diff)
+#   res:   append _res to form the actual output column (e.g. pH_res)
+#   state: append _state and add it to predictors (e.g. pH_state), if present in data
+auto_target_suffixes:
+  diff: true
+  res: false
+  state: true
+
+# ── Predictor columns ─────────────────────────────────────────────────────────
+# _state columns for each target are appended automatically when auto_target_suffixes.state=true.
+predictor_columns:
+  - Pfl - Water temperature (°C)
+  - Pfl - Sp Cond (microS_cm)
+  - Pfl - pH
+  - Pfl - DO (% Sat)
+  - Pfl - Turbidity (FNU)
+  - Pfl - fDOM (RFU)
+  - Pfl - fDOM (QSU)
+  - Wind speed x (m/s)
+  - Wind speed y (m/s)
+  - Atmospheric pressure (mBar)
+  - Longwave (IR) radiation (W/m2)
+  - Shortwave (solar) radiation (W/m2)
+  - 24hr precipitation total (mm)
+  - Air temperature (°C)
+  - Humidity (%)
+  - SCADA - pH
+  - SCADA - Temperature (°C)
+
+# ── Sample dimensions ─────────────────────────────────────────────────────────
+# sample_length: integer row count, or "auto" to look up the median hours between
+#   Eurofins measurements for each target and use that as the row count.
+sample_length: auto
+sample_length_fallback: 168   # rows used when auto-lookup fails
+
+# gap_rows: rows between the last predictor row and the target row.
+#   0 (default) = the target value is taken from the same row as the last predictor.
+#   N > 0       = the predictor window is shifted N rows earlier; the last row of
+#                 each segment CSV retains predictor values from N rows before the
+#                 target but gets its TIMESTAMP and target-column values from the
+#                 target row.  The segment CSV always contains sample_length rows.
+gap_rows: 0
+
+# ── Normalization ─────────────────────────────────────────────────────────────
+# "auto" normalizes all predictor columns plus base target names and their
+# _state, _res, and _diff variants that are present in the data.
+# Replace with an explicit list to override.
+to_normalize: auto
+
+# ── Monte Carlo uncertainty replicates ────────────────────────────────────────
+use_uncertainty_perturbation: true
+n_mc_replicates: 10
+random_seed: 1
+
+# ── Eurofins summary table (for auto sample_length) ──────────────────────────
+# null = use the built-in default path (data/output/sensors/tables/Eurofins_summary.csv)
+eurofins_summary_path: null
+
+# ── Verbosity ─────────────────────────────────────────────────────────────────
+verbose: false
+
+# ── Training config overrides ─────────────────────────────────────────────────
+# Values here are merged into the generated config_xgb_01.yml /
+# config_transformer_01.yml / config_gp_01.yml for each target dataset.
+# Any key at the top level (model_type, device, …) or inside hyperparameters,
+# data, or data_split can be overridden.
+# Leave a section empty ({}) to use the built-in defaults.
+training_config_defaults:
+  xgb:
+    hyperparameters:
+      n_estimators: 300
+      max_depth: 7
+      subsample: 0.2
+      colsample_bytree: 0.8
+      min_child_weight: 8
+      learning_rate: 0.01
+      early_stopping_rounds: 300
+      train_loss_plateau_rounds: 10
+      train_loss_min_relative_improvement: 0.01
+      'cv_tuning':
+                'enabled': False
+                'n_folds': 5
+                'n_trials': 250
+                'seed': 21
+                'parallel_jobs': 1
+                'metric': 'rmse_r2'
+                'search_method': 'optuna'
+                'optuna_sampler': 'tpe'
+                'random_start_trials': 30
+                'use_early_stopping': False
+                'early_stopping_rounds': null
+                'verbose': False
+                'min_r2': 0.0
+                'r2_penalty': 10.0
+                'param_space':
+                    'n_estimators': {'low': 10, 'high': 300, 'type': 'int'}
+                    'max_depth': {'low': 2, 'high': 9, 'type': 'int'}
+                    'min_child_weight': {'low': 1, 'high': 20, 'type': 'int'}
+                    'gamma': {'low': 0.0, 'high': 2.0, 'type': 'float'}
+                    'subsample': {'low': 0.5, 'high': 0.9, 'type': 'float'}
+                    'colsample_bytree': {'low': 0.3, 'high': 1.0, 'type': 'float'}
+                    'reg_lambda': {'low': 1e-3, 'high': 10.0, 'type': 'log'}
+                    'reg_alpha': {'low': 1e-4, 'high': 5.0, 'type': 'log'}
+                    'learning_rate': {'low': 0.003, 'high': 0.2, 'type': 'log'}
+  transformer:
+    hyperparameters:
+      num_epochs: 100
+      patience: 10
+      model_dim: 64
+  gp:
+    hyperparameters:
+      num_epochs: 250
+      patience: 20
+      max_train_size: 5000
