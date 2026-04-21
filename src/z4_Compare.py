@@ -32,8 +32,8 @@ CLI arguments:
                          (default: summaries).
     --summary-file       Filename of the summary CSV (default:
                          summary_best_model_performance.csv).
-    --sort               Sort datasets by mean statistic across all roots
-                         (descending).  Default: alphabetical.
+    --sort               Sort datasets by the chosen --sort-by key (descending).
+                         Default: alphabetical.
     --all-datasets       Include datasets missing from some roots (their bars
                          are omitted; intersection-only is the default).
     --output PATH        Output PNG path.  Defaults to compare_<stat>.png in
@@ -45,6 +45,7 @@ Examples:
 python src/z3_Compare.py --root data/output/CV14 --root data/output/profileless
 python src/z3_Compare.py --root data/output/CV14 --label "With profiles" --root data/output/CV15profileless --label "No profiles" --stat skill_vs_best_baseline --sort --output data/output/comparisons/profile/skill_vs_best_baseline.png
 python src/z3_Compare.py --root data/output/CV14 --label "With state" --root data/output/CV16statelessless --label "No state" --stat skill_vs_best_baseline --sort --output data/output/comparisons/state/skill_vs_best_baseline.png
+python src/z4_Compare.py --root data/output/CV14 --label "With state" --root data/output/CV16stateless --label "No state" --root data/output/CV15profileless --label "No Surface" --root data/output/CV18_raw --label "No residual" --stat r2 --sort --output data/output/comparisons/all/r2.png
 """
 from __future__ import annotations
 
@@ -82,13 +83,13 @@ _SKILL_COLS = ("skill_vs_naive", "skill_vs_seasonal", "skill_vs_linear")
 _SKILL_VS_BEST = "skill_vs_best_baseline"
 
 # Suffixes stripped when normalising dataset names for cross-directory matching.
-_NORM_SUFFIX_RE = _re.compile(r"(_res|_state)+$", _re.IGNORECASE)
+_NORM_SUFFIX_RE = _re.compile(r"(_diff|_res|_state)+$", _re.IGNORECASE)
 
 
 def _normalize_dataset_name(name: str) -> str:
     """Return a canonical key for *name* used when matching across directories.
 
-    Strips trailing ``_res`` / ``_state`` suffixes (any number of repetitions)
+    Strips trailing ``_diff`` / ``_res`` / ``_state`` suffixes (any number of repetitions)
     and then strips any remaining trailing underscores, so that e.g.
     ``MC_Arsenic__µg_L__res`` and ``MC_Arsenic__µg_L_`` both map to
     ``MC_Arsenic__µg_L``.
@@ -149,6 +150,46 @@ def _add_skill_vs_best(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df[_SKILL_VS_BEST] = df[present].max(axis=1)
     return df
+
+
+def _format_bar_annotation(value: float, scientific: bool) -> str:
+    """Return a compact annotation string with chart-wide scientific formatting when needed."""
+    if scientific:
+        s = f"{value:.2e}"
+        mantissa, exp = s.split("e")
+        return f"{mantissa}e{int(exp)}"
+    return f"{value:.2f}"
+
+
+def _expand_ylim_to_fit_annotations(ax: plt.Axes, pad_pixels: float = 2.0, max_passes: int = 3) -> None:
+    """Expand y-limits just enough so existing annotation texts fit inside the axes box."""
+    texts = [txt for txt in ax.texts if txt.get_visible()]
+    if not texts:
+        return
+    fig = ax.figure
+    for _ in range(max_passes):
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        ax_bbox = ax.get_window_extent(renderer=renderer)
+        top_over = 0.0
+        bottom_over = 0.0
+        for txt in texts:
+            bbox = txt.get_window_extent(renderer=renderer)
+            top_over = max(top_over, bbox.y1 - ax_bbox.y1)
+            bottom_over = max(bottom_over, ax_bbox.y0 - bbox.y0)
+        if top_over <= 0 and bottom_over <= 0:
+            break
+        x_ref = 0.5 * (ax_bbox.x0 + ax_bbox.x1)
+        y_lo, y_hi = ax.get_ylim()
+        new_y_lo = y_lo
+        new_y_hi = y_hi
+        if bottom_over > 0:
+            new_y_lo = ax.transData.inverted().transform((x_ref, ax_bbox.y0 - bottom_over - pad_pixels))[1]
+        if top_over > 0:
+            new_y_hi = ax.transData.inverted().transform((x_ref, ax_bbox.y1 + top_over + pad_pixels))[1]
+        if new_y_lo == y_lo and new_y_hi == y_hi:
+            break
+        ax.set_ylim(new_y_lo, new_y_hi)
 
 
 def generate_figure(
@@ -251,7 +292,9 @@ def generate_figure(
     # Optional sort
     # ------------------------------------------------------------------
     if sort:
-        if sort_by == "diff":
+        if sort_by == "first":
+            sort_vals = value_matrix[:, 0]
+        elif sort_by == "diff":
             sort_vals = value_matrix[:, -1] - value_matrix[:, 0]
         else:
             sort_vals = np.nanmean(value_matrix, axis=1)
@@ -265,11 +308,17 @@ def generate_figure(
     # ------------------------------------------------------------------
     n_datasets = len(norm_pool)
     n_roots    = len(labels)
-    bar_w      = 0.8 / n_roots          # cluster width = 0.8 of one tick unit
+    # Use contiguous bars within each cluster, with an inter-cluster gap equal
+    # to half of one bar width.  Since dataset centres are one x-unit apart,
+    # solve n_roots * bar_w + 0.5 * bar_w = 1 for bar_w.
+    bar_w      = 1.0 / (n_roots + 0.5)
+    font_size  = 9
     x          = np.arange(n_datasets)
 
     fig_w = max(7.0, 0.85 * n_datasets + 2.0)
     fig, ax = plt.subplots(figsize=(fig_w, 5.0))
+    finite_vals = value_matrix[np.isfinite(value_matrix)]
+    use_scientific = bool(finite_vals.size and np.any(np.abs(finite_vals) < 0.01))
 
     for j, (label, color) in enumerate(zip(labels, _SERIES_COLORS)):
         offsets = x + (j - (n_roots - 1) / 2.0) * bar_w
@@ -277,31 +326,28 @@ def generate_figure(
         # Draw bars; NaN values produce zero-height bars, so skip them explicitly
         for xi, v in zip(offsets, vals):
             if np.isfinite(v):
-                ax.bar(xi, v, width=bar_w * 0.92, color=color, label=label if xi == offsets[0] else "")
+                ax.bar(xi, v, width=bar_w, color=color, label=label if xi == offsets[0] else "")
                 # Value label: above positive bars, below negative bars
                 va = "bottom" if v >= 0 else "top"
                 y_offset = 0.005 * (1 if v >= 0 else -1)
-                ax.text(xi, v + y_offset, f"{v:.2f}", ha="center", va=va,
-                        fontsize=8, rotation=90)
+                ax.text(xi, v + y_offset, _format_bar_annotation(v, use_scientific), ha="center", va=va,
+                        fontsize=font_size, rotation=90)
 
     # Zero reference line
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
 
     # Axes
     ax.set_xticks(x)
-    ax.set_xticklabels(display_labels, rotation=45, ha="right", fontsize=10)
-    # Tight horizontal margins: ~0.1 unit gap beyond the outermost bar edge.
-    half_cluster = (n_roots - 1) * bar_w / 2 + bar_w * 0.92 / 2
-    ax.set_xlim(x[0] - half_cluster - 0.1, x[-1] + half_cluster + 0.1)
-    # Extend the upper y-limit so rotated value labels are not clipped.
-    y_lo, y_hi = ax.get_ylim()
-    y_span = y_hi - y_lo
-    ax.set_ylim(y_lo, y_hi + 0.15 * y_span)
+    ax.set_xticklabels(display_labels, rotation=45, ha="right", fontsize=font_size)
+    ax.tick_params(axis="y", labelsize=font_size)
+    # Keep edge margins small and proportional to the inter-cluster spacing.
+    half_cluster = n_roots * bar_w / 2
+    ax.set_xlim(x[0] - half_cluster - 0.25 * bar_w, x[-1] + half_cluster + 0.25 * bar_w)
     stat_ylabel = _STAT_LABELS.get(stat_col, stat_col.replace("_", " "))
-    ax.set_ylabel(stat_ylabel, fontsize=12)
+    ax.set_ylabel(stat_ylabel, fontsize=font_size)
     ax.grid(axis="y", alpha=0.3)
 
-    # Legend — deduplicate entries
+    # Legend — deduplicate entries and place to minimise overlap with bars
     handles, leg_labels = ax.get_legend_handles_labels()
     seen: dict[str, int] = {}
     unique_h, unique_l = [], []
@@ -310,10 +356,58 @@ def generate_figure(
             seen[l] = 1
             unique_h.append(h)
             unique_l.append(l)
-    ax.legend(unique_h, unique_l, fontsize=11, framealpha=0.85,
-              loc="upper right" if not sort else "upper left")
+
+    # Pick the corner whose rectangular region overlaps the least bar area.
+    # We approximate the legend size as a fraction of the axes and score each
+    # candidate location by summing the absolute bar heights that fall inside
+    # that region.
+    x_lo, x_hi = ax.get_xlim()
+    y_lo, y_hi = ax.get_ylim()
+    x_span = x_hi - x_lo
+    y_span_ax = y_hi - y_lo
+    # Rough legend footprint in data coords (overestimate to be safe).
+    leg_w = 0.25 * x_span
+    leg_h = 0.20 * y_span_ax
+
+    _CANDIDATE_LOCS = [
+        ("upper left",  x_lo,            y_hi - leg_h),
+        ("upper right", x_hi - leg_w,    y_hi - leg_h),
+        ("lower left",  x_lo,            y_lo),
+        ("lower right", x_hi - leg_w,    y_lo),
+    ]
+
+    # All bar centres and tops (including text labels above them).
+    bar_xs: list[float] = []
+    bar_tops: list[float] = []
+    bar_bottoms: list[float] = []
+    for j in range(n_roots):
+        offsets_j = x + (j - (n_roots - 1) / 2.0) * bar_w
+        for xi, v in zip(offsets_j, value_matrix[:, j]):
+            if np.isfinite(v):
+                bar_xs.append(float(xi))
+                bar_tops.append(float(v) if v >= 0 else 0.0)
+                bar_bottoms.append(float(v) if v < 0 else 0.0)
+    bar_xs_arr = np.array(bar_xs)
+    bar_tops_arr = np.array(bar_tops)
+    bar_bottoms_arr = np.array(bar_bottoms)
+
+    best_loc = "upper right"
+    best_score = np.inf
+    for loc_name, rx_lo, ry_lo in _CANDIDATE_LOCS:
+        rx_hi = rx_lo + leg_w
+        ry_hi = ry_lo + leg_h
+        in_x = (bar_xs_arr >= rx_lo - bar_w) & (bar_xs_arr <= rx_hi + bar_w)
+        # A bar overlaps vertically if its extent intersects [ry_lo, ry_hi].
+        in_y = (bar_tops_arr >= ry_lo) & (bar_bottoms_arr <= ry_hi)
+        overlap = np.sum(np.abs(bar_tops_arr[in_x & in_y] - bar_bottoms_arr[in_x & in_y]))
+        if overlap < best_score:
+            best_score = overlap
+            best_loc = loc_name
+
+    ax.legend(unique_h, unique_l, fontsize=font_size, framealpha=0.85, loc=best_loc)
 
     fig.tight_layout()
+    _expand_ylim_to_fit_annotations(ax)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
@@ -385,11 +479,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--sort-by",
-        choices=["diff", "mean"],
-        default="diff",
+        choices=["first", "diff", "mean"],
+        default="first",
         help=(
             "Key used when --sort is active.  "
-            "'diff' (default) sorts by root[-1] minus root[0]; "
+            "'first' (default) sorts by the stat value of the first --root; "
+            "'diff' sorts by root[-1] minus root[0]; "
             "'mean' sorts by the mean across all roots."
         ),
     )

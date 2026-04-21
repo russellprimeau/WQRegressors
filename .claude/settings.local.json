@@ -241,7 +241,14 @@
       "Bash(.venv/Scripts/python src/z3_ParticleFilterPostProcess.py --help)",
       "Bash(.venv/Scripts/python src/z3_ParticleFilterPostProcess.py --run-dir data/output/pf_mlr --cv-dir data/output/CV14)",
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z3_ParticleFilter.py'\\).read\\(\\)\\); print\\('z3_ParticleFilter OK'\\); ast.parse\\(open\\('src/z3_ParticleFilterPostProcess.py'\\).read\\(\\)\\); print\\('z3_ParticleFilterPostProcess OK'\\)\")",
-      "Bash(.venv/Scripts/python src/z3_ParticleFilterPostProcess.py --run-dir data/output/pf_ml --cv-dir data/output/CV14)"
+      "Bash(.venv/Scripts/python src/z3_ParticleFilterPostProcess.py --run-dir data/output/pf_ml --cv-dir data/output/CV14)",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z4_Compare.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z1_FeaturePostProcess.py'\\).read\\(\\)\\); print\\('✓ Syntax OK'\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z1_FeaturePostProcess.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('test_ml_comparison_plot.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(.venv/Scripts/python test_ml_comparison_plot.py --data-root data/output --output-dir ./test_output)",
+      "Bash(.venv/Scripts/python test_ml_comparison_plot.py --data-root data/output/CV14 --output-dir data/output/CV14/summaries/tmp)",
+      "Bash(.venv/Scripts/python)"
     ]
   }
 }

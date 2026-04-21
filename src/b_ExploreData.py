@@ -29,6 +29,18 @@ from utils.limits import (
 OVERLAY_TRAIN_FRACTION = 0.7
 
 
+def _is_target_delta_column(name: str) -> bool:
+    return str(name).endswith(("_res", "_diff"))
+
+
+def _strip_target_delta_suffix(name: str) -> str:
+    text = str(name)
+    for suffix in ("_diff", "_res"):
+        if text.endswith(suffix):
+            return text[: -len(suffix)]
+    return text
+
+
 def _summary_theme_dirs(repo_root: Path) -> dict:
     """Return themed output directories under data/output/sensors."""
     base = repo_root / "data" / "output" / "sensors"
@@ -435,8 +447,8 @@ def write_target_split_comparison(repo_root: Path) -> None:
 
     surface_cols = [c for c in all_cols if c.startswith("Pfl - ")]
     scada_cols = [c for c in all_cols if c.startswith("SCADA - ")]
-    target_cols = [c for c in all_cols if (not c.endswith("_res") and c not in weather_cols and not c.startswith("Pfl - ") and not c.startswith("SCADA - "))]
-    target_diff_cols = [c for c in all_cols if c.endswith("_res")]
+    target_cols = [c for c in all_cols if (not _is_target_delta_column(c) and c not in weather_cols and not c.startswith("Pfl - ") and not c.startswith("SCADA - "))]
+    target_diff_cols = [c for c in all_cols if _is_target_delta_column(c)]
     predictor_cols = [c for c in all_cols if c not in target_cols and c not in target_diff_cols]
     # Threshold map for base target columns.
     limits_records = load_limits_records(limits_csv)
@@ -465,7 +477,7 @@ def write_target_split_comparison(repo_root: Path) -> None:
         shift_rows = []
         for col in series_cols:
             series = pd.to_numeric(df[col], errors="coerce")
-            base_target_col = col[:-4] if col.endswith("_res") else col
+            base_target_col = _strip_target_delta_suffix(col)
             base_target_col = all_cols_by_norm.get(_norm_col(base_target_col), base_target_col)
             base_series = pd.to_numeric(df[base_target_col], errors="coerce") if base_target_col in df.columns else series
             limit_spec = all_limit_specs.get(base_target_col)
@@ -548,8 +560,8 @@ def write_target_split_comparison(repo_root: Path) -> None:
                 )
 
                 disp = col
-                if category_name == "Target_diff" and disp.endswith("_res"):
-                    disp = disp[:-4]
+                if category_name == "Target_diff":
+                    disp = _strip_target_delta_suffix(disp)
 
                 rows.append({
                     "category": category_name,
@@ -573,7 +585,7 @@ def write_target_split_comparison(repo_root: Path) -> None:
             shift_rows.append({
                 "category": category_name,
                 "series": col,
-                "series_display": (col[:-4] if (category_name == "Target_diff" and col.endswith("_res")) else col),
+                "series_display": (_strip_target_delta_suffix(col) if category_name == "Target_diff" else col),
                 "n_train": int(len(split_map["train"])),
                 "n_test": int(len(split_map["test"])),
                 "ks_train_test_norm01": _ks_statistic(norm_train, norm_test),
@@ -1064,14 +1076,14 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
 
     surface_cols = [c for c in all_cols if c.startswith("Pfl - ")]
     scada_cols = [c for c in all_cols if c.startswith("SCADA - ")]
-    target_cols = [c for c in all_cols if (not c.endswith("_res") and c not in weather_cols and not c.startswith("Pfl - ") and not c.startswith("SCADA - "))]
-    target_diff_cols = [c for c in all_cols if c.endswith("_res")]
+    target_cols = [c for c in all_cols if (not _is_target_delta_column(c) and c not in weather_cols and not c.startswith("Pfl - ") and not c.startswith("SCADA - "))]
+    target_diff_cols = [c for c in all_cols if _is_target_delta_column(c)]
 
     # Enforce identical ordering between Target and Target_diff:
     # 1) descending valid count
     # 2) alphabetical by label (base target name) as tie-break.
     target_by_base = {c: c for c in target_cols}
-    target_diff_by_base = {(c[:-4] if c.endswith("_res") else c): c for c in target_diff_cols}
+    target_diff_by_base = {_strip_target_delta_suffix(c): c for c in target_diff_cols}
     base_names = sorted(set(target_by_base.keys()).union(set(target_diff_by_base.keys())))
 
     base_valid_counts = {}
@@ -1121,7 +1133,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
         if figure_name == "SCADA":
             labels = [l[len("SCADA - "):] if l.startswith("SCADA - ") else l for l in labels]
         if figure_name == "Target_diff":
-            labels = [l[:-4] if l.endswith("_res") else l for l in labels]
+            labels = [_strip_target_delta_suffix(l) for l in labels]
         labels = _strip_common_affixes(labels)
         wrapped_labels = [textwrap.fill(lbl, width=17) for lbl in labels]
         label_map[figure_name] = wrapped_labels
@@ -1208,7 +1220,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                 y_high = float(np.max(finite_vals))
 
             if figure_name == "Target_diff":
-                base_target_col = col[:-4] if col.endswith("_res") else col
+                base_target_col = _strip_target_delta_suffix(col)
                 target_col_match = all_cols_by_norm.get(_norm_col(base_target_col))
                 exceed_mask = pd.Series(False, index=series.index)
                 if target_col_match in all_limit_specs:
@@ -1384,7 +1396,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                     y_high = float(np.max(finite_vals))
                 if figure_name in {"Target", "Target_diff"}:
                     if figure_name == "Target_diff":
-                        base_target_col = col[:-4] if col.endswith("_res") else col
+                        base_target_col = _strip_target_delta_suffix(col)
                         target_col_match = all_cols_by_norm.get(_norm_col(base_target_col))
                         exceed_mask = pd.Series(False, index=series.index)
                         if target_col_match in all_limit_specs:
@@ -1994,7 +2006,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                         series_color = palette_norm[i]
                         valid_mask = series_norm.notna()
                         # Limit checking
-                        base_target_col = col[:-4] if col.endswith("_res") else col
+                        base_target_col = _strip_target_delta_suffix(col)
                         target_col_match = all_cols_by_norm.get(_norm_col(base_target_col))
                         exceed_mask = pd.Series(False, index=series_norm.index)
                         if target_col_match in all_limit_specs:
@@ -2584,6 +2596,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 

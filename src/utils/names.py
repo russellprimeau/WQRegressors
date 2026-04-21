@@ -29,6 +29,10 @@ residuals = ['01-Farge_res', '04-Turbiditet_res', '06-E.coli_res',
     '07-Intestinale enterokokker_res', '08-Kimtall 22°C_res', '09-Koliforme bakterier 37°C_res', '21-Arsen_res',
              '24-Bly_res', '32-Kadmium_res', '36-Kopper filtrert_res', '37-Krom_res', '41-Nikkel_res', 'Sink (Zn)_res']
 
+diffs = ['01-Farge_diff', '04-Turbiditet_diff', '06-E.coli_diff',
+    '07-Intestinale enterokokker_diff', '08-Kimtall 22°C_diff', '09-Koliforme bakterier 37°C_diff', '21-Arsen_diff',
+             '24-Bly_diff', '32-Kadmium_diff', '36-Kopper filtrert_diff', '37-Krom_diff', '41-Nikkel_diff', 'Sink (Zn)_diff']
+
 
 import re as _re
 
@@ -43,7 +47,7 @@ def clean_target_label(dataset_name: str, prefix: str = "MC") -> str:
     Strips (in order):
       1. Dataset prefix + underscore (e.g. ``MC_``)
       2. Leading ``ex`` marker
-      3. Trailing ``_res`` and ``_state`` suffixes
+      3. Trailing ``_diff``, ``_res`` and ``_state`` suffixes
       4. Trailing parenthesised unit block ``_(...)``
       5. Underscores → spaces
       6. Digits and the characters °, µ, /
@@ -65,7 +69,7 @@ def clean_target_label(dataset_name: str, prefix: str = "MC") -> str:
         lbl = lbl[len(bare) + 1:]
     if lbl.startswith("ex"):
         lbl = lbl[2:]
-    for sfx in ("_res", "_state"):
+    for sfx in ("_diff", "_res", "_state"):
         if lbl.endswith(sfx):
             lbl = lbl[: -len(sfx)]
     lbl = _re.sub(r"_\([^)]*\)$", "", lbl)        # trailing _(unit) block

@@ -391,6 +391,51 @@ def add_res(df: pd.DataFrame, columns: list) -> pd.DataFrame:
     return final_df
 
 
+def add_diff(df: pd.DataFrame, columns: list) -> pd.DataFrame:
+    """
+    For each column in 'columns' that exists in 'df', create a new column
+    'col_diff' using a fixed lag equal to the median observation gap in rows.
+
+    Rules:
+      - If the value in col is NaN, col_diff is NaN.
+      - If fewer than 2 non-NaN values exist, col_diff is NaN.
+      - Otherwise, col_diff is the difference between the current observed
+        value and the forward-filled state value shifted by the median gap.
+      - Values in the new column are rounded to 3 decimal places.
+
+    Parameters:
+        df (pd.DataFrame): The input dataframe.
+        columns (list): List of column names to process.
+
+    Returns:
+        pd.DataFrame: Modified dataframe with new fixed-interval difference columns.
+    """
+    final_df = df.copy()
+
+    for col in columns:
+        if col not in final_df.columns:
+            continue
+
+        state_col = f"{col}_state"
+        if state_col not in final_df.columns:
+            continue
+
+        obs_ilocs = np.flatnonzero(final_df[col].notna().to_numpy())
+        if obs_ilocs.size < 2:
+            final_df[f"{col}_diff"] = np.nan
+            continue
+
+        median_gap = int(round(float(np.median(np.diff(obs_ilocs)))))
+        median_gap = max(1, median_gap)
+
+        lagged_state = final_df[state_col].shift(median_gap)
+        diffs = final_df[col] - lagged_state
+        diffs = diffs.where(final_df[col].notna(), np.nan)
+        final_df[f"{col}_diff"] = diffs.round(3)
+
+    return final_df
+
+
 def prepare_tsne_plot(
     df_or_path: pd.DataFrame | str | Path,
     feature_columns: list | None = None,

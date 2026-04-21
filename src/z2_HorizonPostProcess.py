@@ -7,8 +7,10 @@ directory (written by ``k_RunHorizonSweep.py``) and produces:
   1. ``lookahead_r2_comparison.png``    – R² vs forecast horizon (hours)
   2. ``lookahead_nrmse_comparison.png`` – nRMSE vs forecast horizon (hours)
   3. ``lookahead_skill_comparison.png``     – skill vs. best baseline per horizon
-  4. ``lookahead_time_to_zero_skill.png``   – initial skill / skill rate (hours to zero skill)
-  5. ``lookahead_aggregate.csv``            – combined table of all datasets × horizons × replicates
+    4. ``lookahead_time_to_zero_skill.png``   – initial skill / skill rate (days to zero skill)
+    5. ``lookahead_time_to_baseline_r2.png``  – time for R² to reach best baseline R² (days)
+    6. ``lookahead_aggregate.csv``            – combined table of all datasets × horizons × replicates
+    7. ``lookahead_time_to_baseline_r2_repro.csv`` – per-horizon values used to reproduce the timing calculation
 
 nRMSE (= RMSE / std_target) is used instead of raw RMSE so that datasets with
 very different target magnitudes can be compared on the same axis.  The
@@ -16,7 +18,8 @@ very different target magnitudes can be compared on the same axis.  The
 ``forecasts/feature_sweeps/feature_sweep_final_metrics.csv`` (populated by
 ``z1_PostProcess.py``).
 
-All outputs are written to the ``summaries/horizons/`` subdirectory of the data root.
+All outputs are written to the ``summaries/horizons/eval_test/`` and
+``summaries/horizons/eval_all/`` subdirectories of the data root.
 
 Uncertainty bands (replicates > 1):
     When ``k_RunHorizonSweep.py`` is run with ``--replicates M > 1``,
@@ -39,20 +42,13 @@ CLI arguments:
                             Default: data/output/regression
     --dataset-prefix STR    Only include datasets whose name starts with this
                             prefix.  Default: MC
-    --evaluate-all          Compute statistics over all samples (train + test) instead
-                            of the test set only.  For each horizon/replicate that
-                            lacks combined-set metrics, f_Evaluate.py is re-run with
-                            evaluate_all=true against the saved model weights — no
-                            retraining is performed.  Results are written alongside
-                            lookahead_metrics.csv as _combined_metrics.csv; the normal
-                            lookahead_metrics.csv is left unchanged.
-
-                            nRMSE uses std_target from the combined row
-                            (written by f_Evaluate.py). Skill scores use
-                            combined_baseline_summary.csv, produced by re-running
-                            the Naive/Seasonal/Linear baselines on the combined
-                            sample set — so both metrics are correctly normalised
-                            for the combined evaluation.
+        --evaluate-all          Deprecated compatibility flag; no longer needed.
+                                                        This script now always generates both:
+                                                            - eval_test : test-set only evaluation
+                                                            - eval_all  : combined train+test evaluation
+                                                        For eval_all, when combined-set metrics are missing,
+                                                        f_Evaluate.py is re-run with evaluate_all=true against
+                                                        saved model weights (no retraining).
 
 Examples:
 python src/z2_HorizonPostProcess.py
@@ -97,6 +93,58 @@ _SERIES_COLORS = [
     "#8c564b",  # brown
     "#c7c7c7",  # light gray
 ]
+
+_BAR_LABEL_FONTSIZE = 12
+_BAR_ANNOTATION_FONTSIZE = 12
+_BAR_LEGEND_FONTSIZE = 12
+_CLUSTERED_BAR_WIDTH = 0.50
+_SINGLE_BAR_WIDTH = 0.86
+
+
+def _bar_fig_width(n_bars: int, clustered: bool) -> float:
+    """Return a compact figure width that still leaves labels readable."""
+    per_dataset = 0.72 if clustered else 0.66
+    return max(5.4, per_dataset * max(n_bars, 1) + 1.4)
+
+
+def _set_bar_xlim(ax: plt.Axes, x: np.ndarray, bar_w: float, clustered: bool) -> None:
+    """Keep edge margins small and proportional to the bar width."""
+    if len(x) == 0:
+        return
+    half_span = bar_w if clustered else bar_w / 2
+    margin = 0.20 * bar_w
+    ax.set_xlim(x[0] - half_span - margin, x[-1] + half_span + margin)
+
+
+def _expand_ylim_to_fit_annotations(ax: plt.Axes, pad_pixels: float = 2.0, max_passes: int = 3) -> None:
+    """Expand y-limits just enough so existing annotation texts fit inside the axes box."""
+    texts = [txt for txt in ax.texts if txt.get_visible()]
+    if not texts:
+        return
+    fig = ax.figure
+    for _ in range(max_passes):
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        ax_bbox = ax.get_window_extent(renderer=renderer)
+        top_over = 0.0
+        bottom_over = 0.0
+        for txt in texts:
+            bbox = txt.get_window_extent(renderer=renderer)
+            top_over = max(top_over, bbox.y1 - ax_bbox.y1)
+            bottom_over = max(bottom_over, ax_bbox.y0 - bbox.y0)
+        if top_over <= 0 and bottom_over <= 0:
+            break
+        x_ref = 0.5 * (ax_bbox.x0 + ax_bbox.x1)
+        y_lo, y_hi = ax.get_ylim()
+        new_y_lo = y_lo
+        new_y_hi = y_hi
+        if bottom_over > 0:
+            new_y_lo = ax.transData.inverted().transform((x_ref, ax_bbox.y0 - bottom_over - pad_pixels))[1]
+        if top_over > 0:
+            new_y_hi = ax.transData.inverted().transform((x_ref, ax_bbox.y1 + top_over + pad_pixels))[1]
+        if new_y_lo == y_lo and new_y_hi == y_hi:
+            break
+        ax.set_ylim(new_y_lo, new_y_hi)
 
 
 def _find_horizon_forecast_dirs(dataset_dir: Path) -> list[tuple[int, int, Path, "str | None"]]:
@@ -718,6 +766,38 @@ def _rate_table(records: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
         _min_h = skill_by_h.index.min()
         initial_skill = float(skill_by_h.loc[_min_h]) if pd.notna(skill_by_h.loc[_min_h]) else float("nan")
 
+        # Also get initial R2, RMSE, and baseline metrics at min horizon
+        _nrmse_at_min_h = float(means["nrmse"].loc[_min_h]) if _min_h in means.index and pd.notna(means["nrmse"].loc[_min_h]) else float("nan")
+        _r2_at_min_h = float(means["r2"].loc[_min_h]) if _min_h in means.index and pd.notna(means["r2"].loc[_min_h]) else float("nan")
+        _rmse_at_min_h = float(means["rmse"].loc[_min_h]) if _min_h in means.index and pd.notna(means["rmse"].loc[_min_h]) else float("nan")
+        
+        # Get individual baseline skills at min horizon to determine which is best
+        _df_at_min_h = df[df["lookahead"] == _min_h]
+        _skill_v_naive_at_min = float(_df_at_min_h["skill_v_naive"].mean()) if "skill_v_naive" in _df_at_min_h.columns and not _df_at_min_h["skill_v_naive"].isnull().all() else float("nan")
+        _skill_v_seasonal_at_min = float(_df_at_min_h["skill_v_seasonal"].mean()) if "skill_v_seasonal" in _df_at_min_h.columns and not _df_at_min_h["skill_v_seasonal"].isnull().all() else float("nan")
+        _skill_v_linear_at_min = float(_df_at_min_h["skill_v_linear"].mean()) if "skill_v_linear" in _df_at_min_h.columns and not _df_at_min_h["skill_v_linear"].isnull().all() else float("nan")
+
+        baseline_candidates = {
+            "naive": _skill_v_naive_at_min,
+            "seasonal": _skill_v_seasonal_at_min,
+            "linear": _skill_v_linear_at_min,
+        }
+        finite_baselines = {name: score for name, score in baseline_candidates.items() if np.isfinite(score)}
+        if finite_baselines:
+            best_baseline_label, best_skill = max(finite_baselines.items(), key=lambda item: item[1])
+            if np.isfinite(_rmse_at_min_h) and _rmse_at_min_h > 0 and np.isfinite(_nrmse_at_min_h) and _nrmse_at_min_h > 0 and best_skill < 1.0:
+                _baseline_rmse_at_min = _rmse_at_min_h / (1.0 - best_skill)
+                _std_target_at_min = _rmse_at_min_h / _nrmse_at_min_h
+                _raw_initial_baseline_r2 = 1.0 - (_baseline_rmse_at_min / _std_target_at_min) ** 2 if _std_target_at_min > 0 else float("nan")
+                _initial_baseline_r2 = max(0.0, _raw_initial_baseline_r2) if np.isfinite(_raw_initial_baseline_r2) else float("nan")
+            else:
+                _raw_initial_baseline_r2 = float("nan")
+                _initial_baseline_r2 = float("nan")
+        else:
+            best_baseline_label = ""
+            _raw_initial_baseline_r2 = float("nan")
+            _initial_baseline_r2 = float("nan")
+
         rows.append({
             "dataset":         label,
             "rmse_rate":       _slope(means["rmse"]),
@@ -728,7 +808,84 @@ def _rate_table(records: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
             "std_r2_rate":     _std_slope(std_r2),
             "std_skill_rate":  _std_slope(std_skill),
             "initial_skill":   initial_skill,
+            "initial_nrmse":   _nrmse_at_min_h,
+            "initial_r2":      _r2_at_min_h,
+            "raw_initial_baseline_r2": _raw_initial_baseline_r2,
+            "initial_baseline_r2": _initial_baseline_r2,
+            "best_baseline_label": best_baseline_label,
+            "initial_rmse":    _rmse_at_min_h,
+            "initial_skill_v_naive":    _skill_v_naive_at_min,
+            "initial_skill_v_seasonal": _skill_v_seasonal_at_min,
+            "initial_skill_v_linear":   _skill_v_linear_at_min,
         })
+    return pd.DataFrame(rows)
+
+
+def _time_to_baseline_r2_hours(rate_df: pd.DataFrame) -> pd.Series:
+    """Return hours needed for R² to reach the best baseline R² at horizon 0."""
+
+    def _row_hours(row: pd.Series) -> float:
+        initial_r2 = float(row.get("initial_r2", float("nan")))
+        initial_rmse = float(row.get("initial_rmse", float("nan")))
+        initial_nrmse = float(row.get("initial_nrmse", float("nan")))
+        r2_rate = float(row.get("r2_rate", float("nan")))
+        if not (
+            np.isfinite(initial_r2)
+            and np.isfinite(initial_rmse)
+            and np.isfinite(initial_nrmse)
+            and np.isfinite(r2_rate)
+            and r2_rate != 0
+            and initial_rmse > 0
+            and initial_nrmse > 0
+        ):
+            return float("nan")
+
+        skill_candidates = {
+            "naive": float(row.get("initial_skill_v_naive", float("nan"))),
+            "seasonal": float(row.get("initial_skill_v_seasonal", float("nan"))),
+            "linear": float(row.get("initial_skill_v_linear", float("nan"))),
+        }
+        finite_candidates = {name: score for name, score in skill_candidates.items() if np.isfinite(score)}
+        if not finite_candidates:
+            return float("nan")
+        best_baseline_label, best_skill = max(finite_candidates.items(), key=lambda item: item[1])
+        if best_skill >= 1.0:
+            return float("nan")
+
+        baseline_rmse = initial_rmse / (1.0 - best_skill)
+        std_target = initial_rmse / initial_nrmse if initial_nrmse > 0 else float("nan")
+        if not np.isfinite(std_target) or std_target <= 0:
+            return float("nan")
+
+        baseline_r2 = 1.0 - (baseline_rmse / std_target) ** 2
+        baseline_r2 = max(0.0, baseline_r2)
+        return (baseline_r2 - initial_r2) / r2_rate
+
+    return rate_df.apply(_row_hours, axis=1)
+
+
+def _baseline_r2_reproducibility_table(records: list[tuple[str, pd.DataFrame]], rate_df: pd.DataFrame) -> pd.DataFrame:
+    """Return per-horizon values used to reproduce the baseline-R² timing calculation."""
+    rate_lookup = rate_df.set_index("dataset") if not rate_df.empty and "dataset" in rate_df.columns else pd.DataFrame()
+    rows: list[dict[str, object]] = []
+    for label, df in records:
+        if rate_lookup.empty or label not in rate_lookup.index:
+            continue
+        rate_row = rate_lookup.loc[label]
+        grouped_r2 = df.groupby("lookahead", sort=True)["r2"].mean().reset_index(name="mean_r2_used_for_rate")
+        for _, row in grouped_r2.iterrows():
+            rows.append({
+                "dataset": label,
+                "lookahead": int(row["lookahead"]),
+                "mean_r2_used_for_rate": float(row["mean_r2_used_for_rate"]),
+                "initial_r2": float(rate_row.get("initial_r2", float("nan"))),
+                "raw_initial_baseline_r2": float(rate_row.get("raw_initial_baseline_r2", float("nan"))),
+                "initial_baseline_r2": float(rate_row.get("initial_baseline_r2", float("nan"))),
+                "best_baseline_label": str(rate_row.get("best_baseline_label", "")),
+                "r2_rate": float(rate_row.get("r2_rate", float("nan"))),
+                "time_to_baseline_r2_hours": float(rate_row.get("time_to_baseline_r2_hours", float("nan"))),
+                "time_to_baseline_r2_days": float(rate_row.get("time_to_baseline_r2", float("nan"))),
+            })
     return pd.DataFrame(rows)
 
 
@@ -798,24 +955,30 @@ def _discover_datasets(
     return hits
 
 
-def _bar_fmt(v: float) -> str:
-    """Scientific notation without padding or explicit positive sign (e.g. '1.23e3')."""
-    s = f"{v:.3g}"
-    if "e" in s:
+def _bar_fmt(v: float, scientific: bool = False) -> str:
+    """Return a compact annotation string for bar values."""
+    if scientific:
+        s = f"{v:.2e}"
         mantissa, exp = s.split("e")
         return f"{mantissa}e{int(exp)}"
-    return s
+    return f"{v:.3g}"
 
 
-def _annotate_bars(ax: plt.Axes, fontsize: int = 9) -> None:
+def _annotate_bars(ax: plt.Axes, fontsize: int = _BAR_ANNOTATION_FONTSIZE) -> None:
     """Annotate each bar patch with its numeric value (rotated 90°), anchored at y=0."""
+    heights = [
+        rect.get_height()
+        for rect in ax.patches
+        if np.isfinite(rect.get_height()) and rect.get_height() != 0
+    ]
+    use_scientific = any(abs(h) < 0.01 for h in heights)
     for rect in ax.patches:
         h = rect.get_height()
         if not np.isfinite(h) or h == 0:
             continue
         x = rect.get_x() + rect.get_width() / 2
         va = "bottom" if h >= 0 else "top"
-        ax.text(x, 0, _bar_fmt(h), ha="center", va=va, fontsize=fontsize,
+        ax.text(x, 0, _bar_fmt(h, scientific=use_scientific), ha="center", va=va, fontsize=fontsize,
                 rotation=90, clip_on=True)
 
 
@@ -842,9 +1005,9 @@ def _plot_rate_bar(
     n = len(df)
     x = np.arange(n)
     clustered = std_col is not None and df[std_col].notna().any()
-    bar_w = 0.42 if clustered else 0.72
+    bar_w = _CLUSTERED_BAR_WIDTH if clustered else _SINGLE_BAR_WIDTH
 
-    fig_w = max(6.0, 0.9 * n + 1.5)
+    fig_w = _bar_fig_width(n, clustered)
     fig, ax = plt.subplots(figsize=(fig_w, 4.5))
 
     x_main = x - bar_w / 2 if clustered else x
@@ -853,21 +1016,19 @@ def _plot_rate_bar(
     if clustered:
         ax.bar(x + bar_w / 2, df[std_col], width=bar_w,
                color=std_color, label=std_label)
-        ax.legend(fontsize=11, framealpha=0.85)
+        ax.legend(fontsize=_BAR_LEGEND_FONTSIZE, framealpha=0.85)
 
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
     ax.set_xticks(x)
-    ax.set_xticklabels(df["dataset"], rotation=45, ha="right", fontsize=14)
-    ax.tick_params(axis="y", labelsize=14)
-    ax.set_ylabel(textwrap.fill(ylabel, width=20), fontsize=14)
-    ax.set_xlim(-0.5, n - 0.5)
+    ax.set_xticklabels(df["dataset"], rotation=45, ha="right", fontsize=_BAR_LABEL_FONTSIZE)
+    ax.tick_params(axis="y", labelsize=_BAR_LABEL_FONTSIZE)
+    ax.set_ylabel(textwrap.fill(ylabel, width=20), fontsize=_BAR_LABEL_FONTSIZE)
+    _set_bar_xlim(ax, x, bar_w, clustered)
     ax.grid(axis="y", alpha=0.3)
     _annotate_bars(ax)
-    _ylo, _yhi = ax.get_ylim()
-    _span = _yhi - _ylo
-    ax.set_ylim(_ylo - 0.12 * _span, _yhi + 0.20 * _span)
 
     fig.tight_layout()
+    _expand_ylim_to_fit_annotations(ax)
     out = summaries_dir / filename
     fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
@@ -886,9 +1047,9 @@ def _plot_rates(rate_df: pd.DataFrame, summaries_dir: Path, show_std: bool = Tru
 
     n = len(df)
     x = np.arange(n)
-    bar_w = 0.42
+    bar_w = _CLUSTERED_BAR_WIDTH
 
-    fig_w = max(6.0, 0.9 * n + 1.5)
+    fig_w = _bar_fig_width(n, clustered=True)
     fig, ax = plt.subplots(figsize=(fig_w, 4.5))
 
     rmse_color = _SERIES_COLORS[0]   # blue
@@ -904,18 +1065,16 @@ def _plot_rates(rate_df: pd.DataFrame, summaries_dir: Path, show_std: bool = Tru
 
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
     ax.set_xticks(x)
-    ax.set_xticklabels(df["dataset"], rotation=45, ha="right", fontsize=14)
-    ax.tick_params(axis="y", labelsize=14)
-    ax.set_ylabel(textwrap.fill("nRMSE avg. rate of change (/hr)", width=20), fontsize=14)
-    ax.set_xlim(-0.5, n - 0.5)
+    ax.set_xticklabels(df["dataset"], rotation=45, ha="right", fontsize=_BAR_LABEL_FONTSIZE)
+    ax.tick_params(axis="y", labelsize=_BAR_LABEL_FONTSIZE)
+    ax.set_ylabel(textwrap.fill("nRMSE avg. rate of change (/hr)", width=20), fontsize=_BAR_LABEL_FONTSIZE)
+    _set_bar_xlim(ax, x, bar_w, clustered=True)
     ax.grid(axis="y", alpha=0.3)
-    ax.legend(fontsize=11, framealpha=0.85)
+    ax.legend(fontsize=_BAR_LEGEND_FONTSIZE, framealpha=0.85)
     _annotate_bars(ax)
-    _ylo, _yhi = ax.get_ylim()
-    _span = _yhi - _ylo
-    ax.set_ylim(_ylo - 0.12 * _span, _yhi + 0.12 * _span)
 
     fig.tight_layout()
+    _expand_ylim_to_fit_annotations(ax)
     out = summaries_dir / "lookahead_rates_bar.png"
     fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
@@ -1128,7 +1287,7 @@ def _generate_all_figures(
     all_x: "list | None" = None,
     tag: str = "",
 ) -> None:
-    """Generate the standard 7-figure + 2-CSV set for a single records list.
+    """Generate the standard 8-figure + 2-CSV set for a single records list.
 
     *all_x*: shared x-axis tick values; computed from *records* if not provided.
     *tag*: short string for log messages (e.g. 'best', 'ml', 'mlr').
@@ -1308,13 +1467,28 @@ def _generate_all_figures(
     )
     print(f"[INFO] {pfx}Wrote R² rate bar: {r2_bar_path}")
 
-    rate_df["time_to_zero_skill"] = rate_df["initial_skill"] / (-24 * rate_df["skill_rate"])
+    rate_df["time_to_zero_skill_hours"] = rate_df["initial_skill"] / (-rate_df["skill_rate"])
+    rate_df["time_to_zero_skill"] = rate_df["time_to_zero_skill_hours"] / 24.0
     tzs_path = _plot_rate_bar(
         rate_df, "time_to_zero_skill", "Forecast Horizon (days)",
         "lookahead_time_to_zero_skill.png", out_dir,
         ascending=False, color=_SERIES_COLORS[1],
     )
     print(f"[INFO] {pfx}Wrote time-to-zero-skill: {tzs_path}")
+
+    rate_df["time_to_baseline_r2_hours"] = _time_to_baseline_r2_hours(rate_df)
+    rate_df["time_to_baseline_r2"] = rate_df["time_to_baseline_r2_hours"] / 24.0
+    ttbr2_path = _plot_rate_bar(
+        rate_df, "time_to_baseline_r2", "Forecast Horizon (days)",
+        "lookahead_time_to_baseline_r2.png", out_dir,
+        ascending=False, color=_SERIES_COLORS[1],
+    )
+    print(f"[INFO] {pfx}Wrote time-to-baseline-R²: {ttbr2_path}")
+
+    repro_df = _baseline_r2_reproducibility_table(records, rate_df)
+    repro_path = out_dir / "lookahead_time_to_baseline_r2_repro.csv"
+    repro_df.to_csv(repro_path, index=False)
+    print(f"[INFO] {pfx}Wrote baseline-R² reproducibility CSV: {repro_path}")
 
 
 def _generate_combined_figures(
@@ -1502,8 +1676,8 @@ def _generate_combined_figures(
         ), reverse=not ascending)
         n = len(order)
         x = np.arange(n)
-        bar_w = 0.42
-        fig_w = max(6.0, 0.9 * n + 1.5)
+        bar_w = _CLUSTERED_BAR_WIDTH
+        fig_w = _bar_fig_width(n, clustered=True)
         fig, ax = plt.subplots(figsize=(fig_w, 4.5))
         ax.bar(x - bar_w / 2, [ml_vals.get(d, float("nan")) for d in order],
                width=bar_w, color=_SERIES_COLORS[0], label="Machine Learning")
@@ -1511,17 +1685,15 @@ def _generate_combined_figures(
                width=bar_w, color=_SERIES_COLORS[5], label="Multiple Linear Regression")
         ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
         ax.set_xticks(x)
-        ax.set_xticklabels(order, rotation=45, ha="right", fontsize=14)
-        ax.tick_params(axis="y", labelsize=14)
-        ax.set_ylabel(textwrap.fill(ylabel, width=20), fontsize=14)
-        ax.set_xlim(-0.5, n - 0.5)
+        ax.set_xticklabels(order, rotation=45, ha="right", fontsize=_BAR_LABEL_FONTSIZE)
+        ax.tick_params(axis="y", labelsize=_BAR_LABEL_FONTSIZE)
+        ax.set_ylabel(textwrap.fill(ylabel, width=20), fontsize=_BAR_LABEL_FONTSIZE)
+        _set_bar_xlim(ax, x, bar_w, clustered=True)
         ax.grid(axis="y", alpha=0.3)
-        ax.legend(fontsize=11, framealpha=0.85)
+        ax.legend(fontsize=_BAR_LEGEND_FONTSIZE, framealpha=0.85)
         _annotate_bars(ax)
-        _ylo, _yhi = ax.get_ylim()
-        _span = _yhi - _ylo
-        ax.set_ylim(_ylo - 0.12 * _span, _yhi + 0.20 * _span)
         fig.tight_layout()
+        _expand_ylim_to_fit_annotations(ax)
         out = out_dir / filename
         fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.02)
         plt.close(fig)
@@ -1536,9 +1708,25 @@ def _generate_combined_figures(
 
     # Time-to-zero-skill combined
     for _rdf in [rate_df_ml, rate_df_mlr]:
-        _rdf["time_to_zero_skill"] = _rdf["initial_skill"] / (-24 * _rdf["skill_rate"])
+        _rdf["time_to_zero_skill_hours"] = _rdf["initial_skill"] / (-_rdf["skill_rate"])
+        _rdf["time_to_zero_skill"] = _rdf["time_to_zero_skill_hours"] / 24.0
     _plot_combined_rate_bar("time_to_zero_skill", "Forecast Horizon (days)",
                             "lookahead_time_to_zero_skill.png", ascending=False)
+
+    # Time-to-baseline-R² combined
+    for _rdf in [rate_df_ml, rate_df_mlr]:
+        _rdf["time_to_baseline_r2_hours"] = _time_to_baseline_r2_hours(_rdf)
+        _rdf["time_to_baseline_r2"] = _rdf["time_to_baseline_r2_hours"] / 24.0
+    _plot_combined_rate_bar("time_to_baseline_r2", "Forecast Horizon (days)",
+                            "lookahead_time_to_baseline_r2.png", ascending=False)
+
+    combined_repro_df = pd.concat([
+        _baseline_r2_reproducibility_table(records_ml, rate_df_ml).assign(model_class="ml"),
+        _baseline_r2_reproducibility_table(records_mlr, rate_df_mlr).assign(model_class="mlr"),
+    ], ignore_index=True)
+    combined_repro_path = out_dir / "lookahead_time_to_baseline_r2_repro.csv"
+    combined_repro_df.to_csv(combined_repro_path, index=False)
+    print(f"[INFO] [combined] Wrote baseline-R² reproducibility CSV: {combined_repro_path}")
 
 
 def generate_figures(
@@ -1631,13 +1819,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--evaluate-all",
         action="store_true",
         help=(
-            "Compute statistics over all samples (train + test) instead of the test set "
-            "only.  For each horizon/replicate that lacks combined-set metrics, "
-            "f_Evaluate.py is re-run with evaluate_all=true against the saved model "
-            "weights and sample files — no retraining is performed.  Results are "
-            "written to _combined_metrics.csv alongside lookahead_metrics.csv and are "
-            "used only for the figures produced in this run; the normal "
-            "lookahead_metrics.csv is left unchanged."
+            "Deprecated compatibility flag.  The script now always generates both "
+            "eval_test (test set only) and eval_all (combined train+test) outputs "
+            "under summaries/horizons/."
         ),
     )
     return parser
@@ -1649,18 +1833,35 @@ def main() -> int:
     data_root = Path(args.data_root)
     if not data_root.is_absolute():
         data_root = (workspace_root / data_root).resolve()
-    summaries_dir = (data_root / "summaries" / "horizons").resolve()
+    summaries_root = (data_root / "summaries" / "horizons").resolve()
     print(f"[INFO] data_root : {data_root}")
-    print(f"[INFO] summaries : {summaries_dir}")
+    print(f"[INFO] summaries : {summaries_root}")
     if args.evaluate_all:
-        print("[INFO] --evaluate-all: statistics will be computed over train + test samples.")
-    return generate_figures(
+        print("[INFO] --evaluate-all is deprecated; generating both eval_test and eval_all outputs.")
+
+    # Always generate both evaluation scopes under separate directory levels.
+    eval_test_dir = summaries_root / "eval_test"
+    eval_all_dir = summaries_root / "eval_all"
+
+    print("[INFO] Generating eval_test outputs (test set only)...")
+    rc_test = generate_figures(
         data_root=data_root,
         prefix=args.dataset_prefix,
-        summaries_dir=summaries_dir,
+        summaries_dir=eval_test_dir,
         show_std=args.std,
-        evaluate_all=args.evaluate_all,
+        evaluate_all=False,
     )
+
+    print("[INFO] Generating eval_all outputs (train + test combined)...")
+    rc_all = generate_figures(
+        data_root=data_root,
+        prefix=args.dataset_prefix,
+        summaries_dir=eval_all_dir,
+        show_std=args.std,
+        evaluate_all=True,
+    )
+
+    return 0 if (rc_test == 0 and rc_all == 0) else 1
 
 
 if __name__ == "__main__":

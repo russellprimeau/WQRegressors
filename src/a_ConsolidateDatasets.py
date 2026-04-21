@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from utils.preprocessing import (clean_profiler, add_source, decompose_direction, rolling_sum,
-                                 forward_fill_columns, add_res, count_segs)
+                                 forward_fill_columns, add_res, add_diff, count_segs)
 
 ## Configuration Parameters
 # Whether to keep all timesteps (True) or drop rows with missing values (False)
@@ -177,6 +177,7 @@ if __name__ == '__main__':
             merge3_prior_df = forward_fill_columns(merge3_plain_df, eurofins_cols_renamed)
             if add_res_cols:
                 final_df = add_res(merge3_prior_df, eurofins_cols_renamed)
+                final_df = add_diff(final_df, eurofins_cols_renamed)
             else:
                 final_df = merge3_prior_df
         else:

@@ -60,6 +60,7 @@ from z1_FeaturePostProcess import (  # noqa: E402
     BASELINE_PLOT_LABELS,
     _annotate_bars_within_ylim,
     _draw_bar_group,
+    _expand_ylims_to_fit_annotations,
 )
 
 _PF_MODEL_LABEL = "particle_filter"
@@ -300,10 +301,11 @@ def _write_summary_figure(perf_df: pd.DataFrame, output_path: Path) -> None:
         clean_target_label(str(t), "") for t in perf_df.get("target", perf_df["dataset"])
     ]
     x = np.arange(len(perf_df))
-    width = 0.20
+    font_size = 9
 
     methods = [_PF_DISPLAY_LABEL] + [BASELINE_PLOT_LABELS[name] for name in BASELINE_ORDER]
     colors = ["tab:blue"] + [BASELINE_PLOT_COLORS[name] for name in BASELINE_ORDER]
+    width = 1.0 / (len(methods) + 0.5)
 
     std_target_col = pd.to_numeric(perf_df["std_target"], errors="coerce").replace(0, np.nan)
     nrmse_data = [
@@ -334,38 +336,43 @@ def _write_summary_figure(perf_df: pd.DataFrame, output_path: Path) -> None:
         BASELINE_PLOT_COLORS["seasonal"],
         BASELINE_PLOT_COLORS["linear"],
     ]
+    skill_width = 1.0 / (len(skill_methods) + 0.5)
 
     fig, (ax_skill, ax_nrmse, ax_r2) = plt.subplots(
-        3, 1, figsize=(max(12, len(perf_df) * 0.8), 13), sharex=True
+        3, 1, figsize=(max(8, len(perf_df) * 0.72 + 1.6), 13), sharex=True
     )
 
     _draw_bar_group(
-        ax_skill, x, width, skill_data, skill_colors, skill_methods, ".2f",
-        center_offset=0.5,
+        ax_skill, x, skill_width, skill_data, skill_colors, skill_methods, ".2f",
+        center_offset=0.5, fontsize=font_size,
     )
     ax_skill.axhline(0, color="black", linewidth=0.8, linestyle="--")
-    ax_skill.set_ylabel("Skill Score")
+    ax_skill.set_ylabel("Skill Score", fontsize=font_size)
+    ax_skill.tick_params(axis="y", labelsize=font_size)
     ax_skill.grid(axis="y", alpha=0.3)
-    ax_skill.legend()
+    ax_skill.legend(fontsize=font_size)
 
-    _draw_bar_group(ax_nrmse, x, width, nrmse_data, colors, methods, ".2e")
-    ax_nrmse.set_ylabel("nRMSE")
+    _draw_bar_group(ax_nrmse, x, width, nrmse_data, colors, methods, ".2e", fontsize=font_size)
+    ax_nrmse.set_ylabel("nRMSE", fontsize=font_size)
+    ax_nrmse.tick_params(axis="y", labelsize=font_size)
     ax_nrmse.grid(axis="y", alpha=0.3)
-    ax_nrmse.legend()
+    ax_nrmse.legend(fontsize=font_size)
 
     r2_bars = _draw_bar_group(
-        ax_r2, x, width, r2_data, colors, methods, ".2f", annotate=False
+        ax_r2, x, width, r2_data, colors, methods, ".2f", annotate=False, fontsize=font_size
     )
-    ax_r2.set_ylabel("Coefficient of Determination")
+    ax_r2.set_ylabel("Coefficient of Determination", fontsize=font_size)
+    ax_r2.tick_params(axis="y", labelsize=font_size)
     ax_r2.set_ylim(-0.1, 1.0)
     for bars in r2_bars:
-        _annotate_bars_within_ylim(ax_r2, bars, ".2f")
+        _annotate_bars_within_ylim(ax_r2, bars, ".2f", fontsize=font_size)
     ax_r2.grid(axis="y", alpha=0.3)
-    ax_r2.legend()
+    ax_r2.legend(fontsize=font_size)
     ax_r2.set_xticks(x)
-    ax_r2.set_xticklabels(labels, rotation=45, ha="right")
+    ax_r2.set_xticklabels(labels, rotation=45, ha="right", fontsize=font_size)
 
     fig.tight_layout()
+    _expand_ylims_to_fit_annotations((ax_skill, ax_nrmse, ax_r2))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)

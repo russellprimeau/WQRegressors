@@ -46,8 +46,10 @@ NORMALIZATION_OUTPUT_PATH = (
 def _normalize_target_for_eurofins_lookup(name):
     """Normalize target/parameter names for robust Eurofins matching."""
     text = str(name).strip()
-    if text.endswith("_res"):
-        text = text[:-4]
+    for suffix in ("_diff", "_res", "_state"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+            break
     text = re.sub(r"\s*\([^)]*\)\s*$", "", text).strip()
     return text.casefold()
 
@@ -1336,11 +1338,11 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
 
 def _build_auto_normalize_list(predictor_cols, target_base_names, df_columns):
     """
-    Build the to_normalize list automatically from predictors + target base/state/res variants.
+    Build the to_normalize list automatically from predictors + target base/state/res/diff variants.
     """
     candidates = list(predictor_cols)
     for name in target_base_names:
-        for suffix in ["", "_state", "_res"]:
+        for suffix in ["", "_state", "_res", "_diff"]:
             col = name + suffix
             if col in df_columns:
                 candidates.append(col)
@@ -1351,7 +1353,8 @@ def _resolve_columns_from_config(config, df_columns):
     """
     Resolve final target_columns, predictor_columns, and to_normalize list from config dict.
 
-    Handles auto_target_suffixes.res and auto_target_suffixes.state:
+    Handles auto_target_suffixes.diff / res / state:
+      - diff=True -> each name in target_columns becomes <name>_diff (if present in df)
       - res=True  -> each name in target_columns becomes <name>_res (if present in df)
       - state=True -> <name>_state is appended to predictors (if present in df)
 
@@ -1360,23 +1363,24 @@ def _resolve_columns_from_config(config, df_columns):
     df_col_set = set(df_columns)
     raw_target_names = list(config.get("target_columns", []))
     suffix_opts = config.get("auto_target_suffixes", {})
+    use_diff = suffix_opts.get("diff", False)
     use_res = suffix_opts.get("res", True)
 
     target_columns = []
     for name in raw_target_names:
+        candidate_columns = []
+        if use_diff:
+            candidate_columns.append(f"{name}_diff")
         if use_res:
-            candidate = f"{name}_res"
-            if candidate in df_col_set:
-                target_columns.append(candidate)
-            elif name in df_col_set:
-                target_columns.append(name)
-            else:
-                print(f"[WARN] Target '{name}' not found as '{candidate}' or '{name}' in data. Skipping.")
+            candidate_columns.append(f"{name}_res")
+        candidate_columns.append(name)
+
+        resolved = next((candidate for candidate in candidate_columns if candidate in df_col_set), None)
+        if resolved is not None:
+            target_columns.append(resolved)
         else:
-            if name in df_col_set:
-                target_columns.append(name)
-            else:
-                print(f"[WARN] Target column '{name}' not found in data. Skipping.")
+            display_candidates = "', '".join(candidate_columns)
+            print(f"[WARN] Target '{name}' not found as '{display_candidates}' in data. Skipping.")
 
     predictor_columns = list(config.get("predictor_columns", []))
 
@@ -1394,14 +1398,17 @@ def _resolve_state_predictor_column(target_name, available_columns):
     Resolve the target-linked state predictor column.
 
     Rules:
+    - "<target>_diff" -> "<target>_state" (strip "_diff" first)
     - "<target>_res"  -> "<target>_state" (strip "_res" first)
     - "<target>"      -> "<target>_state"
     - If target is already a "_state" column, keep it as-is
     - Return None if no candidate exists in available_columns
     """
     base = str(target_name)
-    if base.endswith("_res"):
-        base = base[:-4]
+    for suffix in ("_diff", "_res"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
 
     candidates = [base] if base.endswith("_state") else [f"{base}_state"]
     for candidate in candidates:

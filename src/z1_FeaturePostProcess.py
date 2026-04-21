@@ -342,11 +342,31 @@ def _filter_min_valid_independent(df: "pd.DataFrame", min_required: int = MIN_RE
     return out[np.isfinite(vals) & (vals >= int(min_required))].copy()
 
 
+def _axis_uses_scientific_bar_annotations(ax) -> bool:
+    """Return True when any finite nonzero bar height on *ax* is below 0.01 in magnitude."""
+    heights = [
+        rect.get_height()
+        for rect in ax.patches
+        if np.isfinite(rect.get_height()) and rect.get_height() != 0
+    ]
+    return any(abs(h) < 0.01 for h in heights)
+
+
+def _format_bar_annotation_value(value: float, fmt: str, scientific: bool) -> str:
+    """Format a bar annotation value using either fixed chart-wide scientific notation or *fmt*."""
+    if scientific:
+        s = f"{value:.2e}"
+        mantissa, exp = s.split("e")
+        return f"{mantissa}e{int(exp)}"
+    return f"{value:{fmt}}"
+
+
 def _annotate_bars_within_ylim(ax, bars, fmt: str, fontsize: int = 8) -> None:
     """Annotate bars only when the bar-top y value falls within current y-axis limits."""
     ymin, ymax = ax.get_ylim()
     yspan = float(ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
     pad = 0.01 * yspan
+    use_scientific = _axis_uses_scientific_bar_annotations(ax)
     for bar in bars:
         h = bar.get_height()
         if not np.isfinite(h):
@@ -361,7 +381,7 @@ def _annotate_bars_within_ylim(ax, bars, fmt: str, fontsize: int = 8) -> None:
         ax.text(
             bar.get_x() + bar.get_width() / 2,
             y_txt,
-            f'{h:{fmt}}',
+            _format_bar_annotation_value(h, fmt, use_scientific),
             ha='center',
             va=va,
             fontsize=fontsize,
@@ -370,11 +390,12 @@ def _annotate_bars_within_ylim(ax, bars, fmt: str, fontsize: int = 8) -> None:
         )
 
 
-def _annotate_ml_bars(ax, bars, vals, ns, fmt: str, fontsize: int = 7) -> None:
+def _annotate_ml_bars(ax, bars, vals, ns, fmt: str, fontsize: int = 10) -> None:
     """Annotate bars with combined value and sample-count label, e.g. '1.23e-02, n=8'."""
     ymin, ymax = ax.get_ylim()
     yspan = float(ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
-    pad = 0.01 * yspan
+    pad = 0.02 * yspan
+    use_scientific = _axis_uses_scientific_bar_annotations(ax)
     for bar, val, n in zip(bars, vals, ns):
         if not np.isfinite(val):
             continue
@@ -382,7 +403,7 @@ def _annotate_ml_bars(ax, bars, vals, ns, fmt: str, fontsize: int = 7) -> None:
         if h < ymin or h > ymax:
             continue
         n_str = f", n={int(n)}" if np.isfinite(n) else ""
-        label = f"{val:{fmt}}{n_str}"
+        label = f"{_format_bar_annotation_value(val, fmt, use_scientific)}{n_str}"
         y_txt = h + pad
         va = 'bottom'
         if y_txt > (ymax - pad):
@@ -396,7 +417,7 @@ def _annotate_ml_bars(ax, bars, vals, ns, fmt: str, fontsize: int = 7) -> None:
             va=va,
             fontsize=fontsize,
             rotation=90,
-            clip_on=True,
+            clip_on=False,
         )
 
 
@@ -436,13 +457,20 @@ def _compute_rolling_cv_r2_stats(df_cv: "pd.DataFrame") -> tuple[float, float, f
 
 
 def _draw_bar_group(ax, x, width: float, data, colors, methods, fmt: str,
-                    center_offset: float = 1.0, annotate: bool = True,
+                    center_offset: float | None = None, annotate: bool = True,
                     fontsize: int = 8) -> list:
     """Draw a grouped bar chart and optionally annotate each bar with its value."""
     bar_groups = []
+    n_series = len(data)
+    if center_offset is None:
+        center_offset = (n_series - 1) / 2.0
     for i, (vals, color, method) in enumerate(zip(data, colors, methods)):
         bars = ax.bar(x + (i - center_offset) * width, vals, width, label=method, color=color)
         bar_groups.append(bars)
+    if len(x) > 0 and n_series > 0:
+        cluster_half = n_series * width / 2.0
+        edge_margin = 0.2 * width
+        ax.set_xlim(x[0] - cluster_half - edge_margin, x[-1] + cluster_half + edge_margin)
     if annotate:
         for bars in bar_groups:
             _annotate_bars_within_ylim(ax, bars, fmt, fontsize=fontsize)
@@ -467,10 +495,48 @@ def _style_stacked_axes(axes, y_fontsize: int = 8, tick_fontsize: int = 8, legen
                 t.set_fontsize(legend_fontsize)
 
 
+def _expand_ylim_to_fit_annotations(ax, pad_pixels: float = 2.0, max_passes: int = 3) -> None:
+    """Expand y-limits just enough so existing annotation texts fit inside the axes box."""
+    texts = [txt for txt in ax.texts if txt.get_visible()]
+    if not texts:
+        return
+    fig = ax.figure
+    for _ in range(max_passes):
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        ax_bbox = ax.get_window_extent(renderer=renderer)
+        top_over = 0.0
+        bottom_over = 0.0
+        for txt in texts:
+            bbox = txt.get_window_extent(renderer=renderer)
+            top_over = max(top_over, bbox.y1 - ax_bbox.y1)
+            bottom_over = max(bottom_over, ax_bbox.y0 - bbox.y0)
+        if top_over <= 0 and bottom_over <= 0:
+            break
+        x_ref = 0.5 * (ax_bbox.x0 + ax_bbox.x1)
+        y_lo, y_hi = ax.get_ylim()
+        new_y_lo = y_lo
+        new_y_hi = y_hi
+        if bottom_over > 0:
+            new_y_lo = ax.transData.inverted().transform((x_ref, ax_bbox.y0 - bottom_over - pad_pixels))[1]
+        if top_over > 0:
+            new_y_hi = ax.transData.inverted().transform((x_ref, ax_bbox.y1 + top_over + pad_pixels))[1]
+        if new_y_lo == y_lo and new_y_hi == y_hi:
+            break
+        ax.set_ylim(new_y_lo, new_y_hi)
+
+
+def _expand_ylims_to_fit_annotations(axes, pad_pixels: float = 2.0) -> None:
+    """Apply annotation-aware y-limit expansion to one axis or a sequence of axes."""
+    for ax in np.atleast_1d(axes):
+        _expand_ylim_to_fit_annotations(ax, pad_pixels=pad_pixels)
+
+
 def _finalize_stacked_figure(fig, axes, left: float = 0.30, right: float = 0.98, top: float = 0.97,
                              bottom: float = 0.12, hspace: float = 0.50) -> None:
     _style_stacked_axes(axes)
     fig.subplots_adjust(left=left, right=right, top=top, bottom=bottom, hspace=hspace)
+    _expand_ylims_to_fit_annotations(axes)
 
 
 def _resolve_summary_plot_dirs(summaries_dir: Path) -> tuple[Path, Path, Path]:
@@ -1026,17 +1092,17 @@ def _plot_ml_model_comparison(
     n_targets = len(ordered_targets)
     x = np.arange(n_targets)
     n_models = len(ordered_model_types)
-    # Each cluster spans n_models bars; keep total cluster width ≤ 0.85 units
-    # so adjacent clusters have visible gaps.
-    width = min(0.22, 0.85 / max(n_models, 1))
+    # Use contiguous bars within a cluster with an inter-cluster gap equal to
+    # one bar width, so spacing never exceeds the width of a column.
+    width = 1.0 / max(n_models + 1, 1)
     offsets = np.array([(i - (n_models - 1) / 2) for i in range(n_models)])
-    _FS = 12  # unified font size for all text elements
+    _FS = 14  # unified font size for all text elements
 
     metric_specs = [
-        ('rmse',          'RMSE',                    '.2e', False),
-        ('nrmse',         'nRMSE',                   '.2e', False),
-        ('r2',            'R²',                      '.2f', False),
-        ('skill_vs_best', 'Skill vs. Best Baseline', '.2f', True),
+        ('rmse',          'RMSE',                    '.2e', False, 'ascending'),
+        ('nrmse',         'nRMSE',                   '.2e', False, 'ascending'),
+        ('r2',            'R²',                      '.2f', False, 'descending'),
+        ('skill_vs_best', 'Skill vs. Best Baseline', '.2f', True, 'descending'),
     ]
     file_names = {
         'rmse':          'ml_comparison_rmse.png',
@@ -1045,8 +1111,34 @@ def _plot_ml_model_comparison(
         'skill_vs_best': 'ml_comparison_skill_vs_best_baseline.png',
     }
 
-    for metric_key, ylabel, fmt, add_hline in metric_specs:
-        fig, ax = plt.subplots(figsize=(max(10, n_targets * (n_models * 0.35 + 0.5)), 6))
+    for metric_key, ylabel, fmt, add_hline, sort_order in metric_specs:
+        # Sort clusters based on metric and sort_order
+        # For ascending: prefer lowest positive value
+        # For descending: prefer highest value
+        cluster_sort_vals = {}
+        for cluster_idx, ds in enumerate(ordered_datasets):
+            cluster_data = comp_df[comp_df['dataset'] == ds][metric_key]
+            valid_vals = cluster_data.dropna().to_numpy(dtype=float)
+            valid_vals = valid_vals[np.isfinite(valid_vals)]
+
+            if sort_order == 'ascending':
+                # For RMSE/nRMSE: prefer lowest positive value
+                positive_vals = valid_vals[valid_vals > 0]
+                if len(positive_vals) > 0:
+                    cluster_sort_vals[ds] = np.min(positive_vals)
+                else:
+                    cluster_sort_vals[ds] = np.inf
+            else:
+                # For R2/skill: prefer highest value
+                if len(valid_vals) > 0:
+                    cluster_sort_vals[ds] = np.max(valid_vals)
+                else:
+                    cluster_sort_vals[ds] = -np.inf
+
+        # Re-sort ordered_targets based on cluster sort values
+        sorted_targets = sorted(ordered_targets, key=lambda x: cluster_sort_vals.get(x[0], np.inf if sort_order == 'ascending' else -np.inf), reverse=(sort_order == 'descending'))
+
+        fig, ax = plt.subplots(figsize=(max(8, n_targets * 0.72 + 1.6), 6))
         # Build proxy Patch handles upfront so labels are always correct.
         legend_handles = [
             matplotlib.patches.Patch(facecolor=ML_COMPARISON_COLORS[m], label=m)
@@ -1054,18 +1146,21 @@ def _plot_ml_model_comparison(
         ]
         pending_annotations = []
 
+        # Use sorted_targets instead of ordered_targets for this metric
+        sorted_x = np.arange(len(sorted_targets))
+
         for mi, model_display in enumerate(ordered_model_types):
             color = ML_COMPARISON_COLORS[model_display]
             vals = []
             ns = []
             bar_x = []
-            for ti, (ds, _lbl) in enumerate(ordered_targets):
+            for ti, (ds, _lbl) in enumerate(sorted_targets):
                 row_match = comp_df[
                     (comp_df['dataset'] == ds) & (comp_df['model_display'] == model_display)
                 ]
                 if row_match.empty or not np.isfinite(_safe_float(row_match.iloc[0][metric_key])):
                     continue
-                bar_x.append(x[ti] + offsets[mi] * width)
+                bar_x.append(sorted_x[ti] + offsets[mi] * width)
                 vals.append(_safe_float(row_match.iloc[0][metric_key]))
                 ns.append(_safe_float(row_match.iloc[0]['n_samples']))
 
@@ -1079,7 +1174,7 @@ def _plot_ml_model_comparison(
             ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
 
         if metric_key in {'r2', 'skill_vs_best'}:
-            ax.set_ylim(-1.0, 1.0)
+            ax.set_ylim(-1.1, 1.1)
         else:
             # Constrain y-axis lower limit: never below -1; if all bars positive, floor at 0.
             ymin_cur, ymax_cur = ax.get_ylim()
@@ -1087,23 +1182,23 @@ def _plot_ml_model_comparison(
             all_metric_vals = all_metric_vals[np.isfinite(all_metric_vals)]
             min_val = float(np.min(all_metric_vals)) if all_metric_vals.size else 0.0
             if min_val >= 0.0:
-                ax.set_ylim(bottom=0.0)
+                ax.set_ylim(bottom=-0.1, top=ymax_cur * 1.1)
             else:
-                ax.set_ylim(bottom=max(ymin_cur, -1.0))
+                ax.set_ylim(bottom=max(ymin_cur, -1.0), top=ymax_cur * 1.1)
 
         for bars, vals, ns in pending_annotations:
             _annotate_ml_bars(ax, bars, vals, ns, fmt)
 
-        # Tight horizontal bounds: ~0.07 units of padding beyond the outermost bar edges.
+        # Tight horizontal bounds with only a small edge margin beyond the outer bars.
         cluster_half = (n_models - 1) / 2 * width + width / 2
-        if n_targets > 0:
-            ax.set_xlim(x[0] - cluster_half - 0.07, x[-1] + cluster_half + 0.07)
+        if len(sorted_targets) > 0:
+            ax.set_xlim(sorted_x[0] - cluster_half - 0.2 * width, sorted_x[-1] + cluster_half + 0.2 * width)
 
         ax.set_ylabel(ylabel, fontsize=_FS)
         ax.tick_params(axis='y', labelsize=_FS)
-        ax.set_xticks(x)
+        ax.set_xticks(sorted_x)
         ax.set_xticklabels(
-            [lbl for _ds, lbl in ordered_targets],
+            [lbl for _ds, lbl in sorted_targets],
             rotation=45,
             ha='right',
             fontsize=_FS,
@@ -1121,6 +1216,7 @@ def _plot_ml_model_comparison(
         )
 
         fig.tight_layout(rect=[0, 0, 1, 0.92])
+        _expand_ylim_to_fit_annotations(ax)
         out_path = ml_comp_dir / file_names[metric_key]
         fig.savefig(out_path, dpi=180, bbox_inches='tight')
         plt.close(fig)
@@ -3190,7 +3286,6 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             print(f"[INFO] Wrote summary CSV: {summary_csv}")
 
             x = np.arange(len(perf_df))
-            width = 0.20
             labels = perf_df['dataset']
             # Use the actual ML model type(s) as the label; fall back to 'Model' if not recorded.
             if 'model' in perf_df.columns:
@@ -3203,6 +3298,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 model_series_label = 'Model'
             methods = [model_series_label] + [BASELINE_PLOT_LABELS[name] for name in BASELINE_ORDER]
             colors = ['tab:blue'] + [BASELINE_PLOT_COLORS[name] for name in BASELINE_ORDER]
+            width = 1.0 / (len(methods) + 0.5)
 
             std_target_col = perf_df['std_target'].replace(0, np.nan)
             nrmse_data = [
@@ -3228,13 +3324,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 'Compared with Linear Baseline',
             ]
             skill_colors = [BASELINE_PLOT_COLORS['naive'], BASELINE_PLOT_COLORS['seasonal'], BASELINE_PLOT_COLORS['linear']]
+            skill_width = 1.0 / (len(skill_methods) + 0.5)
 
             # --- Combined 3-panel figure (no title): Skill, nRMSE, R2 ---
             fig, (ax_skill_combo, ax_nrmse_combo, ax_r2_combo) = plt.subplots(
-                3, 1, figsize=(max(12, len(perf_df)*0.8), 13), sharex=True
+                3, 1, figsize=(max(8, len(perf_df) * 0.72 + 1.6), 13), sharex=True
             )
             _draw_bar_group(
-                ax_skill_combo, x, width, skill_data, skill_colors, skill_methods, '.2f',
+                ax_skill_combo, x, skill_width, skill_data, skill_colors, skill_methods, '.2f',
                 center_offset=0.5
             )
             ax_skill_combo.axhline(0, color='black', linewidth=0.8, linestyle='--')
@@ -3257,13 +3354,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             ax_r2_combo.set_xticks(x)
             ax_r2_combo.set_xticklabels(labels, rotation=45, ha='right')
             plt.tight_layout()
+            _expand_ylims_to_fit_annotations((ax_skill_combo, ax_nrmse_combo, ax_r2_combo))
             plot_path = combined_dir / "summary_best_model_performance.png"
             fig.savefig(plot_path, dpi=180, bbox_inches='tight')
             plt.close(fig)
             print(f"[INFO] Wrote summary_best_model_performance.png to {plot_path}")
 
             # --- Standalone nRMSE subplot ---
-            fig_nrmse, ax_nrmse = plt.subplots(figsize=(max(10, len(perf_df)*0.7), 5))
+            fig_nrmse, ax_nrmse = plt.subplots(figsize=(max(7, len(perf_df) * 0.72 + 1.2), 5))
             _draw_bar_group(ax_nrmse, x, width, nrmse_data, colors, methods, '.2e')
             ax_nrmse.set_ylabel('nRMSE')
             ax_nrmse.set_xticks(x)
@@ -3271,13 +3369,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             ax_nrmse.grid(axis='y', alpha=0.3)
             ax_nrmse.legend()
             plt.tight_layout()
+            _expand_ylim_to_fit_annotations(ax_nrmse)
             nrmse_path = individual_dir / "summary_best_model_nrmse.png"
             fig_nrmse.savefig(nrmse_path, dpi=300, bbox_inches='tight')
             plt.close(fig_nrmse)
             print(f"[INFO] Wrote nRMSE subplot: {nrmse_path}")
 
             # --- Standalone R2 subplot ---
-            fig_r2, ax_r2 = plt.subplots(figsize=(max(10, len(perf_df)*0.7), 5))
+            fig_r2, ax_r2 = plt.subplots(figsize=(max(7, len(perf_df) * 0.72 + 1.2), 5))
             r2_bars = _draw_bar_group(ax_r2, x, width, r2_data, colors, methods, '.2f', annotate=False)
             ax_r2.set_ylabel('Coefficient of Determination')
             ax_r2.set_ylim(-0.1, 1.0)
@@ -3288,14 +3387,15 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             ax_r2.grid(axis='y', alpha=0.3)
             ax_r2.legend()
             plt.tight_layout()
+            _expand_ylim_to_fit_annotations(ax_r2)
             r2_path = individual_dir / "summary_best_model_r2.png"
             fig_r2.savefig(r2_path, dpi=300, bbox_inches='tight')
             plt.close(fig_r2)
             print(f"[INFO] Wrote R2 subplot: {r2_path}")
 
             # --- Standalone skill score subplot ---
-            fig_skill, ax_skill = plt.subplots(figsize=(max(10, len(perf_df)*0.7), 5))
-            _draw_bar_group(ax_skill, x, width, skill_data, skill_colors, skill_methods, '.2f', center_offset=0.5)
+            fig_skill, ax_skill = plt.subplots(figsize=(max(7, len(perf_df) * 0.72 + 1.2), 5))
+            _draw_bar_group(ax_skill, x, skill_width, skill_data, skill_colors, skill_methods, '.2f', center_offset=0.5)
             ax_skill.axhline(0, color='black', linewidth=0.8, linestyle='--')
             ax_skill.set_ylabel('Skill Score')
             ax_skill.set_xticks(x)
@@ -3303,6 +3403,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             ax_skill.grid(axis='y', alpha=0.3)
             ax_skill.legend()
             plt.tight_layout()
+            _expand_ylim_to_fit_annotations(ax_skill)
             skill_path = individual_dir / "summary_best_model_skill.png"
             fig_skill.savefig(skill_path, dpi=300, bbox_inches='tight')
             plt.close(fig_skill)
@@ -4103,6 +4204,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 wrapped_xlabels.append(textwrap.fill(txt, width=18))
             ax_mat.set_xticklabels(wrapped_xlabels, rotation=60, ha="right", fontsize=8)
             plt.tight_layout()
+            _expand_ylims_to_fit_annotations(cv_axes)
             matrix_path = evaluation_dir / "summary_model_quality_matrix.png"
             fig_mat.savefig(matrix_path, dpi=300, bbox_inches='tight')
             plt.close(fig_mat)

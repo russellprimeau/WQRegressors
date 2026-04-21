@@ -72,16 +72,16 @@ Search/output behavior:
     (`_ensure_k01_baselines`, dataset-level `evaluation_summary.csv`).
 
 Examples:
-        python src/h_RunMCFeatureSelectionSweep.py --dry-run
+python src/h_RunMCFeatureSelectionSweep.py --dry-run
 
-        python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --limit-datasets 0 --eval-budget 240 --final-top-k 4
+python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --limit-datasets 0 --eval-budget 240 --final-top-k 4
 
-        python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --eval-budget 180 --seed-subsets-from-shapley
+python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --eval-budget 180 --seed-subsets-from-shapley
 
-        python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --eval-budget 180 --seed-subsets-csv data/output/regression/MC_exColor_res/forecasts/Shapley_sweeps/feature_seed_subsets_r671_d1234abcd.csv --max-seed-subsets 6
+python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --eval-budget 180 --seed-subsets-csv data/output/regression/MC_exColor_res/forecasts/Shapley_sweeps/feature_seed_subsets_r671_d1234abcd.csv --max-seed-subsets 6
 
-        # Opt in to search-phase plots when diagnosing candidate behavior:
-        python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --eval-budget 60 --keep-training-plots --keep-eval-plots --keep-search-plots
+# Opt in to search-phase plots when diagnosing candidate behavior:
+python src/h_RunMCFeatureSelectionSweep.py --dataset-prefix MC --eval-budget 60 --keep-training-plots --keep-eval-plots --keep-search-plots
 """
 from __future__ import annotations
 import contextlib
