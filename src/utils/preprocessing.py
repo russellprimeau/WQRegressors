@@ -394,13 +394,14 @@ def add_res(df: pd.DataFrame, columns: list) -> pd.DataFrame:
 def add_diff(df: pd.DataFrame, columns: list) -> pd.DataFrame:
     """
     For each column in 'columns' that exists in 'df', create a new column
-    'col_diff' using a fixed lag equal to the median observation gap in rows.
+    'col_diff' using the first and last row of the inferred sample window.
 
     Rules:
       - If the value in col is NaN, col_diff is NaN.
       - If fewer than 2 non-NaN values exist, col_diff is NaN.
       - Otherwise, col_diff is the difference between the current observed
-        value and the forward-filled state value shifted by the median gap.
+        value and the forward-filled state value at the first row of the
+        inferred sample window.
       - Values in the new column are rounded to 3 decimal places.
 
     Parameters:
@@ -427,8 +428,9 @@ def add_diff(df: pd.DataFrame, columns: list) -> pd.DataFrame:
 
         median_gap = int(round(float(np.median(np.diff(obs_ilocs)))))
         median_gap = max(1, median_gap)
+        sample_start_offset = max(0, median_gap - 1)
 
-        lagged_state = final_df[state_col].shift(median_gap)
+        lagged_state = final_df[state_col].shift(sample_start_offset)
         diffs = final_df[col] - lagged_state
         diffs = diffs.where(final_df[col].notna(), np.nan)
         final_df[f"{col}_diff"] = diffs.round(3)

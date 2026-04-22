@@ -534,18 +534,21 @@ class MLRProcessModel:
 
 
 class MLGapResidualProcessModel:
-    """Process model using saved ML residual predictions over the long lookback L.
+    """Process model using saved ML-derived delta predictions.
 
-    The loaded ML model predicts a residual delta over the target-specific
-    lookback interval ``L = state_offset`` in normalized ``_res`` units.
+    The loaded ML model predicts either:
+      - a legacy residual delta in normalized ``_res`` units, anchored to a
+        long-gap lookback state, or
+      - a normalized ``_diff`` value anchored to the first row of the sample.
+
     At row ``i`` this process model converts that into an absolute target-state
     goal:
 
-        x_ml_target(i) = filtered_state[i-L] + delta_raw(i)
+        x_ml_target(i) = base_state(i) + delta_raw(i)
 
-    where ``filtered_state[i-L]`` comes from PF posterior history when
-    available, falling back to the raw observed/state series only to bootstrap
-    early rows before enough PF history exists.
+    where ``base_state(i)`` comes from PF posterior history when available,
+    falling back to the raw observed/state series only to bootstrap early rows
+    before enough PF history exists.
     """
 
     def __init__(
@@ -563,6 +566,7 @@ class MLGapResidualProcessModel:
     ):
         self._target_col = str(target_col)
         self._output_col = str(output_col)
+        self._output_suffix = _output_suffix_from_column(output_col)
         self._state_offset = int(state_offset)
         self._norm_bounds = dict(norm_bounds or {})
         self._pred_res_norm = np.asarray(pred_res_norm, dtype=float)
@@ -633,7 +637,7 @@ class MLGapResidualProcessModel:
 
 
 class MLRGapResidualProcessModel(MLGapResidualProcessModel):
-    """Process model using saved MLR residual predictions over the long lookback L."""
+    """Process model using saved MLR-derived delta predictions."""
 
 
 class NoiseOverrideProcessModel:
@@ -1280,7 +1284,7 @@ def build_ml_gap_process_model_for_target(
     process_noise_override: float | None = None,
 ) -> dict | None:
     """Build an ML long-gap residual process model from saved CV artifacts."""
-    dataset_dir = _dataset_dir_for_target(cv_dir, target_col)
+    dataset_dir = _dataset_dir_for_target(cv_dir, target_col, preferred_suffixes=("diff", "res"))
     if dataset_dir is None:
         print(f"  [WARN] No dataset directory found in {cv_dir} for '{target_col}'.")
         return None
@@ -1326,10 +1330,11 @@ def build_ml_gap_process_model_for_target(
         )
         return None
 
-    pred_res_norm = _predict_all_rows(bundle, df)
-    state_offset = _compute_state_offset(df, target_col) if target_col in df.columns else 1
-    rmse_norm = float(pd.to_numeric(best_row.get("rmse", np.nan), errors="coerce"))
     output_col = str(bundle.output_column)
+    output_suffix = _output_suffix_from_column(output_col)
+    pred_res_norm = _predict_all_rows(bundle, df)
+    state_offset = int(bundle.seq_len) if output_suffix == "diff" else (_compute_state_offset(df, target_col) if target_col in df.columns else 1)
+    rmse_norm = float(pd.to_numeric(best_row.get("rmse", np.nan), errors="coerce"))
     rmse_raw = _denormalize_value(rmse_norm, output_col, bundle.norm_bounds) if np.isfinite(rmse_norm) else np.nan
     rmse_raw = abs(float(rmse_raw)) if np.isfinite(rmse_raw) else np.nan
     process_noise_std = (
@@ -1405,7 +1410,7 @@ def build_mlr_gap_process_model_for_target(
     process_noise_override: float | None = None,
 ) -> dict | None:
     """Build a saved-MLR long-gap residual process model from CV artifacts."""
-    dataset_dir = _dataset_dir_for_target(cv_dir, target_col)
+    dataset_dir = _dataset_dir_for_target(cv_dir, target_col, preferred_suffixes=("diff", "res"))
     if dataset_dir is None:
         print(f"  [WARN] No dataset directory found in {cv_dir} for '{target_col}'.")
         return None
@@ -1451,10 +1456,11 @@ def build_mlr_gap_process_model_for_target(
         )
         return None
 
-    pred_res_norm = _predict_all_rows(bundle, df)
-    state_offset = _compute_state_offset(df, target_col) if target_col in df.columns else 1
-    rmse_norm = float(pd.to_numeric(best_row.get("rmse", np.nan), errors="coerce"))
     output_col = str(bundle.output_column)
+    output_suffix = _output_suffix_from_column(output_col)
+    pred_res_norm = _predict_all_rows(bundle, df)
+    state_offset = int(bundle.seq_len) if output_suffix == "diff" else (_compute_state_offset(df, target_col) if target_col in df.columns else 1)
+    rmse_norm = float(pd.to_numeric(best_row.get("rmse", np.nan), errors="coerce"))
     rmse_raw = _denormalize_value(rmse_norm, output_col, bundle.norm_bounds) if np.isfinite(rmse_norm) else np.nan
     rmse_raw = abs(float(rmse_raw)) if np.isfinite(rmse_raw) else np.nan
     process_noise_std = (
@@ -1987,7 +1993,7 @@ def tune_filter_hyperparameters_for_target(
 # Dataset directory name prefixes for each target — mirrors the naming
 # convention used by h_RunMCFeatureSelectionSweep (e.g. "MC_pH_res").
 # Built lazily from the cv_dir at runtime; see _find_normalization().
-_NORM_CACHE: dict[str, dict] = {}   # target_col -> {col: {min, max}}
+_NORM_CACHE: dict[tuple[str, str], dict] = {}   # (target_col, suffix_key) -> {col: {min, max}}
 
 
 def _sanitise_for_dirname(name: str) -> str:
@@ -2005,56 +2011,94 @@ def _sanitise_for_dirname(name: str) -> str:
     return s.strip("_")
 
 
-def _dataset_dir_for_target(cv_dir: Path, target_col: str) -> Path | None:
-    """Return the MC_<target>_res dataset directory for *target_col*, or None.
+def _output_suffix_from_column(output_col: object) -> str:
+    text = str(output_col or "").strip().lower()
+    if text.endswith("_diff"):
+        return "diff"
+    if text.endswith("_res"):
+        return "res"
+    return ""
 
-    Matches directory names against a sanitised version of the target name.
-    E.g. target_col="Arsenic (µg/L)" → sanitised "Arsenic__µg_L_" → matches
-    directory "MC_Arsenic__µg_L__res".
-    """
+
+def _norm_label_from_suffix(output_suffix: str) -> str:
+    return f"particle_filter ({output_suffix}_norm)" if output_suffix in {"diff", "res"} else "particle_filter (absolute)"
+
+
+def _dataset_suffixes_for_target(
+    cv_dir: Path,
+    target_col: str,
+    preferred_suffixes: tuple[str, ...] = ("diff", "res"),
+) -> list[tuple[str, Path]]:
+    """Return matching dataset directories for *target_col*, ordered by suffix preference."""
     if not cv_dir.is_dir():
-        return None
+        return []
     sanitised = _sanitise_for_dirname(target_col)
-    # Look for MC_<sanitised>_res (exact) or a directory whose name contains
-    # the sanitised target and ends with _res.
+    matches: dict[str, Path] = {}
     for d in sorted(cv_dir.iterdir()):
         if not d.is_dir() or d.name == "summaries":
             continue
-        # Strip the MC_ prefix for matching
         dname = d.name
         if dname.startswith("MC_"):
-            dname_core = dname[3:]  # e.g. "Arsenic__µg_L__res"
+            dname_core = dname[3:]
         else:
             dname_core = dname
-        if not dname_core.endswith("_res"):
+        suffix = None
+        for candidate_suffix in ("_diff", "_res"):
+            if dname_core.endswith(candidate_suffix):
+                suffix = candidate_suffix[1:]
+                dname_target = dname_core[: -len(candidate_suffix)]
+                break
+        if suffix is None:
             continue
-        dname_target = dname_core[:-4]  # e.g. "Arsenic__µg_L_"
-        # Compare sanitised forms
         if _sanitise_for_dirname(dname_target) == sanitised:
-            return d
-    return None
+            matches.setdefault(suffix, d)
+    ordered: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for suffix in preferred_suffixes:
+        if suffix in matches and suffix not in seen:
+            ordered.append((suffix, matches[suffix]))
+            seen.add(suffix)
+    for suffix, path in matches.items():
+        if suffix not in seen:
+            ordered.append((suffix, path))
+            seen.add(suffix)
+    return ordered
 
 
-def _find_normalization(cv_dir: Path, target_col: str) -> dict:
+def _dataset_dir_for_target(
+    cv_dir: Path,
+    target_col: str,
+    preferred_suffixes: tuple[str, ...] = ("diff", "res"),
+) -> Path | None:
+    matches = _dataset_suffixes_for_target(cv_dir, target_col, preferred_suffixes=preferred_suffixes)
+    return matches[0][1] if matches else None
+
+
+def _find_normalization(
+    cv_dir: Path,
+    target_col: str,
+    preferred_suffixes: tuple[str, ...] = ("diff", "res"),
+) -> dict:
     """Load normalization.json for *target_col* from *cv_dir*.
 
     Returns a dict {col: {"min": float, "max": float}} or {} if not found.
     Results are cached for the lifetime of the process.
     """
-    if target_col in _NORM_CACHE:
-        return _NORM_CACHE[target_col]
-    d = _dataset_dir_for_target(cv_dir, target_col)
+    cache_key = (str(target_col), "|".join(preferred_suffixes))
+    if cache_key in _NORM_CACHE:
+        return _NORM_CACHE[cache_key]
+    d = _dataset_dir_for_target(cv_dir, target_col, preferred_suffixes=preferred_suffixes)
     if d is None:
-        _NORM_CACHE[target_col] = {}
+        _NORM_CACHE[cache_key] = {}
         return {}
     norm_path = d / "normalization.json"
     try:
         import json as _json
         norm = _json.loads(norm_path.read_text(encoding="utf-8"))
-        _NORM_CACHE[target_col] = norm
+        _NORM_CACHE[cache_key] = norm
         return norm
     except Exception:
-        _NORM_CACHE[target_col] = {}
+        _NORM_CACHE[cache_key] = {}
         return {}
 
 
@@ -2063,6 +2107,7 @@ def _compute_evaluation_rows(
     update_records: list[dict],
     df: pd.DataFrame,
     norm_bounds: dict,
+    output_column: str | None = None,
     eval_row_indices: set[int] | None = None,
     eval_samples: list[tuple[int, str]] | None = None,
     eval_sample_context: dict[str, dict[str, float]] | None = None,
@@ -2074,17 +2119,17 @@ def _compute_evaluation_rows(
 
     Two rows are produced:
       label="particle_filter (absolute)"    — raw physical units
-      label="particle_filter (res_norm)"    — normalised _res units,
-          comparable to existing pipeline metrics
+      label="particle_filter (<suffix>_norm)" — normalized units for the active
+          derived target column (currently ``_diff`` or legacy ``_res``).
 
     Parameters
     ----------
     update_records : list[dict] from run_particle_filter() — each entry has
         z (observed value), prior_mean, and timestamp.
     df : full input DataFrame (must have a forward-filled _state column for
-        computing _res).
-    norm_bounds : dict from normalization.json — must contain the _res key
-        for this target (e.g. "pH_res") to produce the normalised row.
+        computing derived targets).
+    norm_bounds : dict from normalization.json — must contain the active
+        output key (e.g. ``pH_diff`` or ``pH_res``) to produce the normalized row.
 
     Returns
     -------
@@ -2176,12 +2221,14 @@ def _compute_evaluation_rows(
     }
     rows = [row_abs]
 
-    # ---- Normalised _res row ----
-    res_col = f"{target_col}_res"
+    # ---- Normalized derived-target row ----
+    output_col = str(output_column or "")
+    output_suffix = _output_suffix_from_column(output_col)
+    norm_col = output_col if output_suffix in {"diff", "res"} else f"{target_col}_res"
     state_col = f"{target_col}_state"
-    res_bounds = norm_bounds.get(res_col)
+    res_bounds = norm_bounds.get(norm_col)
 
-    if res_bounds is not None and state_col in df.columns:
+    if output_suffix in {"diff", "res"} and res_bounds is not None and state_col in df.columns:
         res_min  = float(res_bounds.get("min", 0.0))
         res_max  = float(res_bounds.get("max", 1.0))
         res_span = res_max - res_min
@@ -2194,18 +2241,18 @@ def _compute_evaluation_rows(
             for k, (rec, sample_file) in enumerate(ordered_pairs):
                 ri = rec["row_idx"]
                 sample_ctx = eval_sample_context.get(sample_file, {})
-                state_val = float(sample_ctx.get("state_raw", np.nan))
-                if not np.isfinite(state_val):
-                    state_val = state_ff[ri] if 0 <= ri < len(state_ff) else np.nan
-                if not np.isfinite(state_val):
+                base_state = float(sample_ctx.get("base_state_raw", np.nan))
+                if not np.isfinite(base_state):
+                    base_state = state_ff[ri] if 0 <= ri < len(state_ff) else np.nan
+                if not np.isfinite(base_state):
                     continue
-                pred_res = rec["prior_mean"] - state_val
+                pred_res = rec["prior_mean"] - base_state
                 pred_res_norm[k] = (pred_res - res_min) / res_span
                 target_norm = float(sample_ctx.get("target_norm", np.nan))
                 if np.isfinite(target_norm):
                     true_res_norm[k] = target_norm
                 else:
-                    true_res = rec["z"] - state_val
+                    true_res = rec["z"] - base_state
                     true_res_norm[k] = (true_res - res_min) / res_span
 
             mae_n, rmse_n, r2_n, pr_n = _metrics(true_res_norm, pred_res_norm)
@@ -2214,7 +2261,7 @@ def _compute_evaluation_rows(
 
             row_norm = {
                 "target":    target_col,
-                "label": "particle_filter (res_norm)",
+                "label": _norm_label_from_suffix(output_suffix),
                 "mae":       mae_n,
                 "rmse":      rmse_n,
                 "r2":        r2_n,
@@ -2278,12 +2325,13 @@ def _build_pf_predictions_rows(
     update_records: list[dict],
     df: pd.DataFrame,
     norm_bounds: dict,
+    output_column: str | None = None,
     eval_row_indices: set[int] | None = None,
     eval_samples: list[tuple[int, str]] | None = None,
     baseline_predictions: dict[str, dict[str, float]] | None = None,
     eval_sample_context: dict[str, dict[str, float]] | None = None,
 ) -> tuple[list[dict], list[str]]:
-    """Build PF predictions.csv rows in normalized _res units.
+    """Build PF predictions.csv rows in normalized derived-target units.
 
     Each held-out observation update is treated as one independent test sample,
     matching the semantics used by the existing model-evaluation artifacts.
@@ -2319,7 +2367,9 @@ def _build_pf_predictions_rows(
     if not selected_records:
         return [], []
 
-    res_col = f"{target_col}_res"
+    output_col = str(output_column or "")
+    output_suffix = _output_suffix_from_column(output_col)
+    res_col = output_col if output_suffix in {"diff", "res"} else f"{target_col}_res"
     state_col = f"{target_col}_state"
     res_bounds = norm_bounds.get(res_col)
     if res_bounds is None or state_col not in df.columns:
@@ -2340,7 +2390,7 @@ def _build_pf_predictions_rows(
         if row_idx < 0 or row_idx >= len(state_ff):
             continue
         sample_ctx = eval_sample_context.get(sample_file, {})
-        state_val = float(sample_ctx.get("state_raw", np.nan))
+        state_val = float(sample_ctx.get("base_state_raw", np.nan))
         if not np.isfinite(state_val):
             state_val = state_ff[row_idx]
         pred_abs = float(rec.get("prior_mean", np.nan))
@@ -2384,11 +2434,15 @@ def _load_cv_test_context(
     cv_dir: Path,
     target_col: str,
     df: pd.DataFrame,
+    preferred_output_suffix: str | None = None,
 ) -> dict[str, object] | None:
     """Return CV test-split mapping and baseline artifacts for a target."""
-    dataset_dir = _dataset_dir_for_target(cv_dir, target_col)
-    if dataset_dir is None:
+    preferred_suffixes = ((preferred_output_suffix,) if preferred_output_suffix in {"diff", "res"} else ()) + ("diff", "res")
+    preferred_suffixes = tuple(dict.fromkeys(preferred_suffixes))
+    matches = _dataset_suffixes_for_target(cv_dir, target_col, preferred_suffixes=preferred_suffixes)
+    if not matches:
         return None
+    dataset_suffix, dataset_dir = matches[0]
 
     test_file_candidates = sorted(dataset_dir.glob("forecasts/**/test_files.txt"))
     if not test_file_candidates:
@@ -2481,13 +2535,15 @@ def _load_cv_test_context(
             continue
         if sample_df.empty:
             continue
+        first_row = sample_df.iloc[0]
         last_row = sample_df.iloc[-1]
         state_candidates = [c for c in sample_df.columns if str(c).endswith("_state")]
-        res_candidates = [c for c in sample_df.columns if str(c).endswith("_res")]
+        derived_candidates = [c for c in sample_df.columns if str(c).endswith(("_diff", "_res"))]
         state_raw = np.nan
         if state_candidates:
             state_col = str(state_candidates[-1])
-            state_norm = float(pd.to_numeric(last_row.get(state_col), errors="coerce"))
+            state_source = first_row if dataset_suffix == "diff" else last_row
+            state_norm = float(pd.to_numeric(state_source.get(state_col), errors="coerce"))
             state_bounds = norm_lookup.get(state_col)
             if np.isfinite(state_norm) and isinstance(state_bounds, dict):
                 state_min = float(state_bounds.get("min", np.nan))
@@ -2497,16 +2553,18 @@ def _load_cv_test_context(
         target_norm = np.nan
         if sample_file in baseline_predictions:
             target_norm = float(pd.to_numeric(baseline_predictions[sample_file].get("target"), errors="coerce"))
-        elif res_candidates:
-            target_norm = float(pd.to_numeric(last_row.get(res_candidates[-1]), errors="coerce"))
+        elif derived_candidates:
+            derived_col = next((c for c in derived_candidates if str(c).endswith(f"_{dataset_suffix}")), derived_candidates[-1])
+            target_norm = float(pd.to_numeric(last_row.get(derived_col), errors="coerce"))
         eval_sample_context[sample_file] = {
             "row_idx": float(row_idx),
-            "state_raw": state_raw,
+            "base_state_raw": state_raw,
             "target_norm": target_norm,
         }
 
     return {
         "dataset_dir": dataset_dir,
+        "dataset_suffix": dataset_suffix,
         "eval_samples": eval_samples,
         "baseline_summary_rows": baseline_summary_rows,
         "baseline_predictions": baseline_predictions,
@@ -2527,6 +2585,7 @@ def _write_pf_forecast_artifacts(
     run_name: str | None,
     tuned: bool,
     make_plots: bool,
+    output_column: str | None = None,
     eval_samples: list[tuple[int, str]] | None = None,
     baseline_predictions: dict[str, dict[str, float]] | None = None,
     eval_sample_context: dict[str, dict[str, float]] | None = None,
@@ -2544,12 +2603,16 @@ def _write_pf_forecast_artifacts(
     eval_summary_path = forecast_dir / "evaluation_summary.csv"
     _write_evaluation_summary(eval_rows, eval_summary_path)
 
-    norm_bounds = _find_normalization(cv_dir, target_col)
+    preferred_output_suffix = _output_suffix_from_column(output_column)
+    preferred_suffixes = ((preferred_output_suffix,) if preferred_output_suffix in {"diff", "res"} else ()) + ("diff", "res")
+    preferred_suffixes = tuple(dict.fromkeys(preferred_suffixes))
+    norm_bounds = _find_normalization(cv_dir, target_col, preferred_suffixes=preferred_suffixes)
     pred_rows, split_files = _build_pf_predictions_rows(
         target_col=target_col,
         update_records=update_records,
         df=df,
         norm_bounds=norm_bounds,
+        output_column=output_column,
         eval_row_indices=eval_row_indices,
         eval_samples=eval_samples,
         baseline_predictions=baseline_predictions,
@@ -3031,9 +3094,11 @@ def _plot_model_comparison(
     except Exception as exc:
         print(f"[WARN] Could not read {pf_eval_all_targets_path}: {exc}; skipping comparison figures.")
         return
-    df_pf_norm = df_pf_all[df_pf_all["label"] == "particle_filter (res_norm)"].copy()
+    df_pf_norm = df_pf_all[
+        df_pf_all["label"].astype(str).str.fullmatch(r"particle_filter \((diff|res)_norm\)", na=False)
+    ].copy()
     if df_pf_norm.empty:
-        print("[WARN] No 'particle_filter (res_norm)' rows; skipping comparison figures.")
+        print("[WARN] No normalized particle-filter rows found; skipping comparison figures.")
         return
 
     # ---- Build comparison records from feature_sweep_final_metrics.csv ----
@@ -3053,14 +3118,17 @@ def _plot_model_comparison(
         if df_fm.empty:
             continue
 
-        # Identify target_col from the CSV's target column (e.g. "pH_res",
-        # "Arsenic__µg_L__res").  Match by checking if sanitising the real
-        # target name + "_res" yields the same string.
+        # Identify target_col from the CSV's target column (e.g. "pH_diff",
+        # "pH_res", "Arsenic__µg_L__diff"). Match by checking whether
+        # sanitising the real target name with either supported suffix matches.
         csv_target = str(df_fm["target"].iloc[0])
         target_col = None
         for tc in target_cols:
-            sanitised = _sanitise_for_dirname(tc + "_res")
-            if sanitised == csv_target or sanitised == _sanitise_for_dirname(csv_target):
+            candidate_names = (
+                _sanitise_for_dirname(tc + "_diff"),
+                _sanitise_for_dirname(tc + "_res"),
+            )
+            if csv_target in candidate_names or _sanitise_for_dirname(csv_target) in candidate_names:
                 target_col = tc
                 break
         if target_col is None:
@@ -3981,6 +4049,7 @@ def main() -> None:
             "proc_model": proc_model,
             "obs_model":  obs_model,
             "prior_blend": prior_blend,
+            "output_column": fit_result.get("ml_output_column", ""),
         }
         holdout_ilocs_by_target[target_col] = {
             int(i) for i in fit_result.get("holdout_ilocs", [])
@@ -4055,13 +4124,17 @@ def main() -> None:
         eval_rows_all: list[dict] = []
 
         for target_col, records in all_update_records.items():
-            norm_bounds = _find_normalization(cv_dir, target_col)
+            model_meta = model_store.get(target_col, {})
+            preferred_output_suffix = _output_suffix_from_column(model_meta.get("output_column", ""))
+            preferred_suffixes = ((preferred_output_suffix,) if preferred_output_suffix in {"diff", "res"} else ()) + ("diff", "res")
+            preferred_suffixes = tuple(dict.fromkeys(preferred_suffixes))
+            norm_bounds = _find_normalization(cv_dir, target_col, preferred_suffixes=preferred_suffixes)
             if not norm_bounds:
                 print(f"  [WARN] normalization.json not found for '{target_col}'; "
                       f"skipping evaluation summary rows for this target.")
                 continue
 
-            cv_test_ctx = _load_cv_test_context(cv_dir, target_col, df)
+            cv_test_ctx = _load_cv_test_context(cv_dir, target_col, df, preferred_output_suffix=preferred_output_suffix)
             eval_samples = None
             eval_indices = holdout_ilocs_by_target.get(target_col, set())
             baseline_summary_rows: list[dict] = []
@@ -4080,6 +4153,7 @@ def main() -> None:
                 records,
                 df,
                 norm_bounds,
+                output_column=model_meta.get("output_column"),
                 eval_row_indices=eval_indices,
                 eval_samples=eval_samples,
                 eval_sample_context=eval_sample_context,
@@ -4112,6 +4186,7 @@ def main() -> None:
                 run_name=args.run_name,
                 tuned=args.tune_filter,
                 make_plots=not args.no_figure,
+                output_column=model_meta.get("output_column"),
                 eval_samples=eval_samples,
                 baseline_predictions=baseline_predictions,
                 eval_sample_context=eval_sample_context,

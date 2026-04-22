@@ -99,6 +99,14 @@ def _normalize_dataset_name(name: str) -> str:
     return _NORM_SUFFIX_RE.sub("", str(name)).rstrip("_")
 
 
+def _base_target_name(output_column: str) -> str:
+    name = str(output_column or "")
+    for suffix in ("_res", "_diff"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
 def _safe_float(value) -> float:
     try:
         out = float(value)
@@ -532,6 +540,7 @@ def _extract_sample_metadata(
         "sample_path": "",
         "timestamp": pd.NaT,
         "state_norm": np.nan,
+        "start_state_norm": np.nan,
         "prev_state_norm": np.nan,
         "target_norm": np.nan,
         "target_full": np.nan,
@@ -555,6 +564,8 @@ def _extract_sample_metadata(
             if len(timestamps) > 0:
                 meta["timestamp"] = timestamps.iloc[-1]
         if state_column in sample_df.columns:
+            if len(sample_df.index) > 0:
+                meta["start_state_norm"] = _safe_float(sample_df[state_column].iloc[0])
             meta["state_norm"] = _nanmean_or_nan(sample_df.loc[output_idx, state_column])
             prev_idx = [idx - 1 for idx in output_idx if int(idx) - 1 >= 0]
             if prev_idx:
@@ -601,6 +612,7 @@ def _reconstruct_full_values(
     pred_norm,
     target_name: str,
     output_column: str,
+    start_state_norm,
     prev_state_norm,
     truth_full_direct,
     norm_bounds: dict,
@@ -615,6 +627,16 @@ def _reconstruct_full_values(
             truth_full = prev_state_full + truth_res if np.isfinite(prev_state_full) and np.isfinite(truth_res) else np.nan
         pred_full = prev_state_full + pred_res if np.isfinite(prev_state_full) and np.isfinite(pred_res) else np.nan
         return truth_full, pred_full, prev_state_full, truth_res, pred_res
+    if output_column.endswith("_diff"):
+        state_column = f"{target_name}_state"
+        start_state_full = _denormalize_value(start_state_norm, state_column, norm_bounds)
+        truth_diff = _denormalize_value(truth_norm, output_column, norm_bounds)
+        pred_diff = _denormalize_value(pred_norm, output_column, norm_bounds)
+        truth_full = _safe_float(truth_full_direct)
+        if not np.isfinite(truth_full):
+            truth_full = start_state_full + truth_diff if np.isfinite(start_state_full) and np.isfinite(truth_diff) else np.nan
+        pred_full = start_state_full + pred_diff if np.isfinite(start_state_full) and np.isfinite(pred_diff) else np.nan
+        return truth_full, pred_full, start_state_full, truth_diff, pred_diff
     truth_full = _denormalize_value(truth_norm, output_column, norm_bounds)
     pred_full = _denormalize_value(pred_norm, output_column, norm_bounds)
     return truth_full, pred_full, np.nan, truth_full, pred_full
@@ -959,6 +981,7 @@ def _build_point_rows(
             pred_norm=_safe_float(pred_row.get("pred_norm")),
             target_name=sample_target_name,
             output_column=output_column,
+            start_state_norm=metadata.get("start_state_norm"),
             prev_state_norm=metadata.get("prev_state_norm"),
             truth_full_direct=metadata.get("target_full"),
             norm_bounds=norm_bounds,
@@ -983,6 +1006,7 @@ def _build_point_rows(
                 "truth_norm": truth_norm,
                 "pred_norm": _safe_float(pred_row.get("pred_norm")),
                 "state_norm": _safe_float(metadata.get("state_norm")),
+                "start_state_norm": _safe_float(metadata.get("start_state_norm")),
                 "prev_state_norm": _safe_float(metadata.get("prev_state_norm")),
                 "truth_full_value": truth_full,
                 "pred_full_value": pred_full,
@@ -1068,7 +1092,7 @@ def _evaluate_selected_row(
 
     output_columns = list(context.get("output_columns", []))
     output_column = output_columns[0] if output_columns else target_name
-    sample_target_name = output_column[:-4] if output_column.endswith("_res") else output_column
+    sample_target_name = _base_target_name(output_column)
     norm_bounds = _load_normalization_bounds(target_dir)
 
     try:

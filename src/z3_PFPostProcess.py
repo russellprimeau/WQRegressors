@@ -47,6 +47,7 @@ from utils.names import clean_target_label  # noqa: E402
 
 # Reuse the particle-filter-side helpers that are pure functions over on-disk data.
 from n_ParticleFilter import (  # noqa: E402
+    _output_suffix_from_column,
     _plot_model_comparison,
     _pf_forecast_name,
     _sanitise_for_dirname,
@@ -188,13 +189,19 @@ def _build_perf_row(
         print(f"[WARN] Could not read {eval_csv}: {exc}; skipping target '{target_col}'.")
         return None
 
-    norm_rows = eval_df[eval_df["label"].astype(str).str.contains("res_norm", na=False)]
+    norm_rows = eval_df[
+        eval_df["label"].astype(str).str.fullmatch(r"particle_filter \((diff|res)_norm\)", na=False)
+    ]
     if norm_rows.empty:
-        print(f"[WARN] No 'particle_filter (res_norm)' row in {eval_csv}; skipping.")
+        print(f"[WARN] No normalized particle-filter row in {eval_csv}; skipping.")
         return None
     pf_row = norm_rows.iloc[0]
 
-    dataset_label = f"{dataset_prefix}_{_sanitise_for_dirname(target_col)}_res"
+    output_suffix = _output_suffix_from_column(log_row.get("ml_output_column", "")) if (log_row := mlr_log_by_target.get(target_col, {})) else ""
+    if output_suffix not in {"diff", "res"}:
+        label_text = str(pf_row.get("label", ""))
+        output_suffix = "diff" if "diff_norm" in label_text else "res"
+    dataset_label = f"{dataset_prefix}_{_sanitise_for_dirname(target_col)}_{output_suffix}"
 
     row: dict = {
         "dataset":    dataset_label,
@@ -271,7 +278,6 @@ def _build_perf_row(
         row["compliance_reason"] = "n_test_valid_source_below_5"
 
     # ---- MLR log metadata ----
-    log_row = mlr_log_by_target.get(target_col, {})
     for key in (
         "variant_chosen", "process_noise_std", "measurement_noise_std",
         "prior_blend", "prior_blend_mode", "selected_features", "n_selected_features",
