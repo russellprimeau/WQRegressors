@@ -9,6 +9,10 @@ Key CLI groups (detailed):
     `--path PATH`: Optional alias for `--data-root`; path scanned for dataset folders.
     `--sweep-namespace NAME`: Forecast subdirectory namespace to post-process
       (for example `feature_sweeps` or `Shapley_sweeps`).
+    `--ml-selection {best,xgb}`: Choose whether ML-family best-model summaries use
+      the best of XGB/GP/Transformer or restrict ML-family selection to XGB only.
+    `--treat-mlr-as-baseline`: Include the best MLR result as an additional
+      baseline candidate when computing “best baseline” skill summaries.
 - Rolling CV control:
     `--run-rolling-cv`: Enable optional rolling-origin CV execution.
 - Statistical evidence controls:
@@ -34,6 +38,8 @@ python src/z1_FeaturePostProcess.py --sweep-namespace Shapley_sweeps
 python src/z1_FeaturePostProcess.py --path data/output/regression_alt --sweep-namespace Shapley_sweeps
 python src/z1_FeaturePostProcess.py --sweep-namespace feature_sweeps --run-rolling-cv
 python src/z1_FeaturePostProcess.py --path data/output/CV14 --sweep-namespace feature_sweeps --bootstrap-mode moving_block --bootstrap-block-len 7
+python src/z1_FeaturePostProcess.py --ml-selection xgb
+python src/z1_FeaturePostProcess.py --treat-mlr-as-baseline
 python src/z1_FeaturePostProcess.py --all-datasets
 python src/z1_FeaturePostProcess.py --limit-datasets 1
 """
@@ -89,8 +95,11 @@ BASELINE_PLOT_COLORS = {
     "naive": "tab:gray",
     "seasonal": "tab:green",
     "linear": "tab:orange",
+    "mlr": "tab:red",
 }
 BASELINE_MODEL_IDS = {"naive", "seasonal", "linear"}
+MLR_MODEL_IDS = {"mlr", "mlr_avg12", "mlr_avgall"}
+XGB_MODEL_IDS = {"xgb", "xgbregressor", "xgb_regressor", "xgbclassifier", "xgb_classifier"}
 MIN_REQUIRED_VALID_INDEPENDENT = 5
 
 ML_COMPARISON_MODEL_TYPES = ['XGB', 'Trans.', 'GP', 'MLR', 'MLR12', 'MLRall']
@@ -151,6 +160,69 @@ def _exclude_baseline_metric_rows(df: "pd.DataFrame") -> "pd.DataFrame":
     if 'model' not in out.columns:
         return out
     return out[~out['model'].apply(_is_baseline_model_value)].copy()
+
+
+def _normalize_model_id(value: object) -> str:
+    return str(value).strip().lower().replace(" ", "").replace("-", "").replace("_", "")
+
+
+_NORMALIZED_XGB_MODEL_IDS = {_normalize_model_id(v) for v in XGB_MODEL_IDS}
+_NORMALIZED_MLR_MODEL_IDS = {_normalize_model_id(v) for v in MLR_MODEL_IDS}
+
+BEST_BASELINE_PLOT_LABELS = {
+    **BASELINE_PLOT_LABELS,
+    "mlr": "MLR",
+}
+
+
+def _is_xgb_model_value(value: object) -> bool:
+    return _normalize_model_id(value) in _NORMALIZED_XGB_MODEL_IDS
+
+
+def _is_mlr_model_value(value: object) -> bool:
+    return _normalize_model_id(value) in _NORMALIZED_MLR_MODEL_IDS
+
+
+def _filter_best_model_candidates(df: "pd.DataFrame", ml_selection: str) -> "pd.DataFrame":
+    """Restrict ML-family candidates for best-model selection when requested."""
+    out = df.copy()
+    if ml_selection != "xgb" or "model" not in out.columns:
+        return out
+
+    model_vals = out["model"]
+    keep_mask = model_vals.apply(_is_xgb_model_value) | model_vals.apply(_is_mlr_model_value)
+    return out[keep_mask].copy()
+
+
+def _best_baseline_order(args: argparse.Namespace) -> tuple[str, ...]:
+    order = list(BASELINE_ORDER)
+    if bool(getattr(args, "treat_mlr_as_baseline", False)):
+        order.append("mlr")
+    return tuple(order)
+
+
+def _load_best_mlr_baseline_stats(data_root: Path, dataset_name: str) -> dict[str, float]:
+    """Return stats for the best MLR row from feature_sweep_final_metrics.csv."""
+    csv_path = Path(data_root) / dataset_name / "forecasts" / "feature_sweeps" / "feature_sweep_final_metrics.csv"
+    if not csv_path.exists():
+        return {k: float("nan") for k in ("mae", "rmse", "r2", "pearson_r")}
+    try:
+        df = pd.read_csv(csv_path)
+        if df.empty or "model" not in df.columns:
+            raise ValueError("no MLR metrics rows available")
+        mlr_df = df[df["model"].apply(_is_mlr_model_value)].copy()
+        mlr_df = _filter_min_valid_independent(_filter_valid_rows(mlr_df), min_required=MIN_REQUIRED_VALID_INDEPENDENT)
+        if mlr_df.empty:
+            raise ValueError("no valid MLR rows available")
+        best_mlr = select_best_model_row(mlr_df)
+        return {
+            "mae": _safe_float(best_mlr.get("mae", float("nan"))),
+            "rmse": _safe_float(best_mlr.get("rmse", float("nan"))),
+            "r2": _safe_float(best_mlr.get("r2", float("nan"))),
+            "pearson_r": _safe_float(best_mlr.get("pearson_r", float("nan"))),
+        }
+    except Exception:
+        return {k: float("nan") for k in ("mae", "rmse", "r2", "pearson_r")}
 
 
 _SHAPLEY_MERGE_LABEL_PREFIX = "shap_"
@@ -986,11 +1058,14 @@ def _plot_ml_model_comparison(
             continue
 
         # Apply the same validity filters used for best-model selection
-        valid_df = _exclude_baseline_metric_rows(
-            _filter_min_valid_independent(
-                _filter_valid_rows(df),
-                min_required=MIN_REQUIRED_VALID_INDEPENDENT,
-            )
+        valid_df = _filter_best_model_candidates(
+            _exclude_baseline_metric_rows(
+                _filter_min_valid_independent(
+                    _filter_valid_rows(df),
+                    min_required=MIN_REQUIRED_VALID_INDEPENDENT,
+                )
+            ),
+            getattr(args, "ml_selection", "best"),
         )
         if valid_df.empty:
             continue
@@ -2991,8 +3066,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                         _df_for_selection = df  # fall back to unfiltered if nothing matches
                         print(f"[WARN] No rows match target_name={target_name!r} in {final_metrics_csv.name}; using all rows for selection.")
                     # Select best row across all models/subsets by R2
-                    valid_r2 = _exclude_baseline_metric_rows(
-                        _filter_min_valid_independent(_filter_valid_rows(_df_for_selection), min_required=MIN_REQUIRED_VALID_INDEPENDENT)
+                    valid_r2 = _filter_best_model_candidates(
+                        _exclude_baseline_metric_rows(
+                            _filter_min_valid_independent(
+                                _filter_valid_rows(_df_for_selection),
+                                min_required=MIN_REQUIRED_VALID_INDEPENDENT,
+                            )
+                        ),
+                        getattr(args, "ml_selection", "best"),
                     )
                     if valid_r2.empty:
                         print(
@@ -3044,11 +3125,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                             _df_post = df[df["target"].astype(str) == target_name].copy() if "target" in df.columns else df
                             if _df_post.empty:
                                 _df_post = df
-                            _post_mlr = _exclude_baseline_metric_rows(
-                                _filter_min_valid_independent(
-                                    _filter_valid_rows(_df_post),
-                                    min_required=MIN_REQUIRED_VALID_INDEPENDENT,
-                                )
+                            _post_mlr = _filter_best_model_candidates(
+                                _exclude_baseline_metric_rows(
+                                    _filter_min_valid_independent(
+                                        _filter_valid_rows(_df_post),
+                                        min_required=MIN_REQUIRED_VALID_INDEPENDENT,
+                                    )
+                                ),
+                                getattr(args, "ml_selection", "best"),
                             )
                             if not _post_mlr.empty:
                                 best_row = select_best_model_row(_post_mlr)
@@ -3163,11 +3247,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                             _df_final = df[df["target"].astype(str) == target_name].copy() if "target" in df.columns else df
                             if _df_final.empty:
                                 _df_final = df
-                            valid_r2_2 = _exclude_baseline_metric_rows(
-                                _filter_min_valid_independent(
-                                    _filter_valid_rows(_df_final),
-                                    min_required=MIN_REQUIRED_VALID_INDEPENDENT,
-                                )
+                            valid_r2_2 = _filter_best_model_candidates(
+                                _exclude_baseline_metric_rows(
+                                    _filter_min_valid_independent(
+                                        _filter_valid_rows(_df_final),
+                                        min_required=MIN_REQUIRED_VALID_INDEPENDENT,
+                                    )
+                                ),
+                                getattr(args, "ml_selection", "best"),
                             )
                             if not valid_r2_2.empty:
                                 best_updated = select_best_model_row(valid_r2_2)
@@ -3218,11 +3305,12 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 dataset = entry['dataset']
                 # Standard location for a full-dataset evaluation summary with baselines
                 eval_csv = os.path.join(data_root, dataset, 'evaluation_summary.csv')
-                baseline_stats = {name: {} for name in BASELINE_ORDER}
+                baseline_order = _best_baseline_order(args)
+                baseline_stats = {name: {} for name in baseline_order}
                 if os.path.exists(eval_csv):
                     try:
                         df_eval = pd.read_csv(eval_csv)
-                        for kind in baseline_stats.keys():
+                        for kind in BASELINE_ORDER:
                             row = df_eval[df_eval['label'].str.lower().str.contains(kind)].iloc[0] if not df_eval[df_eval['label'].str.lower().str.contains(kind)].empty else None
                             if row is not None:
                                 for stat in ['mae', 'rmse', 'r2', 'pearson_r']:
@@ -3239,6 +3327,8 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     for kind in baseline_stats.keys():
                         for stat in ['mae', 'rmse', 'r2', 'pearson_r']:
                             baseline_stats[kind][stat] = np.nan
+                if 'mlr' in baseline_stats:
+                    baseline_stats['mlr'] = _load_best_mlr_baseline_stats(data_root, dataset)
                 for kind in baseline_stats.keys():
                     for stat in ['mae', 'rmse', 'r2', 'pearson_r']:
                         entry[f'{kind}_{stat}'] = baseline_stats[kind][stat]
@@ -3268,7 +3358,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             # Compute skill vs best baseline for target ordering in heatmaps.
             _baseline_rmse_cols = [
                 perf_df.get(f'{name}_rmse', pd.Series(dtype=float)).replace(0, np.nan)
-                for name in BASELINE_ORDER
+                for name in _best_baseline_order(args)
             ]
             _best_baseline_rmse = pd.concat(_baseline_rmse_cols, axis=1).min(axis=1)
             perf_df['skill_vs_best_baseline'] = 1.0 - perf_df['rmse'] / _best_baseline_rmse
@@ -3296,34 +3386,34 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 )
             else:
                 model_series_label = 'Model'
-            methods = [model_series_label] + [BASELINE_PLOT_LABELS[name] for name in BASELINE_ORDER]
-            colors = ['tab:blue'] + [BASELINE_PLOT_COLORS[name] for name in BASELINE_ORDER]
+            baseline_order = _best_baseline_order(args)
+            methods = [model_series_label] + [BEST_BASELINE_PLOT_LABELS[name] for name in baseline_order]
+            colors = ['tab:blue'] + [BASELINE_PLOT_COLORS[name] for name in baseline_order]
             width = 1.0 / (len(methods) + 0.5)
 
             std_target_col = perf_df['std_target'].replace(0, np.nan)
             nrmse_data = [
                 perf_df['nrmse'],
-                perf_df['naive_rmse'] / std_target_col,
-                perf_df['seasonal_rmse'] / std_target_col,
-                perf_df['linear_rmse'] / std_target_col,
+            ] + [
+                perf_df.get(f'{name}_rmse', pd.Series(dtype=float)) / std_target_col
+                for name in baseline_order
             ]
             r2_data = [
                 perf_df['r2'],
-                perf_df['naive_r2'],
-                perf_df['seasonal_r2'],
-                perf_df['linear_r2'],
+            ] + [
+                perf_df.get(f'{name}_r2', pd.Series(dtype=float))
+                for name in baseline_order
             ]
             # Skill score: 1 - (model_rmse / baseline_rmse); positive = better than baseline
-            skill_naive = 1.0 - perf_df['rmse'] / perf_df['naive_rmse'].replace(0, np.nan)
-            skill_seasonal = 1.0 - perf_df['rmse'] / perf_df['seasonal_rmse'].replace(0, np.nan)
-            skill_linear = 1.0 - perf_df['rmse'] / perf_df['linear_rmse'].replace(0, np.nan)
-            skill_data = [skill_naive, skill_seasonal, skill_linear]
-            skill_methods = [
-                'Compared with Naive Baseline',
-                'Compared with Seasonal Baseline',
-                'Compared with Linear Baseline',
+            skill_data = [
+                1.0 - perf_df['rmse'] / perf_df.get(f'{name}_rmse', pd.Series(dtype=float)).replace(0, np.nan)
+                for name in baseline_order
             ]
-            skill_colors = [BASELINE_PLOT_COLORS['naive'], BASELINE_PLOT_COLORS['seasonal'], BASELINE_PLOT_COLORS['linear']]
+            skill_methods = [
+                f'Compared with {BEST_BASELINE_PLOT_LABELS[name]} Baseline'
+                for name in baseline_order
+            ]
+            skill_colors = [BASELINE_PLOT_COLORS[name] for name in baseline_order]
             skill_width = 1.0 / (len(skill_methods) + 0.5)
 
             # --- Combined 3-panel figure (no title): Skill, nRMSE, R2 ---
@@ -4427,6 +4517,24 @@ def main() -> int:
         help=(
             "Forecast sweep subdirectory to post-process "
             "(e.g., 'feature_sweeps' or 'Shapley_sweeps')."
+        ),
+    )
+    parser.add_argument(
+        "--ml-selection",
+        choices=["best", "xgb"],
+        default="best",
+        help=(
+            "How to choose ML-family results in best-model summaries and comparisons: "
+            '"best" uses the best of XGB/GP/Transformer, '
+            '"xgb" restricts ML-family selection to XGB only.'
+        ),
+    )
+    parser.add_argument(
+        "--treat-mlr-as-baseline",
+        action="store_true",
+        help=(
+            "Include the best MLR result as an additional baseline candidate in "
+            "best-baseline skill summaries."
         ),
     )
     parser.add_argument(

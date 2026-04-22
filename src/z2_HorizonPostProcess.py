@@ -42,6 +42,12 @@ CLI arguments:
                             Default: data/output/regression
     --dataset-prefix STR    Only include datasets whose name starts with this
                             prefix.  Default: MC
+    --ml-selection MODE     Which ML-family horizon results to include. "best"
+                            keeps the current behavior (best of XGB, GP,
+                            Transformer). "xgb" restricts ML-family results to
+                            XGB only. Default: best
+    --treat-mlr-as-baseline Include MLR as an additional baseline candidate
+                            when computing best-baseline skill summaries.
         --evaluate-all          Deprecated compatibility flag; no longer needed.
                                                         This script now always generates both:
                                                             - eval_test : test-set only evaluation
@@ -53,6 +59,8 @@ CLI arguments:
 Examples:
 python src/z2_HorizonPostProcess.py
 python src/z2_HorizonPostProcess.py --data-root data/output/regression
+python src/z2_HorizonPostProcess.py --ml-selection xgb
+python src/z2_HorizonPostProcess.py --treat-mlr-as-baseline
 python src/z2_HorizonPostProcess.py --data-root data/output/CV14 --dataset-prefix MC
 python src/z2_HorizonPostProcess.py --data-root data/output/CV14 --dataset-prefix MC --evaluate-all
 """
@@ -99,6 +107,29 @@ _BAR_ANNOTATION_FONTSIZE = 12
 _BAR_LEGEND_FONTSIZE = 12
 _CLUSTERED_BAR_WIDTH = 0.50
 _SINGLE_BAR_WIDTH = 0.86
+_MLR_MODEL_NAMES = {"mlr", "mlr_avg12", "mlr_avgall"}
+_XGB_MODEL_NAMES = {"xgb", "xgbregressor", "xgb_regressor", "xgbclassifier", "xgb_classifier"}
+
+
+def _normalize_model_id(value: object) -> str:
+    return str(value).strip().lower().replace(" ", "").replace("-", "").replace("_", "")
+
+
+_NORMALIZED_MLR_MODEL_NAMES = {_normalize_model_id(v) for v in _MLR_MODEL_NAMES}
+_NORMALIZED_XGB_MODEL_NAMES = {_normalize_model_id(v) for v in _XGB_MODEL_NAMES}
+_DEFAULT_BASELINE_LABELS = ("naive", "seasonal", "linear")
+
+
+def _is_mlr_model_name(value: object) -> bool:
+    return _normalize_model_id(value) in _NORMALIZED_MLR_MODEL_NAMES
+
+
+def _is_xgb_model_name(value: object) -> bool:
+    return _normalize_model_id(value) in _NORMALIZED_XGB_MODEL_NAMES
+
+
+def _baseline_labels(include_mlr_baseline: bool = False) -> tuple[str, ...]:
+    return _DEFAULT_BASELINE_LABELS + (("mlr",) if include_mlr_baseline else ())
 
 
 def _bar_fig_width(n_bars: int, clustered: bool) -> float:
@@ -656,6 +687,7 @@ def _load_baseline_rmses(
     horizon_hr: int,
     replicate: int,
     model_class: "str | None" = None,
+    include_mlr_baseline: bool = False,
     evaluate_all: bool = False,
 ) -> dict[str, float]:
     """Return ``{baseline_label: rmse}`` from a baseline summary CSV for one horizon.
@@ -701,7 +733,7 @@ def _load_baseline_rmses(
         df = pd.read_csv(baseline_csv)
         if "rmse" not in df.columns:
             return {}
-        _known = {"naive", "seasonal", "linear"}
+        _known = set(_DEFAULT_BASELINE_LABELS)
         if "kind" in df.columns:
             mask = df["kind"].str.lower() == "baseline"
         else:
@@ -713,6 +745,33 @@ def _load_baseline_rmses(
             rmse_val = float(row["rmse"])
             if np.isfinite(rmse_val) and rmse_val > 0:
                 result[lbl] = rmse_val
+        if include_mlr_baseline:
+            mlr_csv = (
+                dataset_dir / "horizons" / "lookahead_sweeps" / "_combined_metrics.csv"
+                if evaluate_all
+                else dataset_dir / "horizons" / "lookahead_sweeps" / "lookahead_metrics.csv"
+            )
+            if mlr_csv.exists():
+                try:
+                    mlr_df = pd.read_csv(mlr_csv)
+                    horizon_col = "horizon" if "horizon" in mlr_df.columns else "lookahead"
+                    if horizon_col in mlr_df.columns and "rmse" in mlr_df.columns:
+                        mlr_subset = mlr_df[pd.to_numeric(mlr_df[horizon_col], errors="coerce") == int(horizon_hr)].copy()
+                        if "model_class" in mlr_subset.columns:
+                            mlr_subset = mlr_subset[mlr_subset["model_class"].astype(str).str.lower() == "mlr"].copy()
+                        elif "model_name" in mlr_subset.columns:
+                            mlr_subset = mlr_subset[mlr_subset["model_name"].apply(_is_mlr_model_name)].copy()
+                        if evaluate_all and "kind" in mlr_subset.columns:
+                            combined = mlr_subset[mlr_subset["kind"] == "combined"]
+                            mlr_subset = combined if not combined.empty else mlr_subset[mlr_subset["kind"] == "test"]
+                        elif "kind" in mlr_subset.columns:
+                            mlr_subset = mlr_subset[mlr_subset["kind"] == "test"]
+                        mlr_rmse = pd.to_numeric(mlr_subset["rmse"], errors="coerce").dropna()
+                        mlr_rmse = mlr_rmse[mlr_rmse > 0]
+                        if not mlr_rmse.empty:
+                            result["mlr"] = float(mlr_rmse.min())
+                except Exception:
+                    pass
         return result
     except Exception:
         return {}
@@ -742,7 +801,7 @@ def _load_std_target(dataset_dir: Path) -> float | None:
         return None
 
 
-def _rate_table(records: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
+def _rate_table(records: list[tuple[str, pd.DataFrame]], include_mlr_baseline: bool = False) -> pd.DataFrame:
     """One row per dataset: linear slope of each metric vs. horizon (units per hour)."""
     rows = []
     for label, df in records:
@@ -776,12 +835,15 @@ def _rate_table(records: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
         _skill_v_naive_at_min = float(_df_at_min_h["skill_v_naive"].mean()) if "skill_v_naive" in _df_at_min_h.columns and not _df_at_min_h["skill_v_naive"].isnull().all() else float("nan")
         _skill_v_seasonal_at_min = float(_df_at_min_h["skill_v_seasonal"].mean()) if "skill_v_seasonal" in _df_at_min_h.columns and not _df_at_min_h["skill_v_seasonal"].isnull().all() else float("nan")
         _skill_v_linear_at_min = float(_df_at_min_h["skill_v_linear"].mean()) if "skill_v_linear" in _df_at_min_h.columns and not _df_at_min_h["skill_v_linear"].isnull().all() else float("nan")
+        _skill_v_mlr_at_min = float(_df_at_min_h["skill_v_mlr"].mean()) if include_mlr_baseline and "skill_v_mlr" in _df_at_min_h.columns and not _df_at_min_h["skill_v_mlr"].isnull().all() else float("nan")
 
         baseline_candidates = {
             "naive": _skill_v_naive_at_min,
             "seasonal": _skill_v_seasonal_at_min,
             "linear": _skill_v_linear_at_min,
         }
+        if include_mlr_baseline:
+            baseline_candidates["mlr"] = _skill_v_mlr_at_min
         finite_baselines = {name: score for name, score in baseline_candidates.items() if np.isfinite(score)}
         if finite_baselines:
             best_baseline_label, best_skill = max(finite_baselines.items(), key=lambda item: item[1])
@@ -817,11 +879,12 @@ def _rate_table(records: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
             "initial_skill_v_naive":    _skill_v_naive_at_min,
             "initial_skill_v_seasonal": _skill_v_seasonal_at_min,
             "initial_skill_v_linear":   _skill_v_linear_at_min,
+            "initial_skill_v_mlr":      _skill_v_mlr_at_min,
         })
     return pd.DataFrame(rows)
 
 
-def _time_to_baseline_r2_hours(rate_df: pd.DataFrame) -> pd.Series:
+def _time_to_baseline_r2_hours(rate_df: pd.DataFrame, include_mlr_baseline: bool = False) -> pd.Series:
     """Return hours needed for R² to reach the best baseline R² at horizon 0."""
 
     def _row_hours(row: pd.Series) -> float:
@@ -845,6 +908,8 @@ def _time_to_baseline_r2_hours(rate_df: pd.DataFrame) -> pd.Series:
             "seasonal": float(row.get("initial_skill_v_seasonal", float("nan"))),
             "linear": float(row.get("initial_skill_v_linear", float("nan"))),
         }
+        if include_mlr_baseline:
+            skill_candidates["mlr"] = float(row.get("initial_skill_v_mlr", float("nan")))
         finite_candidates = {name: score for name, score in skill_candidates.items() if np.isfinite(score)}
         if not finite_candidates:
             return float("nan")
@@ -1086,6 +1151,8 @@ def _build_records(
     prefix: str,
     model_class_filter: "str | None",
     show_std: bool,
+    ml_selection: str = "best",
+    treat_mlr_as_baseline: bool = False,
     evaluate_all: bool = False,
 ) -> list[tuple[str, pd.DataFrame]]:
     """Load and enrich metrics for each dataset, filtered by model_class.
@@ -1119,6 +1186,19 @@ def _build_records(
             # Filter by model_class if requested and column is present.
             if model_class_filter is not None and "model_class" in df.columns:
                 df = df[df["model_class"] == model_class_filter].copy()
+            if df.empty:
+                continue
+
+            if ml_selection == "xgb" and "model_name" in df.columns:
+                if model_class_filter == "ml":
+                    df = df[df["model_name"].apply(_is_xgb_model_name)].copy()
+                elif model_class_filter is None:
+                    keep_mask = df["model_name"].apply(_is_xgb_model_name)
+                    if "model_class" in df.columns:
+                        keep_mask = keep_mask | df["model_class"].astype(str).str.lower().eq("mlr")
+                    else:
+                        keep_mask = keep_mask | df["model_name"].apply(_is_mlr_model_name)
+                    df = df[keep_mask].copy()
             if df.empty:
                 continue
 
@@ -1165,6 +1245,7 @@ def _build_records(
                 _key = (_h, _r, _mc)
                 if _key not in _baseline_cache:
                     _baseline_cache[_key] = _load_baseline_rmses(dataset_dir, _h, _r, _mc,
+                                                                  include_mlr_baseline=treat_mlr_as_baseline,
                                                                   evaluate_all=evaluate_all)
 
             def _skill(model_rmse: float, baseline_rmse: float) -> float:
@@ -1182,15 +1263,18 @@ def _build_records(
                     "skill_v_naive":    _skill(m, bl.get("naive",    float("nan"))),
                     "skill_v_seasonal": _skill(m, bl.get("seasonal", float("nan"))),
                     "skill_v_linear":   _skill(m, bl.get("linear",   float("nan"))),
+                    "skill_v_mlr":      _skill(m, bl.get("mlr",      float("nan"))),
                 })
 
             _skills = df.apply(_get_skills, axis=1)
             df["skill_v_naive"]    = _skills["skill_v_naive"]
             df["skill_v_seasonal"] = _skills["skill_v_seasonal"]
             df["skill_v_linear"]   = _skills["skill_v_linear"]
-            df["skill_v_best_baseline"] = _skills[
-                ["skill_v_naive", "skill_v_seasonal", "skill_v_linear"]
-            ].max(axis=1)
+            df["skill_v_mlr"]      = _skills["skill_v_mlr"]
+            baseline_skill_cols = ["skill_v_naive", "skill_v_seasonal", "skill_v_linear"]
+            if treat_mlr_as_baseline:
+                baseline_skill_cols.append("skill_v_mlr")
+            df["skill_v_best_baseline"] = _skills[baseline_skill_cols].max(axis=1)
 
             label = _clean_label(name, prefix)
             records.append((label, df))
@@ -1286,6 +1370,7 @@ def _generate_all_figures(
     show_std: bool = True,
     all_x: "list | None" = None,
     tag: str = "",
+    treat_mlr_as_baseline: bool = False,
 ) -> None:
     """Generate the standard 8-figure + 2-CSV set for a single records list.
 
@@ -1441,7 +1526,7 @@ def _generate_all_figures(
     _write_aggregate_csv(records, agg_path)
     print(f"[INFO] {pfx}Wrote aggregate CSV: {agg_path}")
 
-    rate_df = _rate_table(records)
+    rate_df = _rate_table(records, include_mlr_baseline=treat_mlr_as_baseline)
     rate_path = out_dir / "lookahead_rates.csv"
     rate_df.to_csv(rate_path, index=False)
     print(f"[INFO] {pfx}Wrote rates CSV: {rate_path}")
@@ -1476,7 +1561,10 @@ def _generate_all_figures(
     )
     print(f"[INFO] {pfx}Wrote time-to-zero-skill: {tzs_path}")
 
-    rate_df["time_to_baseline_r2_hours"] = _time_to_baseline_r2_hours(rate_df)
+    rate_df["time_to_baseline_r2_hours"] = _time_to_baseline_r2_hours(
+        rate_df,
+        include_mlr_baseline=treat_mlr_as_baseline,
+    )
     rate_df["time_to_baseline_r2"] = rate_df["time_to_baseline_r2_hours"] / 24.0
     ttbr2_path = _plot_rate_bar(
         rate_df, "time_to_baseline_r2", "Forecast Horizon (days)",
@@ -1497,6 +1585,7 @@ def _generate_combined_figures(
     out_dir: Path,
     show_std: bool = True,
     all_x: "list | None" = None,
+    treat_mlr_as_baseline: bool = False,
 ) -> None:
     """Generate combined figures with ML (solid) and MLR (dashed) series on same axes.
 
@@ -1651,8 +1740,8 @@ def _generate_combined_figures(
     print(f"[INFO] [combined] Wrote aggregate CSV: {agg_path}")
 
     # Combined rates CSV (two rows per dataset: ML and MLR)
-    rate_df_ml  = _rate_table(records_ml)
-    rate_df_mlr = _rate_table(records_mlr)
+    rate_df_ml  = _rate_table(records_ml, include_mlr_baseline=treat_mlr_as_baseline)
+    rate_df_mlr = _rate_table(records_mlr, include_mlr_baseline=treat_mlr_as_baseline)
     if not rate_df_ml.empty:
         rate_df_ml["model_class"] = "ml"
     if not rate_df_mlr.empty:
@@ -1715,7 +1804,10 @@ def _generate_combined_figures(
 
     # Time-to-baseline-R² combined
     for _rdf in [rate_df_ml, rate_df_mlr]:
-        _rdf["time_to_baseline_r2_hours"] = _time_to_baseline_r2_hours(_rdf)
+        _rdf["time_to_baseline_r2_hours"] = _time_to_baseline_r2_hours(
+            _rdf,
+            include_mlr_baseline=treat_mlr_as_baseline,
+        )
         _rdf["time_to_baseline_r2"] = _rdf["time_to_baseline_r2_hours"] / 24.0
     _plot_combined_rate_bar("time_to_baseline_r2", "Forecast Horizon (days)",
                             "lookahead_time_to_baseline_r2.png", ascending=False)
@@ -1734,6 +1826,8 @@ def generate_figures(
     prefix: str,
     summaries_dir: Path,
     show_std: bool = True,
+    ml_selection: str = "best",
+    treat_mlr_as_baseline: bool = False,
     evaluate_all: bool = False,
 ) -> int:
     datasets = _discover_datasets(data_root, prefix, evaluate_all=evaluate_all)
@@ -1757,11 +1851,35 @@ def generate_figures(
     all_x = sorted(all_x_set)
 
     print("[INFO] Building ML records...")
-    records_ml   = _build_records(datasets, prefix, model_class_filter="ml",   show_std=show_std, evaluate_all=evaluate_all)
+    records_ml   = _build_records(
+        datasets,
+        prefix,
+        model_class_filter="ml",
+        show_std=show_std,
+        ml_selection=ml_selection,
+        treat_mlr_as_baseline=treat_mlr_as_baseline,
+        evaluate_all=evaluate_all,
+    )
     print("[INFO] Building MLR records...")
-    records_mlr  = _build_records(datasets, prefix, model_class_filter="mlr",  show_std=show_std, evaluate_all=evaluate_all)
+    records_mlr  = _build_records(
+        datasets,
+        prefix,
+        model_class_filter="mlr",
+        show_std=show_std,
+        ml_selection=ml_selection,
+        treat_mlr_as_baseline=treat_mlr_as_baseline,
+        evaluate_all=evaluate_all,
+    )
     print("[INFO] Building combined (all) records for 'best' selection...")
-    records_all  = _build_records(datasets, prefix, model_class_filter=None,   show_std=show_std, evaluate_all=evaluate_all)
+    records_all  = _build_records(
+        datasets,
+        prefix,
+        model_class_filter=None,
+        show_std=show_std,
+        ml_selection=ml_selection,
+        treat_mlr_as_baseline=treat_mlr_as_baseline,
+        evaluate_all=evaluate_all,
+    )
 
     # 'best' = one record per label, whichever model_class has better initial_skill
     if records_ml or records_mlr:
@@ -1770,18 +1888,45 @@ def generate_figures(
         records_best = records_all
 
     print(f"\n[INFO] Generating best/ figures ({len(records_best)} dataset(s))...")
-    _generate_all_figures(records_best, summaries_dir / "best", show_std=show_std, all_x=all_x, tag="best")
+    _generate_all_figures(
+        records_best,
+        summaries_dir / "best",
+        show_std=show_std,
+        all_x=all_x,
+        tag="best",
+        treat_mlr_as_baseline=treat_mlr_as_baseline,
+    )
 
     print(f"\n[INFO] Generating ml/ figures ({len(records_ml)} dataset(s))...")
-    _generate_all_figures(records_ml, summaries_dir / "ml", show_std=show_std, all_x=all_x, tag="ml")
+    _generate_all_figures(
+        records_ml,
+        summaries_dir / "ml",
+        show_std=show_std,
+        all_x=all_x,
+        tag="ml",
+        treat_mlr_as_baseline=treat_mlr_as_baseline,
+    )
 
     print(f"\n[INFO] Generating mlr/ figures ({len(records_mlr)} dataset(s))...")
-    _generate_all_figures(records_mlr, summaries_dir / "mlr", show_std=show_std, all_x=all_x, tag="mlr")
+    _generate_all_figures(
+        records_mlr,
+        summaries_dir / "mlr",
+        show_std=show_std,
+        all_x=all_x,
+        tag="mlr",
+        treat_mlr_as_baseline=treat_mlr_as_baseline,
+    )
 
     if records_ml and records_mlr:
         print(f"\n[INFO] Generating combined/ figures...")
-        _generate_combined_figures(records_ml, records_mlr, summaries_dir / "combined",
-                                   show_std=show_std, all_x=all_x)
+        _generate_combined_figures(
+            records_ml,
+            records_mlr,
+            summaries_dir / "combined",
+            show_std=show_std,
+            all_x=all_x,
+            treat_mlr_as_baseline=treat_mlr_as_baseline,
+        )
     else:
         print("[INFO] Skipping combined/ figures — fewer than 2 model classes have data.")
 
@@ -1805,6 +1950,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="MC",
         help="Only include dataset directories whose name starts with this prefix (default: MC).",
+    )
+    parser.add_argument(
+        "--ml-selection",
+        choices=["best", "xgb"],
+        default="best",
+        help=(
+            'How to choose ML-family horizon results: "best" uses the best of '
+            'XGB/GP/Transformer, "xgb" restricts ML-family results to XGB only.'
+        ),
+    )
+    parser.add_argument(
+        "--treat-mlr-as-baseline",
+        action="store_true",
+        help=(
+            "Include MLR as an additional baseline candidate in best-baseline "
+            "skill summaries."
+        ),
     )
     parser.add_argument(
         "--std",
@@ -1849,6 +2011,8 @@ def main() -> int:
         prefix=args.dataset_prefix,
         summaries_dir=eval_test_dir,
         show_std=args.std,
+        ml_selection=args.ml_selection,
+        treat_mlr_as_baseline=args.treat_mlr_as_baseline,
         evaluate_all=False,
     )
 
@@ -1858,6 +2022,8 @@ def main() -> int:
         prefix=args.dataset_prefix,
         summaries_dir=eval_all_dir,
         show_std=args.std,
+        ml_selection=args.ml_selection,
+        treat_mlr_as_baseline=args.treat_mlr_as_baseline,
         evaluate_all=True,
     )
 

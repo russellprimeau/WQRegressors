@@ -37,6 +37,10 @@ CLI arguments:
                             Default: data/output/regression
     --dataset-prefix STR    Only process datasets whose name starts with this prefix.
                             Default: MC
+    --ml-selection MODE     Which non-MLR model pool to select from for the horizon
+                            sweep. "best" keeps the current behavior (best of XGB,
+                            GP, Transformer). "xgb" restricts selection to XGB only.
+                            Default: best
     --resample-config PATH  Path to the d_RunResample YAML config that was used to
                             generate the original samples.  Provides input_csv, column
                             lists, and Monte Carlo settings.  Required.
@@ -224,11 +228,11 @@ def find_best_configs(data_root, dataset_prefix):
     return best_configs
 
 
-def find_best_configs_dual(data_root, dataset_prefix):
+def find_best_configs_dual(data_root, dataset_prefix, ml_selection='best'):
     """Return list of (dataset_dir, ml_entry, mlr_entry) for each dataset.
 
     Each entry is (config_path, best_row) or None if no valid model of that class exists.
-    ml_entry  — best non-MLR model (GP, XGB, Transformer)
+    ml_entry  — best non-MLR model according to *ml_selection*
     mlr_entry — best MLR variant (mlr, mlr_avg12, mlr_avgall)
     """
     results = []
@@ -245,10 +249,10 @@ def find_best_configs_dual(data_root, dataset_prefix):
         if metrics_df.empty or 'rmse' not in metrics_df.columns or 'r2' not in metrics_df.columns:
             continue
 
-        is_baseline = metrics_df['model'].astype(str).str.strip().str.lower().isin(_BASELINE_MODEL_NAMES)
-        is_mlr = metrics_df['model'].astype(str).str.strip().str.lower().isin(_MLR_MODEL_NAMES)
+        model_names = metrics_df['model'].astype(str).str.strip().str.lower()
+        is_mlr = model_names.isin(_MLR_MODEL_NAMES)
 
-        ml_rows  = metrics_df[~is_baseline & ~is_mlr].copy()
+        ml_rows = _filter_ml_rows(metrics_df, ml_selection)
         mlr_rows = metrics_df[is_mlr].copy()
 
         ml_entry = None
@@ -259,6 +263,8 @@ def find_best_configs_dual(data_root, dataset_prefix):
                 ml_entry = (result[0], best_ml)
             else:
                 print(f"  [WARN] {dataset_dir.name}: could not resolve ML config for {best_ml['model']}")
+        elif ml_selection == 'xgb':
+            print(f"  [WARN] {dataset_dir.name}: no valid XGB config found for ML horizon sweep.")
 
         mlr_entry = None
         if not mlr_rows.empty:
@@ -275,6 +281,22 @@ def find_best_configs_dual(data_root, dataset_prefix):
 
         results.append((dataset_dir, ml_entry, mlr_entry))
     return results
+
+
+def _filter_ml_rows(metrics_df: pd.DataFrame, ml_selection: str) -> pd.DataFrame:
+    """Return the ML candidate subset for the requested selection mode."""
+    model_names = metrics_df['model'].astype(str).str.strip().str.lower()
+    is_baseline = model_names.isin(_BASELINE_MODEL_NAMES)
+    is_mlr = model_names.isin(_MLR_MODEL_NAMES)
+    ml_rows = metrics_df[~is_baseline & ~is_mlr].copy()
+
+    if ml_selection == 'xgb':
+        xgb_keys = {'xgbregressor', 'xgb_regressor', 'xgb_classifier'}
+        ml_rows = ml_rows[
+            ml_rows['model'].astype(str).str.strip().str.lower().isin(xgb_keys)
+        ].copy()
+
+    return ml_rows
 
 
 def _migrate_flat_horizon_layout(horizon_dir: Path) -> 'str | None':
@@ -690,6 +712,7 @@ def run_horizon_sweep(
     resample_config_path,
     preferred_lookaheads=None,
     n_replicates=1,
+    ml_selection='best',
 ):
     # --- Load resample config ---
     resample_cfg = load_config(resample_config_path)
@@ -710,7 +733,11 @@ def run_horizon_sweep(
     df_raw = df_raw.sort_values('TIMESTAMP').reset_index(drop=True)
 
     # --- Find best ML and MLR configs per dataset ---
-    best_configs_dual = find_best_configs_dual(data_root, dataset_prefix)
+    best_configs_dual = find_best_configs_dual(
+        data_root,
+        dataset_prefix,
+        ml_selection=ml_selection,
+    )
 
     for dataset_dir, ml_entry, mlr_entry in best_configs_dual:
         print(f"\n[DATASET] {dataset_dir.name}")
@@ -768,7 +795,8 @@ def run_horizon_sweep(
             print(f"  [WARN] No horizons to sweep. Skipping.")
             continue
         print(f"  [INFO] sample_length={sample_length}; horizons={lookaheads}; "
-              f"ml={'yes' if ml_entry else 'no'}; mlr={'yes' if mlr_entry else 'no'}")
+              f"ml={'yes' if ml_entry else 'no'}; mlr={'yes' if mlr_entry else 'no'}; "
+              f"ml_selection={ml_selection}")
 
         # --- Sweep horizons ---
         # metrics_by_class collects DataFrames keyed by model class.
@@ -1115,6 +1143,14 @@ if __name__ == '__main__':
     parser.add_argument('--data-root', type=str, default='data/output/regression')
     parser.add_argument('--dataset-prefix', type=str, default='MC')
     parser.add_argument(
+        '--ml-selection',
+        choices=['best', 'xgb'],
+        default='best',
+        help='How to choose the non-MLR model for the horizon sweep: '
+             '"best" uses the best of XGB/GP/Transformer, '
+             '"xgb" restricts selection to XGB only.',
+    )
+    parser.add_argument(
         '--resample-config',
         type=str,
         required=True,
@@ -1143,4 +1179,5 @@ if __name__ == '__main__':
         args.resample_config,
         args.horizons,
         n_replicates=args.replicates,
+        ml_selection=args.ml_selection,
     )
