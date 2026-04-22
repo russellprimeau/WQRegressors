@@ -1025,6 +1025,95 @@ def _normalize_ml_model_display(val: str) -> str:
     return None
 
 
+def _display_model_type(val: object) -> str:
+    key = str(val).strip().lower()
+    if 'xgb' in key:
+        return 'XGB'
+    if 'transformer' in key:
+        return 'Trans.'
+    if key == 'gp_regressor' or key == 'gpregressor' or key == 'gp':
+        return 'GP'
+    if key == 'mlr':
+        return 'MLR'
+    if key == 'mlr_avg12':
+        return 'MLR-12'
+    if key == 'mlr_avgall':
+        return 'MLR-All'
+    if key == 'naive':
+        return 'Naive'
+    if key == 'seasonal':
+        return 'Seasonal'
+    if key == 'linear':
+        return 'Linear'
+    return key.title()
+
+
+def _select_best_ml_row_for_eval_figure(df: pd.DataFrame, args: argparse.Namespace) -> "pd.Series | None":
+    """Return the best ML-category row for the evaluation figure under the current flags."""
+    if df.empty or "model" not in df.columns:
+        return None
+    ml_rows = _exclude_baseline_metric_rows(df)
+    if bool(getattr(args, "treat_mlr_as_baseline", False)):
+        ml_rows = ml_rows[~ml_rows["model"].apply(_is_mlr_model_value)].copy()
+    elif str(getattr(args, "ml_selection", "best")) == "xgb":
+        ml_rows = ml_rows[ml_rows["model"].apply(_is_xgb_model_value)].copy()
+    ml_rows = _filter_min_valid_independent(_filter_valid_rows(ml_rows), min_required=MIN_REQUIRED_VALID_INDEPENDENT)
+    if ml_rows.empty:
+        return None
+    return select_best_model_row(ml_rows)
+
+
+def _select_best_baseline_row_for_eval_figure(df: pd.DataFrame, args: argparse.Namespace) -> "pd.Series | None":
+    """Return the best baseline-category row for the evaluation figure under the current flags."""
+    if df.empty or "model" not in df.columns:
+        return None
+    baseline_rows = df[df["model"].apply(_is_baseline_model_value)].copy()
+    if bool(getattr(args, "treat_mlr_as_baseline", False)):
+        mlr_rows = df[df["model"].apply(_is_mlr_model_value)].copy()
+        baseline_rows = pd.concat([baseline_rows, mlr_rows], ignore_index=True)
+    baseline_rows = _filter_min_valid_independent(_filter_valid_rows(baseline_rows), min_required=MIN_REQUIRED_VALID_INDEPENDENT)
+    if baseline_rows.empty:
+        return None
+    return select_best_model_row(baseline_rows)
+
+
+def _annotate_bars_with_model_labels(
+    ax,
+    bars,
+    vals,
+    model_labels,
+    fmt: str = ".2f",
+    fontsize: int = 10,
+) -> None:
+    """Annotate bars with value plus model-type label."""
+    ymin, ymax = ax.get_ylim()
+    yspan = float(ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
+    pad = 0.02 * yspan
+    use_scientific = _axis_uses_scientific_bar_annotations(ax)
+    for bar, val, model_label in zip(bars, vals, model_labels):
+        if not np.isfinite(val):
+            continue
+        h = bar.get_height()
+        if h < ymin or h > ymax:
+            continue
+        label = f"{_format_bar_annotation_value(float(val), fmt, use_scientific)}, {model_label}"
+        y_txt = h + pad
+        va = "bottom"
+        if y_txt > (ymax - pad):
+            y_txt = h - pad
+            va = "top"
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            y_txt,
+            label,
+            ha="center",
+            va=va,
+            fontsize=fontsize,
+            rotation=90,
+            clip_on=False,
+        )
+
+
 def _plot_ml_model_comparison(
     plans: "list",
     data_root: "Path",
@@ -4294,11 +4383,108 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 wrapped_xlabels.append(textwrap.fill(txt, width=18))
             ax_mat.set_xticklabels(wrapped_xlabels, rotation=60, ha="right", fontsize=8)
             plt.tight_layout()
-            _expand_ylims_to_fit_annotations(cv_axes)
+            _expand_ylims_to_fit_annotations(ax_mat)
             matrix_path = evaluation_dir / "summary_model_quality_matrix.png"
             fig_mat.savefig(matrix_path, dpi=300, bbox_inches='tight')
             plt.close(fig_mat)
             print(f"[INFO] Wrote model quality matrix: {matrix_path}")
+
+            # --- Best ML vs best baseline R² clustered chart (evaluation/) ---
+            eval_r2_rows: list[dict[str, object]] = []
+            for plan in plans:
+                final_metrics_csv = _forecast_sweeps_dir(plan.dataset_dir) / "feature_sweep_final_metrics.csv"
+                if not final_metrics_csv.exists():
+                    continue
+                try:
+                    df_eval_candidates = pd.read_csv(final_metrics_csv)
+                except Exception:
+                    continue
+                if df_eval_candidates.empty:
+                    continue
+
+                target_name = _derive_target_name(plan.dataset_dir.name, args.dataset_prefix)
+                if "target" in df_eval_candidates.columns:
+                    df_target = df_eval_candidates[df_eval_candidates["target"].astype(str) == target_name].copy()
+                    if df_target.empty:
+                        df_target = df_eval_candidates.copy()
+                else:
+                    df_target = df_eval_candidates.copy()
+
+                best_ml_row = _select_best_ml_row_for_eval_figure(df_target, args)
+                best_baseline_row = _select_best_baseline_row_for_eval_figure(df_target, args)
+                if best_ml_row is None or best_baseline_row is None:
+                    print(
+                        f"[WARN] Skipping ML-vs-baseline R² figure row for {plan.dataset_dir.name}: "
+                        f"missing {'ML' if best_ml_row is None else 'baseline'} candidate."
+                    )
+                    continue
+
+                eval_r2_rows.append({
+                    "dataset": plan.dataset_dir.name,
+                    "target_label": clean_target_label(plan.dataset_dir.name, args.dataset_prefix),
+                    "ml_r2": _safe_float(best_ml_row.get("r2", float("nan"))),
+                    "ml_model_label": _display_model_type(best_ml_row.get("model", "")),
+                    "baseline_r2": _safe_float(best_baseline_row.get("r2", float("nan"))),
+                    "baseline_model_label": _display_model_type(best_baseline_row.get("model", "")),
+                })
+
+            if eval_r2_rows:
+                eval_r2_df = pd.DataFrame(eval_r2_rows)
+                eval_r2_df = eval_r2_df.sort_values(["ml_r2", "baseline_r2"], ascending=[False, False], na_position="last")
+
+                x_eval = np.arange(len(eval_r2_df), dtype=float)
+                labels_eval = eval_r2_df["target_label"].astype(str).tolist()
+                ml_vals = pd.to_numeric(eval_r2_df["ml_r2"], errors="coerce").to_numpy(dtype=float)
+                baseline_vals = pd.to_numeric(eval_r2_df["baseline_r2"], errors="coerce").to_numpy(dtype=float)
+                ml_model_labels = eval_r2_df["ml_model_label"].astype(str).tolist()
+                baseline_model_labels = eval_r2_df["baseline_model_label"].astype(str).tolist()
+
+                cluster_w = 0.44
+                fig_eval, ax_eval = plt.subplots(figsize=(max(10, len(eval_r2_df) * 0.82 + 1.2), 6.4))
+                bars_ml = ax_eval.bar(
+                    x_eval - cluster_w / 2,
+                    ml_vals,
+                    width=cluster_w,
+                    color="tab:blue",
+                    label="ML",
+                )
+                bars_bl = ax_eval.bar(
+                    x_eval + cluster_w / 2,
+                    baseline_vals,
+                    width=cluster_w,
+                    color="tab:orange",
+                    label="Baseline",
+                )
+                ax_eval.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+                ax_eval.set_ylabel("Coefficient of Determination ($R^2$)")
+                finite_eval_vals = np.concatenate([ml_vals, baseline_vals])
+                finite_eval_vals = finite_eval_vals[np.isfinite(finite_eval_vals)]
+                if finite_eval_vals.size and float(np.nanmin(finite_eval_vals)) >= 0.0:
+                    ax_eval.set_ylim(0.0, 1.0)
+                else:
+                    ax_eval.set_ylim(-1.0, 1.0)
+                ax_eval.set_xticks(x_eval)
+                ax_eval.set_xticklabels(labels_eval, rotation=45, ha="right")
+                if len(x_eval) > 0:
+                    ax_eval.set_xlim(x_eval[0] - cluster_w - 0.10, x_eval[-1] + cluster_w + 0.10)
+                ax_eval.grid(axis="y", alpha=0.3)
+                ax_eval.legend(
+                    loc="lower center",
+                    bbox_to_anchor=(0.5, 1.02),
+                    ncol=2,
+                    frameon=False,
+                    fontsize=10,
+                )
+                _annotate_bars_with_model_labels(ax_eval, bars_ml, ml_vals, ml_model_labels, fmt=".2f", fontsize=9)
+                _annotate_bars_with_model_labels(ax_eval, bars_bl, baseline_vals, baseline_model_labels, fmt=".2f", fontsize=9)
+                fig_eval.tight_layout(rect=[0, 0, 1, 0.93])
+                _expand_ylims_to_fit_annotations(ax_eval)
+                eval_r2_path = evaluation_dir / "summary_best_ml_vs_best_baseline_r2.png"
+                fig_eval.savefig(eval_r2_path, dpi=300, bbox_inches="tight")
+                plt.close(fig_eval)
+                print(f"[INFO] Wrote best-ML-vs-best-baseline R² figure: {eval_r2_path}")
+            else:
+                print("[INFO] Skipped best-ML-vs-best-baseline R² figure: no datasets had both ML and baseline candidates.")
 
             # --- Cross-validation figure (sorted by descending R2, same order as perf_df) ---
             cv_cols = [
