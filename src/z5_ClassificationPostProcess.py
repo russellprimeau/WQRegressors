@@ -23,6 +23,11 @@ Optional arguments:
         "combined" keeps best-model selection based on test r2, then recomputes
         predictions over the combined train + test evaluation samples for the selected model.
 
+    --ml-selection <model> [<model> ...]
+        Restrict processing to one or more model groups, such as "xgb",
+        "transformer", "gp", "mlr", "mlr12", "mlrall", "seasonal",
+        "linear", or "naive". Defaults to all model groups.
+
     --exclude-no-out-of-limit
         Exclude targets whose active evaluation scope contains zero ground-truth
         out-of-limit values. Excluded targets are still recorded in the threshold
@@ -44,6 +49,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
 from matplotlib.patches import Patch
 import numpy as np
 import pandas as pd
@@ -58,7 +64,18 @@ from utils.names import clean_target_label
 
 _NORM_SUFFIX_RE = re.compile(r"(?:(?:_+)?(?:res|state))+$", re.IGNORECASE)
 _BASELINE_MODELS = {"naive", "seasonal", "linear"}
-_MODEL_ORDER = ["XGB", "transformer", "GP", "MLR", "MLR12", "MLRAll", "seasonal", "linear", "naive"]
+_MODEL_ORDER = ["transformer", "XGB", "GP", "MLR", "MLR12", "MLRAll", "seasonal", "linear", "naive"]
+_MODEL_DISPLAY_LABELS = {
+    "transformer": "Transformer",
+    "XGB": "XGB",
+    "GP": "GP",
+    "MLR": "MLR",
+    "MLR12": "MLR12",
+    "MLRAll": "MLRALL",
+    "seasonal": "Season",
+    "linear": "Linear",
+    "naive": "Naive",
+}
 _MODEL_COLORS = {
     "XGB": "#2a9d8f",
     "transformer": "#457b9d",
@@ -85,6 +102,28 @@ _MLR_AGGREGATION_BY_MODEL = {
     "mlr": "last",
     "mlr_avg12": "avg12",
     "mlr_avgall": "avgall",
+}
+_MODEL_SELECTION_ALIASES = {
+    "all": _MODEL_ORDER,
+    "best": _MODEL_ORDER,
+    "ml": ["transformer", "XGB", "GP"],
+    "xgb": ["XGB"],
+    "xgbregressor": ["XGB"],
+    "transformer": ["transformer"],
+    "trans": ["transformer"],
+    "gp": ["GP"],
+    "gpregressor": ["GP"],
+    "mlr": ["MLR"],
+    "mlr12": ["MLR12"],
+    "mlravg12": ["MLR12"],
+    "mlrall": ["MLRAll"],
+    "mlravgall": ["MLRAll"],
+    "baseline": ["seasonal", "linear", "naive"],
+    "baselines": ["seasonal", "linear", "naive"],
+    "season": ["seasonal"],
+    "seasonal": ["seasonal"],
+    "linear": ["linear"],
+    "naive": ["naive"],
 }
 
 
@@ -149,6 +188,38 @@ def _model_group(raw_model: str) -> str | None:
     if key in _BASELINE_MODELS:
         return key
     return None
+
+
+def _normalize_selection_token(value: object) -> str:
+    return str(value or "").strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+
+
+def _parse_model_selection(selection: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    if selection is None:
+        tokens = ["all"]
+    elif isinstance(selection, str):
+        tokens = re.split(r"[\s,]+", selection.strip())
+    else:
+        tokens = []
+        for item in selection:
+            tokens.extend(re.split(r"[\s,]+", str(item).strip()))
+
+    selected: list[str] = []
+    unknown: list[str] = []
+    for token in [tok for tok in tokens if tok]:
+        key = _normalize_selection_token(token)
+        groups = _MODEL_SELECTION_ALIASES.get(key)
+        if groups is None:
+            unknown.append(token)
+            continue
+        for group in groups:
+            if group not in selected:
+                selected.append(group)
+
+    if unknown:
+        allowed = ", ".join(sorted(_MODEL_SELECTION_ALIASES))
+        raise ValueError(f"Unknown --ml-selection value(s): {', '.join(unknown)}. Allowed values include: {allowed}")
+    return [group for group in _MODEL_ORDER if group in selected] if selected else list(_MODEL_ORDER)
 
 
 def _build_target_limit_spec(target_name: str, dataset_dir_name: str, limits_records: list[dict]) -> dict | None:
@@ -976,7 +1047,7 @@ def _build_point_rows(
         truth_norm = _safe_float(pred_row.get("target_norm"))
         if not np.isfinite(truth_norm):
             truth_norm = _safe_float(metadata.get("target_norm"))
-        truth_full, pred_full, prev_state_full, truth_res, pred_res = _reconstruct_full_values(
+        truth_full, pred_full, prev_state_full, truth_delta, pred_delta = _reconstruct_full_values(
             truth_norm=truth_norm,
             pred_norm=_safe_float(pred_row.get("pred_norm")),
             target_name=sample_target_name,
@@ -1012,8 +1083,10 @@ def _build_point_rows(
                 "pred_full_value": pred_full,
                 "state_full_value": _safe_float(metadata.get("target_full")),
                 "prev_state_full_value": prev_state_full,
-                "truth_res_value": truth_res,
-                "pred_res_value": pred_res,
+                "truth_delta_value": truth_delta,
+                "pred_delta_value": pred_delta,
+                "truth_res_value": truth_delta,
+                "pred_res_value": pred_delta,
                 "truth_out_of_limit": truth_out_of_limit,
                 "threshold_upper": threshold_upper,
                 "threshold_lower": threshold_lower,
@@ -1180,20 +1253,23 @@ def _build_threshold_coverage_rows(class_df: pd.DataFrame, all_targets_df: pd.Da
     return pd.DataFrame(rows)
 
 
-def _annotate_grouped_bars(ax, bars, values):
+def _annotate_grouped_bars(ax, bars, values, fractions=None):
     ymax = ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else 1.0
-    for bar, val in zip(bars, values):
+    for bar, val, frac in zip(bars, values, fractions if fractions else [None] * len(values)):
         x = bar.get_x() + bar.get_width() / 2.0
         y = bar.get_height()
         if np.isfinite(val):
-            label = f"{val:.2f}" if abs(val) < 100 else f"{val:.0f}"
+            if frac is not None:
+                label = frac
+            else:
+                label = f"{val:.2f}" if abs(val) < 100 else f"{val:.0f}"
         else:
             label = "NA"
             y = 0.0
         ax.text(x, y + ymax * 0.01, label, ha="center", va="bottom", rotation=90, fontsize=7)
 
 
-def _plot_grouped_metric(ax, df: pd.DataFrame, metric: str, title: str, ylabel: str):
+def _plot_grouped_metric(ax, df: pd.DataFrame, metric: str, title: str, ylabel: str, ylim: float | None = None, plot_percentages: bool = False):
     targets = list(dict.fromkeys(df["target"].tolist()))
     if not targets:
         ax.set_axis_off()
@@ -1203,23 +1279,55 @@ def _plot_grouped_metric(ax, df: pd.DataFrame, metric: str, title: str, ylabel: 
     for idx, model_type in enumerate(_MODEL_ORDER):
         subset = df[df["model_type"] == model_type]
         values = []
+        fractions = []
         for target_name in targets:
             rows = subset[subset["target"] == target_name]
-            values.append(_safe_float(rows.iloc[0][metric]) if not rows.empty else np.nan)
+            if not rows.empty:
+                count = _safe_float(rows.iloc[0][metric])
+                values.append(count)
+                if plot_percentages and np.isfinite(count):
+                    n_total = _safe_float(rows.iloc[0]["n_total"])
+                    if np.isfinite(n_total) and n_total > 0:
+                        pct = 100.0 * count / n_total
+                        fractions.append(f"{int(count)}/{int(n_total)}")
+                    else:
+                        fractions.append(f"{int(count)}/?")
+                else:
+                    fractions.append(None)
+            else:
+                values.append(np.nan)
+                fractions.append(None)
         offsets = x + (idx - (len(_MODEL_ORDER) - 1) / 2.0) * width
+        if plot_percentages:
+            plot_values = []
+            for i, target_name in enumerate(targets):
+                rows = subset[subset["target"] == target_name]
+                if not rows.empty:
+                    count = _safe_float(rows.iloc[0][metric])
+                    n_total = _safe_float(rows.iloc[0]["n_total"])
+                    if np.isfinite(count) and np.isfinite(n_total) and n_total > 0:
+                        plot_values.append(100.0 * count / n_total)
+                    else:
+                        plot_values.append(0.0)
+                else:
+                    plot_values.append(0.0)
+        else:
+            plot_values = [0.0 if not np.isfinite(v) else v for v in values]
         bars = ax.bar(
             offsets,
-            [0.0 if not np.isfinite(v) else v for v in values],
+            plot_values,
             width=width,
             color=_MODEL_COLORS[model_type],
             label=model_type,
         )
-        _annotate_grouped_bars(ax, bars, values)
+        _annotate_grouped_bars(ax, bars, values, fractions=fractions if plot_percentages else None)
     ax.set_title(title)
     ax.set_ylabel(ylabel)
     ax.set_xticks(x)
     ax.set_xticklabels([clean_target_label(t, "MC") or t for t in targets], rotation=45, ha="right")
     ax.grid(axis="y", alpha=0.25)
+    if ylim is not None:
+        ax.set_ylim(0, ylim)
 
 
 def _write_metric_figures(class_df: pd.DataFrame, out_dir: Path, evaluation_scope: str) -> None:
@@ -1250,10 +1358,11 @@ def _write_metric_figures(class_df: pd.DataFrame, out_dir: Path, evaluation_scop
     plt.close(fig)
 
     fig, axes = plt.subplots(2, 2, figsize=(max(12, 0.9 * plot_df["target"].nunique()), 14), sharex=True)
-    _plot_grouped_metric(axes[0, 0], plot_df, "tp", "True Positives", "Count")
-    _plot_grouped_metric(axes[0, 1], plot_df, "fp", "False Positives", "Count")
-    _plot_grouped_metric(axes[1, 0], plot_df, "fn", "False Negatives", "Count")
-    _plot_grouped_metric(axes[1, 1], plot_df, "tn", "True Negatives", "Count")
+    ylim = 100.0
+    _plot_grouped_metric(axes[0, 0], plot_df, "tp", "True Positives", "Percentage (%)", ylim=ylim, plot_percentages=True)
+    _plot_grouped_metric(axes[0, 1], plot_df, "fp", "False Positives", "Percentage (%)", ylim=ylim, plot_percentages=True)
+    _plot_grouped_metric(axes[1, 0], plot_df, "fn", "False Negatives", "Percentage (%)", ylim=ylim, plot_percentages=True)
+    _plot_grouped_metric(axes[1, 1], plot_df, "tn", "True Negatives", "Percentage (%)", ylim=ylim, plot_percentages=True)
     handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=min(len(labels), 5), frameon=False)
     fig.text(0.5, 0.01, "Support counts expose targets with zero positive or zero negative ground-truth cases.", ha="center", fontsize=10)
@@ -1272,6 +1381,47 @@ def _build_scope_spans(group: pd.DataFrame) -> list[tuple[str, pd.Timestamp, pd.
     return spans
 
 
+def _add_legend_entry(handles_by_label: dict[str, object], label: str, handle) -> None:
+    if label not in handles_by_label:
+        handles_by_label[label] = handle
+
+
+def _ordered_overlay_legend(handles_by_label: dict[str, object]) -> tuple[list, list[str]]:
+    ordered_labels = [
+        "Training set",
+        "Test set",
+        "Measured (within)",
+        "Measured (out)",
+        *[_MODEL_DISPLAY_LABELS[model_type] for model_type in _MODEL_ORDER],
+        "Upper limit",
+        "Lower limit",
+    ]
+    labels = [label for label in ordered_labels if label in handles_by_label]
+    return [handles_by_label[label] for label in labels], labels
+
+
+def _matplotlib_column_major_legend_order(handles: list, labels: list[str], ncol: int) -> tuple[list, list[str]]:
+    if ncol <= 1 or len(labels) <= ncol:
+        return handles, labels
+    nrows = int(math.ceil(len(labels) / ncol))
+    ordered_handles = []
+    ordered_labels = []
+    for col_idx in range(ncol):
+        for row_idx in range(nrows):
+            idx = row_idx * ncol + col_idx
+            if idx < len(labels):
+                ordered_handles.append(handles[idx])
+                ordered_labels.append(labels[idx])
+    return ordered_handles, ordered_labels
+
+
+def _overlay_legend_layout(n_labels: int) -> tuple[int, int, float]:
+    ncol = min(max(n_labels, 1), 8)
+    nrows = int(math.ceil(n_labels / ncol)) if n_labels else 1
+    row_height = 0.055 if nrows <= 1 else 0.105
+    return ncol, nrows, row_height
+
+
 def _write_overlay_figure(
     points_df: pd.DataFrame,
     coverage_df: pd.DataFrame,
@@ -1288,8 +1438,8 @@ def _write_overlay_figure(
         return
 
     font_size = 10
-    y_label_font_size = int(round(font_size * 1.5))
-    x_label_font_size = int(round(font_size * 1.5))
+    y_label_font_size = 11
+    x_label_font_size = 8
     y_value_font_size = font_size
 
     target_order = coverage_df["target"].tolist() if not coverage_df.empty else list(dict.fromkeys(plot_df["target"].tolist()))
@@ -1298,12 +1448,22 @@ def _write_overlay_figure(
         print("[INFO] No included targets available for overlay figure.")
         return
 
-    fig, axes = plt.subplots(len(targets), 1, sharex=False, figsize=(17, max(4.5, 2.9 * len(targets))), gridspec_kw={"hspace": 0.28})
-    if len(targets) == 1:
-        axes = [axes]
+    kind_values = {str(kind).lower() for kind in plot_df.get("kind", pd.Series(dtype=str)).dropna().unique()}
+    show_scope_spans = {"train", "test"}.issubset(kind_values)
+    fig = plt.figure(figsize=(17, max(4.2, 0.18 + 2.45 * len(targets))))
+    # Temporary legend axis; the precise legend-row height is set after entries are known.
+    gs = GridSpec(
+        len(targets) + 1,
+        1,
+        figure=fig,
+        height_ratios=[0.24, *([1.0] * len(targets))],
+        hspace=0.30,
+    )
+    legend_ax = fig.add_subplot(gs[0, 0])
+    legend_ax.set_axis_off()
+    axes = [fig.add_subplot(gs[idx + 1, 0]) for idx in range(len(targets))]
 
-    legend_handles = []
-    legend_labels = []
+    legend_handles_by_label: dict[str, object] = {}
     for ax, target in zip(axes, targets):
         target_points = plot_df[plot_df["target"] == target].copy().sort_values(["timestamp", "sample_file", "model_type"])
         base_row = coverage_df[coverage_df["target"] == target].iloc[0] if not coverage_df.empty and target in set(coverage_df["target"]) else None
@@ -1311,17 +1471,16 @@ def _write_overlay_figure(
         upper = _safe_float(base_row.get("threshold_upper")) if base_row is not None else np.nan
         lower = _safe_float(base_row.get("threshold_lower")) if base_row is not None else np.nan
 
-        for kind, start, end in _build_scope_spans(target_points):
-            if kind == "train":
-                color = "#66bb66"
-                label = "Training set"
-            else:
-                color = "#f4a3c2"
-                label = "Test set"
-            ax.axvspan(start, end, ymin=0.03, ymax=0.97, color=color, alpha=0.20, zorder=0)
-            if label not in legend_labels:
-                legend_handles.append(Patch(facecolor=color, alpha=0.20, edgecolor="none"))
-                legend_labels.append(label)
+        if show_scope_spans:
+            for kind, start, end in _build_scope_spans(target_points):
+                if str(kind).lower() == "train":
+                    color = "#66bb66"
+                    label = "Training set"
+                else:
+                    color = "#f4a3c2"
+                    label = "Test set"
+                ax.axvspan(start, end, ymin=0.03, ymax=0.97, color=color, alpha=0.20, zorder=0)
+                _add_legend_entry(legend_handles_by_label, label, Patch(facecolor=color, alpha=0.20, edgecolor="none"))
 
         truth = target_points.drop_duplicates(subset=["sample_file", "kind"]).sort_values("timestamp")
         truth_within = truth[~truth["truth_out_of_limit"].fillna(False)].copy()
@@ -1348,12 +1507,8 @@ def _write_overlay_figure(
                 linewidths=1.0,
                 zorder=4,
             )
-        if "Measured value (within limit)" not in legend_labels:
-            legend_handles.append(plt.Line2D([0], [0], color="black", linestyle="", marker="o", markersize=6))
-            legend_labels.append("Measured value (within limit)")
-        if "Measured value (out of limit)" not in legend_labels:
-            legend_handles.append(plt.Line2D([0], [0], color="#d00000", linestyle="", marker="x", markersize=7))
-            legend_labels.append("Measured value (out of limit)")
+        _add_legend_entry(legend_handles_by_label, "Measured (within)", plt.Line2D([0], [0], color="black", linestyle="", marker="o", markersize=6))
+        _add_legend_entry(legend_handles_by_label, "Measured (out)", plt.Line2D([0], [0], color="#d00000", linestyle="", marker="x", markersize=7))
 
         for model_type in _MODEL_ORDER:
             model_points = target_points[target_points["model_type"] == model_type].copy()
@@ -1397,31 +1552,45 @@ def _write_overlay_figure(
                     linewidths=1.0,
                     zorder=2.6,
                 )
-            if model_type not in legend_labels:
-                legend_handles.append(plt.Line2D([0], [0], color=_MODEL_COLORS[model_type], linewidth=1.4, marker="o", markersize=5))
-                legend_labels.append(model_type)
+            model_label = _MODEL_DISPLAY_LABELS[model_type]
+            _add_legend_entry(
+                legend_handles_by_label,
+                model_label,
+                plt.Line2D([0], [0], color=_MODEL_COLORS[model_type], linewidth=1.4, marker="o", markersize=5),
+            )
 
         if show_limit_lines and np.isfinite(upper):
             ax.axhline(upper, color="#ff0000", linewidth=0.8, linestyle="-", alpha=0.9)
-            if "Upper limit" not in legend_labels:
-                legend_handles.append(plt.Line2D([0], [0], color="#ff0000", linewidth=0.8))
-                legend_labels.append("Upper limit")
+            _add_legend_entry(legend_handles_by_label, "Upper limit", plt.Line2D([0], [0], color="#ff0000", linewidth=0.8))
         if show_limit_lines and np.isfinite(lower):
             ax.axhline(lower, color="#2ca02c", linewidth=0.8, linestyle="-", alpha=0.9)
-            if "Lower limit" not in legend_labels:
-                legend_handles.append(plt.Line2D([0], [0], color="#2ca02c", linewidth=0.8))
-                legend_labels.append("Lower limit")
+            _add_legend_entry(legend_handles_by_label, "Lower limit", plt.Line2D([0], [0], color="#2ca02c", linewidth=0.8))
 
-        ax.set_ylabel(target_label, rotation=0, ha="right", va="center", labelpad=24, fontsize=y_label_font_size)
+        ax.set_ylabel(target_label, rotation=0, ha="right", va="center", labelpad=12, fontsize=y_label_font_size)
         ax.grid(axis="y", linestyle="--", alpha=0.25, linewidth=0.5)
-        ax.tick_params(axis="x", rotation=25, labelsize=x_label_font_size)
+        ax.tick_params(axis="x", rotation=25, labelsize=x_label_font_size, pad=1)
         ax.tick_params(axis="y", labelsize=y_value_font_size)
         ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=8))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
 
-    fig.legend(legend_handles, legend_labels, loc="upper center", bbox_to_anchor=(0.5, 0.988), ncol=min(max(len(legend_labels), 1), 6), framealpha=0.85, fontsize=y_label_font_size, borderaxespad=0.06)
-    fig.subplots_adjust(left=0.11, right=0.985, top=0.942, bottom=0.06, hspace=0.34)
-    fig.savefig(out_dir / output_filename, dpi=220, bbox_inches="tight", pad_inches=0.02)
+    legend_handles, legend_labels = _ordered_overlay_legend(legend_handles_by_label)
+    legend_ncol, legend_rows, legend_row_height = _overlay_legend_layout(len(legend_labels))
+    gs.set_height_ratios([legend_row_height, *([1.0] * len(targets))])
+    legend_handles, legend_labels = _matplotlib_column_major_legend_order(legend_handles, legend_labels, legend_ncol)
+    legend_ax.legend(
+        legend_handles,
+        legend_labels,
+        loc="center",
+        ncol=legend_ncol,
+        frameon=False,
+        fontsize=9,
+        borderaxespad=0.0,
+        handlelength=2.2,
+        columnspacing=1.1,
+        labelspacing=0.20,
+    )
+    fig.subplots_adjust(left=0.105, right=0.99, top=0.99, bottom=0.08, hspace=0.30)
+    fig.savefig(out_dir / output_filename, dpi=220, bbox_inches="tight", pad_inches=0.01)
     plt.close(fig)
 
 
@@ -1442,8 +1611,8 @@ def _write_figures(class_df: pd.DataFrame, points_df: pd.DataFrame, coverage_df:
         coverage_df,
         out_dir,
         evaluation_scope,
-        truth_value_column="truth_res_value",
-        pred_value_column="pred_res_value",
+        truth_value_column="truth_delta_value",
+        pred_value_column="pred_delta_value",
         output_filename="classification_timeseries_overlay_res.png",
         show_limit_lines=False,
     )
@@ -1457,12 +1626,18 @@ def post_process_run(
     make_figures: bool = True,
     evaluation_scope: str = "test",
     exclude_no_out_of_limit: bool = False,
+    ml_selection: str | list[str] | tuple[str, ...] | None = None,
 ) -> int:
     if not run_dir.is_dir():
         print(f"[ERROR] --run-dir does not exist: {run_dir}")
         return 1
     if evaluation_scope not in {"test", "combined"}:
         print(f"[ERROR] Unsupported evaluation scope: {evaluation_scope}")
+        return 1
+    try:
+        selected_model_groups = _parse_model_selection(ml_selection)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}")
         return 1
 
     limits_csv = Path(__file__).resolve().parent.parent / "data" / "input" / "Limits.csv"
@@ -1485,8 +1660,9 @@ def post_process_run(
             continue
 
         filtered_df = _filter_candidate_rows(metrics_df)
+        filtered_df = filtered_df[filtered_df["model_group"].isin(selected_model_groups)].copy()
         if filtered_df.empty:
-            print(f"[WARN] No usable candidate rows for {target_dir.name}; skipping.")
+            print(f"[WARN] No usable candidate rows for {target_dir.name} after --ml-selection; skipping.")
             continue
 
         target_name = str(filtered_df.iloc[0].get("target", target_dir.name))
@@ -1566,6 +1742,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--summaries-subdir", default="classification", help="Subdirectory under <run-dir>/summaries for output files (default: classification).")
     parser.add_argument("--targets", nargs="*", default=None, help="Optional target directory names to limit processing.")
     parser.add_argument("--sweep-namespace", default="feature_sweeps", help="Forecast sweep subdirectory under forecasts/ (default: feature_sweeps).")
+    parser.add_argument(
+        "--ml-selection",
+        nargs="+",
+        default=["all"],
+        help=(
+            "Restrict classification post-processing to one or more model groups "
+            "(default: all). Examples: --ml-selection xgb, --ml-selection xgb gp, "
+            "--ml-selection baseline. Accepted groups include transformer, xgb, gp, "
+            "mlr, mlr12, mlrall, seasonal, linear, and naive."
+        ),
+    )
     parser.add_argument("--evaluation-scope", choices=["test", "combined"], default="test", help="Evaluate saved test predictions only, or recompute train+test combined metrics.")
     parser.add_argument("--exclude-no-out-of-limit", action="store_true", help="Exclude targets whose selected evaluation scope has zero out-of-limit ground-truth values.")
     parser.add_argument("--no-figures", action="store_true", help="Skip PNG figure generation.")
@@ -1579,6 +1766,7 @@ def main() -> int:
     print(f"[INFO] run_dir              : {run_dir}")
     print(f"[INFO] summaries_subdir    : {args.summaries_subdir}")
     print(f"[INFO] sweep_namespace     : {args.sweep_namespace}")
+    print(f"[INFO] ml_selection        : {' '.join(args.ml_selection)}")
     print(f"[INFO] evaluation_scope    : {args.evaluation_scope}")
     print(f"[INFO] exclude_no_out_limit: {bool(args.exclude_no_out_of_limit)}")
     return post_process_run(
@@ -1589,6 +1777,7 @@ def main() -> int:
         make_figures=not bool(args.no_figures),
         evaluation_scope=str(args.evaluation_scope),
         exclude_no_out_of_limit=bool(args.exclude_no_out_of_limit),
+        ml_selection=args.ml_selection,
     )
 
 

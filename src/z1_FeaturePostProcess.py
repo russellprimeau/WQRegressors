@@ -37,7 +37,7 @@ python src/z1_FeaturePostProcess.py --sweep-namespace feature_sweeps
 python src/z1_FeaturePostProcess.py --sweep-namespace Shapley_sweeps
 python src/z1_FeaturePostProcess.py --path data/output/regression_alt --sweep-namespace Shapley_sweeps
 python src/z1_FeaturePostProcess.py --sweep-namespace feature_sweeps --run-rolling-cv
-python src/z1_FeaturePostProcess.py --path data/output/CV14 --sweep-namespace feature_sweeps --bootstrap-mode moving_block --bootstrap-block-len 7
+python src/z1_FeaturePostProcess.py --path data/output/CV19 --sweep-namespace feature_sweeps --bootstrap-mode moving_block --bootstrap-block-len 7 --treat-mlr-as-baseline
 python src/z1_FeaturePostProcess.py --ml-selection xgb
 python src/z1_FeaturePostProcess.py --treat-mlr-as-baseline
 python src/z1_FeaturePostProcess.py --all-datasets
@@ -90,12 +90,17 @@ BASELINE_PLOT_LABELS = {
     "naive": "Naive",
     "seasonal": "Seasonal",
     "linear": "Linear",
+    "mlr": "MLR",
+    "mlr_avg12": "MLR-12",
+    "mlr_avgall": "MLR-All",
 }
 BASELINE_PLOT_COLORS = {
     "naive": "tab:gray",
     "seasonal": "tab:green",
     "linear": "tab:orange",
     "mlr": "tab:red",
+    "mlr_avg12": "tab:purple",
+    "mlr_avgall": "tab:brown",
 }
 BASELINE_MODEL_IDS = {"naive", "seasonal", "linear"}
 MLR_MODEL_IDS = {"mlr", "mlr_avg12", "mlr_avgall"}
@@ -143,6 +148,22 @@ class CandidateResult:
     input_dim: float
     target_dim: float
 
+
+@dataclass
+class SelectionRecord:
+    dataset: str
+    target: str
+    best_model_row: pd.Series
+    best_baseline_row: pd.Series
+    best_model_id: str
+    best_model_label: str
+    best_baseline_id: str
+    best_baseline_label: str
+    baseline_model_set: tuple[str, ...]
+    best_model_is_configured_baseline: bool
+    best_model_equals_best_baseline: bool
+    skill_vs_best_baseline: float
+
 def _safe_float(val) -> float:
     """Return float(val) if val is non-null, otherwise float('nan')."""
     try:
@@ -153,6 +174,18 @@ def _safe_float(val) -> float:
 
 def _is_baseline_model_value(value: object) -> bool:
     return str(value).strip().lower() in BASELINE_MODEL_IDS
+
+
+def configured_baseline_ids(args: argparse.Namespace) -> tuple[str, ...]:
+    """Return the model ids considered baselines for this postprocess run."""
+    ids = list(BASELINE_ORDER)
+    if bool(getattr(args, "treat_mlr_as_baseline", False)):
+        ids.extend(("mlr", "mlr_avg12", "mlr_avgall"))
+    return tuple(ids)
+
+
+def is_configured_baseline(value: object, args: argparse.Namespace) -> bool:
+    return str(value).strip().lower() in set(configured_baseline_ids(args))
 
 
 def _exclude_baseline_metric_rows(df: "pd.DataFrame") -> "pd.DataFrame":
@@ -195,10 +228,7 @@ def _filter_best_model_candidates(df: "pd.DataFrame", ml_selection: str) -> "pd.
 
 
 def _best_baseline_order(args: argparse.Namespace) -> tuple[str, ...]:
-    order = list(BASELINE_ORDER)
-    if bool(getattr(args, "treat_mlr_as_baseline", False)):
-        order.append("mlr")
-    return tuple(order)
+    return configured_baseline_ids(args)
 
 
 def _load_best_mlr_baseline_stats(data_root: Path, dataset_name: str) -> dict[str, float]:
@@ -412,6 +442,105 @@ def _filter_min_valid_independent(df: "pd.DataFrame", min_required: int = MIN_RE
         return out
     vals = pd.to_numeric(out[count_col], errors="coerce")
     return out[np.isfinite(vals) & (vals >= int(min_required))].copy()
+
+
+def valid_selection_rows(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Rows eligible for headline best-model/best-baseline selection."""
+    return _filter_min_valid_independent(
+        _filter_valid_rows(df),
+        min_required=MIN_REQUIRED_VALID_INDEPENDENT,
+    )
+
+
+def select_best_row(df: "pd.DataFrame") -> "pd.Series | None":
+    """Select the best row from already-valid candidates, or None."""
+    if df is None or df.empty or "r2" not in df.columns:
+        return None
+    vals = pd.to_numeric(df["r2"], errors="coerce")
+    out = df[np.isfinite(vals)].copy()
+    if out.empty:
+        return None
+    return select_best_model_row(out)
+
+
+def _row_identity_key(row: "pd.Series | None") -> tuple[str, str, str, str]:
+    if row is None:
+        return ("", "", "", "")
+    return (
+        str(row.get("model", "")).strip().lower(),
+        str(row.get("feature_tag", "")),
+        str(row.get("row_count", "")),
+        str(row.get("subset_label", "")),
+    )
+
+
+def _selection_metric(row: "pd.Series", name: str) -> float:
+    if name == "nrmse":
+        val = _safe_float(row.get("nrmse", float("nan")))
+        if np.isfinite(val):
+            return val
+        rmse = _safe_float(row.get("rmse", float("nan")))
+        std = _safe_float(row.get("std_target", float("nan")))
+        return float(rmse / std) if np.isfinite(rmse) and np.isfinite(std) and std > 0 else float("nan")
+    return _safe_float(row.get(name, float("nan")))
+
+
+def _display_model_id(value: object) -> str:
+    return str(value).strip().lower()
+
+
+def build_selection_record(plan: DatasetPlan, df: "pd.DataFrame", args: argparse.Namespace) -> "SelectionRecord | None":
+    """Build the authoritative per-target selection record used by summary outputs."""
+    if df is None or df.empty or "model" not in df.columns:
+        return None
+    target_name = _derive_target_name(plan.dataset_dir.name, args.dataset_prefix)
+    target_df = df[df["target"].astype(str) == target_name].copy() if "target" in df.columns else df.copy()
+    if target_df.empty:
+        target_df = df.copy()
+        print(f"[WARN] No rows match target_name={target_name!r} for {plan.dataset_dir.name}; using all rows for selection.")
+
+    candidates = valid_selection_rows(target_df)
+    best_model_row = select_best_row(candidates)
+    if best_model_row is None:
+        return None
+
+    best_model_id = _display_model_id(best_model_row.get("model", ""))
+    baseline_ids = configured_baseline_ids(args)
+    is_best_baseline = best_model_id in set(baseline_ids)
+    if is_best_baseline:
+        best_baseline_row = best_model_row
+    else:
+        baseline_rows = candidates[candidates["model"].astype(str).str.strip().str.lower().isin(baseline_ids)].copy()
+        best_baseline_row = select_best_row(baseline_rows)
+        if best_baseline_row is None:
+            print(f"[WARN] No configured baseline candidate for {plan.dataset_dir.name}; skipping headline selection.")
+            return None
+
+    best_baseline_id = _display_model_id(best_baseline_row.get("model", ""))
+    same_row = _row_identity_key(best_model_row) == _row_identity_key(best_baseline_row)
+    model_rmse = _selection_metric(best_model_row, "rmse")
+    baseline_rmse = _selection_metric(best_baseline_row, "rmse")
+    if same_row or is_best_baseline:
+        skill = 0.0
+    elif np.isfinite(model_rmse) and np.isfinite(baseline_rmse) and baseline_rmse > 0:
+        skill = float(1.0 - model_rmse / baseline_rmse)
+    else:
+        skill = float("nan")
+
+    return SelectionRecord(
+        dataset=plan.dataset_dir.name,
+        target=target_name,
+        best_model_row=best_model_row,
+        best_baseline_row=best_baseline_row,
+        best_model_id=best_model_id,
+        best_model_label=_display_model_type(best_model_id),
+        best_baseline_id=best_baseline_id,
+        best_baseline_label=_display_model_type(best_baseline_id),
+        baseline_model_set=baseline_ids,
+        best_model_is_configured_baseline=bool(is_best_baseline),
+        best_model_equals_best_baseline=bool(same_row or is_best_baseline),
+        skill_vs_best_baseline=skill,
+    )
 
 
 def _axis_uses_scientific_bar_annotations(ax) -> bool:
@@ -1052,26 +1181,58 @@ def _select_best_ml_row_for_eval_figure(df: pd.DataFrame, args: argparse.Namespa
     """Return the best ML-category row for the evaluation figure under the current flags."""
     if df.empty or "model" not in df.columns:
         return None
-    ml_rows = _exclude_baseline_metric_rows(df)
-    if bool(getattr(args, "treat_mlr_as_baseline", False)):
-        ml_rows = ml_rows[~ml_rows["model"].apply(_is_mlr_model_value)].copy()
-    elif str(getattr(args, "ml_selection", "best")) == "xgb":
-        ml_rows = ml_rows[ml_rows["model"].apply(_is_xgb_model_value)].copy()
-    ml_rows = _filter_min_valid_independent(_filter_valid_rows(ml_rows), min_required=MIN_REQUIRED_VALID_INDEPENDENT)
+    model_series = df["model"].astype(str)
+    ml_selection = str(getattr(args, "ml_selection", "best")).strip().lower()
+    treat_mlr_as_baseline = bool(getattr(args, "treat_mlr_as_baseline", False))
+
+    if ml_selection == "xgb":
+        ml_mask = model_series.apply(lambda v: _normalize_ml_model_display(v) == "XGB")
+    else:
+        ml_mask = ~model_series.apply(_is_baseline_model_value)
+        if treat_mlr_as_baseline:
+            ml_mask = ml_mask & ~model_series.apply(_is_mlr_model_value)
+
+    ml_rows_raw = df[ml_mask].copy()
+    if ml_rows_raw.empty:
+        return None
+
+    ml_rows = _filter_min_valid_independent(
+        _filter_valid_rows(ml_rows_raw),
+        min_required=MIN_REQUIRED_VALID_INDEPENDENT,
+    )
+    if ml_rows.empty:
+        # Fallback: keep the requested model family constraint, but relax the
+        # stricter post-process validity gates so an existing finite-R² XGB row
+        # is still surfaced in the figure instead of silently disappearing.
+        ml_rows = ml_rows_raw.copy()
+        ml_rows = ml_rows[pd.to_numeric(ml_rows.get("r2"), errors="coerce").notna()].copy()
     if ml_rows.empty:
         return None
-    return select_best_model_row(ml_rows)
+    best_row = select_best_model_row(ml_rows)
+    if ml_selection == "xgb" and _normalize_ml_model_display(best_row.get("model", "")) != "XGB":
+        print(f"[WARN] Expected XGB row for evaluation figure, got {best_row.get('model', '')!r}; discarding.")
+        return None
+    return best_row
 
 
 def _select_best_baseline_row_for_eval_figure(df: pd.DataFrame, args: argparse.Namespace) -> "pd.Series | None":
     """Return the best baseline-category row for the evaluation figure under the current flags."""
     if df.empty or "model" not in df.columns:
         return None
-    baseline_rows = df[df["model"].apply(_is_baseline_model_value)].copy()
+    model_series = df["model"].astype(str)
+    baseline_mask = model_series.apply(_is_baseline_model_value)
     if bool(getattr(args, "treat_mlr_as_baseline", False)):
-        mlr_rows = df[df["model"].apply(_is_mlr_model_value)].copy()
-        baseline_rows = pd.concat([baseline_rows, mlr_rows], ignore_index=True)
-    baseline_rows = _filter_min_valid_independent(_filter_valid_rows(baseline_rows), min_required=MIN_REQUIRED_VALID_INDEPENDENT)
+        baseline_mask = baseline_mask | model_series.apply(_is_mlr_model_value)
+    baseline_rows_raw = df[baseline_mask].copy()
+    if baseline_rows_raw.empty:
+        return None
+    baseline_rows = _filter_min_valid_independent(
+        _filter_valid_rows(baseline_rows_raw),
+        min_required=MIN_REQUIRED_VALID_INDEPENDENT,
+    )
+    if baseline_rows.empty:
+        baseline_rows = baseline_rows_raw.copy()
+        baseline_rows = baseline_rows[pd.to_numeric(baseline_rows.get("r2"), errors="coerce").notna()].copy()
     if baseline_rows.empty:
         return None
     return select_best_model_row(baseline_rows)
@@ -1089,18 +1250,18 @@ def _annotate_bars_with_model_labels(
     ymin, ymax = ax.get_ylim()
     yspan = float(ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
     pad = 0.02 * yspan
-    use_scientific = _axis_uses_scientific_bar_annotations(ax)
     for bar, val, model_label in zip(bars, vals, model_labels):
         if not np.isfinite(val):
             continue
         h = bar.get_height()
         if h < ymin or h > ymax:
             continue
-        label = f"{_format_bar_annotation_value(float(val), fmt, use_scientific)}, {model_label}"
-        y_txt = h + pad
+        label = f"{float(val):{fmt}}, {model_label}"
+        anchor_y = max(float(h), 0.0)
+        y_txt = anchor_y + pad
         va = "bottom"
         if y_txt > (ymax - pad):
-            y_txt = h - pad
+            y_txt = anchor_y - pad
             va = "top"
         ax.text(
             bar.get_x() + bar.get_width() / 2,
@@ -1146,16 +1307,13 @@ def _plot_ml_model_comparison(
         if df.empty:
             continue
 
-        # Apply the same validity filters used for best-model selection
-        valid_df = _filter_best_model_candidates(
-            _exclude_baseline_metric_rows(
-                _filter_min_valid_independent(
-                    _filter_valid_rows(df),
-                    min_required=MIN_REQUIRED_VALID_INDEPENDENT,
-                )
-            ),
-            getattr(args, "ml_selection", "best"),
-        )
+        # Apply the same validity filters, then remove the configured baseline
+        # set so this remains a model-family comparison rather than a headline
+        # best-model plot.
+        valid_df = valid_selection_rows(df)
+        baseline_ids = set(configured_baseline_ids(args))
+        valid_df = valid_df[~valid_df["model"].astype(str).str.strip().str.lower().isin(baseline_ids)].copy()
+        valid_df = _filter_best_model_candidates(valid_df, getattr(args, "ml_selection", "best"))
         if valid_df.empty:
             continue
 
@@ -1167,28 +1325,10 @@ def _plot_ml_model_comparison(
         else:
             n_col = None
 
-        # Read baseline RMSE from evaluation_summary.csv
-        eval_csv = data_root / dataset_name / 'evaluation_summary.csv'
-        baseline_rmse = {}
-        if eval_csv.exists():
-            try:
-                df_eval = pd.read_csv(eval_csv)
-                for kind in BASELINE_ORDER:
-                    match = df_eval[df_eval['label'].str.lower().str.contains(kind)]
-                    if not match.empty:
-                        baseline_rmse[kind] = _safe_float(match.iloc[0].get('rmse', float('nan')))
-                    else:
-                        baseline_rmse[kind] = float('nan')
-            except Exception:
-                for kind in BASELINE_ORDER:
-                    baseline_rmse[kind] = float('nan')
-        else:
-            for kind in BASELINE_ORDER:
-                baseline_rmse[kind] = float('nan')
-
-        best_baseline_rmse = min(
-            (v for v in baseline_rmse.values() if np.isfinite(v) and v > 0),
-            default=float('nan'),
+        selection = build_selection_record(plan, df, args)
+        best_baseline_rmse = (
+            _selection_metric(selection.best_baseline_row, "rmse")
+            if selection is not None else float("nan")
         )
 
         # Add normalized display type column
@@ -2511,8 +2651,68 @@ def _compute_retraining_stability(
     }
 
 
-def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args: argparse.Namespace) -> dict:
+def _neutral_self_comparison_evidence(selection: "SelectionRecord | None", args: argparse.Namespace) -> dict:
+    """Evidence payload for a best model that is also the configured best baseline."""
+    label = selection.best_baseline_label if selection is not None else ""
+    return {
+        "evidence_status": "ok",
+        "evidence_variant_resolution": "self_baseline",
+        "evidence_variant_dir": "",
+        "evidence_comparison": "best_model_equals_best_baseline",
+        "best_baseline_evidence_model": label,
+        "skill_vs_best_baseline": 0.0,
+        "bootstrap_skill_mean_vs_best_baseline": 0.0,
+        "lcb95_skill_vs_best_baseline": 0.0,
+        "bootstrap_prob_skill_gt0_vs_best_baseline": 0.0,
+        "bootstrap_rmse_diff_mean_vs_best_baseline": 0.0,
+        "bootstrap_rmse_diff_ci05_vs_best_baseline": 0.0,
+        "bootstrap_rmse_diff_ci95_vs_best_baseline": 0.0,
+        "bootstrap_r2_diff_mean_vs_best_baseline": 0.0,
+        "effect_median_ae_diff_vs_best_baseline": 0.0,
+        "effect_mean_ae_diff_vs_best_baseline": 0.0,
+        "effect_cohen_d_ae_diff_vs_best_baseline": 0.0,
+        "dm_stat_vs_best_baseline": 0.0,
+        "dm_p_vs_best_baseline": 1.0,
+        "dm_q_vs_best_baseline": 1.0,
+        "wilcoxon_stat_vs_best_baseline": 0.0,
+        "wilcoxon_p_vs_best_baseline": 1.0,
+        "wilcoxon_q_vs_best_baseline": 1.0,
+        "sign_wins_vs_best_baseline": 0.0,
+        "sign_win_rate_vs_best_baseline": 0.5,
+        "sign_p_vs_best_baseline": 1.0,
+        "sign_q_vs_best_baseline": 1.0,
+        "picp_delta_vs_best_baseline": 0.0,
+        "nmpiw_delta_vs_best_baseline": 0.0,
+        "interval_score_delta_vs_best_baseline": 0.0,
+        "gate_min_raw_vs_best_baseline": True,
+        "gate_prob_vs_best_baseline": False,
+        "gate_lcb_vs_best_baseline": False,
+        "gate_dm_vs_best_baseline": False,
+        "gate_wilcoxon_vs_best_baseline": False,
+        "gate_sign_vs_best_baseline": False,
+        "gate_coverage_vs_best_baseline": True,
+        "gate_dm_q_vs_best_baseline": False,
+        "gate_wilcoxon_q_vs_best_baseline": False,
+        "gate_sign_q_vs_best_baseline": False,
+        "evidence_score_vs_best_baseline": 1,
+        "evidence_score_overall_min": 1,
+        "evidence_score_overall_mean": 1.0,
+        "interval_alpha": float(getattr(args, "interval_alpha", 0.1)),
+        "evidence_alpha": float(getattr(args, "evidence_alpha", 0.05)),
+        "bootstrap_mode": str(getattr(args, "bootstrap_mode", "iid")),
+        "bootstrap_block_len": int(getattr(args, "bootstrap_block_len", 3)),
+    }
+
+
+def _compute_statistical_evidence(
+    plan: DatasetPlan,
+    best_row: "pd.Series",
+    args: argparse.Namespace,
+    best_baseline_row: "pd.Series | None" = None,
+    selection: "SelectionRecord | None" = None,
+) -> dict:
     evidence: dict[str, float | str | int | bool] = {}
+    is_self_baseline = bool(selection is not None and selection.best_model_equals_best_baseline)
     variant_dir, eval_cfg_path, resolve_status = _find_best_variant_eval_config(plan, best_row)
     evidence["evidence_variant_resolution"] = str(resolve_status)
     evidence["evidence_variant_dir"] = str(variant_dir) if variant_dir is not None else ""
@@ -2620,6 +2820,10 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
     evidence["model_gp_coverage_deficit"] = _safe_float(gp_int["gp_coverage_deficit"])
     evidence["model_gp_nmpiw"] = _safe_float(gp_int["gp_nmpiw"])
     evidence["model_gp_interval_score"] = _safe_float(gp_int["gp_interval_score"])
+
+    if is_self_baseline:
+        evidence.update(_neutral_self_comparison_evidence(selection, args))
+        return evidence
 
     for bname in BASELINE_ORDER:
         pred_b = _safe_as_2d(baseline_preds.get(bname, np.full_like(y_test, np.nan, dtype=float)))[:n_rows, :]
@@ -2730,6 +2934,125 @@ def _compute_statistical_evidence(plan: DatasetPlan, best_row: "pd.Series", args
             evidence[f"gate_dm_q_{prefix}"] = bool(np.isfinite(dm_q) and dm_q < float(args.evidence_alpha) and np.isfinite(dm_stat) and dm_stat < 0)
             evidence[f"gate_wilcoxon_q_{prefix}"] = bool(np.isfinite(wilc_q) and wilc_q < float(args.evidence_alpha))
             evidence[f"gate_sign_q_{prefix}"] = bool(np.isfinite(sign_q) and sign_q < float(args.evidence_alpha) and np.isfinite(sign_wr) and sign_wr > 0.5)
+
+    best_baseline_id = ""
+    if selection is not None:
+        best_baseline_id = selection.best_baseline_id
+        evidence["best_baseline_evidence_model"] = selection.best_baseline_label
+    elif best_baseline_row is not None:
+        best_baseline_id = _display_model_id(best_baseline_row.get("model", ""))
+        evidence["best_baseline_evidence_model"] = _display_model_type(best_baseline_id)
+
+    if best_baseline_id in BASELINE_ORDER:
+        src_prefix = f"vs_{best_baseline_id}"
+        alias_names = [
+            "dm_stat", "dm_p", "dm_q",
+            "wilcoxon_stat", "wilcoxon_p", "wilcoxon_q",
+            "sign_wins", "sign_win_rate", "sign_p", "sign_q",
+            "skill",
+            "effect_median_ae_diff", "effect_mean_ae_diff", "effect_cohen_d_ae_diff",
+            "bootstrap_n", "bootstrap_skill_mean", "bootstrap_skill_ci05", "bootstrap_skill_ci95",
+            "bootstrap_prob_skill_gt0", "bootstrap_rmse_diff_mean",
+            "bootstrap_rmse_diff_ci05", "bootstrap_rmse_diff_ci95", "bootstrap_r2_diff_mean",
+            "lcb95_skill", "picp_delta", "nmpiw_delta", "interval_score_delta",
+            "gate_min_raw", "gate_prob", "gate_lcb", "gate_dm", "gate_wilcoxon",
+            "gate_sign", "gate_coverage", "gate_dm_q", "gate_wilcoxon_q", "gate_sign_q",
+            "evidence_score",
+        ]
+        for name in alias_names:
+            src = f"{name}_{src_prefix}"
+            if src in evidence:
+                evidence[f"{name}_vs_best_baseline"] = evidence[src]
+        for name in ("picp", "nominal_coverage", "coverage_gap", "coverage_deficit", "nmpiw", "interval_score", "interval_is_diagnostic"):
+            src = f"{best_baseline_id}_{name}"
+            if src in evidence:
+                evidence[f"best_baseline_{name}"] = evidence[src]
+    elif best_baseline_row is not None:
+        try:
+            baseline_payload = _collect_prediction_payload(_find_best_variant_eval_config(plan, best_baseline_row)[1])
+            pred_b = _safe_as_2d(baseline_payload["pred_model"])[:n_rows, :]
+            n_direct = min(len(pred_b), len(y_test), len(pred_model), len(group_ids))
+            pred_b = pred_b[:n_direct, :]
+            y_direct = y_test[:n_direct, :]
+            pred_direct = pred_model[:n_direct, :]
+            group_direct = group_ids[:n_direct]
+            mae_b, mse_b = _compute_per_sample_losses(pred_b, y_direct)
+            mae_m, mse_m = _compute_per_sample_losses(pred_direct, y_direct)
+            mse_diff_group = _aggregate_by_group(mse_m - mse_b, group_direct)
+            ae_diff_group = _aggregate_by_group(mae_m - mae_b, group_direct)
+            dm_stat, dm_p = _dm_test_from_diff(mse_diff_group, max_lag=int(args.dm_max_lag))
+            w_stat, w_p = _wilcoxon_from_diff(ae_diff_group)
+            sign_wins, sign_win_rate, sign_p = _sign_test_from_diff(ae_diff_group)
+            boot = _bootstrap_grouped_skill(
+                y_direct,
+                pred_direct,
+                pred_b,
+                group_ids=group_direct,
+                n_boot=int(args.bootstrap_iterations),
+                seed=int(args.bootstrap_seed),
+                mode=str(getattr(args, "bootstrap_mode", "iid")),
+                block_len=int(getattr(args, "bootstrap_block_len", 3)),
+            )
+            base_metrics = _compute_point_metrics_grouped(pred_b, y_direct, group_direct)
+            baseline_rmse = base_metrics["rmse"]
+            skill = float(1.0 - model_metrics["rmse"] / baseline_rmse) if np.isfinite(model_metrics["rmse"]) and np.isfinite(baseline_rmse) and baseline_rmse > 0 else float("nan")
+            int_base = _interval_proxy_metrics(pred_b, y_direct, alpha=interval_alpha)
+            evidence["dm_stat_vs_best_baseline"] = dm_stat
+            evidence["dm_p_vs_best_baseline"] = dm_p
+            evidence["wilcoxon_stat_vs_best_baseline"] = w_stat
+            evidence["wilcoxon_p_vs_best_baseline"] = w_p
+            evidence["sign_wins_vs_best_baseline"] = sign_wins
+            evidence["sign_win_rate_vs_best_baseline"] = sign_win_rate
+            evidence["sign_p_vs_best_baseline"] = sign_p
+            evidence["skill_vs_best_baseline"] = skill
+            evidence["effect_median_ae_diff_vs_best_baseline"] = float(np.nanmedian(ae_diff_group)) if ae_diff_group.size else float("nan")
+            evidence["effect_mean_ae_diff_vs_best_baseline"] = float(np.nanmean(ae_diff_group)) if ae_diff_group.size else float("nan")
+            evidence["effect_cohen_d_ae_diff_vs_best_baseline"] = _cohen_d_from_diff(ae_diff_group)
+            evidence["bootstrap_n_vs_best_baseline"] = int(boot.get("n_boot_ok", 0))
+            evidence["bootstrap_skill_mean_vs_best_baseline"] = _safe_float(boot.get("skill_mean"))
+            evidence["bootstrap_skill_ci05_vs_best_baseline"] = _safe_float(boot.get("skill_ci05"))
+            evidence["bootstrap_skill_ci95_vs_best_baseline"] = _safe_float(boot.get("skill_ci95"))
+            evidence["bootstrap_prob_skill_gt0_vs_best_baseline"] = _safe_float(boot.get("prob_skill_gt0"))
+            evidence["bootstrap_rmse_diff_mean_vs_best_baseline"] = _safe_float(boot.get("rmse_diff_mean"))
+            evidence["bootstrap_rmse_diff_ci05_vs_best_baseline"] = _safe_float(boot.get("rmse_diff_ci05"))
+            evidence["bootstrap_rmse_diff_ci95_vs_best_baseline"] = _safe_float(boot.get("rmse_diff_ci95"))
+            evidence["bootstrap_r2_diff_mean_vs_best_baseline"] = _safe_float(boot.get("r2_diff_mean"))
+            evidence["lcb95_skill_vs_best_baseline"] = _safe_float(boot.get("skill_ci05"))
+            evidence["best_baseline_picp"] = _safe_float(int_base["picp"])
+            evidence["best_baseline_nominal_coverage"] = _safe_float(int_base["nominal_coverage"])
+            evidence["best_baseline_coverage_gap"] = _safe_float(int_base["coverage_gap"])
+            evidence["best_baseline_coverage_deficit"] = _safe_float(int_base["coverage_deficit"])
+            evidence["best_baseline_nmpiw"] = _safe_float(int_base["nmpiw"])
+            evidence["best_baseline_interval_score"] = _safe_float(int_base["interval_score"])
+            evidence["picp_delta_vs_best_baseline"] = _safe_float(model_int["picp"]) - _safe_float(int_base["picp"])
+            evidence["nmpiw_delta_vs_best_baseline"] = _safe_float(model_int["nmpiw"]) - _safe_float(int_base["nmpiw"])
+            evidence["interval_score_delta_vs_best_baseline"] = _safe_float(model_int["interval_score"]) - _safe_float(int_base["interval_score"])
+            evidence["dm_q_vs_best_baseline"] = dm_p
+            evidence["wilcoxon_q_vs_best_baseline"] = w_p
+            evidence["sign_q_vs_best_baseline"] = sign_p
+            evidence["gate_min_raw_vs_best_baseline"] = bool(n_raw >= int(args.evidence_min_raw_samples))
+            evidence["gate_prob_vs_best_baseline"] = bool(np.isfinite(evidence["bootstrap_prob_skill_gt0_vs_best_baseline"]) and evidence["bootstrap_prob_skill_gt0_vs_best_baseline"] >= float(args.evidence_min_prob))
+            evidence["gate_lcb_vs_best_baseline"] = bool(np.isfinite(evidence["lcb95_skill_vs_best_baseline"]) and evidence["lcb95_skill_vs_best_baseline"] > 0)
+            evidence["gate_dm_vs_best_baseline"] = bool(np.isfinite(dm_p) and dm_p < float(args.evidence_alpha) and np.isfinite(dm_stat) and dm_stat < 0)
+            evidence["gate_wilcoxon_vs_best_baseline"] = bool(np.isfinite(w_p) and w_p < float(args.evidence_alpha))
+            evidence["gate_sign_vs_best_baseline"] = bool(np.isfinite(sign_p) and sign_p < float(args.evidence_alpha) and np.isfinite(sign_win_rate) and sign_win_rate > 0.5)
+            evidence["gate_coverage_vs_best_baseline"] = bool(
+                np.isfinite(_safe_float(model_int["coverage_deficit"]))
+                and np.isfinite(_safe_float(int_base["coverage_deficit"]))
+                and _safe_float(model_int["coverage_deficit"]) <= coverage_tol
+                and _safe_float(model_int["coverage_deficit"]) <= _safe_float(int_base["coverage_deficit"]) + coverage_tol
+            )
+            evidence["gate_dm_q_vs_best_baseline"] = evidence["gate_dm_vs_best_baseline"]
+            evidence["gate_wilcoxon_q_vs_best_baseline"] = evidence["gate_wilcoxon_vs_best_baseline"]
+            evidence["gate_sign_q_vs_best_baseline"] = evidence["gate_sign_vs_best_baseline"]
+            evidence["evidence_score_vs_best_baseline"] = int(evidence["gate_lcb_vs_best_baseline"]) + int(evidence["gate_dm_vs_best_baseline"]) + int(evidence["gate_wilcoxon_vs_best_baseline"]) + int(evidence["gate_sign_vs_best_baseline"]) + int(evidence["gate_coverage_vs_best_baseline"])
+        except Exception as exc:
+            print(f"[WARN] Could not compute direct best-baseline evidence for {plan.dataset_dir.name}: {exc}")
+
+    if "skill_vs_best_baseline" not in evidence and selection is not None:
+        evidence["skill_vs_best_baseline"] = selection.skill_vs_best_baseline
+    if "evidence_score_vs_best_baseline" in evidence:
+        baseline_scores = [int(evidence["evidence_score_vs_best_baseline"])]
 
     if baseline_scores:
         evidence["evidence_score_overall_min"] = int(min(baseline_scores))
@@ -3036,6 +3359,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
     importance_sources_used: set[str] = set()
     datasets_with_outputs = 0
     best_model_performance = []
+    final_metrics_by_dataset: dict[str, pd.DataFrame] = {}
     target_order_by_skill: list[str] = []
 
     for plan in plans:
@@ -3154,16 +3478,10 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     if _df_for_selection.empty:
                         _df_for_selection = df  # fall back to unfiltered if nothing matches
                         print(f"[WARN] No rows match target_name={target_name!r} in {final_metrics_csv.name}; using all rows for selection.")
-                    # Select best row across all models/subsets by R2
-                    valid_r2 = _filter_best_model_candidates(
-                        _exclude_baseline_metric_rows(
-                            _filter_min_valid_independent(
-                                _filter_valid_rows(_df_for_selection),
-                                min_required=MIN_REQUIRED_VALID_INDEPENDENT,
-                            )
-                        ),
-                        getattr(args, "ml_selection", "best"),
-                    )
+                    # Select an initial seed row across all valid model types.  This
+                    # is only used for artifact maintenance before the final
+                    # authoritative SelectionRecord is built after MLR/Shapley merge.
+                    valid_r2 = valid_selection_rows(_df_for_selection)
                     if valid_r2.empty:
                         print(
                             f"[WARN] No valid r2 rows meeting min valid independent test samples "
@@ -3214,31 +3532,11 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                             _df_post = df[df["target"].astype(str) == target_name].copy() if "target" in df.columns else df
                             if _df_post.empty:
                                 _df_post = df
-                            _post_mlr = _filter_best_model_candidates(
-                                _exclude_baseline_metric_rows(
-                                    _filter_min_valid_independent(
-                                        _filter_valid_rows(_df_post),
-                                        min_required=MIN_REQUIRED_VALID_INDEPENDENT,
-                                    )
-                                ),
-                                getattr(args, "ml_selection", "best"),
-                            )
+                            _post_mlr = valid_selection_rows(_df_post)
                             if not _post_mlr.empty:
                                 best_row = select_best_model_row(_post_mlr)
                         except Exception:
                             pass  # keep pre-MLR best_row as fallback
-
-                        # Re-run best model evaluation context and compute statistical evidence
-                        try:
-                            stat_evidence = _compute_statistical_evidence(plan, best_row, args)
-                            status = str(stat_evidence.get("evidence_status", ""))
-                            if status == "ok":
-                                print(f"[INFO] Statistical evidence computed for {plan.dataset_dir.name}")
-                            else:
-                                print(f"[WARN] Statistical evidence incomplete for {plan.dataset_dir.name}: {status}")
-                        except Exception as exc:
-                            print(f"[WARN] Statistical evidence failed for {plan.dataset_dir.name}: {exc}")
-                            traceback.print_exc()
 
                         # Patch rolling CV metrics into the in-memory DataFrame.
                         if run_rolling_cv:
@@ -3325,36 +3623,34 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                         # Recompute min_skill_rmse once across all sources, write once, plot once.
                         df = _recompute_min_skill_rmse(df)
                         df.to_csv(final_metrics_csv, index=False)
+                        final_metrics_by_dataset[plan.dataset_dir.name] = df.copy()
                         try:
                             _plot_final_metrics_comparison(df, output_dir)
                         except Exception as exc:
                             print(f"[WARN] Could not generate final metrics comparison plot for {plan.dataset_dir.name}: {exc}")
 
-                        # Select final best row for the summary entry.
-                        best_updated = best_row
+                        # Select final best model/baseline rows for the summary entry.
+                        selection = build_selection_record(plan, df, args)
+                        if selection is None:
+                            print(f"[WARN] Could not build selection record for {plan.dataset_dir.name}; skipping summary row.")
+                            continue
+                        best_updated = selection.best_model_row
                         try:
-                            _df_final = df[df["target"].astype(str) == target_name].copy() if "target" in df.columns else df
-                            if _df_final.empty:
-                                _df_final = df
-                            valid_r2_2 = _filter_best_model_candidates(
-                                _exclude_baseline_metric_rows(
-                                    _filter_min_valid_independent(
-                                        _filter_valid_rows(_df_final),
-                                        min_required=MIN_REQUIRED_VALID_INDEPENDENT,
-                                    )
-                                ),
-                                getattr(args, "ml_selection", "best"),
+                            stat_evidence = _compute_statistical_evidence(
+                                plan,
+                                selection.best_model_row,
+                                args,
+                                best_baseline_row=selection.best_baseline_row,
+                                selection=selection,
                             )
-                            if not valid_r2_2.empty:
-                                best_updated = select_best_model_row(valid_r2_2)
-                                _best_label = str(best_updated.get("subset_label", ""))
-                                if _best_label.startswith(_SHAPLEY_MERGE_LABEL_PREFIX):
-                                    try:
-                                        stat_evidence = _compute_statistical_evidence(plan, best_updated, args)
-                                    except Exception as _se_exc:
-                                        print(f"[WARN] Statistical evidence recompute failed for Shapley best in {plan.dataset_dir.name}: {_se_exc}")
+                            status = str(stat_evidence.get("evidence_status", ""))
+                            if status == "ok":
+                                print(f"[INFO] Statistical evidence computed for {plan.dataset_dir.name}")
+                            else:
+                                print(f"[WARN] Statistical evidence incomplete for {plan.dataset_dir.name}: {status}")
                         except Exception as exc:
-                            print(f"[WARN] Could not select final best row for {plan.dataset_dir.name}: {exc}")
+                            print(f"[WARN] Statistical evidence failed for {plan.dataset_dir.name}: {exc}")
+                            traceback.print_exc()
 
                         cv_r2_to_write = _safe_float(best_updated.get('rolling_cv_r2')) if run_rolling_cv else rolling_cv_r2
                         cv_r2_median_to_write = _safe_float(best_updated.get('rolling_cv_r2_median')) if run_rolling_cv else rolling_cv_r2_median
@@ -3371,7 +3667,26 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                             rolling_cv_rmse=cv_rmse_to_write,
                             rolling_cv_mae=cv_mae_to_write,
                             rolling_cv_n_folds=rolling_cv_n_folds,
-                            extra_metrics=stat_evidence,
+                            extra_metrics={
+                                **stat_evidence,
+                                "selection_semantics": "best_model_all_valid_models_vs_configured_best_baseline",
+                                "baseline_model_set": "|".join(selection.baseline_model_set),
+                                "best_model_id": selection.best_model_id,
+                                "best_model_label": selection.best_model_label,
+                                "best_baseline_id": selection.best_baseline_id,
+                                "best_baseline_label": selection.best_baseline_label,
+                                "best_model_is_configured_baseline": selection.best_model_is_configured_baseline,
+                                "best_model_equals_best_baseline": selection.best_model_equals_best_baseline,
+                                "best_model_rmse": _selection_metric(selection.best_model_row, "rmse"),
+                                "best_model_r2": _selection_metric(selection.best_model_row, "r2"),
+                                "best_model_nrmse": _selection_metric(selection.best_model_row, "nrmse"),
+                                "best_model_mae": _selection_metric(selection.best_model_row, "mae"),
+                                "best_baseline_rmse": _selection_metric(selection.best_baseline_row, "rmse"),
+                                "best_baseline_r2": _selection_metric(selection.best_baseline_row, "r2"),
+                                "best_baseline_nrmse": _selection_metric(selection.best_baseline_row, "nrmse"),
+                                "best_baseline_mae": _selection_metric(selection.best_baseline_row, "mae"),
+                                "skill_vs_best_baseline": selection.skill_vs_best_baseline,
+                            },
                         ))
         except Exception as e:
             print(f"[WARN] Could not process best model performance for {plan.dataset_dir.name}: {e}")
@@ -3420,6 +3735,8 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     baseline_stats['mlr'] = _load_best_mlr_baseline_stats(data_root, dataset)
                 for kind in baseline_stats.keys():
                     for stat in ['mae', 'rmse', 'r2', 'pearson_r']:
+                        if stat not in baseline_stats[kind]:
+                            baseline_stats[kind][stat] = np.nan
                         entry[f'{kind}_{stat}'] = baseline_stats[kind][stat]
 
             perf_df = pd.DataFrame(best_model_performance)
@@ -3444,13 +3761,39 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     ),
                 ),
             )
-            # Compute skill vs best baseline for target ordering in heatmaps.
-            _baseline_rmse_cols = [
-                perf_df.get(f'{name}_rmse', pd.Series(dtype=float)).replace(0, np.nan)
-                for name in _best_baseline_order(args)
+            # Use the authoritative selection-record columns for headline outputs.
+            if "best_model_nrmse" not in perf_df.columns:
+                perf_df["best_model_nrmse"] = perf_df.get("nrmse", pd.Series(dtype=float))
+            if "best_model_r2" not in perf_df.columns:
+                perf_df["best_model_r2"] = perf_df.get("r2", pd.Series(dtype=float))
+            if "best_baseline_nrmse" not in perf_df.columns:
+                perf_df["best_baseline_nrmse"] = float("nan")
+            if "best_baseline_r2" not in perf_df.columns:
+                perf_df["best_baseline_r2"] = float("nan")
+            if "skill_vs_best_baseline" not in perf_df.columns:
+                perf_df["skill_vs_best_baseline"] = 1.0 - (
+                    pd.to_numeric(perf_df.get("best_model_rmse"), errors="coerce")
+                    / pd.to_numeric(perf_df.get("best_baseline_rmse"), errors="coerce").replace(0, np.nan)
+                )
+            same_baseline = perf_df.get("best_model_equals_best_baseline", pd.Series([False] * len(perf_df))).astype(bool)
+            perf_df.loc[same_baseline, "skill_vs_best_baseline"] = 0.0
+            required_headline_cols = [
+                "best_model_label", "best_baseline_label",
+                "best_model_nrmse", "best_baseline_nrmse",
+                "best_model_r2", "best_baseline_r2",
+                "skill_vs_best_baseline",
             ]
-            _best_baseline_rmse = pd.concat(_baseline_rmse_cols, axis=1).min(axis=1)
-            perf_df['skill_vs_best_baseline'] = 1.0 - perf_df['rmse'] / _best_baseline_rmse
+            missing_headline_cols = [c for c in required_headline_cols if c not in perf_df.columns]
+            if missing_headline_cols:
+                print(f"[WARN] Headline summary missing expected selection columns: {missing_headline_cols}")
+            if same_baseline.any():
+                nonzero_self = pd.to_numeric(
+                    perf_df.loc[same_baseline, "skill_vs_best_baseline"],
+                    errors="coerce",
+                ).abs() > 1e-12
+                if bool(nonzero_self.any()):
+                    print("[WARN] Correcting nonzero self-baseline skill values to 0.")
+                    perf_df.loc[same_baseline, "skill_vs_best_baseline"] = 0.0
             # Order targets by increasing skill (worst first → best last).
             _skill_sorted = perf_df.sort_values('skill_vs_best_baseline', ascending=True, na_position='first')
             target_order_by_skill = []
@@ -3466,50 +3809,31 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             x = np.arange(len(perf_df))
             labels = perf_df['dataset']
-            # Use the actual ML model type(s) as the label; fall back to 'Model' if not recorded.
-            if 'model' in perf_df.columns:
-                _model_types = perf_df['model'].dropna().tolist()
-                _unique = list(dict.fromkeys(_model_types))  # preserve order, deduplicate
-                model_series_label = _unique[0] if len(_unique) == 1 else (
-                    max(set(_model_types), key=_model_types.count) if _model_types else 'Model'
-                )
-            else:
-                model_series_label = 'Model'
-            baseline_order = _best_baseline_order(args)
-            methods = [model_series_label] + [BEST_BASELINE_PLOT_LABELS[name] for name in baseline_order]
-            colors = ['tab:blue'] + [BASELINE_PLOT_COLORS[name] for name in baseline_order]
+            model_series_label = 'Best Model'
+            methods = ['Best Model', 'Best Baseline']
+            colors = ['tab:blue', 'tab:orange']
             width = 1.0 / (len(methods) + 0.5)
 
-            std_target_col = perf_df['std_target'].replace(0, np.nan)
             nrmse_data = [
-                perf_df['nrmse'],
-            ] + [
-                perf_df.get(f'{name}_rmse', pd.Series(dtype=float)) / std_target_col
-                for name in baseline_order
+                pd.to_numeric(perf_df['best_model_nrmse'], errors='coerce'),
+                pd.to_numeric(perf_df['best_baseline_nrmse'], errors='coerce'),
             ]
             r2_data = [
-                perf_df['r2'],
-            ] + [
-                perf_df.get(f'{name}_r2', pd.Series(dtype=float))
-                for name in baseline_order
+                pd.to_numeric(perf_df['best_model_r2'], errors='coerce'),
+                pd.to_numeric(perf_df['best_baseline_r2'], errors='coerce'),
             ]
-            # Skill score: 1 - (model_rmse / baseline_rmse); positive = better than baseline
-            skill_data = [
-                1.0 - perf_df['rmse'] / perf_df.get(f'{name}_rmse', pd.Series(dtype=float)).replace(0, np.nan)
-                for name in baseline_order
-            ]
-            skill_methods = [
-                f'Compared with {BEST_BASELINE_PLOT_LABELS[name]} Baseline'
-                for name in baseline_order
-            ]
-            skill_colors = [BASELINE_PLOT_COLORS[name] for name in baseline_order]
+            best_model_labels = perf_df.get("best_model_label", perf_df.get("model", pd.Series(["Model"] * len(perf_df)))).astype(str).tolist()
+            best_baseline_labels = perf_df.get("best_baseline_label", pd.Series(["Baseline"] * len(perf_df))).astype(str).tolist()
+            skill_data = [pd.to_numeric(perf_df['skill_vs_best_baseline'], errors='coerce')]
+            skill_methods = ['Best Model vs Best Baseline']
+            skill_colors = ['tab:blue']
             skill_width = 1.0 / (len(skill_methods) + 0.5)
 
             # --- Combined 3-panel figure (no title): Skill, nRMSE, R2 ---
             fig, (ax_skill_combo, ax_nrmse_combo, ax_r2_combo) = plt.subplots(
                 3, 1, figsize=(max(8, len(perf_df) * 0.72 + 1.6), 13), sharex=True
             )
-            _draw_bar_group(
+            skill_bars_combo = _draw_bar_group(
                 ax_skill_combo, x, skill_width, skill_data, skill_colors, skill_methods, '.2f',
                 center_offset=0.5
             )
@@ -3517,7 +3841,9 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             ax_skill_combo.set_ylabel('Skill Score')
             ax_skill_combo.grid(axis='y', alpha=0.3)
             ax_skill_combo.legend()
-            _draw_bar_group(ax_nrmse_combo, x, width, nrmse_data, colors, methods, '.2e')
+            nrmse_bars_combo = _draw_bar_group(ax_nrmse_combo, x, width, nrmse_data, colors, methods, '.2e', annotate=False)
+            _annotate_bars_with_model_labels(ax_nrmse_combo, nrmse_bars_combo[0], nrmse_data[0], best_model_labels, fmt=".2e", fontsize=8)
+            _annotate_bars_with_model_labels(ax_nrmse_combo, nrmse_bars_combo[1], nrmse_data[1], best_baseline_labels, fmt=".2e", fontsize=8)
             ax_nrmse_combo.set_ylabel('nRMSE')
             ax_nrmse_combo.grid(axis='y', alpha=0.3)
             ax_nrmse_combo.legend()
@@ -3526,8 +3852,8 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             )
             ax_r2_combo.set_ylabel('Coefficient of Determination')
             ax_r2_combo.set_ylim(-0.1, 1.0)
-            for bars in r2_bars_combo:
-                _annotate_bars_within_ylim(ax_r2_combo, bars, '.2f')
+            _annotate_bars_with_model_labels(ax_r2_combo, r2_bars_combo[0], r2_data[0], best_model_labels, fmt=".2f", fontsize=8)
+            _annotate_bars_with_model_labels(ax_r2_combo, r2_bars_combo[1], r2_data[1], best_baseline_labels, fmt=".2f", fontsize=8)
             ax_r2_combo.grid(axis='y', alpha=0.3)
             ax_r2_combo.legend()
             ax_r2_combo.set_xticks(x)
@@ -3541,7 +3867,9 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             # --- Standalone nRMSE subplot ---
             fig_nrmse, ax_nrmse = plt.subplots(figsize=(max(7, len(perf_df) * 0.72 + 1.2), 5))
-            _draw_bar_group(ax_nrmse, x, width, nrmse_data, colors, methods, '.2e')
+            nrmse_bars = _draw_bar_group(ax_nrmse, x, width, nrmse_data, colors, methods, '.2e', annotate=False)
+            _annotate_bars_with_model_labels(ax_nrmse, nrmse_bars[0], nrmse_data[0], best_model_labels, fmt=".2e", fontsize=8)
+            _annotate_bars_with_model_labels(ax_nrmse, nrmse_bars[1], nrmse_data[1], best_baseline_labels, fmt=".2e", fontsize=8)
             ax_nrmse.set_ylabel('nRMSE')
             ax_nrmse.set_xticks(x)
             ax_nrmse.set_xticklabels(labels, rotation=45, ha='right')
@@ -3559,8 +3887,8 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             r2_bars = _draw_bar_group(ax_r2, x, width, r2_data, colors, methods, '.2f', annotate=False)
             ax_r2.set_ylabel('Coefficient of Determination')
             ax_r2.set_ylim(-0.1, 1.0)
-            for bars in r2_bars:
-                _annotate_bars_within_ylim(ax_r2, bars, '.2f')
+            _annotate_bars_with_model_labels(ax_r2, r2_bars[0], r2_data[0], best_model_labels, fmt=".2f", fontsize=8)
+            _annotate_bars_with_model_labels(ax_r2, r2_bars[1], r2_data[1], best_baseline_labels, fmt=".2f", fontsize=8)
             ax_r2.set_xticks(x)
             ax_r2.set_xticklabels(labels, rotation=45, ha='right')
             ax_r2.grid(axis='y', alpha=0.3)
@@ -3596,13 +3924,11 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     return pd.to_numeric(perf_df[name], errors="coerce")
                 return pd.Series([float("nan")] * n_perf)
 
-            baseline_prob_cols = [_perf_col(f"bootstrap_prob_skill_gt0_vs_{name}") for name in BASELINE_ORDER]
-            baseline_lcb_cols = [_perf_col(f"lcb95_skill_vs_{name}") for name in BASELINE_ORDER]
+            baseline_prob_cols = [_perf_col("bootstrap_prob_skill_gt0_vs_best_baseline")]
+            baseline_lcb_cols = [_perf_col("lcb95_skill_vs_best_baseline")]
             overall_score = _perf_col("evidence_score_overall_min")
             model_picp = _perf_col("model_picp")
-            naive_picp = _perf_col("naive_picp")
-            seasonal_picp = _perf_col("seasonal_picp")
-            linear_picp = _perf_col("linear_picp")
+            best_baseline_picp = _perf_col("best_baseline_picp")
             nominal_cov = _perf_col("model_nominal_coverage")
             fig_conf, conf_axes = plt.subplots(
                 4, 1, figsize=(max(12, len(perf_df) * 0.8), 15), sharex=True
@@ -3611,8 +3937,8 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             _draw_bar_group(
                 conf_axes[0], x, width,
                 baseline_prob_cols,
-                [BASELINE_PLOT_COLORS[name] for name in BASELINE_ORDER],
-                [f"Prob(skill>0) vs {BASELINE_PLOT_LABELS[name]}" for name in BASELINE_ORDER],
+                ['tab:orange'],
+                ["Prob(skill>0) vs Best Baseline"],
                 '.2f',
             )
             conf_axes[0].axhline(float(args.evidence_min_prob), color='black', linewidth=0.8, linestyle='--')
@@ -3624,8 +3950,8 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             _draw_bar_group(
                 conf_axes[1], x, width,
                 baseline_lcb_cols,
-                [BASELINE_PLOT_COLORS[name] for name in BASELINE_ORDER],
-                [f"95% Lower Confidence Bound of Skill\nCompared with {BASELINE_PLOT_LABELS[name]} Baseline" for name in BASELINE_ORDER],
+                ['tab:orange'],
+                ["95% Lower Confidence Bound of Skill\nCompared with Best Baseline"],
                 '.2f',
             )
             conf_axes[1].axhline(0.0, color='black', linewidth=0.8, linestyle='--')
@@ -3635,9 +3961,9 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             _draw_bar_group(
                 conf_axes[2], x, width,
-                [model_picp, naive_picp, seasonal_picp, linear_picp],
-                ['tab:blue', BASELINE_PLOT_COLORS['naive'], BASELINE_PLOT_COLORS['seasonal'], BASELINE_PLOT_COLORS['linear']],
-                [model_series_label, 'Naive', 'Seasonal', 'Linear'],
+                [model_picp, best_baseline_picp],
+                ['tab:blue', 'tab:orange'],
+                ['Best Model', 'Best Baseline'],
                 '.2f',
             )
             nom_arr = nominal_cov.to_numpy(dtype=float) if hasattr(nominal_cov, "to_numpy") else np.array(nominal_cov, dtype=float)
@@ -3662,8 +3988,8 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 _draw_bar_group(
                     ax, x, width,
                     baseline_prob_cols,
-                    [BASELINE_PLOT_COLORS[name] for name in BASELINE_ORDER],
-                    [f"Prob(skill>0) vs {BASELINE_PLOT_LABELS[name]}" for name in BASELINE_ORDER],
+                    ['tab:orange'],
+                    ["Prob(skill>0) vs Best Baseline"],
                     '.2f',
                 )
                 ax.axhline(float(args.evidence_min_prob), color='black', linewidth=0.8, linestyle='--')
@@ -3676,8 +4002,8 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 _draw_bar_group(
                     ax, x, width,
                     baseline_lcb_cols,
-                    [BASELINE_PLOT_COLORS[name] for name in BASELINE_ORDER],
-                    [f"95% Lower Confidence Bound of Skill\nCompared with {BASELINE_PLOT_LABELS[name]} Baseline" for name in BASELINE_ORDER],
+                    ['tab:orange'],
+                    ["95% Lower Confidence Bound of Skill\nCompared with Best Baseline"],
                     '.2f',
                 )
                 ax.axhline(0.0, color='black', linewidth=0.8, linestyle='--')
@@ -3688,9 +4014,9 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             def _conf_panel_picp(ax):
                 _draw_bar_group(
                     ax, x, width,
-                    [model_picp, naive_picp, seasonal_picp, linear_picp],
-                    ['tab:blue', BASELINE_PLOT_COLORS['naive'], BASELINE_PLOT_COLORS['seasonal'], BASELINE_PLOT_COLORS['linear']],
-                    [model_series_label, 'Naive', 'Seasonal', 'Linear'],
+                    [model_picp, best_baseline_picp],
+                    ['tab:blue', 'tab:orange'],
+                    ['Best Model', 'Best Baseline'],
                     '.2f',
                 )
                 nom_arr = nominal_cov.to_numpy(dtype=float) if hasattr(nominal_cov, "to_numpy") else np.array(nominal_cov, dtype=float)
@@ -3727,10 +4053,10 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     return pd.to_numeric(perf_df[name], errors='coerce')
                 return pd.Series([float('nan')] * len(perf_df))
 
-            baseline_colors = [BASELINE_PLOT_COLORS[name] for name in BASELINE_ORDER]
-            baseline_methods = [f"{BASELINE_PLOT_LABELS[name]} Baseline" for name in BASELINE_ORDER]
+            baseline_colors = ['tab:orange']
+            baseline_methods = ["Best Baseline"]
             trio_colors = ['tab:blue'] + baseline_colors
-            trio_methods = [model_series_label] + [BASELINE_PLOT_LABELS[name] for name in BASELINE_ORDER]
+            trio_methods = ['Best Model'] + baseline_methods
 
             def _baseline_panel(ax, cols: list[str], ylabel: str, fmt: str = '.2f',
                             hline: float | None = None, ylim: tuple[float, float] | None = None) -> None:
@@ -3751,15 +4077,15 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             # Statistical tests and adjusted significance (decision-first ordering).
             fig_tests, axes_tests = plt.subplots(9, 1, figsize=(max(12, len(perf_df) * 0.8), 28), sharex=True)
-            _baseline_panel(axes_tests[0], ['dm_p_vs_naive', 'dm_p_vs_seasonal', 'dm_p_vs_linear'], 'Diebold-Mariano Test p-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
-            _baseline_panel(axes_tests[1], ['dm_q_vs_naive', 'dm_q_vs_seasonal', 'dm_q_vs_linear'], 'Diebold-Mariano Test\nFalse Discovery Rate Adjusted q-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
-            _baseline_panel(axes_tests[2], ['wilcoxon_p_vs_naive', 'wilcoxon_p_vs_seasonal', 'wilcoxon_p_vs_linear'], 'Wilcoxon Signed-Rank Test p-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
-            _baseline_panel(axes_tests[3], ['wilcoxon_q_vs_naive', 'wilcoxon_q_vs_seasonal', 'wilcoxon_q_vs_linear'], 'Wilcoxon Signed-Rank Test\nFalse Discovery Rate Adjusted q-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
-            _baseline_panel(axes_tests[4], ['sign_p_vs_naive', 'sign_p_vs_seasonal', 'sign_p_vs_linear'], 'Sign Test p-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
-            _baseline_panel(axes_tests[5], ['sign_q_vs_naive', 'sign_q_vs_seasonal', 'sign_q_vs_linear'], 'Sign Test\nFalse Discovery Rate Adjusted q-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
-            _baseline_panel(axes_tests[6], ['dm_stat_vs_naive', 'dm_stat_vs_seasonal', 'dm_stat_vs_linear'], 'Diebold-Mariano Test Statistic', '.2f', hline=0.0)
-            _baseline_panel(axes_tests[7], ['wilcoxon_stat_vs_naive', 'wilcoxon_stat_vs_seasonal', 'wilcoxon_stat_vs_linear'], 'Wilcoxon Statistic', '.2f')
-            _baseline_panel(axes_tests[8], ['sign_win_rate_vs_naive', 'sign_win_rate_vs_seasonal', 'sign_win_rate_vs_linear'], 'Sign Test Win Rate', '.2f', hline=0.5, ylim=(0.0, 1.05))
+            _baseline_panel(axes_tests[0], ['dm_p_vs_best_baseline'], 'Diebold-Mariano Test p-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _baseline_panel(axes_tests[1], ['dm_q_vs_best_baseline'], 'Diebold-Mariano Test\nFalse Discovery Rate Adjusted q-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _baseline_panel(axes_tests[2], ['wilcoxon_p_vs_best_baseline'], 'Wilcoxon Signed-Rank Test p-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _baseline_panel(axes_tests[3], ['wilcoxon_q_vs_best_baseline'], 'Wilcoxon Signed-Rank Test\nFalse Discovery Rate Adjusted q-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _baseline_panel(axes_tests[4], ['sign_p_vs_best_baseline'], 'Sign Test p-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _baseline_panel(axes_tests[5], ['sign_q_vs_best_baseline'], 'Sign Test\nFalse Discovery Rate Adjusted q-value', '.3f', hline=float(args.evidence_alpha), ylim=(0.0, 1.05))
+            _baseline_panel(axes_tests[6], ['dm_stat_vs_best_baseline'], 'Diebold-Mariano Test Statistic', '.2f', hline=0.0)
+            _baseline_panel(axes_tests[7], ['wilcoxon_stat_vs_best_baseline'], 'Wilcoxon Statistic', '.2f')
+            _baseline_panel(axes_tests[8], ['sign_win_rate_vs_best_baseline'], 'Sign Test Win Rate', '.2f', hline=0.5, ylim=(0.0, 1.05))
             axes_tests[0].set_title("Evidence Tests (p/q thresholds first, diagnostics after)")
             axes_tests[-1].set_xticks(x)
             axes_tests[-1].set_xticklabels(labels, rotation=45, ha='right')
@@ -3768,15 +4094,15 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             fig_tests.savefig(tests_path, dpi=300, bbox_inches='tight')
 
             test_specs = [
-                (['dm_p_vs_naive', 'dm_p_vs_seasonal', 'dm_p_vs_linear'], 'Diebold-Mariano Test p-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
-                (['dm_q_vs_naive', 'dm_q_vs_seasonal', 'dm_q_vs_linear'], 'Diebold-Mariano Test\nFalse Discovery Rate Adjusted q-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
-                (['wilcoxon_p_vs_naive', 'wilcoxon_p_vs_seasonal', 'wilcoxon_p_vs_linear'], 'Wilcoxon Signed-Rank Test p-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
-                (['wilcoxon_q_vs_naive', 'wilcoxon_q_vs_seasonal', 'wilcoxon_q_vs_linear'], 'Wilcoxon Signed-Rank Test\nFalse Discovery Rate Adjusted q-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
-                (['sign_p_vs_naive', 'sign_p_vs_seasonal', 'sign_p_vs_linear'], 'Sign Test p-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
-                (['sign_q_vs_naive', 'sign_q_vs_seasonal', 'sign_q_vs_linear'], 'Sign Test\nFalse Discovery Rate Adjusted q-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
-                (['dm_stat_vs_naive', 'dm_stat_vs_seasonal', 'dm_stat_vs_linear'], 'Diebold-Mariano Test Statistic', '.2f', 0.0, None),
-                (['wilcoxon_stat_vs_naive', 'wilcoxon_stat_vs_seasonal', 'wilcoxon_stat_vs_linear'], 'Wilcoxon Statistic', '.2f', None, None),
-                (['sign_win_rate_vs_naive', 'sign_win_rate_vs_seasonal', 'sign_win_rate_vs_linear'], 'Sign Test Win Rate', '.2f', 0.5, (0.0, 1.05)),
+                (['dm_p_vs_best_baseline'], 'Diebold-Mariano Test p-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
+                (['dm_q_vs_best_baseline'], 'Diebold-Mariano Test\nFalse Discovery Rate Adjusted q-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
+                (['wilcoxon_p_vs_best_baseline'], 'Wilcoxon Signed-Rank Test p-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
+                (['wilcoxon_q_vs_best_baseline'], 'Wilcoxon Signed-Rank Test\nFalse Discovery Rate Adjusted q-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
+                (['sign_p_vs_best_baseline'], 'Sign Test p-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
+                (['sign_q_vs_best_baseline'], 'Sign Test\nFalse Discovery Rate Adjusted q-value', '.3f', float(args.evidence_alpha), (0.0, 1.05)),
+                (['dm_stat_vs_best_baseline'], 'Diebold-Mariano Test Statistic', '.2f', 0.0, None),
+                (['wilcoxon_stat_vs_best_baseline'], 'Wilcoxon Statistic', '.2f', None, None),
+                (['sign_win_rate_vs_best_baseline'], 'Sign Test Win Rate', '.2f', 0.5, (0.0, 1.05)),
             ]
             tests_builders = [
                 (lambda cols=cols, ylabel=ylabel, fmt=fmt, hline=hline, ylim=ylim: (lambda ax: _baseline_panel(ax, cols, ylabel, fmt, hline=hline, ylim=ylim)))()
@@ -3798,16 +4124,16 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             # Effect size and bootstrap summaries (interpretation flow).
             fig_eff, axes_eff = plt.subplots(10, 1, figsize=(max(12, len(perf_df) * 0.8), 31), sharex=True)
-            _baseline_panel(axes_eff[0], ['skill_vs_naive', 'skill_vs_seasonal', 'skill_vs_linear'], 'Skill (RMSE-Based)', '.2f', hline=0.0)
-            _baseline_panel(axes_eff[1], ['bootstrap_skill_mean_vs_naive', 'bootstrap_skill_mean_vs_seasonal', 'bootstrap_skill_mean_vs_linear'], 'Bootstrap Skill Mean', '.2f', hline=0.0)
-            _baseline_panel(axes_eff[2], ['lcb95_skill_vs_naive', 'lcb95_skill_vs_seasonal', 'lcb95_skill_vs_linear'], '95% Lower Confidence Bound of Skill', '.2f', hline=0.0)
-            _baseline_panel(axes_eff[3], ['effect_median_ae_diff_vs_naive', 'effect_median_ae_diff_vs_seasonal', 'effect_median_ae_diff_vs_linear'], 'Median MAE Difference', '.2e', hline=0.0)
-            _baseline_panel(axes_eff[4], ['effect_mean_ae_diff_vs_naive', 'effect_mean_ae_diff_vs_seasonal', 'effect_mean_ae_diff_vs_linear'], 'Mean MAE Difference', '.2e', hline=0.0)
-            _baseline_panel(axes_eff[5], ['effect_cohen_d_ae_diff_vs_naive', 'effect_cohen_d_ae_diff_vs_seasonal', 'effect_cohen_d_ae_diff_vs_linear'], "Cohen's d for MAE Difference", '.2f', hline=0.0)
-            _baseline_panel(axes_eff[6], ['bootstrap_rmse_diff_mean_vs_naive', 'bootstrap_rmse_diff_mean_vs_seasonal', 'bootstrap_rmse_diff_mean_vs_linear'], 'Bootstrap RMSE Difference Mean', '.2e', hline=0.0)
-            _baseline_panel(axes_eff[7], ['bootstrap_rmse_diff_ci05_vs_naive', 'bootstrap_rmse_diff_ci05_vs_seasonal', 'bootstrap_rmse_diff_ci05_vs_linear'], 'Bootstrap RMSE Difference\n5th Percentile', '.2e', hline=0.0)
-            _baseline_panel(axes_eff[8], ['bootstrap_rmse_diff_ci95_vs_naive', 'bootstrap_rmse_diff_ci95_vs_seasonal', 'bootstrap_rmse_diff_ci95_vs_linear'], 'Bootstrap RMSE Difference\n95th Percentile', '.2e', hline=0.0)
-            _baseline_panel(axes_eff[9], ['bootstrap_r2_diff_mean_vs_naive', 'bootstrap_r2_diff_mean_vs_seasonal', 'bootstrap_r2_diff_mean_vs_linear'], 'Bootstrap Coefficient of Determination Difference Mean', '.2f', hline=0.0)
+            _baseline_panel(axes_eff[0], ['skill_vs_best_baseline'], 'Skill (RMSE-Based)', '.2f', hline=0.0)
+            _baseline_panel(axes_eff[1], ['bootstrap_skill_mean_vs_best_baseline'], 'Bootstrap Skill Mean', '.2f', hline=0.0)
+            _baseline_panel(axes_eff[2], ['lcb95_skill_vs_best_baseline'], '95% Lower Confidence Bound of Skill', '.2f', hline=0.0)
+            _baseline_panel(axes_eff[3], ['effect_median_ae_diff_vs_best_baseline'], 'Median MAE Difference', '.2e', hline=0.0)
+            _baseline_panel(axes_eff[4], ['effect_mean_ae_diff_vs_best_baseline'], 'Mean MAE Difference', '.2e', hline=0.0)
+            _baseline_panel(axes_eff[5], ['effect_cohen_d_ae_diff_vs_best_baseline'], "Cohen's d for MAE Difference", '.2f', hline=0.0)
+            _baseline_panel(axes_eff[6], ['bootstrap_rmse_diff_mean_vs_best_baseline'], 'Bootstrap RMSE Difference Mean', '.2e', hline=0.0)
+            _baseline_panel(axes_eff[7], ['bootstrap_rmse_diff_ci05_vs_best_baseline'], 'Bootstrap RMSE Difference\n5th Percentile', '.2e', hline=0.0)
+            _baseline_panel(axes_eff[8], ['bootstrap_rmse_diff_ci95_vs_best_baseline'], 'Bootstrap RMSE Difference\n95th Percentile', '.2e', hline=0.0)
+            _baseline_panel(axes_eff[9], ['bootstrap_r2_diff_mean_vs_best_baseline'], 'Bootstrap Coefficient of Determination Difference Mean', '.2f', hline=0.0)
             axes_eff[0].set_title("Evidence Effects (skill, effect sizes, then bootstrap deltas)")
             axes_eff[-1].set_xticks(x)
             axes_eff[-1].set_xticklabels(labels, rotation=45, ha='right')
@@ -3816,16 +4142,16 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             fig_eff.savefig(eff_path, dpi=300, bbox_inches='tight')
 
             eff_specs = [
-                (['skill_vs_naive', 'skill_vs_seasonal', 'skill_vs_linear'], 'Skill (RMSE-Based)', '.2f', 0.0, None),
-                (['bootstrap_skill_mean_vs_naive', 'bootstrap_skill_mean_vs_seasonal', 'bootstrap_skill_mean_vs_linear'], 'Bootstrap Skill Mean', '.2f', 0.0, None),
-                (['lcb95_skill_vs_naive', 'lcb95_skill_vs_seasonal', 'lcb95_skill_vs_linear'], '95% Lower Confidence Bound of Skill', '.2f', 0.0, None),
-                (['effect_median_ae_diff_vs_naive', 'effect_median_ae_diff_vs_seasonal', 'effect_median_ae_diff_vs_linear'], 'Median MAE Difference', '.2e', 0.0, None),
-                (['effect_mean_ae_diff_vs_naive', 'effect_mean_ae_diff_vs_seasonal', 'effect_mean_ae_diff_vs_linear'], 'Mean MAE Difference', '.2e', 0.0, None),
-                (['effect_cohen_d_ae_diff_vs_naive', 'effect_cohen_d_ae_diff_vs_seasonal', 'effect_cohen_d_ae_diff_vs_linear'], "Cohen's d for MAE Difference", '.2f', 0.0, None),
-                (['bootstrap_rmse_diff_mean_vs_naive', 'bootstrap_rmse_diff_mean_vs_seasonal', 'bootstrap_rmse_diff_mean_vs_linear'], 'Bootstrap RMSE Difference Mean', '.2e', 0.0, None),
-                (['bootstrap_rmse_diff_ci05_vs_naive', 'bootstrap_rmse_diff_ci05_vs_seasonal', 'bootstrap_rmse_diff_ci05_vs_linear'], 'Bootstrap RMSE Difference\n5th Percentile', '.2e', 0.0, None),
-                (['bootstrap_rmse_diff_ci95_vs_naive', 'bootstrap_rmse_diff_ci95_vs_seasonal', 'bootstrap_rmse_diff_ci95_vs_linear'], 'Bootstrap RMSE Difference\n95th Percentile', '.2e', 0.0, None),
-                (['bootstrap_r2_diff_mean_vs_naive', 'bootstrap_r2_diff_mean_vs_seasonal', 'bootstrap_r2_diff_mean_vs_linear'], 'Bootstrap Coefficient of Determination Difference Mean', '.2f', 0.0, None),
+                (['skill_vs_best_baseline'], 'Skill (RMSE-Based)', '.2f', 0.0, None),
+                (['bootstrap_skill_mean_vs_best_baseline'], 'Bootstrap Skill Mean', '.2f', 0.0, None),
+                (['lcb95_skill_vs_best_baseline'], '95% Lower Confidence Bound of Skill', '.2f', 0.0, None),
+                (['effect_median_ae_diff_vs_best_baseline'], 'Median MAE Difference', '.2e', 0.0, None),
+                (['effect_mean_ae_diff_vs_best_baseline'], 'Mean MAE Difference', '.2e', 0.0, None),
+                (['effect_cohen_d_ae_diff_vs_best_baseline'], "Cohen's d for MAE Difference", '.2f', 0.0, None),
+                (['bootstrap_rmse_diff_mean_vs_best_baseline'], 'Bootstrap RMSE Difference Mean', '.2e', 0.0, None),
+                (['bootstrap_rmse_diff_ci05_vs_best_baseline'], 'Bootstrap RMSE Difference\n5th Percentile', '.2e', 0.0, None),
+                (['bootstrap_rmse_diff_ci95_vs_best_baseline'], 'Bootstrap RMSE Difference\n95th Percentile', '.2e', 0.0, None),
+                (['bootstrap_r2_diff_mean_vs_best_baseline'], 'Bootstrap Coefficient of Determination Difference Mean', '.2f', 0.0, None),
             ]
             eff_builders = [
                 (lambda cols=cols, ylabel=ylabel, fmt=fmt, hline=hline, ylim=ylim: (lambda ax: _baseline_panel(ax, cols, ylabel, fmt, hline=hline, ylim=ylim)))()
@@ -3849,7 +4175,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             fig_int, axes_int = plt.subplots(9, 1, figsize=(max(12, len(perf_df) * 0.8), 28), sharex=True)
             _draw_bar_group(
                 axes_int[0], x, width,
-                [_col('model_picp'), _col('naive_picp'), _col('seasonal_picp'), _col('linear_picp')],
+                [_col('model_picp'), _col('best_baseline_picp')],
                 trio_colors,
                 trio_methods,
                 '.2f',
@@ -3861,7 +4187,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             axes_int[0].legend()
             _draw_bar_group(
                 axes_int[1], x, width,
-                [_col('model_coverage_deficit'), _col('naive_coverage_deficit'), _col('seasonal_coverage_deficit'), _col('linear_coverage_deficit')],
+                [_col('model_coverage_deficit'), _col('best_baseline_coverage_deficit')],
                 trio_colors,
                 trio_methods,
                 '.3f',
@@ -3872,7 +4198,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             axes_int[1].legend()
             _draw_bar_group(
                 axes_int[2], x, width,
-                [_col('model_nmpiw'), _col('naive_nmpiw'), _col('seasonal_nmpiw'), _col('linear_nmpiw')],
+                [_col('model_nmpiw'), _col('best_baseline_nmpiw')],
                 trio_colors,
                 trio_methods,
                 '.2f',
@@ -3882,7 +4208,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             axes_int[2].legend()
             _draw_bar_group(
                 axes_int[3], x, width,
-                [_col('model_interval_score'), _col('naive_interval_score'), _col('seasonal_interval_score'), _col('linear_interval_score')],
+                [_col('model_interval_score'), _col('best_baseline_interval_score')],
                 trio_colors,
                 trio_methods,
                 '.2e',
@@ -3890,9 +4216,9 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             axes_int[3].set_ylabel('Interval Score')
             axes_int[3].grid(axis='y', alpha=0.3)
             axes_int[3].legend()
-            _baseline_panel(axes_int[4], ['picp_delta_vs_naive', 'picp_delta_vs_seasonal', 'picp_delta_vs_linear'], 'Prediction Interval Coverage Probability Difference\n(Model minus Baseline)', '.2f', hline=0.0)
-            _baseline_panel(axes_int[5], ['nmpiw_delta_vs_naive', 'nmpiw_delta_vs_seasonal', 'nmpiw_delta_vs_linear'], 'Normalized Mean Prediction Interval Width Difference\n(Model minus Baseline)', '.2f', hline=0.0)
-            _baseline_panel(axes_int[6], ['interval_score_delta_vs_naive', 'interval_score_delta_vs_seasonal', 'interval_score_delta_vs_linear'], 'Interval Score Delta', '.2e', hline=0.0)
+            _baseline_panel(axes_int[4], ['picp_delta_vs_best_baseline'], 'Prediction Interval Coverage Probability Difference\n(Model minus Best Baseline)', '.2f', hline=0.0)
+            _baseline_panel(axes_int[5], ['nmpiw_delta_vs_best_baseline'], 'Normalized Mean Prediction Interval Width Difference\n(Model minus Best Baseline)', '.2f', hline=0.0)
+            _baseline_panel(axes_int[6], ['interval_score_delta_vs_best_baseline'], 'Interval Score Delta', '.2e', hline=0.0)
             b_raw = axes_int[7].bar(x, _col('n_eval_raw_segments'), width=0.5, color='tab:orange')
             _annotate_bars_within_ylim(axes_int[7], b_raw, '.0f')
             axes_int[7].set_ylabel('Evaluated Independent Raw Segments (Count)')
@@ -3912,7 +4238,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             def _int_panel_picp(ax):
                 _draw_bar_group(
                     ax, x, width,
-                    [_col('model_picp'), _col('naive_picp'), _col('seasonal_picp'), _col('linear_picp')],
+                    [_col('model_picp'), _col('best_baseline_picp')],
                     trio_colors,
                     trio_methods,
                     '.2f',
@@ -3926,7 +4252,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             def _int_panel_deficit(ax):
                 _draw_bar_group(
                     ax, x, width,
-                    [_col('model_coverage_deficit'), _col('naive_coverage_deficit'), _col('seasonal_coverage_deficit'), _col('linear_coverage_deficit')],
+                    [_col('model_coverage_deficit'), _col('best_baseline_coverage_deficit')],
                     trio_colors,
                     trio_methods,
                     '.3f',
@@ -3939,7 +4265,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             def _int_panel_nmpiw(ax):
                 _draw_bar_group(
                     ax, x, width,
-                    [_col('model_nmpiw'), _col('naive_nmpiw'), _col('seasonal_nmpiw'), _col('linear_nmpiw')],
+                    [_col('model_nmpiw'), _col('best_baseline_nmpiw')],
                     trio_colors,
                     trio_methods,
                     '.2f',
@@ -3951,7 +4277,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             def _int_panel_score(ax):
                 _draw_bar_group(
                     ax, x, width,
-                    [_col('model_interval_score'), _col('naive_interval_score'), _col('seasonal_interval_score'), _col('linear_interval_score')],
+                    [_col('model_interval_score'), _col('best_baseline_interval_score')],
                     trio_colors,
                     trio_methods,
                     '.2e',
@@ -3961,13 +4287,13 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 ax.legend()
 
             def _int_panel_picp_delta(ax):
-                _baseline_panel(ax, ['picp_delta_vs_naive', 'picp_delta_vs_seasonal', 'picp_delta_vs_linear'], 'Prediction Interval Coverage Probability Difference\n(Model minus Baseline)', '.2f', hline=0.0)
+                _baseline_panel(ax, ['picp_delta_vs_best_baseline'], 'Prediction Interval Coverage Probability Difference\n(Model minus Best Baseline)', '.2f', hline=0.0)
 
             def _int_panel_nmpiw_delta(ax):
-                _baseline_panel(ax, ['nmpiw_delta_vs_naive', 'nmpiw_delta_vs_seasonal', 'nmpiw_delta_vs_linear'], 'Normalized Mean Prediction Interval Width Difference\n(Model minus Baseline)', '.2f', hline=0.0)
+                _baseline_panel(ax, ['nmpiw_delta_vs_best_baseline'], 'Normalized Mean Prediction Interval Width Difference\n(Model minus Best Baseline)', '.2f', hline=0.0)
 
             def _int_panel_interval_delta(ax):
-                _baseline_panel(ax, ['interval_score_delta_vs_naive', 'interval_score_delta_vs_seasonal', 'interval_score_delta_vs_linear'], 'Interval Score Delta', '.2e', hline=0.0)
+                _baseline_panel(ax, ['interval_score_delta_vs_best_baseline'], 'Interval Score Delta', '.2e', hline=0.0)
 
             def _int_panel_raw_segments(ax):
                 bars = ax.bar(x, _col('n_eval_raw_segments'), width=0.5, color='tab:orange')
@@ -4009,16 +4335,16 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             # Gate-by-gate outcomes used in evidence scoring
             fig_gate, axes_gate = plt.subplots(10, 1, figsize=(max(12, len(perf_df) * 0.8), 30), sharex=True)
             gate_specs = [
-                (['gate_min_raw_vs_naive', 'gate_min_raw_vs_seasonal', 'gate_min_raw_vs_linear'], 'Gate: Minimum Independent Raw Sample Count'),
-                (['gate_prob_vs_naive', 'gate_prob_vs_seasonal', 'gate_prob_vs_linear'], 'Gate: Bootstrap Probability of Positive Skill'),
-                (['gate_lcb_vs_naive', 'gate_lcb_vs_seasonal', 'gate_lcb_vs_linear'], 'Gate: 95% Lower Confidence Bound of Skill > 0'),
-                (['gate_dm_vs_naive', 'gate_dm_vs_seasonal', 'gate_dm_vs_linear'], 'Gate: Diebold-Mariano p-value < alpha and statistic < 0'),
-                (['gate_wilcoxon_vs_naive', 'gate_wilcoxon_vs_seasonal', 'gate_wilcoxon_vs_linear'], 'Gate: Wilcoxon p-value < alpha'),
-                (['gate_sign_vs_naive', 'gate_sign_vs_seasonal', 'gate_sign_vs_linear'], 'Gate: Sign Test p-value < alpha and win rate > 0.5'),
-                (['gate_coverage_vs_naive', 'gate_coverage_vs_seasonal', 'gate_coverage_vs_linear'], 'Gate: Coverage Quality'),
-                (['gate_dm_q_vs_naive', 'gate_dm_q_vs_seasonal', 'gate_dm_q_vs_linear'], 'Gate: Diebold-Mariano q-value < alpha and statistic < 0'),
-                (['gate_wilcoxon_q_vs_naive', 'gate_wilcoxon_q_vs_seasonal', 'gate_wilcoxon_q_vs_linear'], 'Gate: Wilcoxon q-value < alpha'),
-                (['gate_sign_q_vs_naive', 'gate_sign_q_vs_seasonal', 'gate_sign_q_vs_linear'], 'Gate: Sign Test q-value < alpha and win rate > 0.5'),
+                (['gate_min_raw_vs_best_baseline'], 'Gate: Minimum Independent Raw Sample Count'),
+                (['gate_prob_vs_best_baseline'], 'Gate: Bootstrap Probability of Positive Skill'),
+                (['gate_lcb_vs_best_baseline'], 'Gate: 95% Lower Confidence Bound of Skill > 0'),
+                (['gate_dm_vs_best_baseline'], 'Gate: Diebold-Mariano p-value < alpha and statistic < 0'),
+                (['gate_wilcoxon_vs_best_baseline'], 'Gate: Wilcoxon p-value < alpha'),
+                (['gate_sign_vs_best_baseline'], 'Gate: Sign Test p-value < alpha and win rate > 0.5'),
+                (['gate_coverage_vs_best_baseline'], 'Gate: Coverage Quality'),
+                (['gate_dm_q_vs_best_baseline'], 'Gate: Diebold-Mariano q-value < alpha and statistic < 0'),
+                (['gate_wilcoxon_q_vs_best_baseline'], 'Gate: Wilcoxon q-value < alpha'),
+                (['gate_sign_q_vs_best_baseline'], 'Gate: Sign Test q-value < alpha and win rate > 0.5'),
             ]
             for ax_g, (g_cols, ylab) in zip(axes_gate, gate_specs):
                 _baseline_panel(ax_g, g_cols, ylab, '.0f', ylim=(0.0, 1.05))
@@ -4131,14 +4457,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             n_rows_mat = len(matrix_perf_df)
 
             q_cols = [
-                "dm_q_vs_naive", "dm_q_vs_seasonal", "dm_q_vs_linear",
-                "wilcoxon_q_vs_naive", "wilcoxon_q_vs_seasonal", "wilcoxon_q_vs_linear",
-                "sign_q_vs_naive", "sign_q_vs_seasonal", "sign_q_vs_linear",
+                "dm_q_vs_best_baseline",
+                "wilcoxon_q_vs_best_baseline",
+                "sign_q_vs_best_baseline",
             ]
             p_cols = [
-                "dm_p_vs_naive", "dm_p_vs_seasonal", "dm_p_vs_linear",
-                "wilcoxon_p_vs_naive", "wilcoxon_p_vs_seasonal", "wilcoxon_p_vs_linear",
-                "sign_p_vs_naive", "sign_p_vs_seasonal", "sign_p_vs_linear",
+                "dm_p_vs_best_baseline",
+                "wilcoxon_p_vs_best_baseline",
+                "sign_p_vs_best_baseline",
             ]
             present_q_cols = [c for c in q_cols if c in matrix_perf_df.columns]
             present_p_cols = [c for c in p_cols if c in matrix_perf_df.columns]
@@ -4181,20 +4507,12 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             quality_df = pd.DataFrame({
                 "Test Sample Count": _col_values("n_eval_raw_segments"),
-                "R²": _col_values("r2"),
-                "nRMSE": _col_values("nrmse"),
-                "Skill vs. Best Baseline": pd.concat([
-                    pd.Series(_col_values("skill_vs_naive")),
-                    pd.Series(_col_values("skill_vs_seasonal")),
-                    pd.Series(_col_values("skill_vs_linear")),
-                ], axis=1).min(axis=1, skipna=True).to_numpy(dtype=float),
+                "R²": _col_values("best_model_r2"),
+                "nRMSE": _col_values("best_model_nrmse"),
+                "Skill vs. Best Baseline": _col_values("skill_vs_best_baseline"),
                 "Coverage Gap (PICP − Nominal)": _col_values("model_coverage_gap"),
                 "Normalized Mean Prediction Interval Width": _col_values("model_nmpiw"),
-                "Minimum 95% Lower Confidence Bound of Skill": pd.concat([
-                    pd.Series(_col_values("lcb95_skill_vs_naive")),
-                    pd.Series(_col_values("lcb95_skill_vs_seasonal")),
-                    pd.Series(_col_values("lcb95_skill_vs_linear")),
-                ], axis=1).min(axis=1, skipna=True).to_numpy(dtype=float),
+                "Minimum 95% Lower Confidence Bound of Skill": _col_values("lcb95_skill_vs_best_baseline"),
                 "Best False Discovery Rate Adjusted q-value": q_min,
                 "Best p-value": p_min,
                 "Evidence Score": tier_vals,
@@ -4221,6 +4539,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             non_gate_cols = [
                 "Test Sample Count",
                 "Best Model",
+                "Best Baseline",
                 "R²",
                 "nRMSE",
                 "Skill vs. Best Baseline",
@@ -4235,33 +4554,13 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             if np.isfinite(quality_df["Best p-value"].to_numpy(dtype=float)).any():
                 gate_cols.insert(2, "Best p-value")
 
-            # Visual separator between descriptive metrics and gate-evaluated metrics.
-            # Insert 'Best Model' column after 'Test Sample Count'
-            if 'model' in matrix_perf_df.columns:
-                # Normalize model type for display (XGB, Transformer, GP)
-                def _display_model_type(val):
-                    key = str(val).strip().lower()
-                    if 'xgb' in key:
-                        return 'XGB'
-                    elif 'transformer' in key:
-                        return 'Trans.'
-                    elif 'gp' in key:
-                        return 'GP'
-                    elif key == 'mlr':
-                        return 'MLR'
-                    elif key == 'mlr_avg12':
-                        return 'MLR-12'
-                    elif key == 'mlr_avgall':
-                        return 'MLR-All'
-                    else:
-                        return key.title()
-                quality_df['Best Model'] = matrix_perf_df['model'].map(_display_model_type).values
-            else:
-                quality_df['Best Model'] = 'Unknown'
-            # Place as second column (after Test Sample Count)
+            quality_df['Best Model'] = matrix_perf_df.get('best_model_label', matrix_perf_df.get('model', pd.Series(["Unknown"] * len(matrix_perf_df)))).map(_display_model_type).values
+            quality_df['Best Baseline'] = matrix_perf_df.get('best_baseline_label', pd.Series(["Unknown"] * len(matrix_perf_df))).astype(str).values
             col_order = list(quality_df.columns)
             if 'Best Model' in col_order:
                 col_order.insert(1, col_order.pop(col_order.index('Best Model')))
+            if 'Best Baseline' in col_order:
+                col_order.insert(2, col_order.pop(col_order.index('Best Baseline')))
             quality_df = quality_df[col_order]
             quality_df[""] = np.nan
             heat_cols = col_order[:len(non_gate_cols)+2] + [""] + col_order[len(non_gate_cols)+2:]
@@ -4277,7 +4576,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             zero_centered_cols = {"Coverage Gap (PICP − Nominal)"}
             norm = display_df.copy()
             for c in norm.columns:
-                if c == 'Best Model':
+                if c in {'Best Model', 'Best Baseline'}:
                     # Categorical column: fill with 0.5 (no heatmap)
                     norm[c] = 0.5
                 elif c in zero_centered_cols:
@@ -4309,7 +4608,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             annot = display_df.copy()
             for c in annot.columns:
-                if c == 'Best Model':
+                if c in {'Best Model', 'Best Baseline'}:
                     annot[c] = ""  # drawn manually after rectangles
                 elif c in {"Evidence Score", "Test Sample Count"}:
                     annot[c] = annot[c].map(lambda v: "" if not np.isfinite(v) else f"{int(round(v))}")
@@ -4324,18 +4623,19 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             model_color_map = {
                 'XGB': 'tab:blue', 'Trans.': 'tab:purple', 'GP': 'tab:olive',
                 'MLR': 'tab:red', 'MLR-12': 'tab:pink', 'MLR-All': 'brown',
+                'Naive': 'tab:gray', 'Seasonal': 'tab:green', 'Linear': 'tab:orange',
             }
             # Build color matrix
             color_matrix = np.full(norm.shape, np.nan, dtype=object)
             for i, col in enumerate(norm.columns):
-                if col == 'Best Model':
-                    for j, val in enumerate(display_df['Best Model']):
+                if col in {'Best Model', 'Best Baseline'}:
+                    for j, val in enumerate(display_df[col]):
                         color_matrix[j, i] = model_color_map.get(val, 'tab:gray')
                 else:
                     color_matrix[:, i] = None
             def _cell_color_func(val, row, col):
-                if norm.columns[col] == 'Best Model':
-                    return model_color_map.get(display_df['Best Model'].iloc[row], 'tab:gray')
+                if norm.columns[col] in {'Best Model', 'Best Baseline'}:
+                    return model_color_map.get(display_df[norm.columns[col]].iloc[row], 'tab:gray')
                 return None
             # Draw heatmap
             sns.heatmap(
@@ -4351,10 +4651,10 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 fmt="",
                 annot_kws={"fontsize": 8, "rotation": 0},
             )
-            # Overlay colored rectangles for 'Best Model' column, then draw labels on top
+            # Overlay colored rectangles for categorical model columns, then draw labels on top
             for i, col in enumerate(norm.columns):
-                if col == 'Best Model':
-                    for j, val in enumerate(display_df['Best Model']):
+                if col in {'Best Model', 'Best Baseline'}:
+                    for j, val in enumerate(display_df[col]):
                         rect = plt.Rectangle((i, j), 1, 1, facecolor=model_color_map.get(val, 'tab:gray'), edgecolor='white', linewidth=0.5, zorder=4)
                         ax_mat.add_patch(rect)
                         ax_mat.text(i + 0.5, j + 0.5, str(val), ha='center', va='center', fontsize=8, zorder=5)
@@ -4389,43 +4689,16 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             plt.close(fig_mat)
             print(f"[INFO] Wrote model quality matrix: {matrix_path}")
 
-            # --- Best ML vs best baseline R² clustered chart (evaluation/) ---
+            # --- Best model vs best baseline R² clustered chart (evaluation/) ---
             eval_r2_rows: list[dict[str, object]] = []
-            for plan in plans:
-                final_metrics_csv = _forecast_sweeps_dir(plan.dataset_dir) / "feature_sweep_final_metrics.csv"
-                if not final_metrics_csv.exists():
-                    continue
-                try:
-                    df_eval_candidates = pd.read_csv(final_metrics_csv)
-                except Exception:
-                    continue
-                if df_eval_candidates.empty:
-                    continue
-
-                target_name = _derive_target_name(plan.dataset_dir.name, args.dataset_prefix)
-                if "target" in df_eval_candidates.columns:
-                    df_target = df_eval_candidates[df_eval_candidates["target"].astype(str) == target_name].copy()
-                    if df_target.empty:
-                        df_target = df_eval_candidates.copy()
-                else:
-                    df_target = df_eval_candidates.copy()
-
-                best_ml_row = _select_best_ml_row_for_eval_figure(df_target, args)
-                best_baseline_row = _select_best_baseline_row_for_eval_figure(df_target, args)
-                if best_ml_row is None or best_baseline_row is None:
-                    print(
-                        f"[WARN] Skipping ML-vs-baseline R² figure row for {plan.dataset_dir.name}: "
-                        f"missing {'ML' if best_ml_row is None else 'baseline'} candidate."
-                    )
-                    continue
-
+            for _, row in perf_df.iterrows():
                 eval_r2_rows.append({
-                    "dataset": plan.dataset_dir.name,
-                    "target_label": clean_target_label(plan.dataset_dir.name, args.dataset_prefix),
-                    "ml_r2": _safe_float(best_ml_row.get("r2", float("nan"))),
-                    "ml_model_label": _display_model_type(best_ml_row.get("model", "")),
-                    "baseline_r2": _safe_float(best_baseline_row.get("r2", float("nan"))),
-                    "baseline_model_label": _display_model_type(best_baseline_row.get("model", "")),
+                    "dataset": row.get("dataset", ""),
+                    "target_label": clean_target_label(str(row.get("dataset", "")), args.dataset_prefix),
+                    "ml_r2": _safe_float(row.get("best_model_r2", row.get("r2", float("nan")))),
+                    "ml_model_label": str(row.get("best_model_label", _display_model_type(row.get("model", "")))),
+                    "baseline_r2": _safe_float(row.get("best_baseline_r2", float("nan"))),
+                    "baseline_model_label": str(row.get("best_baseline_label", "Baseline")),
                 })
 
             if eval_r2_rows:
@@ -4446,14 +4719,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     ml_vals,
                     width=cluster_w,
                     color="tab:blue",
-                    label="ML",
+                    label="Best Model",
                 )
                 bars_bl = ax_eval.bar(
                     x_eval + cluster_w / 2,
                     baseline_vals,
                     width=cluster_w,
                     color="tab:orange",
-                    label="Baseline",
+                    label="Best Baseline",
                 )
                 ax_eval.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
                 ax_eval.set_ylabel("Coefficient of Determination ($R^2$)")
@@ -4462,7 +4735,25 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 if finite_eval_vals.size and float(np.nanmin(finite_eval_vals)) >= 0.0:
                     ax_eval.set_ylim(0.0, 1.0)
                 else:
-                    ax_eval.set_ylim(-1.0, 1.0)
+                    min_eval_val = float(np.nanmin(finite_eval_vals)) if finite_eval_vals.size else -1.0
+                    if min_eval_val <= -0.9:
+                        y_min = -1.0
+                    else:
+                        y_min = round((1.1 * min_eval_val) / 0.05) * 0.05
+                    ax_eval.set_ylim(y_min, 1.0)
+                # Safety check: never let the chosen display limits clip selected bars.
+                if finite_eval_vals.size:
+                    cur_ymin, cur_ymax = ax_eval.get_ylim()
+                    true_min = float(np.nanmin(finite_eval_vals))
+                    if true_min < cur_ymin:
+                        yspan = float(cur_ymax - cur_ymin) if np.isfinite(cur_ymax - cur_ymin) and (cur_ymax - cur_ymin) > 0 else 1.0
+                        pad = max(0.02, 0.04 * yspan)
+                        new_ymin = true_min - pad
+                        if true_min <= -0.9:
+                            new_ymin = min(-1.0, new_ymin)
+                        else:
+                            new_ymin = round(new_ymin / 0.05) * 0.05
+                        ax_eval.set_ylim(new_ymin, cur_ymax)
                 ax_eval.set_xticks(x_eval)
                 ax_eval.set_xticklabels(labels_eval, rotation=45, ha="right")
                 if len(x_eval) > 0:
@@ -4479,12 +4770,18 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 _annotate_bars_with_model_labels(ax_eval, bars_bl, baseline_vals, baseline_model_labels, fmt=".2f", fontsize=9)
                 fig_eval.tight_layout(rect=[0, 0, 1, 0.93])
                 _expand_ylims_to_fit_annotations(ax_eval)
-                eval_r2_path = evaluation_dir / "summary_best_ml_vs_best_baseline_r2.png"
+                eval_r2_path = evaluation_dir / "summary_best_model_vs_best_baseline_r2.png"
                 fig_eval.savefig(eval_r2_path, dpi=300, bbox_inches="tight")
                 plt.close(fig_eval)
-                print(f"[INFO] Wrote best-ML-vs-best-baseline R² figure: {eval_r2_path}")
+                legacy_eval_r2_path = evaluation_dir / "summary_best_ml_vs_best_baseline_r2.png"
+                if legacy_eval_r2_path.exists():
+                    try:
+                        legacy_eval_r2_path.unlink()
+                    except Exception as exc:
+                        print(f"[WARN] Could not remove legacy ML-vs-baseline figure {legacy_eval_r2_path}: {exc}")
+                print(f"[INFO] Wrote best-model-vs-best-baseline R² figure: {eval_r2_path}")
             else:
-                print("[INFO] Skipped best-ML-vs-best-baseline R² figure: no datasets had both ML and baseline candidates.")
+                print("[INFO] Skipped best-model-vs-best-baseline R² figure: no datasets had both model and baseline candidates.")
 
             # --- Cross-validation figure (sorted by descending R2, same order as perf_df) ---
             cv_cols = [
