@@ -431,13 +431,13 @@ def _filter_valid_rows(df: "pd.DataFrame") -> "pd.DataFrame":
 
 
 def _filter_min_valid_independent(df: "pd.DataFrame", min_required: int = MIN_REQUIRED_VALID_INDEPENDENT) -> "pd.DataFrame":
-    """Keep rows with explicit valid independent test count meeting threshold."""
+    """Keep rows with explicit independent test count meeting threshold."""
     out = df.copy()
     count_col = None
-    if "n_test_valid" in out.columns:
-        count_col = "n_test_valid"
-    elif "n_test_independent" in out.columns:
+    if "n_test_independent" in out.columns:
         count_col = "n_test_independent"
+    elif "n_test_valid" in out.columns:
+        count_col = "n_test_valid"
     if count_col is None:
         return out
     vals = pd.to_numeric(out[count_col], errors="coerce")
@@ -464,11 +464,11 @@ def select_best_row(df: "pd.DataFrame") -> "pd.Series | None":
 
 
 def _best_model_sample_floor(best_model_row: "pd.Series") -> float:
-    """Return n_test_valid of best_model_row as float, or NaN if absent/non-finite."""
+    """Return n_test_independent of best_model_row as float, or NaN if absent/non-finite."""
     if best_model_row is None:
         return float("nan")
     return pd.to_numeric(
-        pd.Series([best_model_row.get("n_test_valid")]),
+        pd.Series([best_model_row.get("n_test_independent")]),
         errors="coerce",
     ).iloc[0]
 
@@ -490,17 +490,17 @@ def _apply_min_eval_samples_floor(
     min_eval_samples: int,
     context_label: str,
 ) -> "pd.DataFrame":
-    """Restrict best-model candidates to n_test_valid >= min_eval_samples.
+    """Restrict best-model candidates to n_test_independent >= min_eval_samples.
 
-    When no row meets the threshold, fall back to rows whose n_test_valid
+    When no row meets the threshold, fall back to rows whose n_test_independent
     equals the maximum available for this candidate pool and emit a
     single [INFO] log line identifying the target.
     """
     if min_eval_samples <= 0 or candidates is None or candidates.empty:
         return candidates
-    if "n_test_valid" not in candidates.columns:
+    if "n_test_independent" not in candidates.columns:
         return candidates
-    vals = pd.to_numeric(candidates["n_test_valid"], errors="coerce")
+    vals = pd.to_numeric(candidates["n_test_independent"], errors="coerce")
     finite_mask = np.isfinite(vals)
     meets = candidates[finite_mask & (vals >= float(min_eval_samples))].copy()
     if not meets.empty:
@@ -508,11 +508,11 @@ def _apply_min_eval_samples_floor(
     finite_rows = candidates[finite_mask].copy()
     if finite_rows.empty:
         return finite_rows
-    finite_vals = pd.to_numeric(finite_rows["n_test_valid"], errors="coerce")
+    finite_vals = pd.to_numeric(finite_rows["n_test_independent"], errors="coerce")
     max_n = float(finite_vals.max())
     print(
         f"[INFO] {context_label}: no model meets --min-eval-samples {min_eval_samples}; "
-        f"falling back to max n_test_valid={max_n:.0f}."
+        f"falling back to max n_test_independent={max_n:.0f}."
     )
     return finite_rows[finite_vals == max_n].copy()
 
@@ -525,7 +525,7 @@ def _select_best_mlfamily_row_for_r2_figure(
 ) -> "pd.Series | None":
     """Figure-only: best row among XGB/Transformer/GP for a target.
 
-    Applies valid_selection_rows, then restricts n_test_valid to
+    Applies valid_selection_rows, then restricts n_test_independent to
     max(headline_best_model_n, min_eval_samples). Returns None if no
     candidate survives (figure should show NaN for that target).
     """
@@ -548,8 +548,8 @@ def _select_best_mlfamily_row_for_r2_figure(
         return None
     floor_vals = [v for v in (headline_best_model_n, float(min_eval_samples)) if np.isfinite(v) and v > 0]
     floor = max(floor_vals) if floor_vals else 0.0
-    if floor > 0 and "n_test_valid" in ml_rows.columns:
-        n_vals = pd.to_numeric(ml_rows["n_test_valid"], errors="coerce")
+    if floor > 0 and "n_test_independent" in ml_rows.columns:
+        n_vals = pd.to_numeric(ml_rows["n_test_independent"], errors="coerce")
         ml_rows = ml_rows[np.isfinite(n_vals) & (n_vals >= float(floor))].copy()
     if ml_rows.empty:
         return None
@@ -560,9 +560,9 @@ def _filter_baselines_by_sample_floor(
     baseline_rows: "pd.DataFrame",
     best_model_row: "pd.Series",
 ) -> "pd.DataFrame | None":
-    """Return baselines whose n_test_valid >= best_model_row.n_test_valid.
+    """Return baselines whose n_test_independent >= best_model_row.n_test_independent.
 
-    Returns None when the best-model row lacks a finite n_test_valid so
+    Returns None when the best-model row lacks a finite n_test_independent so
     callers can distinguish 'cannot enforce floor' from 'no row clears it'.
     """
     floor = _best_model_sample_floor(best_model_row)
@@ -570,7 +570,7 @@ def _filter_baselines_by_sample_floor(
         return None
     if baseline_rows is None or baseline_rows.empty:
         return baseline_rows.copy() if baseline_rows is not None else baseline_rows
-    vals = pd.to_numeric(baseline_rows.get("n_test_valid"), errors="coerce")
+    vals = pd.to_numeric(baseline_rows.get("n_test_independent"), errors="coerce")
     return baseline_rows[np.isfinite(vals) & (vals >= float(floor))].copy()
 
 
@@ -631,7 +631,7 @@ def build_selection_record(plan: DatasetPlan, df: "pd.DataFrame", args: argparse
         fair_baseline_rows = _filter_baselines_by_sample_floor(baseline_rows, best_model_row)
         if fair_baseline_rows is None:
             print(
-                f"[WARN] best-model row for {plan.dataset_dir.name} lacks finite n_test_valid; "
+                f"[WARN] best-model row for {plan.dataset_dir.name} lacks finite n_test_independent; "
                 "skipping headline selection (cannot enforce baseline sample-count fairness)."
             )
             return None
@@ -639,7 +639,7 @@ def build_selection_record(plan: DatasetPlan, df: "pd.DataFrame", args: argparse
         if best_baseline_row is None:
             floor = _best_model_sample_floor(best_model_row)
             print(
-                f"[WARN] No baseline in {plan.dataset_dir.name} has n_test_valid >= {floor:.0f} "
+                f"[WARN] No baseline in {plan.dataset_dir.name} has n_test_independent >= {floor:.0f} "
                 f"(best-model {best_model_id!r}); skipping headline selection."
             )
             return None
@@ -672,13 +672,13 @@ def build_selection_record(plan: DatasetPlan, df: "pd.DataFrame", args: argparse
 
 
 def _axis_uses_scientific_bar_annotations(ax) -> bool:
-    """Return True when any finite nonzero bar height on *ax* is below 0.01 in magnitude."""
+    """Return True when any finite nonzero bar height on *ax* is below 0.005 in magnitude."""
     heights = [
         rect.get_height()
         for rect in ax.patches
         if np.isfinite(rect.get_height()) and rect.get_height() != 0
     ]
-    return any(abs(h) < 0.01 for h in heights)
+    return any(abs(h) < 0.005 for h in heights)
 
 
 def _format_bar_annotation_value(value: float, fmt: str, scientific: bool) -> str:
@@ -691,7 +691,7 @@ def _format_bar_annotation_value(value: float, fmt: str, scientific: bool) -> st
 
 
 def _annotate_bars_within_ylim(ax, bars, fmt: str, fontsize: int = 8) -> None:
-    """Annotate bars only when the bar-top y value falls within current y-axis limits."""
+    """Annotate bar heights; labels anchor at max(h, 0) so negatives rise from y=0."""
     ymin, ymax = ax.get_ylim()
     yspan = float(ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
     pad = 0.01 * yspan
@@ -700,12 +700,11 @@ def _annotate_bars_within_ylim(ax, bars, fmt: str, fontsize: int = 8) -> None:
         h = bar.get_height()
         if not np.isfinite(h):
             continue
-        if h < ymin or h > ymax:
-            continue
-        y_txt = h + pad
+        anchor_y = max(float(h), 0.0)
+        y_txt = anchor_y + pad
         va = 'bottom'
         if y_txt > (ymax - pad):
-            y_txt = h - pad
+            y_txt = anchor_y - pad
             va = 'top'
         ax.text(
             bar.get_x() + bar.get_width() / 2,
@@ -715,11 +714,11 @@ def _annotate_bars_within_ylim(ax, bars, fmt: str, fontsize: int = 8) -> None:
             va=va,
             fontsize=fontsize,
             rotation=90,
-            clip_on=True,
+            clip_on=False,
         )
 
 
-def _annotate_ml_bars(ax, bars, vals, ns, fmt: str, fontsize: int = 10) -> None:
+def _annotate_ml_bars(ax, bars, vals, ns, fmt: str, fontsize: int = 8) -> None:
     """Annotate bars with combined value and sample-count label, e.g. '1.23e-02, n=8'."""
     ymin, ymax = ax.get_ylim()
     yspan = float(ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
@@ -729,14 +728,15 @@ def _annotate_ml_bars(ax, bars, vals, ns, fmt: str, fontsize: int = 10) -> None:
         if not np.isfinite(val):
             continue
         h = bar.get_height()
-        if h < ymin or h > ymax:
+        if not np.isfinite(h):
             continue
         n_str = f", n={int(n)}" if np.isfinite(n) else ""
         label = f"{_format_bar_annotation_value(val, fmt, use_scientific)}{n_str}"
-        y_txt = h + pad
+        anchor_y = max(float(h), 0.0)
+        y_txt = anchor_y + pad
         va = 'bottom'
         if y_txt > (ymax - pad):
-            y_txt = h - pad
+            y_txt = anchor_y - pad
             va = 'top'
         ax.text(
             bar.get_x() + bar.get_width() / 2,
@@ -859,6 +859,21 @@ def _expand_ylims_to_fit_annotations(axes, pad_pixels: float = 2.0) -> None:
     """Apply annotation-aware y-limit expansion to one axis or a sequence of axes."""
     for ax in np.atleast_1d(axes):
         _expand_ylim_to_fit_annotations(ax, pad_pixels=pad_pixels)
+
+
+def _r2_like_ylim(values, top: float = 1.0) -> tuple[float, float]:
+    """Return (ymin, ymax) for an r2- or skill-style axis.
+
+    If any value is negative, the lower limit is -0.1 (just enough to show the
+    negative bar); if all values are non-negative, the lower limit is 0. The
+    upper limit defaults to 1.0 (suitable for r2; pass top=None to leave the
+    upper limit for matplotlib to auto-size, which is usually wanted for skill).
+    """
+    arr = np.asarray(values, dtype=float).ravel()
+    arr = arr[np.isfinite(arr)]
+    has_negative = bool(arr.size and np.min(arr) < 0.0)
+    ymin = -0.1 if has_negative else 0.0
+    return ymin, top
 
 
 def _finalize_stacked_figure(fig, axes, left: float = 0.30, right: float = 0.98, top: float = 0.97,
@@ -995,7 +1010,8 @@ def _read_mlr_k_cluster_rows(sweep_dir: Path, df: pd.DataFrame) -> list[dict]:
         pearson_r = _sfloat("pearson_r")
         n_test_independent = _sfloat("n_test_independent")
         n_test_valid = _sfloat("n_test_valid")
-        n_samples = _sfloat("n_eval_points_finite") if "n_eval_points_finite" in srow.index else n_test_valid
+        n_samples = _sfloat("n_eval_points_finite") if "n_eval_points_finite" in srow.index else n_test_independent
+        n_test_evals = _sfloat("n_test_evals")
         n_features = _sfloat("input_dim") if "input_dim" in srow.index else float(len(input_columns))
         target_dim = _sfloat("n_eval_outputs") if "n_eval_outputs" in srow.index else float(len(output_columns))
 
@@ -1022,7 +1038,7 @@ def _read_mlr_k_cluster_rows(sweep_dir: Path, df: pd.DataFrame) -> list[dict]:
             "nrmse": nrmse,
             "n_test_independent": n_test_independent,
             "n_test_valid": n_test_valid,
-            "n_test_evals": n_test_valid,
+            "n_test_evals": n_test_evals,
             "n_samples": n_samples,
             "input_dim": float(len(input_columns)),
             "target_dim": target_dim,
@@ -1206,7 +1222,7 @@ def _append_mlr_to_final_metrics(
             "nrmse": nrmse_val,
             "n_test_independent": int(res["n_test_independent"]),
             "n_test_valid": int(res["n_test_valid"]),
-            "n_test_evals": int(res["n_test_valid"]),
+            "n_test_evals": int(res["n_test_evals"]) if pd.notnull(res.get("n_test_evals")) else float("nan"),
             "n_samples": int(res["n_samples"]),
             "input_dim": float(len(input_columns)),
             "target_dim": float(len(output_columns)),
@@ -1358,7 +1374,7 @@ def _select_best_baseline_row_for_eval_figure(
     """Return the best baseline-category row for the evaluation figure under the current flags.
 
     When *best_model_row* is provided, restrict candidates to baselines whose
-    n_test_valid is at least that of the best-model row (cross-feature-set
+    n_test_independent is at least that of the best-model row (cross-feature-set
     fairness). Returns None if the floor cannot be computed or no candidate
     clears it.
     """
@@ -1404,7 +1420,7 @@ def _annotate_bars_with_model_labels(
         if not np.isfinite(val):
             continue
         h = bar.get_height()
-        if h < ymin or h > ymax:
+        if not np.isfinite(h):
             continue
         label = f"{float(val):{fmt}}, {model_label}"
         anchor_y = max(float(h), 0.0)
@@ -1467,11 +1483,11 @@ def _plot_ml_model_comparison(
         if valid_df.empty:
             continue
 
-        # Determine n_samples column
-        if 'n_test_valid' in valid_df.columns:
-            n_col = 'n_test_valid'
-        elif 'n_test_independent' in valid_df.columns:
+        # Use independent test samples for display/comparison counts.
+        if 'n_test_independent' in valid_df.columns:
             n_col = 'n_test_independent'
+        elif 'n_test_valid' in valid_df.columns:
+            n_col = 'n_test_valid'
         else:
             n_col = None
 
@@ -1628,7 +1644,10 @@ def _plot_ml_model_comparison(
             ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
 
         if metric_key in {'r2', 'skill_vs_best'}:
-            ax.set_ylim(-1.1, 1.1)
+            all_vals = comp_df[metric_key].dropna().to_numpy(dtype=float)
+            top = 1.0 if metric_key == 'r2' else max(1.0, float(np.max(all_vals[np.isfinite(all_vals)])) if all_vals.size and np.isfinite(all_vals).any() else 1.0)
+            ymin, ymax = _r2_like_ylim(all_vals, top=top)
+            ax.set_ylim(ymin, ymax)
         else:
             # Constrain y-axis lower limit: never below -1; if all bars positive, floor at 0.
             ymin_cur, ymax_cur = ax.get_ylim()
@@ -3891,7 +3910,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             perf_df = pd.DataFrame(best_model_performance)
             perf_df = perf_df.sort_values('r2', ascending=False)
-            valid_src = pd.to_numeric(perf_df.get('n_test_valid_source', np.nan), errors='coerce')
+            valid_src = pd.to_numeric(perf_df.get('n_test_independent_source', np.nan), errors='coerce')
             evidence_ok = perf_df.get('evidence_status', '').astype(str).str.lower().eq('ok') if 'evidence_status' in perf_df.columns else pd.Series(False, index=perf_df.index)
             perf_df['compliance_status'] = np.where(
                 np.isfinite(valid_src) & (valid_src >= float(MIN_REQUIRED_VALID_INDEPENDENT)) & evidence_ok,
@@ -3903,10 +3922,10 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 '',
                 np.where(
                     ~np.isfinite(valid_src),
-                    'missing_n_test_valid_source',
+                    'missing_n_test_independent_source',
                     np.where(
                         valid_src < float(MIN_REQUIRED_VALID_INDEPENDENT),
-                        f'n_test_valid_source_below_{MIN_REQUIRED_VALID_INDEPENDENT}',
+                        f'n_test_independent_source_below_{MIN_REQUIRED_VALID_INDEPENDENT}',
                         perf_df.get('evidence_status', 'evidence_not_ok').astype(str) if 'evidence_status' in perf_df.columns else 'evidence_not_ok',
                     ),
                 ),
@@ -3991,6 +4010,12 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             ax_skill_combo.set_ylabel('Skill Score')
             ax_skill_combo.grid(axis='y', alpha=0.3)
             ax_skill_combo.legend()
+            _skill_combo_vals = np.concatenate([
+                pd.to_numeric(series, errors='coerce').to_numpy(dtype=float)
+                for series in skill_data
+            ]) if skill_data else np.array([], dtype=float)
+            _skill_combo_ymin, _ = _r2_like_ylim(_skill_combo_vals, top=None)
+            ax_skill_combo.set_ylim(bottom=_skill_combo_ymin)
             nrmse_bars_combo = _draw_bar_group(ax_nrmse_combo, x, width, nrmse_data, colors, methods, '.2e', annotate=False)
             _annotate_bars_with_model_labels(ax_nrmse_combo, nrmse_bars_combo[0], nrmse_data[0], best_model_labels, fmt=".2e", fontsize=8)
             _annotate_bars_with_model_labels(ax_nrmse_combo, nrmse_bars_combo[1], nrmse_data[1], best_baseline_labels, fmt=".2e", fontsize=8)
@@ -4001,7 +4026,11 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 ax_r2_combo, x, width, r2_data, colors, methods, '.2f', annotate=False
             )
             ax_r2_combo.set_ylabel('Coefficient of Determination')
-            ax_r2_combo.set_ylim(-0.1, 1.0)
+            _r2_combo_all_vals = np.concatenate([
+                pd.to_numeric(series, errors='coerce').to_numpy(dtype=float)
+                for series in r2_data
+            ]) if r2_data else np.array([], dtype=float)
+            ax_r2_combo.set_ylim(*_r2_like_ylim(_r2_combo_all_vals, top=1.0))
             _annotate_bars_with_model_labels(ax_r2_combo, r2_bars_combo[0], r2_data[0], best_model_labels, fmt=".2f", fontsize=8)
             _annotate_bars_with_model_labels(ax_r2_combo, r2_bars_combo[1], r2_data[1], best_baseline_labels, fmt=".2f", fontsize=8)
             ax_r2_combo.grid(axis='y', alpha=0.3)
@@ -4036,7 +4065,11 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             fig_r2, ax_r2 = plt.subplots(figsize=(max(7, len(perf_df) * 0.72 + 1.2), 5))
             r2_bars = _draw_bar_group(ax_r2, x, width, r2_data, colors, methods, '.2f', annotate=False)
             ax_r2.set_ylabel('Coefficient of Determination')
-            ax_r2.set_ylim(-0.1, 1.0)
+            _r2_all_vals = np.concatenate([
+                pd.to_numeric(series, errors='coerce').to_numpy(dtype=float)
+                for series in r2_data
+            ]) if r2_data else np.array([], dtype=float)
+            ax_r2.set_ylim(*_r2_like_ylim(_r2_all_vals, top=1.0))
             _annotate_bars_with_model_labels(ax_r2, r2_bars[0], r2_data[0], best_model_labels, fmt=".2f", fontsize=8)
             _annotate_bars_with_model_labels(ax_r2, r2_bars[1], r2_data[1], best_baseline_labels, fmt=".2f", fontsize=8)
             ax_r2.set_xticks(x)
@@ -4059,6 +4092,12 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             ax_skill.set_xticklabels(labels, rotation=45, ha='right')
             ax_skill.grid(axis='y', alpha=0.3)
             ax_skill.legend()
+            _skill_vals = np.concatenate([
+                pd.to_numeric(series, errors='coerce').to_numpy(dtype=float)
+                for series in skill_data
+            ]) if skill_data else np.array([], dtype=float)
+            _skill_ymin, _ = _r2_like_ylim(_skill_vals, top=None)
+            ax_skill.set_ylim(bottom=_skill_ymin)
             plt.tight_layout()
             _expand_ylim_to_fit_annotations(ax_skill)
             skill_path = individual_dir / "summary_best_model_skill.png"
@@ -4871,7 +4910,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 if treat_mlr_as_baseline_fig:
                     dataset_name = str(row.get("dataset", ""))
                     target_name = _derive_target_name(dataset_name, args.dataset_prefix)
-                    headline_n = _safe_float(row.get("n_test_valid_source", float("nan")))
+                    headline_n = _safe_float(row.get("n_test_independent_source", float("nan")))
                     sweep_df = _load_sweep_metrics(dataset_name)
                     ml_row = _select_best_mlfamily_row_for_r2_figure(
                         sweep_df,
@@ -4925,28 +4964,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 ax_eval.set_ylabel("Coefficient of Determination ($R^2$)")
                 finite_eval_vals = np.concatenate([ml_vals, baseline_vals])
                 finite_eval_vals = finite_eval_vals[np.isfinite(finite_eval_vals)]
-                if finite_eval_vals.size and float(np.nanmin(finite_eval_vals)) >= 0.0:
-                    ax_eval.set_ylim(0.0, 1.0)
-                else:
-                    min_eval_val = float(np.nanmin(finite_eval_vals)) if finite_eval_vals.size else -1.0
-                    if min_eval_val <= -0.9:
-                        y_min = -1.0
-                    else:
-                        y_min = round((1.1 * min_eval_val) / 0.05) * 0.05
-                    ax_eval.set_ylim(y_min, 1.0)
-                # Safety check: never let the chosen display limits clip selected bars.
-                if finite_eval_vals.size:
-                    cur_ymin, cur_ymax = ax_eval.get_ylim()
-                    true_min = float(np.nanmin(finite_eval_vals))
-                    if true_min < cur_ymin:
-                        yspan = float(cur_ymax - cur_ymin) if np.isfinite(cur_ymax - cur_ymin) and (cur_ymax - cur_ymin) > 0 else 1.0
-                        pad = max(0.02, 0.04 * yspan)
-                        new_ymin = true_min - pad
-                        if true_min <= -0.9:
-                            new_ymin = min(-1.0, new_ymin)
-                        else:
-                            new_ymin = round(new_ymin / 0.05) * 0.05
-                        ax_eval.set_ylim(new_ymin, cur_ymax)
+                ax_eval.set_ylim(*_r2_like_ylim(finite_eval_vals, top=1.0))
                 ax_eval.set_xticks(x_eval)
                 ax_eval.set_xticklabels(labels_eval, rotation=45, ha="right")
                 if len(x_eval) > 0:
@@ -5013,7 +5031,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 for ax_cv, (vals, ylabel, color, fmt) in zip(cv_axes, cv_panel_specs):
                     bars = ax_cv.bar(x, vals, width=0.5, color=color)
                     if ylabel.startswith('Cross-Validation Coefficient of Determination'):
-                        ax_cv.set_ylim(-0.1, 1.0)
+                        ax_cv.set_ylim(*_r2_like_ylim(pd.to_numeric(vals, errors='coerce').to_numpy(dtype=float), top=1.0))
                     _annotate_bars_within_ylim(ax_cv, bars, fmt)
                     if ylabel.startswith('Generalization'):
                         ax_cv.axhline(0, color='black', linewidth=0.8, linestyle='--')
@@ -5030,7 +5048,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     def _builder(ax, vals=vals, ylabel=ylabel, color=color, fmt=fmt):
                         bars = ax.bar(x, vals, width=0.5, color=color)
                         if ylabel.startswith('Cross-Validation Coefficient of Determination'):
-                            ax.set_ylim(-0.1, 1.0)
+                            ax.set_ylim(*_r2_like_ylim(pd.to_numeric(vals, errors='coerce').to_numpy(dtype=float), top=1.0))
                         _annotate_bars_within_ylim(ax, bars, fmt)
                         if ylabel.startswith('Generalization'):
                             ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
@@ -5218,9 +5236,9 @@ def main() -> int:
         type=int,
         default=None,
         help=(
-            "Minimum n_test_valid a candidate must have to be eligible as the "
+            "Minimum n_test_independent a candidate must have to be eligible as the "
             "best model for a target. If no candidate for a target meets the "
-            "threshold, fall back to rows with the maximum available n_test_valid."
+            "threshold, fall back to rows with the maximum available n_test_independent."
         ),
     )
     parser.add_argument(
