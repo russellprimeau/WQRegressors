@@ -463,6 +463,117 @@ def select_best_row(df: "pd.DataFrame") -> "pd.Series | None":
     return select_best_model_row(out)
 
 
+def _best_model_sample_floor(best_model_row: "pd.Series") -> float:
+    """Return n_test_valid of best_model_row as float, or NaN if absent/non-finite."""
+    if best_model_row is None:
+        return float("nan")
+    return pd.to_numeric(
+        pd.Series([best_model_row.get("n_test_valid")]),
+        errors="coerce",
+    ).iloc[0]
+
+
+def _resolve_min_eval_samples(args: argparse.Namespace) -> int:
+    """Return the --min-eval-samples threshold as a positive int, or 0 when disabled."""
+    raw = getattr(args, "min_eval_samples", None)
+    if raw is None:
+        return 0
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return val if val > 0 else 0
+
+
+def _apply_min_eval_samples_floor(
+    candidates: "pd.DataFrame",
+    min_eval_samples: int,
+    context_label: str,
+) -> "pd.DataFrame":
+    """Restrict best-model candidates to n_test_valid >= min_eval_samples.
+
+    When no row meets the threshold, fall back to rows whose n_test_valid
+    equals the maximum available for this candidate pool and emit a
+    single [INFO] log line identifying the target.
+    """
+    if min_eval_samples <= 0 or candidates is None or candidates.empty:
+        return candidates
+    if "n_test_valid" not in candidates.columns:
+        return candidates
+    vals = pd.to_numeric(candidates["n_test_valid"], errors="coerce")
+    finite_mask = np.isfinite(vals)
+    meets = candidates[finite_mask & (vals >= float(min_eval_samples))].copy()
+    if not meets.empty:
+        return meets
+    finite_rows = candidates[finite_mask].copy()
+    if finite_rows.empty:
+        return finite_rows
+    finite_vals = pd.to_numeric(finite_rows["n_test_valid"], errors="coerce")
+    max_n = float(finite_vals.max())
+    print(
+        f"[INFO] {context_label}: no model meets --min-eval-samples {min_eval_samples}; "
+        f"falling back to max n_test_valid={max_n:.0f}."
+    )
+    return finite_rows[finite_vals == max_n].copy()
+
+
+def _select_best_mlfamily_row_for_r2_figure(
+    sweep_metrics_df: "pd.DataFrame",
+    target_name: str,
+    headline_best_model_n: float,
+    min_eval_samples: int,
+) -> "pd.Series | None":
+    """Figure-only: best row among XGB/Transformer/GP for a target.
+
+    Applies valid_selection_rows, then restricts n_test_valid to
+    max(headline_best_model_n, min_eval_samples). Returns None if no
+    candidate survives (figure should show NaN for that target).
+    """
+    if sweep_metrics_df is None or sweep_metrics_df.empty:
+        return None
+    if "model" not in sweep_metrics_df.columns:
+        return None
+    df = sweep_metrics_df
+    if "target" in df.columns:
+        df = df[df["target"].astype(str) == target_name]
+    if df.empty:
+        return None
+    valid = valid_selection_rows(df)
+    if valid.empty:
+        return None
+    model_series = valid["model"].astype(str)
+    ml_mask = ~model_series.apply(_is_baseline_model_value) & ~model_series.apply(_is_mlr_model_value)
+    ml_rows = valid[ml_mask].copy()
+    if ml_rows.empty:
+        return None
+    floor_vals = [v for v in (headline_best_model_n, float(min_eval_samples)) if np.isfinite(v) and v > 0]
+    floor = max(floor_vals) if floor_vals else 0.0
+    if floor > 0 and "n_test_valid" in ml_rows.columns:
+        n_vals = pd.to_numeric(ml_rows["n_test_valid"], errors="coerce")
+        ml_rows = ml_rows[np.isfinite(n_vals) & (n_vals >= float(floor))].copy()
+    if ml_rows.empty:
+        return None
+    return select_best_row(ml_rows)
+
+
+def _filter_baselines_by_sample_floor(
+    baseline_rows: "pd.DataFrame",
+    best_model_row: "pd.Series",
+) -> "pd.DataFrame | None":
+    """Return baselines whose n_test_valid >= best_model_row.n_test_valid.
+
+    Returns None when the best-model row lacks a finite n_test_valid so
+    callers can distinguish 'cannot enforce floor' from 'no row clears it'.
+    """
+    floor = _best_model_sample_floor(best_model_row)
+    if not np.isfinite(floor):
+        return None
+    if baseline_rows is None or baseline_rows.empty:
+        return baseline_rows.copy() if baseline_rows is not None else baseline_rows
+    vals = pd.to_numeric(baseline_rows.get("n_test_valid"), errors="coerce")
+    return baseline_rows[np.isfinite(vals) & (vals >= float(floor))].copy()
+
+
 def _row_identity_key(row: "pd.Series | None") -> tuple[str, str, str, str]:
     if row is None:
         return ("", "", "", "")
@@ -500,7 +611,13 @@ def build_selection_record(plan: DatasetPlan, df: "pd.DataFrame", args: argparse
         print(f"[WARN] No rows match target_name={target_name!r} for {plan.dataset_dir.name}; using all rows for selection.")
 
     candidates = valid_selection_rows(target_df)
-    best_model_row = select_best_row(candidates)
+    min_eval_samples = _resolve_min_eval_samples(args)
+    model_candidates = _apply_min_eval_samples_floor(
+        candidates,
+        min_eval_samples,
+        context_label=f"{plan.dataset_dir.name}/{target_name}",
+    )
+    best_model_row = select_best_row(model_candidates)
     if best_model_row is None:
         return None
 
@@ -511,9 +628,20 @@ def build_selection_record(plan: DatasetPlan, df: "pd.DataFrame", args: argparse
         best_baseline_row = best_model_row
     else:
         baseline_rows = candidates[candidates["model"].astype(str).str.strip().str.lower().isin(baseline_ids)].copy()
-        best_baseline_row = select_best_row(baseline_rows)
+        fair_baseline_rows = _filter_baselines_by_sample_floor(baseline_rows, best_model_row)
+        if fair_baseline_rows is None:
+            print(
+                f"[WARN] best-model row for {plan.dataset_dir.name} lacks finite n_test_valid; "
+                "skipping headline selection (cannot enforce baseline sample-count fairness)."
+            )
+            return None
+        best_baseline_row = select_best_row(fair_baseline_rows)
         if best_baseline_row is None:
-            print(f"[WARN] No configured baseline candidate for {plan.dataset_dir.name}; skipping headline selection.")
+            floor = _best_model_sample_floor(best_model_row)
+            print(
+                f"[WARN] No baseline in {plan.dataset_dir.name} has n_test_valid >= {floor:.0f} "
+                f"(best-model {best_model_id!r}); skipping headline selection."
+            )
             return None
 
     best_baseline_id = _display_model_id(best_baseline_row.get("model", ""))
@@ -1208,6 +1336,13 @@ def _select_best_ml_row_for_eval_figure(df: pd.DataFrame, args: argparse.Namespa
         ml_rows = ml_rows[pd.to_numeric(ml_rows.get("r2"), errors="coerce").notna()].copy()
     if ml_rows.empty:
         return None
+    ml_rows = _apply_min_eval_samples_floor(
+        ml_rows,
+        _resolve_min_eval_samples(args),
+        context_label="eval_figure",
+    )
+    if ml_rows is None or ml_rows.empty:
+        return None
     best_row = select_best_model_row(ml_rows)
     if ml_selection == "xgb" and _normalize_ml_model_display(best_row.get("model", "")) != "XGB":
         print(f"[WARN] Expected XGB row for evaluation figure, got {best_row.get('model', '')!r}; discarding.")
@@ -1215,8 +1350,18 @@ def _select_best_ml_row_for_eval_figure(df: pd.DataFrame, args: argparse.Namespa
     return best_row
 
 
-def _select_best_baseline_row_for_eval_figure(df: pd.DataFrame, args: argparse.Namespace) -> "pd.Series | None":
-    """Return the best baseline-category row for the evaluation figure under the current flags."""
+def _select_best_baseline_row_for_eval_figure(
+    df: pd.DataFrame,
+    args: argparse.Namespace,
+    best_model_row: "pd.Series | None" = None,
+) -> "pd.Series | None":
+    """Return the best baseline-category row for the evaluation figure under the current flags.
+
+    When *best_model_row* is provided, restrict candidates to baselines whose
+    n_test_valid is at least that of the best-model row (cross-feature-set
+    fairness). Returns None if the floor cannot be computed or no candidate
+    clears it.
+    """
     if df.empty or "model" not in df.columns:
         return None
     model_series = df["model"].astype(str)
@@ -1235,6 +1380,11 @@ def _select_best_baseline_row_for_eval_figure(df: pd.DataFrame, args: argparse.N
         baseline_rows = baseline_rows[pd.to_numeric(baseline_rows.get("r2"), errors="coerce").notna()].copy()
     if baseline_rows.empty:
         return None
+    if best_model_row is not None:
+        fair_rows = _filter_baselines_by_sample_floor(baseline_rows, best_model_row)
+        if fair_rows is None or fair_rows.empty:
+            return None
+        baseline_rows = fair_rows
     return select_best_model_row(baseline_rows)
 
 
@@ -4690,13 +4840,56 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             print(f"[INFO] Wrote model quality matrix: {matrix_path}")
 
             # --- Best model vs best baseline R² clustered chart (evaluation/) ---
+            treat_mlr_as_baseline_fig = bool(getattr(args, "treat_mlr_as_baseline", False))
+            min_eval_samples_fig = _resolve_min_eval_samples(args)
+            dataset_dir_by_name = {p.dataset_dir.name: p.dataset_dir for p in plans}
+            _sweep_metrics_cache: dict[str, "pd.DataFrame"] = {}
+
+            def _load_sweep_metrics(dataset_name: str) -> "pd.DataFrame | None":
+                if dataset_name in _sweep_metrics_cache:
+                    return _sweep_metrics_cache[dataset_name]
+                dataset_dir = dataset_dir_by_name.get(dataset_name)
+                if dataset_dir is None:
+                    _sweep_metrics_cache[dataset_name] = None
+                    return None
+                csv_path = _forecast_sweeps_dir(dataset_dir) / "feature_sweep_final_metrics.csv"
+                if not csv_path.exists():
+                    _sweep_metrics_cache[dataset_name] = None
+                    return None
+                try:
+                    df_metrics = pd.read_csv(csv_path)
+                except Exception as exc:
+                    print(f"[WARN] Could not read {csv_path} for ML-family override: {exc}")
+                    df_metrics = None
+                _sweep_metrics_cache[dataset_name] = df_metrics
+                return df_metrics
+
             eval_r2_rows: list[dict[str, object]] = []
             for _, row in perf_df.iterrows():
+                ml_r2_val = _safe_float(row.get("best_model_r2", row.get("r2", float("nan"))))
+                ml_label_val = str(row.get("best_model_label", _display_model_type(row.get("model", ""))))
+                if treat_mlr_as_baseline_fig:
+                    dataset_name = str(row.get("dataset", ""))
+                    target_name = _derive_target_name(dataset_name, args.dataset_prefix)
+                    headline_n = _safe_float(row.get("n_test_valid_source", float("nan")))
+                    sweep_df = _load_sweep_metrics(dataset_name)
+                    ml_row = _select_best_mlfamily_row_for_r2_figure(
+                        sweep_df,
+                        target_name,
+                        headline_n,
+                        min_eval_samples_fig,
+                    )
+                    if ml_row is not None:
+                        ml_r2_val = _selection_metric(ml_row, "r2")
+                        ml_label_val = _display_model_type(ml_row.get("model", ""))
+                    else:
+                        ml_r2_val = float("nan")
+                        ml_label_val = "—"
                 eval_r2_rows.append({
                     "dataset": row.get("dataset", ""),
                     "target_label": clean_target_label(str(row.get("dataset", "")), args.dataset_prefix),
-                    "ml_r2": _safe_float(row.get("best_model_r2", row.get("r2", float("nan")))),
-                    "ml_model_label": str(row.get("best_model_label", _display_model_type(row.get("model", "")))),
+                    "ml_r2": ml_r2_val,
+                    "ml_model_label": ml_label_val,
                     "baseline_r2": _safe_float(row.get("best_baseline_r2", float("nan"))),
                     "baseline_model_label": str(row.get("best_baseline_label", "Baseline")),
                 })
@@ -5018,6 +5211,16 @@ def main() -> int:
         help=(
             "Include the best MLR result as an additional baseline candidate in "
             "best-baseline skill summaries."
+        ),
+    )
+    parser.add_argument(
+        "--min-eval-samples",
+        type=int,
+        default=None,
+        help=(
+            "Minimum n_test_valid a candidate must have to be eligible as the "
+            "best model for a target. If no candidate for a target meets the "
+            "threshold, fall back to rows with the maximum available n_test_valid."
         ),
     )
     parser.add_argument(
