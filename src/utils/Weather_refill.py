@@ -1155,7 +1155,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[2]
     args = parse_args()
     cmd = args.command or "make-template"
 

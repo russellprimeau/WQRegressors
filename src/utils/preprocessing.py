@@ -347,13 +347,6 @@ def forward_fill_columns(df: pd.DataFrame, columns: list) -> pd.DataFrame:
     return final_df
 
 
-import pandas as pd
-import numpy as np
-
-import pandas as pd
-import numpy as np
-
-
 def add_res(df: pd.DataFrame, columns: list) -> pd.DataFrame:
     """
     For each column in 'columns' that exists in 'df', create a new column 'col_res'.

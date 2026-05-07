@@ -10,7 +10,15 @@ Usage:
     python src/utils/correlate_profiler_targets.py
 """
 
+import sys
 from pathlib import Path
+
+# Allow `from utils.X import ...` regardless of the current working directory
+# when this script is invoked directly.
+_SRC_DIR = Path(__file__).resolve().parents[1]
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -19,13 +27,18 @@ import matplotlib.colors as mcolors
 from matplotlib.colors import LinearSegmentedColormap
 from scipy import stats
 
+from utils.plausibility import apply_plausibility_bounds
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _CSV_PATH = _PROJECT_ROOT / "data" / "output" / "regression" / "Consolidated_sparse.csv"
 _OUT_DIR = _PROJECT_ROOT / "data" / "output" / "sensors" / "correlation"
-_HEATMAP_PATH = _OUT_DIR / "predictor_target_correlations.png"
+_HEATMAP_PEARSON_PATH = _OUT_DIR / "predictor_target_correlations.png"
+_HEATMAP_SPEARMAN_PATH = _OUT_DIR / "predictor_target_correlations_spearman.png"
+_PROFILER_PEARSON_PATH = _OUT_DIR / "profiler_correlations_pearson.png"
+_PROFILER_SPEARMAN_PATH = _OUT_DIR / "profiler_correlations_spearman.png"
 
 # ---------------------------------------------------------------------------
 # Column definitions
@@ -120,6 +133,51 @@ def compute_correlations(df: pd.DataFrame):
                 rho, sp = stats.spearmanr(pair[pred], pair[target])
                 spearman_r.loc[pred, target] = rho
                 spearman_p.loc[pred, target] = sp
+
+    return pearson_r, pearson_p, spearman_r, spearman_p
+
+
+def compute_profiler_autocorrelation(df: pd.DataFrame):
+    """Compute Pearson and Spearman correlations among PROFILER_COLS.
+
+    Returns
+    -------
+    pearson_r, pearson_p, spearman_r, spearman_p : DataFrame
+        7x7 matrices indexed and columned by PROFILER_COLS. Diagonal is 1.0
+        (and p=0). Off-diagonal cells use pairwise dropna; cells without
+        enough data or without variation in either input remain NaN.
+    """
+    empty = lambda: pd.DataFrame(index=PROFILER_COLS, columns=PROFILER_COLS, dtype=float)
+    pearson_r, pearson_p = empty(), empty()
+    spearman_r, spearman_p = empty(), empty()
+
+    for i, a in enumerate(PROFILER_COLS):
+        for j, b in enumerate(PROFILER_COLS):
+            if i == j:
+                pearson_r.loc[a, b] = 1.0
+                pearson_p.loc[a, b] = 0.0
+                spearman_r.loc[a, b] = 1.0
+                spearman_p.loc[a, b] = 0.0
+                continue
+            if j < i:
+                # Symmetric — copy from the other triangle
+                pearson_r.loc[a, b] = pearson_r.loc[b, a]
+                pearson_p.loc[a, b] = pearson_p.loc[b, a]
+                spearman_r.loc[a, b] = spearman_r.loc[b, a]
+                spearman_p.loc[a, b] = spearman_p.loc[b, a]
+                continue
+
+            pair = df[[a, b]].dropna()
+            if len(pair) < 3:
+                continue
+            if pair[a].nunique(dropna=True) < 2 or pair[b].nunique(dropna=True) < 2:
+                continue
+            r, p = stats.pearsonr(pair[a], pair[b])
+            pearson_r.loc[a, b] = r
+            pearson_p.loc[a, b] = p
+            rho, sp = stats.spearmanr(pair[a], pair[b])
+            spearman_r.loc[a, b] = rho
+            spearman_p.loc[a, b] = sp
 
     return pearson_r, pearson_p, spearman_r, spearman_p
 
@@ -260,6 +318,74 @@ def plot_scatter_group(df: pd.DataFrame, corr: pd.DataFrame,
     # plt.show()
 
 
+def plot_profiler_pairplot(df: pd.DataFrame, corr: pd.DataFrame,
+                           pvals: pd.DataFrame, out_path: Path,
+                           method_label: str) -> None:
+    """Save a profiler pair plot: scatter (lower) / hist (diag) / r (upper).
+
+    Lower triangle: scatterplots of column pairs in a neutral color.
+    Diagonal: histograms of each profiler variable.
+    Upper triangle: cells filled by the diverging colormap and annotated
+    with the correlation coefficient + significance stars.
+    """
+    sns.set_style("white")
+    n = len(PROFILER_COLS)
+    cell = 1.5
+    label_fontsize = 9
+    fig, axes = plt.subplots(n, n, figsize=(n * cell, n * cell), squeeze=False)
+    fig.subplots_adjust(wspace=0, hspace=0, left=0.08, right=0.98,
+                        top=0.95, bottom=0.08)
+
+    for i, row_col in enumerate(PROFILER_COLS):
+        for j, col_col in enumerate(PROFILER_COLS):
+            ax = axes[i, j]
+
+            if i == j:
+                series = df[row_col].dropna()
+                if len(series) > 0:
+                    ax.hist(series, bins=30, color="0.45", edgecolor="black",
+                            linewidth=0.3)
+                ax.set_yticks([])
+                ax.tick_params(labelsize=label_fontsize)
+            elif i > j:
+                # Lower triangle: scatter (x=col_col, y=row_col)
+                pair = df[[col_col, row_col]].dropna()
+                if len(pair) >= 2:
+                    ax.scatter(pair[col_col], pair[row_col], s=10, alpha=0.7,
+                               color="0.3", edgecolors="black", linewidths=0.3)
+                ax.tick_params(labelsize=label_fontsize)
+            else:
+                # Upper triangle: filled cell with r + stars
+                r = corr.loc[row_col, col_col]
+                p = pvals.loc[row_col, col_col]
+                if np.isfinite(r):
+                    ax.set_facecolor(_CORR_CMAP(_CORR_NORM(r)))
+                    ax.text(0.5, 0.5, f"{r:.2f}{_significance_stars(p)}",
+                            ha="center", va="center", transform=ax.transAxes,
+                            fontsize=label_fontsize + 2, color="white",
+                            fontweight="bold")
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+            # Edge labels: only on outer rim, hide interior tick labels so
+            # there is no whitespace eaten by tick marks between cells.
+            if j == 0:
+                ax.set_ylabel(_short_label(row_col), fontsize=label_fontsize)
+            else:
+                ax.set_ylabel("")
+                ax.set_yticklabels([])
+            if i == n - 1:
+                ax.set_xlabel(_short_label(col_col), fontsize=label_fontsize)
+                plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+            else:
+                ax.set_xlabel("")
+                ax.set_xticklabels([])
+
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved profiler {method_label} pair plot to {out_path}")
+
+
 def main() -> None:
     df = pd.read_csv(_CSV_PATH, parse_dates=["TIMESTAMP"], index_col="TIMESTAMP")
     _OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -272,11 +398,26 @@ def main() -> None:
     if missing_tgt:
         raise ValueError(f"Missing target columns: {missing_tgt}")
 
+    # Apply per-column plausibility bounds. The consolidated CSV has been
+    # filtered once during consolidation, but linear-interpolated rows in
+    # clean_profiler can still fall outside sensor ranges; re-applying here
+    # also catches any future drift in the upstream cleaning logic.
+    before_nans = df.isna().sum().sum()
+    df = apply_plausibility_bounds(df)
+    after_nans = df.isna().sum().sum()
+    if after_nans > before_nans:
+        print(f"Plausibility filter nulled {after_nans - before_nans} additional cells.")
+
     pearson_r, pearson_p, spearman_r, spearman_p = compute_correlations(df)
     print(pearson_r.to_string())
-    plot_correlation_matrix(pearson_r, pearson_p, _HEATMAP_PATH)
+    plot_correlation_matrix(pearson_r, pearson_p, _HEATMAP_PEARSON_PATH)
+    plot_correlation_matrix(spearman_r, spearman_p, _HEATMAP_SPEARMAN_PATH)
     for group_key in PREDICTOR_GROUPS:
         plot_scatter_group(df, pearson_r, group_key, _OUT_DIR)
+
+    pr, pp, sr, sp = compute_profiler_autocorrelation(df)
+    plot_profiler_pairplot(df, pr, pp, _PROFILER_PEARSON_PATH, "Pearson")
+    plot_profiler_pairplot(df, sr, sp, _PROFILER_SPEARMAN_PATH, "Spearman")
 
 
 if __name__ == "__main__":

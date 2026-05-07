@@ -1,7 +1,9 @@
-/data/output/
-/data/sensors/
-/docs/examples/
-/src/__pycache__/
-/src/utils/__pycache__/
-/src/superseded/
-/.idea/
+data/output/
+data/sensors/
+docs/examples/
+src/__pycache__/
+src/utils/__pycache__/
+src/superseded/
+.idea/
+.claude/
+.vscode/
