@@ -40,6 +40,8 @@ TIMELINE_MARKER_SIZE = 28
 TIMELINE_START_DATE = pd.Timestamp("2020-04-01")
 TIMELINE_END_DATE = pd.Timestamp("2025-04-01")
 PROFILE_GAP_HOURS = 13.0
+HOURLY_GAP_HOURS = 2.0
+PROFILE_SEPARATION_HOURS = 6.0
 POINT_COUNT_STYLES = {
     1: ("#4C78A8", "1-point"),
     2: ("#F58518", "2-point"),
@@ -173,8 +175,16 @@ def _sensor_timeline_label(sensor_name: str, calibration_count: int) -> str:
     return f"{_sensor_offset_label(sensor_name)} - {int(calibration_count)} events"
 
 
-def _profiler_window_label(day_count: int) -> str:
-    return f"Profiler Uptime - {int(day_count)} days"
+def _profiler_window_label(profile_count: int) -> str:
+    return f"Profiler Uptime - {int(profile_count):,} profiles"
+
+
+def _profiler_step_uptime_label(profile_count: int) -> str:
+    return f"Profiler (Step) Uptime\n- {int(profile_count):,} profiles"
+
+
+def _hourly_window_label(hour_count: int) -> str:
+    return f"Surface (Hourly) Uptime\n- {hour_count:,} Hours"
 
 
 def _timeline_sensor_order() -> list[str]:
@@ -256,7 +266,13 @@ def _load_surface_raster_data() -> tuple[np.ndarray, np.ndarray, pd.Timestamp, p
     timestamps = pd.to_datetime(df["TIMESTAMP"], errors="coerce").dropna().drop_duplicates().sort_values()
     if timestamps.empty:
         raise ValueError(f"No valid TIMESTAMP values found in {profiles_csv}")
-    day_count = int(pd.DatetimeIndex(timestamps).normalize().nunique())
+    in_window = timestamps[(timestamps >= TIMELINE_START_DATE) & (timestamps < TIMELINE_END_DATE)]
+    if in_window.empty:
+        profile_count = 0
+    else:
+        gaps = in_window.diff()
+        separation = pd.Timedelta(hours=float(PROFILE_SEPARATION_HOURS))
+        profile_count = int((gaps.isna() | (gaps >= separation)).sum())
 
     x_edges, values = _build_profile_operational_window(
         pd.DatetimeIndex(timestamps),
@@ -264,7 +280,31 @@ def _load_surface_raster_data() -> tuple[np.ndarray, np.ndarray, pd.Timestamp, p
         end_date=TIMELINE_END_DATE,
         gap_hours=PROFILE_GAP_HOURS,
     )
-    return x_edges, values.reshape(1, -1), TIMELINE_START_DATE, TIMELINE_END_DATE, day_count
+    return x_edges, values.reshape(1, -1), TIMELINE_START_DATE, TIMELINE_END_DATE, profile_count
+
+
+def _load_hourly_raster_data() -> tuple[np.ndarray, np.ndarray, pd.Timestamp, pd.Timestamp, int]:
+    hourly_csv = _sensor_input_dir() / "FullHourly.csv"
+    if not hourly_csv.exists():
+        raise FileNotFoundError(f"FullHourly.csv not found: {hourly_csv}")
+
+    df = pd.read_csv(hourly_csv, low_memory=False)
+    if "TIMESTAMP" not in df.columns:
+        raise ValueError(f"Missing required column 'TIMESTAMP' in {hourly_csv}")
+
+    timestamps = pd.to_datetime(df["TIMESTAMP"], errors="coerce").dropna().drop_duplicates().sort_values()
+    if timestamps.empty:
+        raise ValueError(f"No valid TIMESTAMP values found in {hourly_csv}")
+    in_window = timestamps[(timestamps >= TIMELINE_START_DATE) & (timestamps < TIMELINE_END_DATE)]
+    hour_count = int(len(in_window))
+
+    x_edges, values = _build_profile_operational_window(
+        pd.DatetimeIndex(timestamps),
+        start_date=TIMELINE_START_DATE,
+        end_date=TIMELINE_END_DATE,
+        gap_hours=HOURLY_GAP_HOURS,
+    )
+    return x_edges, values.reshape(1, -1), TIMELINE_START_DATE, TIMELINE_END_DATE, hour_count
 
 
 def _build_profile_operational_window(
@@ -384,6 +424,7 @@ def _draw_surface_raster(
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
     day_count: int,
+    label_text: str | None = None,
 ) -> None:
     vmax = max(int(np.nanmax(count_values)), 1)
     ax.pcolormesh(
@@ -397,7 +438,7 @@ def _draw_surface_raster(
     )
 
     ax.set_ylabel(
-        _profiler_window_label(day_count),
+        label_text if label_text is not None else _profiler_window_label(day_count),
         rotation=0,
         ha="right",
         va="center",
@@ -410,6 +451,96 @@ def _draw_surface_raster(
     ax.set_xlim(start_date, end_date)
 
 
+def _print_per_year_counts() -> None:
+    profiles_csv = _sensor_input_dir() / "Profiles.csv"
+    hourly_csv = _sensor_input_dir() / "FullHourly.csv"
+
+    profile_ts = pd.Series(dtype="datetime64[ns]")
+    if profiles_csv.exists():
+        df = pd.read_csv(profiles_csv, low_memory=False)
+        if "TIMESTAMP" in df.columns:
+            profile_ts = (
+                pd.to_datetime(df["TIMESTAMP"], errors="coerce")
+                .dropna()
+                .drop_duplicates()
+                .sort_values()
+            )
+
+    hourly_ts = pd.Series(dtype="datetime64[ns]")
+    if hourly_csv.exists():
+        df = pd.read_csv(hourly_csv, low_memory=False)
+        if "TIMESTAMP" in df.columns:
+            hourly_ts = (
+                pd.to_datetime(df["TIMESTAMP"], errors="coerce")
+                .dropna()
+                .drop_duplicates()
+                .sort_values()
+            )
+
+    separation = pd.Timedelta(hours=float(PROFILE_SEPARATION_HOURS))
+    years = sorted(
+        set(profile_ts.dt.year.tolist()) | set(hourly_ts.dt.year.tolist())
+    )
+    if not years:
+        print("Per-year counts: no timestamps available.")
+        return
+
+    print("Per-year counts (calendar year):")
+    print(f"  {'Year':<6} {'Profiles':>10} {'Hourly TS':>12}")
+    for year in years:
+        py = profile_ts[profile_ts.dt.year == year]
+        if py.empty:
+            profile_count = 0
+        else:
+            gaps = py.diff()
+            profile_count = int((gaps.isna() | (gaps >= separation)).sum())
+        hourly_count = int((hourly_ts.dt.year == year).sum())
+        print(f"  {year:<6} {profile_count:>10,} {hourly_count:>12,}")
+
+
+def create_uptime_comparison_figure(output_png: Path, dpi: int = 300) -> None:
+    x_edges_p, count_values_p, start_date, end_date, day_count = _load_surface_raster_data()
+    x_edges_h, count_values_h, _, _, hour_count = _load_hourly_raster_data()
+
+    plt.rcParams.update({"font.size": FONT_SIZE})
+    fig_h = 2 * TIMELINE_RASTER_HEIGHT + 1.2
+    fig, (ax_top, ax_bottom) = plt.subplots(
+        2,
+        1,
+        sharex=True,
+        figsize=(TIMELINE_FIG_WIDTH, fig_h),
+        dpi=dpi,
+        gridspec_kw={"hspace": 0.25},
+    )
+
+    _draw_surface_raster(
+        ax_top,
+        x_edges_p,
+        count_values_p,
+        start_date,
+        end_date,
+        day_count,
+        label_text=_profiler_step_uptime_label(day_count),
+    )
+    _draw_surface_raster(
+        ax_bottom,
+        x_edges_h,
+        count_values_h,
+        start_date,
+        end_date,
+        hour_count,
+        label_text=_hourly_window_label(hour_count),
+    )
+
+    _set_timeline_xticks(ax_bottom, start_date, end_date)
+    ax_bottom.tick_params(axis="x", which="both", labelbottom=True)
+    ax_bottom.set_xlabel("Timestamp", fontsize=FONT_SIZE)
+    fig.subplots_adjust(top=0.95, bottom=0.25, left=0.19, right=0.95)
+    output_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_png, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
 def create_offset_event_timeseries_figure(df: pd.DataFrame, output_png: Path, dpi: int = 300) -> None:
     event_df = df.copy()
     event_df["Offset"] = pd.to_numeric(event_df["Offset"], errors="coerce")
@@ -417,11 +548,19 @@ def create_offset_event_timeseries_figure(df: pd.DataFrame, output_png: Path, dp
     event_df = event_df.dropna(subset=["Calibration_End_Time", "Offset"])
     event_df["N_Points_Plot"] = event_df["N_Points"].clip(lower=1).fillna(1).astype(int).clip(upper=3)
 
-    x_edges, count_values, start_date, end_date, day_count = _load_surface_raster_data()
+    x_edges, count_values, start_date, end_date, hour_count = _load_hourly_raster_data()
     timeline_sensors = _timeline_sensor_order()
     plt.rcParams.update({"font.size": FONT_SIZE})
     fig, raster_ax, axes = _create_timeline_axes(dpi=dpi)
-    _draw_surface_raster(raster_ax, x_edges, count_values, start_date, end_date, day_count)
+    _draw_surface_raster(
+        raster_ax,
+        x_edges,
+        count_values,
+        start_date,
+        end_date,
+        hour_count,
+        label_text=_hourly_window_label(hour_count),
+    )
 
     for ax, sensor in zip(axes, timeline_sensors):
         sensor_df = event_df.loc[event_df["Sensor_Normalized"] == sensor].sort_values("Calibration_End_Time")
@@ -477,7 +616,7 @@ def create_calibration_pointcount_timeline_figure(
     event_df["N_Points"] = pd.to_numeric(event_df["N_Points"], errors="coerce")
     event_df = event_df.dropna(subset=["Calibration_End_Time", "N_Points"])
 
-    x_edges, count_values, start_date, end_date, day_count = _load_surface_raster_data()
+    x_edges, count_values, start_date, end_date, hour_count = _load_hourly_raster_data()
     timeline_sensors = _timeline_sensor_order()
     plt.rcParams.update({"font.size": FONT_SIZE})
     fig_h = max(5.4, 0.65 * (len(timeline_sensors) + 1) + 1.0)
@@ -498,7 +637,7 @@ def create_calibration_pointcount_timeline_figure(
     )
 
     y_positions = [0]
-    y_labels = [_profiler_window_label(day_count)]
+    y_labels = [_hourly_window_label(hour_count)]
     for row_idx, sensor in enumerate(timeline_sensors, start=1):
         sensor_df = event_df.loc[event_df["Sensor_Normalized"] == sensor].sort_values("Calibration_End_Time").copy()
         sensor_df["N_Points_Plot"] = sensor_df["N_Points"].clip(lower=1).fillna(1).astype(int).clip(upper=3)
@@ -840,9 +979,13 @@ def main() -> None:
     pointcount_timeline_png = output_png.parent / "calibration_event_pointcount_timeline.png"
     create_offset_event_timeseries_figure(valid_timeline_df, offset_timeline_png, dpi=args.dpi)
     create_calibration_pointcount_timeline_figure(valid_timeline_df, pointcount_timeline_png, dpi=args.dpi)
+    uptime_png = output_png.parent / "uptime_comparison.png"
+    create_uptime_comparison_figure(uptime_png, dpi=args.dpi)
     print(f"Saved: {output_png}")
     print(f"Saved: {offset_timeline_png}")
     print(f"Saved: {pointcount_timeline_png}")
+    print(f"Saved: {uptime_png}")
+    _print_per_year_counts()
 
 
 if __name__ == "__main__":
