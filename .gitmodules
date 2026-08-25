@@ -1,0 +1,3 @@
+[submodule "docs/report/draft"]
+	path = docs/report/draft
+	url = https://github.com/russellprimeau/forecasting-hazardous-wq-manuscript.git

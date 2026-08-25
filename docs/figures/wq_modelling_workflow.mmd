@@ -1,0 +1,99 @@
+%% Water-quality forecasting workflow.
+%% Editable source of record for wq_modelling_workflow.svg — keep the two in step.
+%% Wording is deliberately code-free: no script or function names.
+%% To add a model, copy one MODEL node and keep the same four annotation lines
+%% (structure / regularize / batch / stop) so the columns stay comparable.
+flowchart TD
+
+    subgraph OBSERVE["1 &nbsp; Observe"]
+        direction LR
+        MET[Meteorology<br/>hourly<br/>rain · air temperature<br/>wind · radiation · humidity]
+        LAKE[Lake sensors<br/>hourly<br/>temperature · pH · oxygen<br/>conductivity · turbidity · fDOM]
+        INTAKE[Waterworks intake<br/>hourly<br/>pH · temperature]
+        LAB[/Laboratory samples<br/>&#8776; weekly<br/>14 parameters<br/>— the forecast target/]
+        CAL[(Sensor calibrations<br/>25–35 events per sensor<br/>fitted measurement-error<br/>distribution per sensor)]
+    end
+
+    MERGE((one hourly<br/>table))
+    MET --> MERGE
+    LAKE --> MERGE
+    INTAKE --> MERGE
+    LAB ==> MERGE
+
+    subgraph CONDITION["2 &nbsp; Condition"]
+        direction LR
+        C1[Reject implausible values<br/>physical bounds per sensor]
+        C2[Align to one hourly grid<br/>every series, one index]
+        C3[Interpolate short gaps<br/>&#8804; 6 h only, longer gaps left open]
+        C4[Derive predictors<br/>wind vectors · 24 h rainfall<br/>last known laboratory value]
+        C5[/Define the target<br/>change since previous sample/]
+        C1 --> C2 --> C3 --> C4 ==> C5
+    end
+
+    MERGE --> C1
+
+    subgraph ASSEMBLE["3 &nbsp; Assemble"]
+        direction LR
+        A1[Scale to 0–1<br/>min–max, one range per channel]
+        A2[Cut gapless windows<br/>18 predictor channels<br/>168 h or 672 h, matched to the<br/>sampling interval of each target]
+        A3[Replicate sensor error<br/>&#215; 10 perturbed copies per window]
+        A4[Split chronologically<br/>70 % earliest / 30 % latest<br/>replicates never split apart]
+        A1 --> A2 --> A3 --> A4
+    end
+
+    C5 --> A1
+    CAL -. measurement uncertainty .-> A3
+
+    subgraph TRAIN["4 &nbsp; Train"]
+        direction TB
+        SEARCH[Search predictor subsets<br/>rank channels by attributed contribution,<br/>then beam search with swaps]
+
+        subgraph MODELS[" "]
+            direction LR
+            XGB["<b>Gradient-boosted trees</b><br/>additive decision-tree ensemble<br/>· · ·<br/><i>structure</i> depth 2–9 · 10–300 trees<br/><i>regularize</i> L2 1e-3–10 · L1 1e-4–5,<br/>min leaf 1–20 · min split gain 0–2,<br/>rows 50–90 % · columns 30–100 %<br/><i>batch</i> one tree per round,<br/>learning rate 0.003–0.2<br/><i>stop</i> 3-fold round budget,<br/>250 tuning trials, 1-SE rule"]
+            TFM["<b>Transformer</b><br/>self-attention sequence encoder<br/>· · ·<br/><i>structure</i> 64-dim · 4 heads · 2 layers,<br/>learned position codes<br/><i>regularize</i> dropout 0.1<br/><i>batch</i> 32 windows,<br/>Adam 1e-3 · loss MSE − 0.1 &#215; corr<br/><i>stop</i> 3-fold epoch budget, &#8804; 100"]
+            GP["<b>Gaussian process</b><br/>Matérn-5/2 + linear kernel<br/>· · ·<br/><i>structure</i> one length-scale per input,<br/>sensor error folded in, 64 draws<br/><i>regularize</i> length-scale 0.05–10,<br/>noise 1e-5–1, gamma priors<br/><i>batch</i> full batch, &#8804; 5000 windows,<br/>Adam 0.01 · loss −log likelihood<br/><i>stop</i> 3-fold epoch budget, &#8804; 250"]
+            MLR["<b>Multiple linear regression</b><br/><i>reference model</i><br/>· · ·<br/><i>structure</i> window collapsed to one row,<br/>last hour or window mean<br/><i>regularize</i> abs(rho) 0.2 pre-filter,<br/>lasso selection,<br/>collinearity dropped at VIF &#8804; 10<br/><i>batch</i> closed-form least squares<br/><i>stop</i> none — selection is the control"]
+        end
+
+        SEARCH --> XGB
+        SEARCH --> TFM
+        SEARCH --> GP
+        SEARCH --> MLR
+    end
+
+    A4 --> SEARCH
+
+    subgraph ASSESS["5 &nbsp; Assess"]
+        direction LR
+        E1[Predict held-out windows<br/>the latest 30 % of the record,<br/>never seen during fitting]
+        E2[Compare to reference forecasts<br/>persistence · climatology<br/>local linear trend]
+        E3[Score and test<br/>R² · RMSE · skill over baseline<br/>Diebold–Mariano · Wilcoxon · sign]
+        E4[[Show<br/>predicted against observed series<br/>quality matrix over 14 targets]]
+        E1 --> E2 --> E3 --> E4
+    end
+
+    XGB --> E1
+    TFM --> E1
+    GP --> E1
+    MLR --> E1
+
+    E3 -. scores steer the search .-> SEARCH
+
+    classDef source fill:#eef6ff,stroke:#7aa5d2,stroke-width:2px,color:#102a43
+    classDef target fill:#fff7d6,stroke:#b38600,stroke-width:2px,color:#102a43
+    classDef step fill:#ffffff,stroke:#486581,stroke-width:2px,color:#102a43
+    classDef stage fill:#edf7ed,stroke:#3a7d44,stroke-width:2px,color:#102a43
+    classDef model fill:#eef2ff,stroke:#4c63b6,stroke-width:2px,color:#102a43
+    classDef ref fill:#f5f7fa,stroke:#829ab1,stroke-width:2px,color:#102a43
+    classDef out fill:#f3e8ff,stroke:#7c3aed,stroke-width:2px,color:#102a43
+    classDef hub fill:#dbe4ee,stroke:#334e68,stroke-width:2px,color:#102a43
+
+    class MET,LAKE,INTAKE,CAL source
+    class LAB,C5 target
+    class C1,C2,C3,C4,A1,A2,A3,A4 step
+    class SEARCH,E1,E2,E3 stage
+    class XGB,TFM,GP model
+    class MLR ref
+    class E4 out
+    class MERGE hub

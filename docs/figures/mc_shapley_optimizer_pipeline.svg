@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="980" viewBox="0 0 1600 980" role="img" aria-labelledby="title desc">
+  <title id="title">MC Shapley Optimizer Pipeline</title>
+  <desc id="desc">Editable flowchart of the modelling pipeline implemented in l_RunMCShapleyOptimizerPipeline.py.</desc>
+  <defs>
+    <style>
+      text { font-family: "Segoe UI", Arial, sans-serif; fill: #102a43; }
+      .title { font-size: 34px; font-weight: 700; }
+      .subtitle { font-size: 18px; fill: #486581; }
+      .lane-title { font-size: 22px; font-weight: 700; }
+      .body { font-size: 17px; }
+      .small { font-size: 15px; fill: #486581; }
+      .box { fill: #ffffff; stroke: #486581; stroke-width: 2.5; rx: 18; ry: 18; }
+      .decision { fill: #fff7d6; stroke: #b38600; stroke-width: 2.5; }
+      .note { fill: #eef6ff; stroke: #7aa5d2; stroke-width: 2.5; rx: 18; ry: 18; }
+      .stage1 { fill: #edf7ed; stroke: #3a7d44; stroke-width: 2.5; rx: 18; ry: 18; }
+      .stage2 { fill: #eef2ff; stroke: #4c63b6; stroke-width: 2.5; rx: 18; ry: 18; }
+      .end { fill: #f3e8ff; stroke: #7c3aed; stroke-width: 2.5; rx: 18; ry: 18; }
+      .lane { fill: none; stroke: #d9e2ec; stroke-width: 2; stroke-dasharray: 8 8; rx: 28; ry: 28; }
+      .arrow { stroke: #334e68; stroke-width: 3.5; fill: none; marker-end: url(#arrowhead); }
+      .dashed { stroke-dasharray: 9 8; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334e68"/>
+    </marker>
+  </defs>
+
+  <text x="70" y="60" class="title">Modelling Pipeline: `l_RunMCShapleyOptimizerPipeline.py`</text>
+  <text x="70" y="95" class="subtitle">Combined Shapley attribution -&gt; subset CV tuning -&gt; seeded optimizer sweep, repeated per dataset plan.</text>
+
+  <rect x="50" y="130" width="1500" height="230" class="lane"/>
+  <text x="80" y="168" class="lane-title">Setup / orchestration</text>
+
+  <rect x="50" y="390" width="1500" height="250" class="lane"/>
+  <text x="80" y="428" class="lane-title">Stage 1: Shapley branch</text>
+
+  <rect x="50" y="670" width="1500" height="250" class="lane"/>
+  <text x="80" y="708" class="lane-title">Stage 2: Optimizer branch</text>
+
+  <rect x="90" y="195" width="250" height="110" class="box"/>
+  <text x="215" y="230" text-anchor="middle" class="body">Parse CLI arguments</text>
+  <text x="215" y="258" text-anchor="middle" class="small">dataset filters, budgets,</text>
+  <text x="215" y="280" text-anchor="middle" class="small">seeds, skip flags, notify</text>
+
+  <rect x="405" y="195" width="290" height="110" class="box"/>
+  <text x="550" y="230" text-anchor="middle" class="body">Discover dataset plans</text>
+  <text x="550" y="258" text-anchor="middle" class="small">resolve configs, dataset dirs,</text>
+  <text x="550" y="280" text-anchor="middle" class="small">row counts, worker stride split</text>
+
+  <rect x="760" y="195" width="300" height="110" class="note"/>
+  <text x="910" y="230" text-anchor="middle" class="body">Optional parallel wrapper</text>
+  <text x="910" y="258" text-anchor="middle" class="small">`m_RunParallelPipeline.py` assigns</text>
+  <text x="910" y="280" text-anchor="middle" class="small">datasets across workers + GPU/CPU</text>
+
+  <rect x="1125" y="195" width="340" height="110" class="box"/>
+  <text x="1295" y="226" text-anchor="middle" class="body">Per dataset: Stage A full-feature</text>
+  <text x="1295" y="252" text-anchor="middle" class="body">XGBoost CV tuning cache</text>
+  <text x="1295" y="280" text-anchor="middle" class="small">write `forecasts/Shapley_sweeps/`</text>
+
+  <path d="M 340 250 L 405 250" class="arrow"/>
+  <path d="M 695 250 L 760 250" class="arrow dashed"/>
+  <path d="M 1060 250 L 1125 250" class="arrow"/>
+
+  <polygon points="250,515 340,445 430,515 340,585" class="decision"/>
+  <text x="340" y="505" text-anchor="middle" class="body">Skip</text>
+  <text x="340" y="533" text-anchor="middle" class="body">Shapley</text>
+  <text x="340" y="561" text-anchor="middle" class="body">stage?</text>
+
+  <rect x="500" y="455" width="280" height="120" class="stage1"/>
+  <text x="640" y="492" text-anchor="middle" class="body">Run Stage 1 sweep</text>
+  <text x="640" y="520" text-anchor="middle" class="small">`i_RunMCFeatureSelectionShapleySweep.py`</text>
+  <text x="640" y="544" text-anchor="middle" class="small">ranked marginal contributions</text>
+  <text x="640" y="566" text-anchor="middle" class="small">under `Shapley_sweeps` namespace</text>
+
+  <rect x="845" y="455" width="300" height="120" class="stage1"/>
+  <text x="995" y="492" text-anchor="middle" class="body">Write Shapley artifacts</text>
+  <text x="995" y="520" text-anchor="middle" class="small">plots, rankings, seed subsets</text>
+  <text x="995" y="544" text-anchor="middle" class="small">`feature_seed_subsets_r###.csv`</text>
+
+  <rect x="1210" y="455" width="280" height="120" class="stage1"/>
+  <text x="1350" y="492" text-anchor="middle" class="body">Stage B subset CV tuning</text>
+  <text x="1350" y="520" text-anchor="middle" class="small">tune top-k Shapley subsets,</text>
+  <text x="1350" y="544" text-anchor="middle" class="small">derive consensus hyperparameters</text>
+  <text x="1350" y="566" text-anchor="middle" class="small">for downstream optimizer cache</text>
+
+  <path d="M 430 515 L 500 515" class="arrow"/>
+  <path d="M 780 515 L 845 515" class="arrow"/>
+  <path d="M 1145 515 L 1210 515" class="arrow"/>
+
+  <polygon points="250,795 340,725 430,795 340,865" class="decision"/>
+  <text x="340" y="785" text-anchor="middle" class="body">Skip</text>
+  <text x="340" y="813" text-anchor="middle" class="body">optimizer</text>
+  <text x="340" y="841" text-anchor="middle" class="body">stage?</text>
+
+  <rect x="500" y="735" width="290" height="120" class="stage2"/>
+  <text x="645" y="772" text-anchor="middle" class="body">Sync feature-sweep cache</text>
+  <text x="645" y="800" text-anchor="middle" class="small">apply consensus XGB params</text>
+  <text x="645" y="824" text-anchor="middle" class="small">to train configs before search</text>
+
+  <rect x="855" y="735" width="290" height="120" class="stage2"/>
+  <text x="1000" y="772" text-anchor="middle" class="body">Run Stage 2 optimizer</text>
+  <text x="1000" y="800" text-anchor="middle" class="small">`h_RunMCFeatureSelectionSweep.py`</text>
+  <text x="1000" y="824" text-anchor="middle" class="small">beam + swap search, one or many seeds</text>
+
+  <rect x="1210" y="735" width="300" height="120" class="stage2"/>
+  <text x="1360" y="762" text-anchor="middle" class="body">Seed subsets for optimizer</text>
+  <text x="1360" y="790" text-anchor="middle" class="small">default: Shapley `feature_seed_subsets`</text>
+  <text x="1360" y="814" text-anchor="middle" class="small">override: `--seed-subsets-csv`</text>
+  <text x="1360" y="838" text-anchor="middle" class="small">outputs in `forecasts/feature_sweeps`</text>
+
+  <path d="M 430 795 L 500 795" class="arrow"/>
+  <path d="M 790 795 L 855 795" class="arrow"/>
+  <path d="M 1145 795 L 1210 795" class="arrow"/>
+  <path d="M 1210 720 L 1120 720 L 1120 735" class="arrow dashed"/>
+
+  <rect x="1165" y="895" width="345" height="60" class="end"/>
+  <text x="1337" y="930" text-anchor="middle" class="body">Aggregate failures, restore namespace, optional notification</text>
+
+  <path d="M 1490 575 L 1490 690 L 1337 690 L 1337 895" class="arrow"/>
+  <path d="M 340 585 L 340 645 L 340 725" class="arrow"/>
+  <path d="M 340 865 L 340 925 L 1165 925" class="arrow"/>
+</svg>

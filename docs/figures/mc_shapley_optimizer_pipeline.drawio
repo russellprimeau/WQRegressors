@@ -1,0 +1,83 @@
+<mxfile host="app.diagrams.net" agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36" version="29.6.3">
+  <diagram id="mc-shapley-optimizer-pipeline" name="Page-1">
+    <mxGraphModel dx="1722" dy="919" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="1400" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=22;fontStyle=1;fontColor=#111827;" value="Conceptual modelling pipeline&#xa;&lt;font style=&quot;font-size: 14px; color: #6b7280;&quot;&gt;Use Shapley attribution to seed a more efficient feature-subset optimizer&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="720" x="80" y="30" as="geometry" />
+        </mxCell>
+        <mxCell id="group1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeColor=#cbd5e1;fillColor=none;dashed=1;fontStyle=1;fontSize=16;align=center;verticalAlign=top;spacingTop=10;spacingLeft=12;" value="Preparation" vertex="1">
+          <mxGeometry height="160" width="860" x="80" y="120" as="geometry" />
+        </mxCell>
+        <mxCell id="group2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeColor=#cbd5e1;fillColor=none;dashed=1;fontStyle=1;fontSize=16;align=center;verticalAlign=top;spacingTop=10;spacingLeft=12;" value="Feature selection" vertex="1">
+          <mxGeometry height="380" width="860" x="80" y="320" as="geometry" />
+        </mxCell>
+        <mxCell id="group3" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;strokeColor=#cbd5e1;fillColor=none;dashed=1;fontStyle=1;fontSize=16;align=left;verticalAlign=top;spacingTop=10;spacingLeft=12;" value="Model Assessment" vertex="1">
+          <mxGeometry height="260" width="880" x="80" y="750" as="geometry" />
+        </mxCell>
+        <mxCell id="n1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;strokeColor=#475569;fillColor=#ffffff;fontSize=16;fontColor=#0f172a;" value="Train/test split by date plus coverage criteria" vertex="1">
+          <mxGeometry height="70" width="220" x="120" y="180" as="geometry" />
+        </mxCell>
+        <mxCell id="n2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;strokeColor=#475569;fillColor=#ffffff;fontSize=16;fontColor=#0f172a;align=center;" value="&lt;div style=&quot;&quot;&gt;&lt;span style=&quot;background-color: transparent; color: light-dark(rgb(15, 23, 42), rgb(211, 218, 234));&quot;&gt;Tune regularization hyperparameters&lt;/span&gt;&lt;font color=&quot;#404040&quot; face=&quot;Lato, proxima-nova, Helvetica Neue, Arial, sans-serif&quot;&gt;&lt;span style=&quot;background-color: rgb(252, 252, 252);&quot;&gt;&amp;nbsp;via cross validation&lt;/span&gt;&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="80" width="180" x="370" y="175" as="geometry" />
+        </mxCell>
+        <mxCell id="n3" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;strokeColor=#475569;fillColor=#ffffff;fontSize=16;fontColor=#0f172a;" value="Estimate feature importance&#xa;from marginal contributions&#xa;across sampled subsets" vertex="1">
+          <mxGeometry height="80" width="220" x="120" y="400" as="geometry" />
+        </mxCell>
+        <mxCell id="n4" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;strokeColor=#475569;fillColor=#f8fafc;fontSize=16;fontColor=#0f172a;" value="Convert importance rankings&#xa;into promising seed&#xa;feature subsets" vertex="1">
+          <mxGeometry height="80" width="260" x="370" y="400" as="geometry" />
+        </mxCell>
+        <mxCell id="n5" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;strokeColor=#475569;fillColor=#ffffff;fontSize=16;fontColor=#0f172a;" value="Retune the model on the best&#xa;attribution-derived subsets to&#xa;stabilize regularization choices" vertex="1">
+          <mxGeometry height="80" width="260" x="660" y="400" as="geometry" />
+        </mxCell>
+        <mxCell id="n6" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;strokeColor=#475569;fillColor=#ffffff;fontSize=16;fontColor=#0f172a;" value="Run seeded subset search&#xa;to refine feature combinations&#xa;with beam-and-swap exploration" vertex="1">
+          <mxGeometry height="80" width="220" x="120" y="550" as="geometry" />
+        </mxCell>
+        <mxCell id="n7" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;strokeColor=#475569;fillColor=#f8fafc;fontSize=16;fontColor=#0f172a;" value="Return ranked feature subsets&#xa;and corresponding tuned&#xa;model configurations" vertex="1">
+          <mxGeometry height="80" width="260" x="370" y="550" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" parent="1" source="n1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#334155;strokeWidth=2;endArrow=block;endFill=1;" target="n2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="n2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#334155;strokeWidth=2;endArrow=block;endFill=1;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="n3">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="530" y="290" />
+              <mxPoint x="230" y="290" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="n3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#334155;strokeWidth=2;endArrow=block;endFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" target="n4">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="370" y="440" />
+              <mxPoint x="370" y="440" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="n5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#334155;strokeWidth=2;endArrow=block;endFill=1;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="n6">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="790" y="510" />
+              <mxPoint x="230" y="510" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e7" edge="1" parent="1" source="n6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#334155;strokeWidth=2;endArrow=block;endFill=1;" target="n7">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="82ojry6Y2z8Y9rQg3ko3-2" edge="1" parent="1" source="n4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#334155;strokeWidth=2;endArrow=block;endFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="n5">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="650" y="440" />
+              <mxPoint x="650" y="440" />
+            </Array>
+            <mxPoint x="610" y="610" as="sourcePoint" />
+            <mxPoint x="640" y="610" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

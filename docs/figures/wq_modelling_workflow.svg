@@ -1,0 +1,320 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="1650" viewBox="0 0 1900 1650" role="img" aria-labelledby="title desc">
+  <title id="title">Water-Quality Forecasting Workflow</title>
+  <desc id="desc">Editable schematic of the modelling workflow: hourly meteorological, in-lake and intake sensor records plus sparse laboratory samples are conditioned onto one hourly table, cut into windowed samples, used to train four model families, and assessed against reference forecasts.</desc>
+
+  <!--
+    GRID CONSTANTS - keep new elements on-grid so the figure stays extensible.
+
+      canvas            1900 x 1650
+      lane rect         x=50  w=1760            (right edge 1810)
+      content band      x=90 .. 1770            (width 1680)
+      side corridor     x=1845                  (dashed side channels only)
+
+      5-column grid (lanes 1, 2)   x = 90, 432, 774, 1116, 1458   w=312  gap=30
+                                   centres = 246, 588, 930, 1272, 1614
+      4-column grid (lanes 3, 5)   x = 90, 520, 950, 1380         w=390  gap=40
+                                   centres = 285, 715, 1145, 1575
+      model grid (lane 4)          x = 260, 650, 1040, 1430       w=340  gap=50
+                                   centres = 430, 820, 1210, 1600
+      strategy-label gutter        x = 90 .. 250, labels right-aligned at x=240
+
+      lane bands        1 Observe    y=130  h=215
+                        2 Condition  y=375  h=175
+                        3 Assemble   y=580  h=180
+                        4 Train      y=785  h=545
+                        5 Assess     y=1370 h=205
+
+    TO ADD A DATA SOURCE OR STEP: widen the content band or reduce w, keeping gaps.
+    TO ADD A MODEL: copy a model card, shift x by the model pitch (390), and reuse
+    the same four strategy rows so the columns stay comparable.
+  -->
+
+  <defs>
+    <style>
+      text { font-family: "Segoe UI", Arial, sans-serif; fill: #102a43; }
+      .title { font-size: 34px; font-weight: 700; }
+      .subtitle { font-size: 18px; fill: #486581; }
+      .lane-title { font-size: 22px; font-weight: 700; }
+      .body { font-size: 17px; }
+      .small { font-size: 15px; fill: #486581; }
+      .box { fill: #ffffff; stroke: #486581; stroke-width: 2.5; rx: 18; ry: 18; }
+      .decision { fill: #fff7d6; stroke: #b38600; stroke-width: 2.5; }
+      .note { fill: #eef6ff; stroke: #7aa5d2; stroke-width: 2.5; rx: 18; ry: 18; }
+      .stage1 { fill: #edf7ed; stroke: #3a7d44; stroke-width: 2.5; rx: 18; ry: 18; }
+      .stage2 { fill: #eef2ff; stroke: #4c63b6; stroke-width: 2.5; rx: 18; ry: 18; }
+      .end { fill: #f3e8ff; stroke: #7c3aed; stroke-width: 2.5; rx: 18; ry: 18; }
+      .lane { fill: none; stroke: #d9e2ec; stroke-width: 2; stroke-dasharray: 8 8; rx: 28; ry: 28; }
+      .arrow { stroke: #334e68; stroke-width: 3.5; fill: none; marker-end: url(#arrowhead); }
+      .dashed { stroke-dasharray: 9 8; }
+
+      /* additions for this figure, drawn from the same palette */
+      .target { fill: #fff7d6; stroke: #b38600; stroke-width: 2.5; rx: 18; ry: 18; }
+      .ref { fill: #f5f7fa; stroke: #829ab1; stroke-width: 2.5; rx: 18; ry: 18; }
+      .tiny { font-size: 13px; fill: #486581; }
+      .rowlabel { font-size: 15px; font-weight: 700; fill: #627d98; }
+      .bus { stroke: #334e68; stroke-width: 3.5; fill: none; }
+      .arrow-target { stroke: #b38600; stroke-width: 3.5; fill: none; marker-end: url(#arrowhead-target); }
+      .bus-target { stroke: #b38600; stroke-width: 3.5; fill: none; }
+      .arrow-soft { stroke: #829ab1; stroke-width: 2.5; fill: none; marker-end: url(#arrowhead-soft); stroke-dasharray: 9 8; }
+      .guide { stroke: #e3ebf3; stroke-width: 1.5; fill: none; stroke-dasharray: 3 5; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334e68"/>
+    </marker>
+    <marker id="arrowhead-target" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b38600"/>
+    </marker>
+    <marker id="arrowhead-soft" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#829ab1"/>
+    </marker>
+  </defs>
+
+  <text x="70" y="62" class="title">Water-Quality Forecasting Workflow</text>
+  <text x="70" y="100" class="subtitle">Hourly sensor records and sparse laboratory samples become windowed samples, four trained model families, and assessed forecasts.</text>
+
+  <!-- ============================ LANE RECTS ============================ -->
+  <rect x="50" y="130" width="1760" height="215" class="lane"/>
+  <rect x="50" y="375" width="1760" height="175" class="lane"/>
+  <rect x="50" y="580" width="1760" height="180" class="lane"/>
+  <rect x="50" y="785" width="1760" height="545" class="lane"/>
+  <rect x="50" y="1370" width="1760" height="205" class="lane"/>
+
+  <!-- ================ STRATEGY ROW GUIDES (behind cards) ================ -->
+  <path d="M 90 1034 L 1770 1034" class="guide"/>
+  <path d="M 90 1095 L 1770 1095" class="guide"/>
+  <path d="M 90 1175 L 1770 1175" class="guide"/>
+  <path d="M 90 1236 L 1770 1236" class="guide"/>
+
+  <!-- ============================== FLOWS =============================== -->
+  <!-- lane 1 -> lane 2 : the four series merge onto one hourly table -->
+  <path d="M 246 322 L 246 358" class="bus"/>
+  <path d="M 588 322 L 588 358" class="bus"/>
+  <path d="M 930 322 L 930 358" class="bus"/>
+  <path d="M 246 358 L 1272 358" class="bus"/>
+  <path d="M 1272 322 L 1272 358" class="bus-target"/>
+  <path d="M 246 358 L 246 422" class="arrow"/>
+
+  <!-- lane 2 : conditioning chain, left to right -->
+  <path d="M 402 480 L 430 480" class="arrow"/>
+  <path d="M 744 480 L 772 480" class="arrow"/>
+  <path d="M 1086 480 L 1114 480" class="arrow"/>
+  <path d="M 1428 480 L 1456 480" class="arrow-target"/>
+
+  <!-- calibration side channel : measurement error -> replicates -->
+  <path d="M 1614 322 L 1614 352 L 1845 352 L 1845 604 L 1145 604 L 1145 627" class="arrow-soft"/>
+
+  <!-- lane 2 -> lane 3 : wrap back to the start of the next stage -->
+  <path d="M 1614 533 L 1614 566 L 285 566 L 285 625" class="arrow"/>
+
+  <!-- lane 3 : sample-assembly chain, left to right -->
+  <path d="M 480 688 L 518 688" class="arrow"/>
+  <path d="M 910 688 L 948 688" class="arrow"/>
+  <path d="M 1340 688 L 1378 688" class="arrow"/>
+
+  <!-- lane 3 -> lane 4 -->
+  <path d="M 1575 743 L 1575 772 L 930 772 L 930 830" class="arrow"/>
+
+  <!-- lane 4 : subset search fans out to every model family -->
+  <path d="M 430 910 L 430 947" class="arrow"/>
+  <path d="M 820 910 L 820 947" class="arrow"/>
+  <path d="M 1210 910 L 1210 947" class="arrow"/>
+  <path d="M 1600 910 L 1600 947" class="arrow"/>
+
+  <!-- lane 4 -> lane 5 : all fitted models are scored the same way -->
+  <path d="M 430 1295 L 430 1355" class="bus"/>
+  <path d="M 820 1295 L 820 1355" class="bus"/>
+  <path d="M 1210 1295 L 1210 1355" class="bus"/>
+  <path d="M 1600 1295 L 1600 1355" class="bus"/>
+  <path d="M 285 1355 L 1600 1355" class="bus"/>
+  <path d="M 285 1355 L 285 1417" class="arrow"/>
+
+  <!-- scores steer the subset search -->
+  <path d="M 1600 1355 L 1845 1355 L 1845 874 L 1776 874" class="arrow-soft"/>
+
+  <!-- lane 5 : assessment chain -->
+  <path d="M 480 1487 L 518 1487" class="arrow"/>
+  <path d="M 910 1487 L 948 1487" class="arrow"/>
+  <path d="M 1340 1487 L 1378 1487" class="arrow"/>
+
+  <!-- ========================= LANE 1 : OBSERVE ========================= -->
+  <text x="80" y="166" class="lane-title">1  Observe</text>
+
+  <rect x="90" y="190" width="312" height="132" class="note"/>
+  <text x="246" y="224" text-anchor="middle" class="body">Meteorology</text>
+  <text x="246" y="250" text-anchor="middle" class="small">hourly</text>
+  <text x="246" y="276" text-anchor="middle" class="small">rain · air temperature</text>
+  <text x="246" y="298" text-anchor="middle" class="small">wind · radiation · humidity</text>
+
+  <rect x="432" y="190" width="312" height="132" class="note"/>
+  <text x="588" y="224" text-anchor="middle" class="body">Lake sensors</text>
+  <text x="588" y="250" text-anchor="middle" class="small">hourly</text>
+  <text x="588" y="276" text-anchor="middle" class="small">temperature · pH · oxygen</text>
+  <text x="588" y="298" text-anchor="middle" class="small">conductivity · turbidity · fDOM</text>
+
+  <rect x="774" y="190" width="312" height="132" class="note"/>
+  <text x="930" y="224" text-anchor="middle" class="body">Waterworks intake</text>
+  <text x="930" y="250" text-anchor="middle" class="small">hourly</text>
+  <text x="930" y="276" text-anchor="middle" class="small">pH · temperature</text>
+
+  <rect x="1116" y="190" width="312" height="132" class="target"/>
+  <text x="1272" y="224" text-anchor="middle" class="body">Laboratory samples</text>
+  <text x="1272" y="250" text-anchor="middle" class="small">≈ weekly</text>
+  <text x="1272" y="276" text-anchor="middle" class="small">14 parameters</text>
+  <text x="1272" y="298" text-anchor="middle" class="small">— the forecast target</text>
+
+  <rect x="1458" y="190" width="312" height="132" class="note"/>
+  <text x="1614" y="224" text-anchor="middle" class="body">Sensor calibrations</text>
+  <text x="1614" y="250" text-anchor="middle" class="small">25–35 events per sensor</text>
+  <text x="1614" y="276" text-anchor="middle" class="small">fitted measurement-error</text>
+  <text x="1614" y="298" text-anchor="middle" class="small">distribution per sensor</text>
+
+  <!-- ======================== LANE 2 : CONDITION ======================== -->
+  <text x="80" y="411" class="lane-title">2  Condition</text>
+
+  <rect x="90" y="428" width="312" height="105" class="box"/>
+  <text x="246" y="464" text-anchor="middle" class="body">Reject implausible values</text>
+  <text x="246" y="492" text-anchor="middle" class="small">physical bounds per sensor</text>
+
+  <rect x="432" y="428" width="312" height="105" class="box"/>
+  <text x="588" y="464" text-anchor="middle" class="body">Align to one hourly grid</text>
+  <text x="588" y="492" text-anchor="middle" class="small">every series, one index</text>
+
+  <rect x="774" y="428" width="312" height="105" class="box"/>
+  <text x="930" y="464" text-anchor="middle" class="body">Interpolate short gaps</text>
+  <text x="930" y="492" text-anchor="middle" class="small">≤ 6 h only, longer gaps left open</text>
+
+  <rect x="1116" y="428" width="312" height="105" class="box"/>
+  <text x="1272" y="458" text-anchor="middle" class="body">Derive predictors</text>
+  <text x="1272" y="484" text-anchor="middle" class="small">wind vectors · 24 h rainfall</text>
+  <text x="1272" y="506" text-anchor="middle" class="small">last known laboratory value</text>
+
+  <rect x="1458" y="428" width="312" height="105" class="target"/>
+  <text x="1614" y="464" text-anchor="middle" class="body">Define the target</text>
+  <text x="1614" y="492" text-anchor="middle" class="small">change since previous sample</text>
+
+  <!-- ======================== LANE 3 : ASSEMBLE ========================= -->
+  <text x="80" y="616" class="lane-title">3  Assemble</text>
+
+  <rect x="90" y="633" width="390" height="110" class="box"/>
+  <text x="285" y="669" text-anchor="middle" class="body">Scale to [0, 1]</text>
+  <text x="285" y="697" text-anchor="middle" class="small">min–max, one range per channel</text>
+
+  <rect x="520" y="633" width="390" height="110" class="box"/>
+  <text x="715" y="659" text-anchor="middle" class="body">Cut gapless windows</text>
+  <text x="715" y="683" text-anchor="middle" class="small">18 predictor channels</text>
+  <text x="715" y="703" text-anchor="middle" class="small">168 h or 672 h, matched to the</text>
+  <text x="715" y="723" text-anchor="middle" class="small">sampling interval of each target</text>
+
+  <rect x="950" y="633" width="390" height="110" class="box"/>
+  <text x="1145" y="669" text-anchor="middle" class="body">Replicate sensor error</text>
+  <text x="1145" y="697" text-anchor="middle" class="small">× 10 perturbed copies per window</text>
+
+  <rect x="1380" y="633" width="390" height="110" class="box"/>
+  <text x="1575" y="663" text-anchor="middle" class="body">Split chronologically</text>
+  <text x="1575" y="689" text-anchor="middle" class="small">70 % earliest / 30 % latest</text>
+  <text x="1575" y="711" text-anchor="middle" class="small">replicates never split apart</text>
+
+  <!-- ========================== LANE 4 : TRAIN ========================== -->
+  <text x="80" y="818" class="lane-title">4  Train</text>
+
+  <rect x="90" y="838" width="1680" height="72" class="stage1"/>
+  <text x="930" y="872" text-anchor="middle" class="body">Search predictor subsets</text>
+  <text x="930" y="896" text-anchor="middle" class="small">rank channels by attributed contribution, then beam search with swaps</text>
+  <text x="1766" y="938" text-anchor="end" class="small">scores steer the search</text>
+
+  <!-- shared strategy row labels : written once, aligned across every model -->
+  <text x="240" y="1058" text-anchor="end" class="rowlabel">Structure</text>
+  <text x="240" y="1119" text-anchor="end" class="rowlabel">Regularize</text>
+  <text x="240" y="1199" text-anchor="end" class="rowlabel">Batch</text>
+  <text x="240" y="1260" text-anchor="end" class="rowlabel">Stop</text>
+
+  <!-- model 1 : gradient-boosted trees -->
+  <rect x="260" y="955" width="340" height="340" class="stage2"/>
+  <text x="430" y="993" text-anchor="middle" class="body">Gradient-boosted trees</text>
+  <text x="430" y="1016" text-anchor="middle" class="small">additive decision-tree ensemble</text>
+  <text x="430" y="1058" text-anchor="middle" class="tiny">depth 2–9 · 10–300 trees</text>
+  <text x="430" y="1119" text-anchor="middle" class="tiny">L2 1e-3–10 · L1 1e-4–5</text>
+  <text x="430" y="1138" text-anchor="middle" class="tiny">min leaf 1–20 · min split gain 0–2</text>
+  <text x="430" y="1157" text-anchor="middle" class="tiny">rows 50–90 % · columns 30–100 %</text>
+  <text x="430" y="1199" text-anchor="middle" class="tiny">one tree per round</text>
+  <text x="430" y="1218" text-anchor="middle" class="tiny">learning rate 0.003–0.2</text>
+  <text x="430" y="1260" text-anchor="middle" class="tiny">3-fold round budget</text>
+  <text x="430" y="1279" text-anchor="middle" class="tiny">250 tuning trials, 1-SE rule</text>
+
+  <!-- model 2 : transformer -->
+  <rect x="650" y="955" width="340" height="340" class="stage2"/>
+  <text x="820" y="993" text-anchor="middle" class="body">Transformer</text>
+  <text x="820" y="1016" text-anchor="middle" class="small">self-attention sequence encoder</text>
+  <text x="820" y="1058" text-anchor="middle" class="tiny">64-dim · 4 heads · 2 layers</text>
+  <text x="820" y="1077" text-anchor="middle" class="tiny">learned position codes</text>
+  <text x="820" y="1119" text-anchor="middle" class="tiny">dropout 0.1</text>
+  <text x="820" y="1199" text-anchor="middle" class="tiny">32 windows per batch</text>
+  <text x="820" y="1218" text-anchor="middle" class="tiny">Adam 1e-3 · loss MSE − 0.1 × corr</text>
+  <text x="820" y="1260" text-anchor="middle" class="tiny">3-fold epoch budget</text>
+  <text x="820" y="1279" text-anchor="middle" class="tiny">≤ 100 epochs</text>
+
+  <!-- model 3 : gaussian process -->
+  <rect x="1040" y="955" width="340" height="340" class="stage2"/>
+  <text x="1210" y="993" text-anchor="middle" class="body">Gaussian process</text>
+  <text x="1210" y="1016" text-anchor="middle" class="small">Matérn-5/2 + linear kernel</text>
+  <text x="1210" y="1058" text-anchor="middle" class="tiny">one length-scale per input</text>
+  <text x="1210" y="1077" text-anchor="middle" class="tiny">sensor error folded in, 64 draws</text>
+  <text x="1210" y="1119" text-anchor="middle" class="tiny">length-scale 0.05–10</text>
+  <text x="1210" y="1138" text-anchor="middle" class="tiny">noise 1e-5–1</text>
+  <text x="1210" y="1157" text-anchor="middle" class="tiny">gamma priors on scale and noise</text>
+  <text x="1210" y="1199" text-anchor="middle" class="tiny">full batch, ≤ 5000 windows</text>
+  <text x="1210" y="1218" text-anchor="middle" class="tiny">Adam 0.01 · loss −log likelihood</text>
+  <text x="1210" y="1260" text-anchor="middle" class="tiny">3-fold epoch budget</text>
+  <text x="1210" y="1279" text-anchor="middle" class="tiny">≤ 250 epochs</text>
+
+  <!-- model 4 : linear reference -->
+  <rect x="1430" y="955" width="340" height="340" class="ref"/>
+  <text x="1600" y="993" text-anchor="middle" class="body">Multiple linear regression</text>
+  <text x="1600" y="1016" text-anchor="middle" class="small">reference model</text>
+  <text x="1600" y="1058" text-anchor="middle" class="tiny">window collapsed to one row</text>
+  <text x="1600" y="1077" text-anchor="middle" class="tiny">last hour, or window mean</text>
+  <text x="1600" y="1119" text-anchor="middle" class="tiny">|ρ| &gt; 0.2 pre-filter</text>
+  <text x="1600" y="1138" text-anchor="middle" class="tiny">lasso selection</text>
+  <text x="1600" y="1157" text-anchor="middle" class="tiny">collinearity dropped at VIF ≤ 10</text>
+  <text x="1600" y="1199" text-anchor="middle" class="tiny">closed-form least squares</text>
+  <text x="1600" y="1260" text-anchor="middle" class="tiny">no iteration —</text>
+  <text x="1600" y="1279" text-anchor="middle" class="tiny">selection is the only control</text>
+
+  <!-- ========================= LANE 5 : ASSESS ========================== -->
+  <text x="80" y="1404" class="lane-title">5  Assess</text>
+
+  <rect x="90" y="1425" width="390" height="125" class="stage1"/>
+  <text x="285" y="1461" text-anchor="middle" class="body">Predict held-out windows</text>
+  <text x="285" y="1489" text-anchor="middle" class="small">the latest 30 % of the record,</text>
+  <text x="285" y="1511" text-anchor="middle" class="small">never seen during fitting</text>
+
+  <rect x="520" y="1425" width="390" height="125" class="stage1"/>
+  <text x="715" y="1461" text-anchor="middle" class="body">Compare to reference forecasts</text>
+  <text x="715" y="1489" text-anchor="middle" class="small">persistence · climatology</text>
+  <text x="715" y="1511" text-anchor="middle" class="small">local linear trend</text>
+
+  <rect x="950" y="1425" width="390" height="125" class="stage1"/>
+  <text x="1145" y="1461" text-anchor="middle" class="body">Score and test</text>
+  <text x="1145" y="1489" text-anchor="middle" class="small">R² · RMSE · skill over baseline</text>
+  <text x="1145" y="1511" text-anchor="middle" class="small">Diebold–Mariano · Wilcoxon · sign</text>
+
+  <rect x="1380" y="1425" width="390" height="125" class="end"/>
+  <text x="1575" y="1461" text-anchor="middle" class="body">Show</text>
+  <text x="1575" y="1489" text-anchor="middle" class="small">predicted against observed series</text>
+  <text x="1575" y="1511" text-anchor="middle" class="small">quality matrix over 14 targets</text>
+
+  <!-- ============================= LEGEND ============================== -->
+  <path d="M 90 1608 L 150 1608" class="bus"/>
+  <text x="162" y="1614" class="small">predictor flow</text>
+
+  <path d="M 320 1608 L 380 1608" class="bus-target"/>
+  <text x="392" y="1614" class="small">target series</text>
+
+  <path d="M 545 1608 L 605 1608" class="arrow-soft"/>
+  <text x="617" y="1614" class="small">measurement uncertainty</text>
+
+  <rect x="860" y="1594" width="34" height="28" class="ref"/>
+  <text x="906" y="1614" class="small">reference model</text>
+
+  <text x="1770" y="1614" text-anchor="end" class="small">Target = change in a laboratory parameter since the previous sample. Implemented in src/.</text>
+</svg>

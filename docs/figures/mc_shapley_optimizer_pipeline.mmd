@@ -1,0 +1,28 @@
+flowchart TD
+    A[CLI args<br/>data root, dataset filters,<br/>budgets, seeds, skip flags]
+    B[Discover dataset plans<br/>resolve configs and row counts]
+    C{{For each dataset plan}}
+    D[Stage A CV tuning on full feature set<br/>write Shapley cache if first XGB config]
+    E{Skip Shapley stage?}
+    F[Stage 1: Shapley sweep<br/>run i_RunMCFeatureSelectionShapleySweep.py]
+    G[Write Shapley artifacts<br/>ranked features + feature_seed_subsets_r###.csv]
+    H[Stage B CV tuning on top-k Shapley subsets<br/>build consensus hyperparameters]
+    I[Write feature_sweeps cache<br/>for downstream optimizer reuse]
+    J{Skip optimizer stage?}
+    K[Sync cached hyperparameters<br/>into train configs]
+    L[Stage 2: seeded optimizer sweep(s)<br/>run h_RunMCFeatureSelectionSweep.py]
+    M[Inputs: Shapley seed subsets by default<br/>or explicit --seed-subsets-csv]
+    N[Beam + swap search over feature subsets<br/>repeat for one or many optimizer seeds]
+    O[Write optimizer outputs<br/>forecasts/feature_sweeps]
+    P[Aggregate failures, restore namespace,<br/>optional ntfy notification]
+
+    A --> B --> C --> D --> E
+    E -- no --> F --> G --> H --> I --> J
+    E -- yes --> J
+    J -- no --> K --> L
+    M --> L
+    L --> N --> O --> P
+    J -- yes --> P
+
+    Q[m_RunParallelPipeline.py optional wrapper<br/>partitions datasets across workers<br/>and assigns GPU/CPU per worker]
+    Q -. launches workers that execute .-> C

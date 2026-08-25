@@ -255,7 +255,8 @@
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/z1_FeaturePostProcess.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/utils/correlate_profiler_targets.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(.venv/Scripts/python src/utils/correlate_profiler_targets.py)",
-      "Bash(.venv/Scripts/python -c \"import sys; print\\(sys.path[0]\\)\")"
+      "Bash(.venv/Scripts/python -c \"import sys; print\\(sys.path[0]\\)\")",
+      "Bash(.venv/Scripts/python src/utils/post_cal_drift.py)"
     ]
   }
 }
