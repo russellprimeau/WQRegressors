@@ -18,6 +18,8 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.ticker as mticker
 import pandas as pd
+from utils.names import label as names_label
+from utils.plotstyle import legend_above
 from utils.limits import (
     load_limits_records,
     map_limits_to_columns,
@@ -1105,7 +1107,11 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
         "Target": ordered_target_cols,
         "Target_diff": ordered_target_diff_cols,
     }
-    predictor_cols_for_split = [c for c in all_cols if c not in ordered_target_cols and c not in ordered_target_diff_cols]
+    # Excluded against the *full* target and delta lists, as in the split-comparison section
+    # above.  Using the ordered lists instead would let 14 lab columns through: ``_res`` and
+    # ``_diff`` share a base name, so ``target_diff_by_base`` keeps only one column per base
+    # and the other of each pair falls into the predictor set, roughly doubling the count.
+    predictor_cols_for_split = [c for c in all_cols if c not in target_cols and c not in target_diff_cols]
     window = 168
     first_valid_idx = window - 1
     if predictor_cols_for_split:
@@ -1127,14 +1133,17 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
     for figure_name, cols in category_columns.items():
         if not cols:
             continue
-        labels = cols.copy()
-        if figure_name == "Surface":
-            labels = [l[len("Pfl - "):] if l.startswith("Pfl - ") else l for l in labels]
-        if figure_name == "SCADA":
-            labels = [l[len("SCADA - "):] if l.startswith("SCADA - ") else l for l in labels]
-        if figure_name == "Target_diff":
-            labels = [_strip_target_delta_suffix(l) for l in labels]
-        labels = _strip_common_affixes(labels)
+        # Row labels come from the shared registry rather than by stripping characters off
+        # the stored column name.  Each of these figures draws a single dataset, so the
+        # source qualifier would be constant down the whole column and is omitted; the
+        # figure caption names the dataset.  These panels plot measured values, so the
+        # units are kept.  Target_diff plots the change for every row, which the caption
+        # states once, so the per-row suffix is dropped.
+        keep_suffix = figure_name != "Target_diff"
+        labels = [
+            names_label(c, with_unit=True, qualified=False, with_suffix=keep_suffix)
+            for c in cols
+        ]
         wrapped_labels = [textwrap.fill(lbl, width=17) for lbl in labels]
         label_map[figure_name] = wrapped_labels
         for lbl in wrapped_labels:
@@ -1147,9 +1156,13 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
     fig_width = 13.0
     row_height = 0.88
     min_fig_height = 2.8
-    font_size = 10
-    y_label_font_size = int(round(font_size * 1.5))
-    x_label_font_size = int(round(font_size * 1.5))
+    # These figures are drawn 13 in wide and then scaled to the 6.5 in text block, so
+    # everything on the page is half the size set here.  At the previous font_size = 10
+    # the y tick values printed at 5 pt.  Sizes are now chosen so that the smallest text
+    # lands at ~7 pt after that 2x reduction.
+    font_size = 14
+    y_label_font_size = int(round(font_size * 1.3))
+    x_label_font_size = int(round(font_size * 1.3))
     y_value_font_size = font_size
     y_label_pad = 8
     # Shared figure margin: estimate required left inches from wrapped label width.
@@ -1609,7 +1622,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                 _cax = ax_raster.inset_axes([1.01, 0.1, 0.018, 0.80])
                 _cb = fig.colorbar(_im, cax=_cax)
                 _cb.set_ticks([0, _raster_vmax // 2, _raster_vmax])
-                _cb.ax.tick_params(labelsize=font_size - 2)
+                _cb.ax.tick_params(labelsize=font_size)
                 ax_raster.set_xlim(start_date, end_date)
                 ax_raster.set_ylabel(
                     "Predictor\nFeature Count", rotation=0, ha="right", va="center",
@@ -1649,15 +1662,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                     legend_handles = [measured_handle, sigma1_handle, sigma2_handle, calib_handle]
                 else:
                     legend_handles = [calib_handle]
-                fig.legend(
-                    handles=legend_handles,
-                    loc="upper center",
-                    bbox_to_anchor=(0.5, 1.03),
-                    ncol=len(legend_handles),
-                    framealpha=0.85,
-                    fontsize=font_size,
-                    borderaxespad=0.12,
-                )
+                legend_above(fig, legend_handles, fontsize=font_size)
             elif figure_name == "Target_diff":
                 _inside_handle = plt.Line2D(
                     [0], [0], color="black", linestyle="", marker="o",
@@ -1669,15 +1674,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                     markersize=4.0, markeredgewidth=0.9,
                     label="Measurement beyond limits",
                 )
-                fig.legend(
-                    handles=[_inside_handle, _beyond_handle],
-                    loc="upper center",
-                    bbox_to_anchor=(0.5, 1.03),
-                    ncol=2,
-                    framealpha=0.85,
-                    fontsize=y_label_font_size,
-                    borderaxespad=0.12,
-                )
+                legend_above(fig, [_inside_handle, _beyond_handle], fontsize=y_label_font_size)
             elif figure_name == "Target":
                 _upper_handle = plt.Line2D(
                     [0], [0], color="#ff0000", linewidth=0.7, linestyle="-",
@@ -1687,15 +1684,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                     [0], [0], color="#2ca02c", linewidth=0.7, linestyle="-",
                     label="Strictest legal threshold (lower bound)",
                 )
-                fig.legend(
-                    handles=[_upper_handle, _lower_handle],
-                    loc="upper center",
-                    bbox_to_anchor=(0.5, 1.03),
-                    ncol=2,
-                    framealpha=0.85,
-                    fontsize=y_label_font_size,
-                    borderaxespad=0.12,
-                )
+                legend_above(fig, [_upper_handle, _lower_handle], fontsize=y_label_font_size)
             out_path = out_dir / f"{figure_name}_{variant_suffix}.png"
             fig.savefig(out_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
             # --- No-raster variant for Target timeseries ---
@@ -1757,17 +1746,13 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                 _nr_top = max(0.86, min(0.995, 1.0 - (top_margin_in / _nr_fig_h)))
                 _nr_bottom = max(0.08, min(0.30, bottom_margin_in / _nr_fig_h))
                 _nr_fig.subplots_adjust(left=shared_left_margin, right=shared_right_margin, top=_nr_top, bottom=_nr_bottom, hspace=shared_hspace)
-                _nr_fig.legend(
-                    handles=[
+                legend_above(
+                    _nr_fig,
+                    [
                         plt.Line2D([0], [0], color="#ff0000", linewidth=0.7, linestyle="-", label="Strictest legal threshold (upper bound)"),
                         plt.Line2D([0], [0], color="#2ca02c", linewidth=0.7, linestyle="-", label="Strictest legal threshold (lower bound)"),
                     ],
-                    loc="upper center",
-                    bbox_to_anchor=(0.5, 1.03),
-                    ncol=2,
-                    framealpha=0.85,
                     fontsize=y_label_font_size,
-                    borderaxespad=0.12,
                 )
                 _nr_out_path = out_dir / "Target_timeseries_no_raster.png"
                 _nr_fig.savefig(_nr_out_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
@@ -1860,17 +1845,13 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                         left=shared_left_margin, right=shared_right_margin,
                         top=_as_top, bottom=_as_bottom, hspace=shared_hspace,
                     )
-                    _as_fig.legend(
-                        handles=[
+                    legend_above(
+                        _as_fig,
+                        [
                             plt.Line2D([0], [0], color=_PRIMARY_BLUE, linewidth=1.0, linestyle="-", label="Sensor"),
                             plt.Line2D([0], [0], color=_ALT_ORANGE, linewidth=1.0, linestyle="-", label="Analysis"),
                         ],
-                        loc="upper center",
-                        bbox_to_anchor=(0.5, 1.03),
-                        ncol=2,
-                        framealpha=0.85,
                         fontsize=font_size,
-                        borderaxespad=0.12,
                     )
                     _as_out_path = out_dir / "Weather_timeseries_alt_source.png"
                     _as_fig.savefig(_as_out_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
@@ -1927,14 +1908,10 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                         (0, 0), 1, 1, facecolor="#f4a3c2", alpha=0.24,
                         label="Test set",
                     )
-                    fig.legend(
-                        handles=[_inside_handle, _beyond_handle, _train_handle, _test_handle],
-                        loc="upper center",
-                        bbox_to_anchor=(0.5, 1.03),
-                        ncol=4,
-                        framealpha=0.85,
+                    legend_above(
+                        fig,
+                        [_inside_handle, _beyond_handle, _train_handle, _test_handle],
                         fontsize=y_label_font_size,
-                        borderaxespad=0.12,
                     )
                 elif figure_name == "Target":
                     if fig.legends:
@@ -1955,14 +1932,10 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                         (0, 0), 1, 1, facecolor="#f4a3c2", alpha=0.24,
                         label="Test set",
                     )
-                    fig.legend(
-                        handles=[_upper_handle, _lower_handle, _train_handle, _test_handle],
-                        loc="upper center",
-                        bbox_to_anchor=(0.5, 1.03),
-                        ncol=4,
-                        framealpha=0.85,
+                    legend_above(
+                        fig,
+                        [_upper_handle, _lower_handle, _train_handle, _test_handle],
                         fontsize=y_label_font_size,
-                        borderaxespad=0.12,
                     )
                 overlay_out_path = out_dir / f"{figure_name}_timeseries_overlay.png"
                 fig.savefig(overlay_out_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
@@ -1994,6 +1967,10 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                         if len(cols) == 1:
                             axes_norm = [axes_norm]
                     palette_norm = _safe_series_colors(len(cols))
+                    # Every series is rescaled to [0, 1] here, which the caption states.  The
+                    # row label still names the parameter in its own units, because that is
+                    # what identifies the series and matches the other target figures; the
+                    # 0 / 0.5 / 1 tick values make the rescaling evident on the axis itself.
                     for i, (ax, col, label) in enumerate(zip(axes_norm, cols, wrapped_labels)):
                         # Compute normalization
                         series_raw = pd.to_numeric(df[col], errors="coerce")
@@ -2032,7 +2009,12 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                             series_norm.values[exceed_plot_mask],
                             linestyle="", marker="x", markersize=4.0, markeredgewidth=0.9, color="#ff0000",
                         )
-                        ax.set_ylim(-0.05, 1.05)
+                        # The 0 and 1 ticks are the extremes of the normalized range, so at a
+                        # tight ylim their labels sit on the axes edges and collide with the
+                        # neighbouring subplot's across the narrow hspace ("1.0" over "0.0").
+                        # Padding the limits insets both labels far enough to clear, which is
+                        # how the un-normalized panels avoid the same collision.
+                        ax.set_ylim(-0.20, 1.20)
                         ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=y_label_font_size, labelpad=y_label_pad)
                         ax.yaxis.set_major_locator(mticker.FixedLocator([0, 0.5, 1]))
                         ax.grid(axis="y", linestyle="--", alpha=0.25, linewidth=0.4)
@@ -2068,7 +2050,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                         _cax_norm = ax_norm_raster.inset_axes([1.01, 0.1, 0.018, 0.80])
                         _cb_norm = fig_norm.colorbar(_im_norm, cax=_cax_norm)
                         _cb_norm.set_ticks([0, _raster_vmax // 2, _raster_vmax])
-                        _cb_norm.ax.tick_params(labelsize=font_size - 2)
+                        _cb_norm.ax.tick_params(labelsize=font_size)
                         ax_norm_raster.set_xlim(start_date, end_date)
                         ax_norm_raster.set_ylabel(
                             "Predictor\nFeature Count", rotation=0, ha="right", va="center",
@@ -2095,14 +2077,10 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                         (0, 0), 1, 1, facecolor="#f4a3c2", alpha=0.24,
                         label="Test set",
                     )
-                    fig_norm.legend(
-                        handles=[_inside_handle, _beyond_handle, _train_handle, _test_handle],
-                        loc="upper center",
-                        bbox_to_anchor=(0.5, 1.03),
-                        ncol=4,
-                        framealpha=0.85,
+                    legend_above(
+                        fig_norm,
+                        [_inside_handle, _beyond_handle, _train_handle, _test_handle],
                         fontsize=y_label_font_size,
-                        borderaxespad=0.12,
                     )
                     overlay_norm_out_path = out_dir / "Target_diff_timeseries_overlay_norm.png"
                     fig_norm.savefig(overlay_norm_out_path, dpi=220, bbox_inches="tight", pad_inches=0.02)

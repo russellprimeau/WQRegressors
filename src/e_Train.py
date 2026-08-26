@@ -726,6 +726,12 @@ def write_evaluation_config(config):
             "input_row_2": data_cfg["input_row_2"],
             "output_columns": data_cfg["output_columns"],
             "output_rows": data_cfg["output_rows"],
+            # Evaluation must rebuild the inputs exactly as training did. Omitting
+            # this silently defaulted evaluation to the unaggregated window, so a
+            # model trained on one value per predictor was scored against the full
+            # flattened window and failed on a shape mismatch against its own saved
+            # uncertainty buffer.
+            "input_aggregation": data_cfg.get("input_aggregation", "none"),
         },
         "data_split": config.get("data_split", DEFAULT_DATA_SPLIT_CONFIG),
         "evaluation": evaluation_cfg,
@@ -1166,11 +1172,33 @@ def train_gp_regressor_model(config, train_samples, test_samples):
     mc_samples = int(hyper_cfg.get("uncertain_kernel_mc_samples", 64))
     mc_seed = int(hyper_cfg.get("uncertain_kernel_mc_seed", 0))
 
-    if use_uncertain_kernel and not requested_ard:
-        print("[WARN] Uncertain-input kernel works best with ARD. Forcing ARD=True for GP kernel.")
+    # ARD gives the kernel one lengthscale per input dimension. Because the
+    # predictor window is flattened, that dimension count is rows x predictors --
+    # 835 for a 167-row window over 5 predictors -- while a target may supply as
+    # few as 11 training samples. Fitting 835 lengthscales from 11 samples does
+    # not fail loudly; it fails silently, leaving every lengthscale at its
+    # initial value, and a kernel at its default scale is not a fitted kernel.
+    # Above the sample count ARD is therefore dropped for an isotropic
+    # lengthscale, which is estimable at any n. The uncertain-input kernel's
+    # per-feature variance is a separate buffer and is unaffected.
+    n_train_rows, n_input_dims = int(X_train.shape[0]), int(X_train.shape[1])
+    requested_effective_ard = bool(requested_ard or use_uncertain_kernel)
+    min_samples_per_dim = float(hyper_cfg.get("ard_min_samples_per_dim", 1.0))
+    ard_dim_budget = max(1, int(n_train_rows / max(min_samples_per_dim, 1e-9)))
+    ard_suppressed = requested_effective_ard and n_input_dims > ard_dim_budget
 
-    effective_ard = bool(requested_ard or use_uncertain_kernel)
-    ard_dims = X_train.shape[1] if effective_ard else None
+    if use_uncertain_kernel and not requested_ard and not ard_suppressed:
+        print("[WARN] Uncertain-input kernel works best with ARD. Forcing ARD=True for GP kernel.")
+    if ard_suppressed:
+        print(
+            f"[WARN] ARD disabled: {n_input_dims} input dimensions exceed the "
+            f"{ard_dim_budget} supportable at {n_train_rows} training samples "
+            f"(ard_min_samples_per_dim={min_samples_per_dim:g}). Using a single isotropic "
+            "lengthscale. Reduce the input dimension (input_aggregation) to use ARD here."
+        )
+
+    effective_ard = bool(requested_effective_ard and not ard_suppressed)
+    ard_dims = n_input_dims if effective_ard else None
     input_uncertainty_var = None
     uncertainty_noise_deltas = None
     uncertainty_bundle = {
@@ -1310,12 +1338,26 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         if early_stop_metric == "mixed" and not (0.0 <= early_stop_alpha <= 1.0):
             raise ValueError("hyperparameters.early_stop_alpha must be in [0, 1]")
 
-        stop_reason_code = "max_epochs_exhausted"
+        # A CV-derived budget is a different outcome from exhausting the
+        # configured schedule, and conflating them hid that GP runs were
+        # training for a median of 24 of 250 configured epochs -- too few for any
+        # kernel hyperparameter to move from its initial value.
+        stop_reason_code = (
+            "cv_epoch_budget_exhausted" if use_cv_epoch_budget else "max_epochs_exhausted"
+        )
         stop_epoch = int(effective_num_epochs)
         stop_reason_text = (
-            "Scheduled stop: all configured epochs exhausted "
-            f"({int(effective_num_epochs)}/{int(effective_num_epochs)} epochs)."
+            f"Scheduled stop: {'CV-derived epoch budget' if use_cv_epoch_budget else 'configured epochs'} "
+            f"exhausted ({int(effective_num_epochs)}/{int(hyper_cfg['num_epochs'])} configured epochs)."
         )
+        if use_cv_epoch_budget and int(effective_num_epochs) < 0.2 * int(hyper_cfg["num_epochs"]):
+            print(
+                f"[WARN] GP cross-validation set an epoch budget of {int(effective_num_epochs)} "
+                f"against {int(hyper_cfg['num_epochs'])} configured epochs. At that budget the "
+                "kernel hyperparameters barely move from initialization, so the reported fit is "
+                "close to a fixed-kernel interpolation. This usually means the input dimension "
+                "is far larger than the training sample count."
+            )
 
         for epoch in range(effective_num_epochs):
             optimizer.zero_grad()
@@ -1387,11 +1429,13 @@ def train_gp_regressor_model(config, train_samples, test_samples):
                     )
                     break
 
-        if stop_reason_code == "max_epochs_exhausted":
+        if stop_reason_code in ("max_epochs_exhausted", "cv_epoch_budget_exhausted"):
             stop_epoch = int(len(losses))
+            budget_label = ("CV-derived epoch budget" if stop_reason_code == "cv_epoch_budget_exhausted"
+                            else "configured epochs")
             stop_reason_text = (
-                "Scheduled stop: all configured epochs exhausted "
-                f"({stop_epoch}/{int(hyper_cfg['num_epochs'])} epochs)."
+                f"Scheduled stop: {budget_label} exhausted "
+                f"({stop_epoch}/{int(hyper_cfg['num_epochs'])} configured epochs)."
             )
 
         model.load_state_dict(best_model_state)
@@ -1452,6 +1496,7 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         'input_row_2': data_cfg["input_row_2"],
         'output_columns': data_cfg["output_columns"],
         'output_rows': data_cfg["output_rows"],
+        'input_aggregation': str(data_cfg.get("input_aggregation", "none")).lower(),
         'kernel': kernel_name,
         'ard': requested_ard,
         'effective_ard': effective_ard,
@@ -1565,7 +1610,7 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         {
             "stop_reason_code": overall_code,
             "stop_reason_text": overall_text,
-            "stopped_early": bool(any(item["stop_reason_code"] != "max_epochs_exhausted" for item in output_stop_summaries)),
+            "stopped_early": bool(any(item["stop_reason_code"] not in {"max_epochs_exhausted", "cv_epoch_budget_exhausted"} for item in output_stop_summaries)),
             "per_output": output_stop_summaries,
             "configured": {
                 "num_epochs": int(hyper_cfg["num_epochs"]),

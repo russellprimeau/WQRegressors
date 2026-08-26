@@ -115,7 +115,10 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from utils.training import load_samples, group_samples_by_segment, SampleComplianceError
-from utils.names import clean_target_label
+from utils.names import clean_target_label, label as names_label
+from utils.plotstyle import PAGE_WIDTH_IN, apply_paper_style, legend_above, save_figure
+
+apply_paper_style()
 
 
 SUPPORTED_CONFIG_SUFFIXES = {".yml", ".yaml", ".json"}
@@ -2065,15 +2068,7 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     fig.subplots_adjust(top=0.89, hspace=0.16)
     legend_handles = [legend_handles_by_model[m] for m in FINAL_METRICS_MODEL_ORDER if m in legend_handles_by_model]
     legend_labels = [legend_labels_by_model[m] for m in FINAL_METRICS_MODEL_ORDER if m in legend_labels_by_model]
-    fig.legend(
-        legend_handles,
-        legend_labels,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.905),
-        ncol=len(legend_handles),
-        frameon=True,
-        fontsize=9,
-    )
+    legend_above(fig, legend_handles, legend_labels, fontsize=9)
     fig.savefig(plot_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
     return plot_path
@@ -3196,11 +3191,19 @@ def _compile_multi_target_comparison(
     heat_xtick_font = heat_font
     heat_ytick_font = heat_font
     heat_axis_label_font = heat_font
-    # Bar typography is tuned for document embedding where figures are often resized down.
-    bar_tick_font = max(8, min(13, int(340 / max_group_len)))
-    bar_title_font = max(12, min(16, int(420 / max_group_len)))
-    bar_value_font = max(7, min(11, int(320 / max_group_len)))
-    bar_axis_label_font = max(11, min(15, int(360 / max_group_len)))
+    # Bar typography.  The figure is now drawn at the width it is printed at, so these are
+    # literal point sizes on the page rather than pre-shrunk values; scaling them by the
+    # feature count would only reintroduce the illegibility it was meant to avoid.
+    bar_tick_font = 7
+    bar_title_font = 8
+    bar_value_font = 7
+    bar_axis_label_font = 8
+
+    # These figures plot importance z-scores and inclusion counts, never measurements, so
+    # predictor labels carry no units.  The source qualifier is kept because the predictor
+    # pool contains both Surface and SCADA pH and water temperature.
+    def _feature_display(feat: str) -> str:
+        return names_label(feat, with_unit=False, qualified=True)
 
     if matrix.size:
         vmin = float(np.percentile(matrix, 5))
@@ -3256,7 +3259,11 @@ def _compile_multi_target_comparison(
         sep_col = np.full((left_block.shape[0], 1), np.nan)
         combined_matrix = np.hstack([left_block, sep_col, right_block])
         sep_pos = left_block.shape[1]
-        xticklabels_with_sep = multi_target_features + [""] + single_target_features
+        xticklabels_with_sep = (
+            [_feature_display(f) for f in multi_target_features]
+            + [""]
+            + [_feature_display(f) for f in single_target_features]
+        )
 
         n_total_cols = combined_matrix.shape[1]
         heat_w = max(14, n_total_cols * 0.85)
@@ -3308,14 +3315,14 @@ def _compile_multi_target_comparison(
             vmax=vmax,
             annot=False,
             cbar_kws={"label": wrapped_importance_label, "pad": 0.01},
-            xticklabels=all_features,
+            xticklabels=[_feature_display(f) for f in all_features],
             yticklabels=yticklabels_with_total,
             linewidths=0.5,
             linecolor="#eeeeee",
             square=False,
         )
         _annotate_heat_cells(ax, matrix_with_total, annot_fontsize)
-        ax.set_xticklabels(all_features, rotation=45, ha='right', fontsize=heat_xtick_font)
+        ax.set_xticklabels([_feature_display(f) for f in all_features], rotation=45, ha='right', fontsize=heat_xtick_font)
         ax.set_yticklabels([textwrap.fill(lbl, 20) for lbl in yticklabels_with_total], rotation=0, fontsize=heat_ytick_font)
         ax.set_xlabel("Predictor", fontsize=heat_axis_label_font)
         ax.set_ylabel("Target", fontsize=heat_axis_label_font)
@@ -3353,14 +3360,14 @@ def _compile_multi_target_comparison(
                 annot=False,
                 cbar_kws={"label": wrapped_importance_label, "pad": 0.01},
                 xticklabels=_xtlabels_t,
-                yticklabels=[textwrap.fill(f, 20) for f in _t_feats],
+                yticklabels=[textwrap.fill(_feature_display(f), 20) for f in _t_feats],
                 linewidths=0.5,
                 linecolor="#eeeeee",
                 square=False,
             )
             _annotate_heat_cells(_ax_t, _t_mat, annot_fontsize)
             _ax_t.set_xticklabels(_xtlabels_t, rotation=45, ha='right', fontsize=heat_xtick_font)
-            _ax_t.set_yticklabels([textwrap.fill(f, 20) for f in _t_feats], rotation=0, fontsize=heat_ytick_font)
+            _ax_t.set_yticklabels([textwrap.fill(_feature_display(f), 20) for f in _t_feats], rotation=0, fontsize=heat_ytick_font)
             _ax_t.set_xlabel("Target", fontsize=heat_axis_label_font)
             _ax_t.set_ylabel("Predictor", fontsize=heat_axis_label_font)
             _t_path = summaries_dir / f"multi_target_importance_heatmap_{_t_suffix}.png"
@@ -3418,12 +3425,24 @@ def _compile_multi_target_comparison(
             return [plt.cm.RdYlGn(0.5) for _ in vals]
         return [plt.cm.RdYlGn(float(color_norm(v))) for v in vals]
 
-    def _draw_group_bars(ax_obj, features: list[str], values: list[float], title: str) -> None:
+    def _draw_group_bars(ax_obj, features: list[str], values: list[float], title: str,
+                         strip_suffix: bool = False) -> None:
         x_vals = np.arange(len(features), dtype=float)
         bars = ax_obj.bar(x_vals, values, color=_bar_colors(values))
-        ax_obj.set_title(title, fontsize=bar_title_font)
+        # The group name goes on the y-axis rather than in a title, because captions live
+        # in the LaTeX document.  It still has to be stated somewhere: the two panels are
+        # multi-target and single-target features, which is not inferable from the bars.
         ax_obj.set_xticks(x_vals)
-        ax_obj.set_xticklabels(features, rotation=45, ha='right', fontsize=bar_tick_font)
+        # The y-axis is a summed z-score, so predictor names must not carry concentration
+        # units here.  The source qualifier is kept: the pool holds both Surface and
+        # SCADA pH and water temperature.  ``strip_suffix`` drops the ", previous value"
+        # wording when every bar in the panel is a state feature, since repeating it 14
+        # times says nothing the axis label does not already say.
+        ax_obj.set_xticklabels(
+            [names_label(f, with_unit=False, qualified=True, with_suffix=not strip_suffix)
+             for f in features],
+            rotation=45, ha='right', fontsize=bar_tick_font,
+        )
         ax_obj.grid(axis='y', alpha=0.3)
         ax_obj.axhline(0.0, color='black', linewidth=0.8, linestyle='--', alpha=0.6)
         ax_obj.margins(x=0.01)
@@ -3438,7 +3457,9 @@ def _compile_multi_target_comparison(
             ax_obj.text(
                 bar.get_x() + bar.get_width() / 2,
                 y_text,
-                f"{val:.2e}",
+                # Summed z-scores are O(1)-O(10); scientific notation made every label
+                # three times longer than the value warranted.
+                f"{val:.2f}",
                 ha='center',
                 va='center',
                 fontsize=bar_value_font,
@@ -3447,38 +3468,45 @@ def _compile_multi_target_comparison(
             )
         ax_obj.set_ylim(y_lower, y_upper)
 
+    # Draw at the width the figure is actually printed at.  Previously this was at least
+    # 15 in wide and then scaled to the 6.5 in text block, which shrank the 13 pt
+    # predictor labels to ~5.6 pt on the page while leaving the colour-coded bars far
+    # wider than they needed to be.
     if multi_target_features and single_target_features:
         fig, (ax_top, ax_bottom) = plt.subplots(
             2,
             1,
-            figsize=(max(15, len(top_features) * 0.58), max(10, 7 + 0.05 * len(top_features))),
+            figsize=(PAGE_WIDTH_IN, 6.4),
             sharey=True,
             constrained_layout=True,
         )
-        _draw_group_bars(
-            ax_top,
-            multi_target_features,
-            multi_scores,
-            f"Multi-target Features",
+        _draw_group_bars(ax_top, multi_target_features, multi_scores, "Multi-target features")
+        # Every single-target feature is a target's own previous value, so that is stated
+        # once here instead of on all fourteen tick labels.
+        _single_are_all_state = all(
+            str(f).endswith("_state") for f in single_target_features_bar
         )
-        _draw_group_bars(
-            ax_bottom,
-            single_target_features_bar,
-            single_scores,
-            f"Single-target Features",
-        )
-        _wrapped_ylabel = textwrap.fill(str(summary_axis_label), width=20)
-        ax_top.set_ylabel(_wrapped_ylabel, fontsize=bar_axis_label_font)
-        ax_bottom.set_ylabel(_wrapped_ylabel, fontsize=bar_axis_label_font)
+        _draw_group_bars(ax_bottom, single_target_features_bar, single_scores,
+                         "Single-target features", strip_suffix=_single_are_all_state)
+        _wrapped_ylabel = textwrap.fill(str(summary_axis_label), width=24)
+        # The panel distinction moves from the (removed) titles into the y-axis labels,
+        # so it survives without duplicating the caption.
+        ax_top.set_ylabel(f"{_wrapped_ylabel}\n(multi-target features)",
+                          fontsize=bar_axis_label_font)
+        _bottom_note = ("previous target value" if _single_are_all_state
+                        else "single-target features")
+        ax_bottom.set_ylabel(f"{_wrapped_ylabel}\n({_bottom_note})",
+                             fontsize=bar_axis_label_font)
         ax_bottom.set_xlabel("")
     else:
-        fig, ax = plt.subplots(figsize=(max(15, len(top_features) * 0.58), 6.5), constrained_layout=True)
-        _draw_group_bars(ax, top_features, summed_scores, "Feature Importance (summed target-wise z-score)")
-        ax.set_ylabel(textwrap.fill(str(summary_axis_label), width=20), fontsize=bar_axis_label_font)
+        fig, ax = plt.subplots(figsize=(PAGE_WIDTH_IN, 3.6), constrained_layout=True)
+        _draw_group_bars(ax, top_features, summed_scores, "Feature importance")
+        ax.set_ylabel(textwrap.fill(str(summary_axis_label), width=24),
+                      fontsize=bar_axis_label_font)
         ax.set_xlabel("")
 
     bar_path = summaries_dir / "multi_target_importance_bars.png"
-    fig.savefig(bar_path, dpi=180, bbox_inches='tight')
+    save_figure(fig, bar_path)
     plt.close(fig)
 
     return plot_path

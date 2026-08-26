@@ -230,6 +230,7 @@ def load_split_samples(
     split_files_override=None,
     fault_tolerant=False,
     input_aggregation="none",
+    drop_report=None,
 ):
     source_dir = Path(split_source_dir) if split_source_dir is not None else Path(data_dir, "forecasts", forecast_name)
     split_files = split_files_override if split_files_override is not None else _read_split_files(source_dir, split_file)
@@ -243,6 +244,7 @@ def load_split_samples(
         file_list=split_files,
         fault_tolerant=fault_tolerant,
         input_aggregation=input_aggregation,
+        drop_report=drop_report,
     )
 
     return samples
@@ -930,6 +932,82 @@ def _compute_classification_summary(label, preds, targets, num_samples, metadata
     return row
 
 
+# All variables are min-max normalized to [0, 1] before training, so this is the
+# target's known support rather than a tuning choice.
+TARGET_SUPPORT = (0.0, 1.0)
+
+
+def _clip_to_target_support(preds, label, bounds=TARGET_SUPPORT):
+    """Clip predictions to the target's normalized support, reporting how many moved.
+
+    A prediction outside [0, 1] is not a forecast of a min-max normalized target;
+    it is unbounded extrapolation. The Matern-5/2 + linear kernel has an
+    unbounded linear component, so a Gaussian process given a test input far from
+    its training data can return an arbitrarily large mean: across this study 15
+    of 58 GP runs contained at least one such point, the worst 106x outside the
+    target range, while XGBoost (3716 runs) and the Transformer (75) contained
+    none. A single point is enough to dominate a squared-error metric -- one
+    prediction of -15.3 on a target spanning 0.42 to 0.53 drove an R^2 of
+    -22173 -- so leaving them unconstrained lets one extrapolation decide which
+    model is reported as best.
+
+    Clipping is applied to every model family so the constraint stays a property
+    of the target rather than of the estimator, and the count is returned so the
+    correction is recorded next to the metrics it changes rather than applied
+    silently.
+    """
+    if preds is None:
+        return None, 0
+    arr = np.asarray(preds, dtype=float)
+    lo, hi = float(bounds[0]), float(bounds[1])
+    finite = np.isfinite(arr)
+    clipped = arr.copy()
+    clipped[finite] = np.clip(arr[finite], lo, hi)
+    n_clipped = int(np.sum(finite & (clipped != arr)))
+    if n_clipped:
+        worst = float(np.nanmax(np.abs(arr[finite]))) if np.any(finite) else float("nan")
+        print(f"[WARN] {label}: {n_clipped} prediction(s) outside the target support "
+              f"[{lo:g}, {hi:g}] clipped; largest magnitude was {worst:.3g}. "
+              "This indicates extrapolation beyond the training data, not a forecast.")
+    return clipped.reshape(arr.shape), n_clipped
+
+
+def _split_size_metadata(train_samples, test_samples, train_drops=None, test_drops=None):
+    """Summary columns recording how large each split was and what it lost.
+
+    ``n_train_samples`` was declared in the summary schema but never populated by
+    this module, so it was null in the overwhelming majority of run directories
+    and the training-set cost of a predictor choice could not be read off the
+    outputs at all. The drop counts and the attributed predictor make that cost
+    a recorded quantity: one partial-coverage predictor can remove three
+    quarters of a target's samples, and that has to be visible next to the
+    metrics it produced.
+    """
+    meta = {
+        "n_train_samples": int(len(train_samples)) if train_samples is not None else np.nan,
+        "n_test_samples_loaded": int(len(test_samples)) if test_samples is not None else np.nan,
+    }
+    for prefix, report in (("train", train_drops), ("test", test_drops)):
+        if not isinstance(report, dict) or not report:
+            continue
+        considered = report.get("n_considered")
+        loaded = report.get("n_loaded")
+        meta[f"{prefix}_n_considered"] = considered
+        meta[f"{prefix}_n_dropped"] = (
+            considered - loaded if considered is not None and loaded is not None else np.nan)
+        meta[f"{prefix}_drop_rate"] = (
+            float(1.0 - loaded / considered)
+            if considered not in (None, 0) and loaded is not None else np.nan)
+        meta[f"{prefix}_dropped_nan_input"] = report.get("dropped_nan_input")
+        meta[f"{prefix}_dropped_nan_output"] = report.get("dropped_nan_output")
+        meta[f"{prefix}_dropped_missing_columns"] = report.get("dropped_missing_columns")
+        culprits = sorted((report.get("nan_input_columns") or {}).items(),
+                          key=lambda kv: -kv[1])
+        meta[f"{prefix}_drop_predictors"] = "; ".join(
+            f"{col}:{n}" for col, n in culprits) or ""
+    return meta
+
+
 def _write_summary_csv(rows, output_path):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -952,6 +1030,22 @@ def _write_summary_csv(rows, output_path):
         "n_test_evals",
         "n_train_samples",
         "n_test_samples",
+        "n_test_samples_loaded",
+        "n_predictions_clipped",
+        "train_n_considered",
+        "train_n_dropped",
+        "train_drop_rate",
+        "train_dropped_nan_input",
+        "train_dropped_nan_output",
+        "train_dropped_missing_columns",
+        "train_drop_predictors",
+        "test_n_considered",
+        "test_n_dropped",
+        "test_drop_rate",
+        "test_dropped_nan_input",
+        "test_dropped_nan_output",
+        "test_dropped_missing_columns",
+        "test_drop_predictors",
         "n_eval_rows",
         "n_eval_outputs",
         "n_eval_points_finite",
@@ -1511,6 +1605,10 @@ def evaluate_single_config(config_path, save_plots_override=None):
     )
     if collapse_mc_for_eval:
         model_split_files = _dedupe_split_files_by_base_sample(model_split_files)
+    # Drop reports are threaded through so the run records how many samples the
+    # chosen predictor set cost it, and which predictors were responsible.
+    test_drop_report: dict = {}
+    train_drop_report: dict = {}
     test_samples = load_split_samples(
         data_cfg["data_dir"],
         data_cfg["sample_subdir"],
@@ -1524,6 +1622,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
         split_files_override=model_split_files,
         fault_tolerant=split_fault_tolerant,
         input_aggregation=input_aggregation,
+        drop_report=test_drop_report,
     )
     if collapse_mc_for_eval:
         print(
@@ -1551,6 +1650,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
             ),
             fault_tolerant=split_fault_tolerant,
             input_aggregation=input_aggregation,
+            drop_report=train_drop_report,
         )
         train_split_files = _read_split_files(split_base_dir, "train_files.txt")
         if collapse_mc_for_eval:
@@ -1575,6 +1675,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 ),
                 fault_tolerant=split_fault_tolerant,
                 input_aggregation=input_aggregation,
+                drop_report=train_drop_report,
             )
             train_split_files = _read_split_files(split_base_dir, "train_files.txt")
             if collapse_mc_for_eval:
@@ -1676,6 +1777,16 @@ def evaluate_single_config(config_path, save_plots_override=None):
             preds_test = model.predict(X_test).reshape(-1, y_test.shape[1] if y_test.ndim > 1 else 1)
             if include_combined_metrics:
                 preds_all = model.predict(X_all).reshape(-1, y_all.shape[1] if y_all.ndim > 1 else 1)
+        # Constrain to the target's support before anything consumes the
+        # predictions, so the metrics, the written predictions.csv and the
+        # selection that reads them all describe the same numbers.
+        preds_train, n_clipped_train = _clip_to_target_support(
+            preds_train, f"{_model_label(model_type)} (train)")
+        preds_test, n_clipped_test = _clip_to_target_support(
+            preds_test, f"{_model_label(model_type)} (test)")
+        preds_all, n_clipped_all = _clip_to_target_support(
+            preds_all, f"{_model_label(model_type)} (combined)")
+
         # Compute metrics for each set
         if preds_train is not None:
             row_train = _compute_regression_summary(
@@ -1683,7 +1794,10 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 preds_train,
                 y_train,
                 len(y_train),
-                metadata={"kind": "train", "gp_uncertainty_mode": gp_uncertainty_mode},
+                metadata={"kind": "train", "gp_uncertainty_mode": gp_uncertainty_mode,
+                          "n_predictions_clipped": n_clipped_train,
+                          **_split_size_metadata(train_samples, test_samples,
+                                                 train_drop_report, test_drop_report)},
                 split_files=(train_split_files or []),
             )
             per_set_metrics.append(row_train)
@@ -1704,7 +1818,10 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 preds_test,
                 y_test,
                 len(y_test),
-                metadata={"kind": "test", "gp_uncertainty_mode": gp_uncertainty_mode},
+                metadata={"kind": "test", "gp_uncertainty_mode": gp_uncertainty_mode,
+                          "n_predictions_clipped": n_clipped_test,
+                          **_split_size_metadata(train_samples, test_samples,
+                                                 train_drop_report, test_drop_report)},
                 split_files=model_split_files,
             )
             per_set_metrics.append(row_test)
@@ -1725,7 +1842,10 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 preds_all,
                 y_all,
                 len(y_all),
-                metadata={"kind": "combined", "gp_uncertainty_mode": gp_uncertainty_mode},
+                metadata={"kind": "combined", "gp_uncertainty_mode": gp_uncertainty_mode,
+                          "n_predictions_clipped": n_clipped_all,
+                          **_split_size_metadata(train_samples, test_samples,
+                                                 train_drop_report, test_drop_report)},
                 split_files=eval_split_files,
             )
             per_set_metrics.append(row_all)
@@ -1809,7 +1929,9 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 preds,
                 targets,
                 len(eval_samples),
-                metadata={"kind": "baseline", "gp_uncertainty_mode": gp_uncertainty_mode},
+                metadata={"kind": "baseline", "gp_uncertainty_mode": gp_uncertainty_mode,
+                          **_split_size_metadata(train_samples, test_samples,
+                                                 train_drop_report, test_drop_report)},
                 split_files=eval_split_files,
             )
             summary_rows.append(row)

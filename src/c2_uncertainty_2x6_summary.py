@@ -21,6 +21,7 @@ import pandas as pd
 from scipy import stats
 
 from c2_uncertainty import apply_filtering_logic, test_distribution_fit
+from utils.names import PARAMS, label as names_label
 
 
 SENSOR_ORDER = [
@@ -78,9 +79,22 @@ def normalize_sensor_name(name: str) -> str:
 
 
 def display_sensor_name(sensor_name: str) -> str:
-    if str(sensor_name).strip() == "Sp Cond (microS_cm)":
-        return "Specific Cond. (µS/cm)"
-    return str(sensor_name).strip()
+    """Display label for a calibration sensor name.
+
+    Calibration files name sensors without the ``Pfl - `` prefix the consolidated data
+    uses, so the prefix is restored before looking the name up in the shared registry.
+    This replaces a one-entry special case for ``Sp Cond`` that was the only place in the
+    repository reversing the ``microS_cm`` mangling, and which therefore disagreed with
+    every other figure.
+    """
+    raw = str(sensor_name).strip()
+    # Prefixed form first: these are always Surface-sonde calibrations, so a bare "pH" or
+    # "Turbidity (FNU)" must not resolve to the laboratory parameter of the same name.
+    for candidate in (f"Pfl - {raw}", raw):
+        if candidate in PARAMS:
+            # One dataset per figure, so the source qualifier would be constant.
+            return names_label(candidate, with_unit=True, qualified=False)
+    return raw
 
 
 def _calibration_output_dir() -> Path:
@@ -770,7 +784,10 @@ def plot_histogram(ax: plt.Axes, errors: np.ndarray, title: str, fit: dict) -> N
         except Exception:
             pass
 
-        ax.legend(loc="upper right", frameon=True, fontsize=FONT_SIZE)
+        # These panels sit in a tight 2x6 grid, so the legend has to stay inside the axes.
+        # Reserve headroom first, otherwise it is drawn over the top of the fitted curves.
+        ax.set_ylim(top=ax.get_ylim()[1] * 1.30)
+        ax.legend(loc="upper right", frameon=True, fontsize=FONT_SIZE, borderaxespad=0.6)
 
     ax.axvline(mu, color="#F58518", linestyle="--", linewidth=1.5)
     ax.set_title("")

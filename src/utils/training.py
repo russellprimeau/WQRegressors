@@ -16,8 +16,37 @@ class SampleComplianceError(RuntimeError):
         self.context = dict(context or {})
 
 def load_samples(directory, input_columns, output_columns, input_rows, output_rows, file_list=None,
-                 fault_tolerant=False, source=None, input_aggregation='none'):
+                 fault_tolerant=False, source=None, input_aggregation='none', drop_report=None):
+    """Load windowed samples, recording why each rejected sample was rejected.
+
+    Every ``continue`` below discards a sample, and until these were counted the
+    loss was invisible: a subset containing one partial-coverage predictor could
+    cost a model 17 of 22 evaluation samples with nothing written down, so the
+    effect could only be inferred afterwards by comparing subsets. Pass a dict as
+    *drop_report* to receive the tally, including which predictor columns made
+    samples unusable. A non-empty tally is also summarized on stdout, so runs
+    that do not opt in still leave a record.
+
+    Behaviour is unchanged: the same samples are loaded and rejected as before.
+    """
     samples = []
+    report = {
+        "n_considered": 0,
+        "n_loaded": 0,
+        "dropped_missing_columns": 0,
+        "dropped_too_few_rows": 0,
+        "dropped_all_nan_predictor": 0,
+        "dropped_nan_output": 0,
+        "dropped_nan_input": 0,
+        "nan_input_columns": {},
+        "dropped_files": [],
+    }
+
+    def _tally_columns(mask, reason, filename):
+        """Attribute a drop to the predictor columns responsible for it."""
+        for col in (c for c, bad in zip(input_columns, mask) if bad):
+            report["nan_input_columns"][col] = report["nan_input_columns"].get(col, 0) + 1
+        report["dropped_files"].append((filename, reason))
 
     if source is not None:
         with open(source) as f:
@@ -27,16 +56,24 @@ def load_samples(directory, input_columns, output_columns, input_rows, output_ro
             continue
         if file_list is not None and filename not in file_list:
             continue  # Skip files not in the provided list
+        report["n_considered"] += 1
         df = pd.read_csv(os.path.join(directory, filename))
         if not set(input_columns + output_columns).issubset(df.columns):
+            report["dropped_missing_columns"] += 1
+            missing = [c for c in input_columns if c not in df.columns]
+            _tally_columns([c in missing for c in input_columns], "missing_columns", filename)
             continue  # skip files with missing columns
         if len(df) < input_rows.stop:
+            report["dropped_too_few_rows"] += 1
+            report["dropped_files"].append((filename, "too_few_rows"))
             continue  # skip files without enough rows
         input_seq = df.iloc[input_rows, :][input_columns].values
         if str(input_aggregation).lower() == 'mean':
             # Require at least one finite value per predictor; otherwise sample is unusable.
             predictor_all_nan = np.all(np.isnan(input_seq), axis=0)
             if np.any(predictor_all_nan):
+                report["dropped_all_nan_predictor"] += 1
+                _tally_columns(predictor_all_nan, "all_nan_predictor", filename)
                 continue
             with np.errstate(invalid='ignore'):
                 input_seq = np.nanmean(input_seq, axis=0, keepdims=True)
@@ -47,12 +84,35 @@ def load_samples(directory, input_columns, output_columns, input_rows, output_ro
             output_seq = df.iloc[output_rows:, :][output_columns].values
         # Always skip samples with NaN in outputs/labels (no model can train with these)
         if np.isnan(output_seq).any():
+            report["dropped_nan_output"] += 1
+            report["dropped_files"].append((filename, "nan_output"))
             continue
         # Only skip samples with NaN in inputs when fault_tolerant=False
         if not fault_tolerant and np.isnan(input_seq).any():
+            report["dropped_nan_input"] += 1
+            _tally_columns(np.any(np.isnan(input_seq), axis=0), "nan_input", filename)
             continue
         samples.append((input_seq, output_seq, filename))
-    print("Samples loaded")
+
+    report["n_loaded"] = len(samples)
+    n_dropped = report["n_considered"] - report["n_loaded"]
+    if n_dropped > 0:
+        reasons = ", ".join(
+            f"{k.replace('dropped_', '')}={report[k]}"
+            for k in ("dropped_missing_columns", "dropped_too_few_rows",
+                      "dropped_all_nan_predictor", "dropped_nan_output", "dropped_nan_input")
+            if report[k]
+        )
+        culprits = sorted(report["nan_input_columns"].items(), key=lambda kv: -kv[1])[:4]
+        culprit_txt = ("; worst predictors: "
+                       + ", ".join(f"{c} ({n})" for c, n in culprits)) if culprits else ""
+        print(f"[INFO] Samples loaded: {report['n_loaded']} of {report['n_considered']}; "
+              f"dropped {n_dropped} ({reasons}){culprit_txt}")
+    else:
+        print(f"[INFO] Samples loaded: {report['n_loaded']} of {report['n_considered']}; no drops")
+
+    if isinstance(drop_report, dict):
+        drop_report.update(report)
     return samples
 
 def extract_index(sample):

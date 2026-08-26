@@ -1,0 +1,150 @@
+// Source of record for the modeling-workflow figure (manuscript Fig. "modeling_workflow").
+//
+// SCOPE.  This is a workflow graphic, not a written summary of the method.  Cells carry
+// noun phrases and numbers: stage names, counts, dimensions, and the constraints that
+// bound each stage.  Full sentences, equations, definitions, and instrument detail all
+// belong in the running text -- an earlier revision put them here and the figure grew
+// into a full page of prose.  If a cell needs a verb, it is probably saying too much.
+// Keep each cell to one detail line wherever the line fits its column.
+//
+// HIERARCHY.  There are four numbered stages of work.  The train/test split is not one of
+// them: it is a property of the data that governs stages 3 and 4, so it is unnumbered,
+// set at annotation weight rather than header weight, and inset from the band grid.  An
+// earlier revision numbered it "3" and set its label at 9 pt bold navy uppercase -- the
+// same weight as a stage header -- which read as a header that had lost its background.
+//
+// SYMBOLS.  No middots.  A middot between counts that end in "= 17" reads as a product
+// (8 x 7 x 2 = 112, not 17), so sums use "+" and lists use commas.  "x" is reserved for
+// the window dimensions and "=" for arithmetic, never for the word "is".
+//
+// WIDTH IS FIXED.  Included at \includegraphics[width=1\linewidth] in the 6.5 in MDPI
+// column (src/utils/plotstyle.py: PAGE_WIDTH_IN), so a figure drawn wider is downscaled
+// and its type shrinks with it: printed_pt = font_pt * 6.5 / fig_width_in.  Each band is
+// pinned to 460 pt (6.389 in) by the WIDTH attributes in its leading spacer row, so the
+// 7.5 pt detail text prints at 7.6 pt, clearing plotstyle.MIN_PRINTED_PT = 7.0.
+//
+// Graphviz never wraps text -- lines break only at <BR/>, so a long line silently widens
+// its column.  Capacity at 7.5 pt Arial is about 3.0 pt per character:
+//   180 pt col ~57 char   165 pt col ~52 char   115 pt col ~35 char   230 pt col ~74 char
+// Bands 1 and 2 must keep identical column widths, or the three fan-in edges between
+// them stop being vertical and splines=ortho routes them as visible steps.
+// After editing, confirm `dot -Tplain` still reports a width of 6.3889.
+//
+// Other traps, all hit in development: BALIGN (not ALIGN) left-aligns the lines inside a
+// cell; Arial via Cairo has no U+2208, which rendered as a tofu box; Graphviz adds no
+// leading around <SUP>/<SUB>, so use the precomposed &#178; and keep subscripts off any
+// line that has text below it; FIXEDSIZE pins height as well as width and clips labels.
+//
+// Colour carries one meaning: navy headers mark sequence, blue is the train split, amber
+// the test split.  Both splits are named in words as well, for greyscale and CVD.
+
+digraph workflow {
+    graph [rankdir=TB, bgcolor="white", pad="0.03", nodesep="0.10", ranksep="0.11",
+           splines=ortho, fontname="Arial", fontcolor="#16283a", outputorder="edgesfirst"];
+    node  [shape=plain, fontname="Arial", fontcolor="#16283a"];
+    edge  [color="#7d8fa0", penwidth=1.1, arrowsize=0.55];
+
+    sources [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" COLOR="#ccd6de">
+        <TR>
+          <TD WIDTH="180" HEIGHT="1" FIXEDSIZE="TRUE" BORDER="0" CELLPADDING="0"></TD>
+          <TD WIDTH="165" HEIGHT="1" FIXEDSIZE="TRUE" BORDER="0" CELLPADDING="0"></TD>
+          <TD WIDTH="115" HEIGHT="1" FIXEDSIZE="TRUE" BORDER="0" CELLPADDING="0"></TD>
+        </TR>
+        <TR>
+          <TD COLSPAN="3" ALIGN="LEFT" BGCOLOR="#1f3d58" BORDER="0" CELLPADDING="5"><FONT COLOR="#ffffff" POINT-SIZE="9"><B>1&#160;&#160;SOURCES</B></FONT><FONT COLOR="#b9cdda" POINT-SIZE="7.5">&#160;&#160;&#160;&#160;Jan 2022 &#8211; Feb 2025</FONT></TD>
+        </TR>
+        <TR>
+          <TD PORT="pred" ALIGN="LEFT" BALIGN="LEFT" BGCOLOR="#eef2f5" VALIGN="TOP"><FONT POINT-SIZE="8.5"><B>Predictors</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">Weather 8 + Surface 7 + SCADA 2 = 17 hourly series</FONT></TD>
+          <TD PORT="tgt" ALIGN="LEFT" BALIGN="LEFT" BGCOLOR="#eef2f5" VALIGN="TOP"><FONT POINT-SIZE="8.5"><B>Targets</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">Samples: 14 series, sparse</FONT></TD>
+          <TD PORT="cal" ALIGN="LEFT" BALIGN="LEFT" BGCOLOR="#eef2f5" VALIGN="TOP"><FONT POINT-SIZE="8.5"><B>Measurement error</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">Calibrations: 6 sensors</FONT></TD>
+        </TR>
+      </TABLE>
+    >];
+
+    prep [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" COLOR="#ccd6de">
+        <TR>
+          <TD WIDTH="180" HEIGHT="1" FIXEDSIZE="TRUE" BORDER="0" CELLPADDING="0"></TD>
+          <TD WIDTH="165" HEIGHT="1" FIXEDSIZE="TRUE" BORDER="0" CELLPADDING="0"></TD>
+          <TD WIDTH="115" HEIGHT="1" FIXEDSIZE="TRUE" BORDER="0" CELLPADDING="0"></TD>
+        </TR>
+        <TR>
+          <TD COLSPAN="3" ALIGN="LEFT" BGCOLOR="#1f3d58" BORDER="0" CELLPADDING="5"><FONT COLOR="#ffffff" POINT-SIZE="9"><B>2&#160;&#160;DATASET CONSTRUCTION</B></FONT><FONT COLOR="#b9cdda" POINT-SIZE="7.5">&#160;&#160;&#160;&#160;one dataset per target</FONT></TD>
+        </TR>
+        <TR>
+          <TD PORT="pred" ALIGN="LEFT" BALIGN="LEFT" BGCOLOR="#f7f9fa" VALIGN="TOP"><FONT POINT-SIZE="8.5"><B>Predictor window</B></FONT><BR/><FONT POINT-SIZE="7.5"><B>X</B>: <I>T</I> &#215; <I>d</I>,&#160;&#160;<I>d</I> &#8804; 17<BR/></FONT><FONT POINT-SIZE="7.5" COLOR="#5b6d7c"><I>T</I> = 168 or 672 h; complete windows</FONT></TD>
+          <TD PORT="tgt" ALIGN="LEFT" BALIGN="LEFT" BGCOLOR="#f7f9fa" VALIGN="TOP"><FONT POINT-SIZE="8.5"><B>Target</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">Change since previous sample;<BR/>prior value: optional 18th input</FONT></TD>
+          <TD PORT="cal" ALIGN="LEFT" BALIGN="LEFT" BGCOLOR="#f7f9fa" VALIGN="TOP"><FONT POINT-SIZE="8.5"><B>Input noise</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">Monte Carlo perturbation<BR/>of Surface inputs</FONT></TD>
+        </TR>
+      </TABLE>
+    >];
+
+    sources:pred:s -> prep:pred:n;
+    sources:tgt:s  -> prep:tgt:n;
+    sources:cal:s  -> prep:cal:n;
+
+    // Unnumbered and inset: a property of the data, not a stage of work.
+    split [label=<
+      <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="0" CELLPADDING="0">
+        <TR>
+          <TD WIDTH="30" HEIGHT="1" FIXEDSIZE="TRUE" BORDER="0"></TD>
+          <TD WIDTH="277" HEIGHT="1" FIXEDSIZE="TRUE" BORDER="0"></TD>
+          <TD WIDTH="119" HEIGHT="1" FIXEDSIZE="TRUE" BORDER="0"></TD>
+          <TD WIDTH="30" HEIGHT="1" FIXEDSIZE="TRUE" BORDER="0"></TD>
+        </TR>
+        <TR>
+          <TD BORDER="0"></TD>
+          <TD COLSPAN="2" ALIGN="LEFT" BORDER="0" CELLPADDING="2"><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">Chronological train/test split, per target</FONT></TD>
+          <TD BORDER="0"></TD>
+        </TR>
+        <TR>
+          <TD BORDER="0"></TD>
+          <TD ALIGN="LEFT" BGCOLOR="#dce9f4" BORDER="1" COLOR="#7ba7cc" CELLPADDING="3"><FONT POINT-SIZE="7.5" COLOR="#17456e"><B>&#160;TRAIN, earliest 70 %</B></FONT></TD>
+          <TD ALIGN="LEFT" BGCOLOR="#fbeed6" BORDER="1" COLOR="#d0a75a" CELLPADDING="3"><FONT POINT-SIZE="7.5" COLOR="#7d4a00"><B>&#160;TEST, latest 30 %</B></FONT></TD>
+          <TD BORDER="0"></TD>
+        </TR>
+      </TABLE>
+    >];
+
+    prep -> split;
+
+    selection [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" COLOR="#a9c8de">
+        <TR>
+          <TD WIDTH="230" HEIGHT="1" FIXEDSIZE="TRUE" BORDER="0" CELLPADDING="0"></TD>
+          <TD WIDTH="230" HEIGHT="1" FIXEDSIZE="TRUE" BORDER="0" CELLPADDING="0"></TD>
+        </TR>
+        <TR>
+          <TD COLSPAN="2" ALIGN="LEFT" BGCOLOR="#1f3d58" BORDER="0" CELLPADDING="5"><FONT COLOR="#ffffff" POINT-SIZE="9"><B>3&#160;&#160;MODEL DEVELOPMENT</B></FONT><FONT COLOR="#a8cbe8" POINT-SIZE="7.5">&#160;&#160;&#160;&#160;train split only; rolling-origin cross-validation</FONT></TD>
+        </TR>
+        <TR>
+          <TD ALIGN="LEFT" BALIGN="LEFT" BGCOLOR="#e7f0f8" VALIGN="TOP"><FONT POINT-SIZE="8.5"><B>Feature selection</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#3d6a91">Shapley ranking &#8594; beam search, width 16</FONT></TD>
+          <TD ALIGN="LEFT" BALIGN="LEFT" BGCOLOR="#e7f0f8" VALIGN="TOP"><FONT POINT-SIZE="8.5"><B>Model families</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#3d6a91">XGBoost, Transformer, Gaussian process</FONT></TD>
+        </TR>
+      </TABLE>
+    >];
+
+    split -> selection;
+
+    eval [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" COLOR="#e0c48f">
+        <TR>
+          <TD WIDTH="230" HEIGHT="1" FIXEDSIZE="TRUE" BORDER="0" CELLPADDING="0"></TD>
+          <TD WIDTH="230" HEIGHT="1" FIXEDSIZE="TRUE" BORDER="0" CELLPADDING="0"></TD>
+        </TR>
+        <TR>
+          <TD COLSPAN="2" ALIGN="LEFT" BGCOLOR="#1f3d58" BORDER="0" CELLPADDING="5"><FONT COLOR="#ffffff" POINT-SIZE="9"><B>4&#160;&#160;EVALUATION</B></FONT><FONT COLOR="#f0cf9a" POINT-SIZE="7.5">&#160;&#160;&#160;&#160;test split, scored once</FONT></TD>
+        </TR>
+        <TR>
+          <TD ALIGN="LEFT" BALIGN="LEFT" BGCOLOR="#fdf6ea" VALIGN="TOP"><FONT POINT-SIZE="8.5"><B>Reference methods</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">Na&#239;ve, Linear, Seasonal, MLR</FONT></TD>
+          <TD ALIGN="LEFT" BALIGN="LEFT" BGCOLOR="#fdf6ea" VALIGN="TOP"><FONT POINT-SIZE="8.5"><B>Metrics</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">Absolute: MAE, RMSE, <I>r</I>, <I>R</I>&#178;<BR/>Relative: skill with 95% CI,<BR/>paired win rate, support verdict</FONT></TD>
+        </TR>
+        <TR>
+          <TD COLSPAN="2" ALIGN="LEFT" BGCOLOR="#fbeed6" BORDER="1" COLOR="#e0c48f" CELLPADDING="4"><FONT POINT-SIZE="8.5"><B>Horizon sweep</B></FONT><FONT POINT-SIZE="7.5" COLOR="#7d4a00">&#160;&#160;&#160;selected model re-evaluated at lookaheads to 336 h</FONT></TD>
+        </TR>
+      </TABLE>
+    >];
+
+    selection -> eval;
+}

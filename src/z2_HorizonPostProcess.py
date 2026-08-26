@@ -84,6 +84,7 @@ matplotlib.use("Agg")
 # directly (python src/z2_...) or from the workspace root.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from utils.names import clean_target_label
+from utils.plotstyle import legend_above
 
 # Color palette matching b_ExploreData.py _safe_series_colors — avoids red/orange hues
 # so uncertainty bands (same color, lower alpha) stay visually distinct from alarm states.
@@ -1081,7 +1082,6 @@ def _plot_rate_bar(
     if clustered:
         ax.bar(x + bar_w / 2, df[std_col], width=bar_w,
                color=std_color, label=std_label)
-        ax.legend(fontsize=_BAR_LEGEND_FONTSIZE, framealpha=0.85)
 
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
     ax.set_xticks(x)
@@ -1094,6 +1094,8 @@ def _plot_rate_bar(
 
     fig.tight_layout()
     _expand_ylim_to_fit_annotations(ax)
+    if clustered:
+        legend_above(ax, fontsize=_BAR_LEGEND_FONTSIZE)
     out = summaries_dir / filename
     fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
@@ -1135,11 +1137,11 @@ def _plot_rates(rate_df: pd.DataFrame, summaries_dir: Path, show_std: bool = Tru
     ax.set_ylabel(textwrap.fill("nRMSE avg. rate of change (/hr)", width=20), fontsize=_BAR_LABEL_FONTSIZE)
     _set_bar_xlim(ax, x, bar_w, clustered=True)
     ax.grid(axis="y", alpha=0.3)
-    ax.legend(fontsize=_BAR_LEGEND_FONTSIZE, framealpha=0.85)
     _annotate_bars(ax)
 
     fig.tight_layout()
     _expand_ylim_to_fit_annotations(ax)
+    legend_above(ax, fontsize=_BAR_LEGEND_FONTSIZE)
     out = summaries_dir / "lookahead_rates_bar.png"
     fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
@@ -1473,9 +1475,12 @@ def _generate_all_figures(
         _xlabel_pad  = max(18, int(0.12 * _axes_h_pts + 15))
         axes[-1].set_xlabel("Forecast horizon (hours)", fontsize=15, labelpad=_xlabel_pad)
 
+        # Each row's y-axis label names its target, so nothing on the axes says which
+        # metric is plotted; "Mean" alone did not. Naming the metric in the legend is the
+        # one place it fits without colliding with the per-row labels.
         legend_handles = [
             plt.Line2D([0], [0], color="black", linewidth=1.5,
-                       marker="o", markersize=4, label="Mean"),
+                       marker="o", markersize=4, label=f"Mean {ylabel}"),
         ]
         if any_replicates:
             legend_handles += [
@@ -1779,10 +1784,10 @@ def _generate_combined_figures(
         ax.set_ylabel(textwrap.fill(ylabel, width=20), fontsize=_BAR_LABEL_FONTSIZE)
         _set_bar_xlim(ax, x, bar_w, clustered=True)
         ax.grid(axis="y", alpha=0.3)
-        ax.legend(fontsize=_BAR_LEGEND_FONTSIZE, framealpha=0.85)
         _annotate_bars(ax)
         fig.tight_layout()
         _expand_ylim_to_fit_annotations(ax)
+        legend_above(ax, fontsize=_BAR_LEGEND_FONTSIZE)
         out = out_dir / filename
         fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.02)
         plt.close(fig)

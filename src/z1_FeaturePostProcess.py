@@ -61,6 +61,7 @@ import textwrap
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 import numpy as np
 import torch
 import yaml
@@ -73,8 +74,19 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from utils.training import load_samples, group_samples_by_segment, _filter_samples_by_nan_tolerance
+from utils.plotstyle import (
+    PAGE_WIDTH_IN,
+    apply_paper_style,
+    legend_above,
+    save_figure,
+    timeseries_font_sizes as _timeseries_font_sizes,
+)
+
+apply_paper_style()
+plotstyle_font_sizes = _timeseries_font_sizes()
 from utils.config_utils import select_best_model_row
-from utils.names import clean_target_label
+from utils.names import clean_target_label, label as names_label
+from utils import evidence as ev_mod
 from utils.mlr import evaluate_mlr as _evaluate_mlr
 from h_RunMCFeatureSelectionSweep import build_parser, discover_mc_dataset_plans, _derive_target_name, _select_surrogate_config, _parse_row_counts, _available_row_counts_for_postprocess, _regenerate_saved_outputs_for_row, _load_feature_stats_artifacts_with_source, _compile_multi_target_comparison, _resolve_dataset_inclusion, _run_rolling_origin_cv, _ensure_k01_baselines, _write_dataset_evaluation_summary, _forecast_sweeps_dir, _plot_final_metrics_comparison, _feature_tag, _mlr_artifact_dir, _write_mlr_artifacts, _run_mlr_variants_on_existing_split
 
@@ -112,6 +124,23 @@ ML_COMPARISON_COLORS = {
     'GP': 'tab:blue', 'Trans.': 'tab:orange', 'XGB': 'tab:green',
     'MLR': 'tab:red', 'MLR12': 'tab:purple', 'MLRall': 'tab:brown',
 }
+# Legend text.  The three MLR variants differ only in how the predictor window is
+# aggregated before fitting; 'MLR12'/'MLRall' do not convey that on their own, and the
+# manuscript describes them as "the latest row, the mean of the preceding 12 rows, and
+# the mean of the full input window".
+ML_COMPARISON_LEGEND_LABELS = {
+    'XGB': 'XGBoost',
+    'Trans.': 'Transformer',
+    'GP': 'Gaussian process',
+    'MLR': 'MLR (latest row)',
+    'MLR12': 'MLR (mean of 12 rows)',
+    'MLRall': 'MLR (mean of window)',
+}
+
+# Bars per row above which rotated value annotations collide once the figure is scaled to
+# the text-block width.  A rotated annotation is as wide as its font height, so the limit
+# is PAGE_WIDTH_IN / (font_pt / 72); at 7 pt that is ~67 bars, and 48 leaves margin.
+ML_COMPARISON_MAX_BARS_PER_ROW = 48
 
 
 def _resolve_summaries_dir(data_root: Path, sweep_namespace: str) -> Path:
@@ -600,6 +629,73 @@ def _display_model_id(value: object) -> str:
     return str(value).strip().lower()
 
 
+def _dataset_target_std(output_dir: Path, dataset_label: str) -> float:
+    """One target standard deviation per dataset, over every sample on record.
+
+    NRMSE is only comparable between methods if its denominator is a property of
+    the target rather than of the configuration being scored.  The former
+    per-row back-fill called ``load_samples`` with each configuration's own
+    ``input_columns`` and ``fault_tolerant=True``, so samples missing those
+    predictors were dropped and sigma was computed over whatever survived.  That
+    made sigma a function of the feature subset: within a single target it took
+    4-9 distinct values, and the sigma behind a model's NRMSE differed from the
+    sigma behind its own reference's by up to a factor of three.
+
+    The target column and row are identical across a dataset's configurations,
+    so the values are read straight from the sample files with no input
+    filtering.  Returns NaN when the target cannot be read; the caller reports
+    that rather than silently continuing.
+    """
+    cfg_paths = sorted((output_dir / "configs").glob("*.yml"))
+    if not cfg_paths:
+        print(f"[WARN] {dataset_label}: no sweep configs; cannot derive a target sigma.")
+        return float("nan")
+
+    for cfg_path in cfg_paths:
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as fh:
+                cfg = yaml.safe_load(fh)
+            data_cfg = cfg["data"]
+            data_dir = Path(train_module._resolve_path_from_config(
+                data_cfg["data_dir"], Path(cfg.get("__config_dir", cfg_path.parent))))
+            sample_dir = data_dir / str(data_cfg.get("sample_subdir", "samples"))
+            out_cols = list(data_cfg["output_columns"])
+            out_rows = list(data_cfg["output_rows"])
+        except Exception as exc:
+            print(f"[WARN] {dataset_label}: unreadable config {cfg_path.name} ({exc}); trying next.")
+            continue
+
+        values: list[float] = []
+        sample_files = sorted(sample_dir.glob("segment_*.csv"))
+        for sample_file in sample_files:
+            try:
+                frame = pd.read_csv(sample_file, usecols=out_cols,
+                                    encoding="utf-8", encoding_errors="replace")
+            except Exception:
+                continue
+            rows = [r for r in out_rows if 0 <= r < len(frame)]
+            if not rows:
+                continue
+            block = pd.to_numeric(frame.iloc[rows][out_cols].stack(), errors="coerce").dropna()
+            values.extend(float(v) for v in block)
+
+        if len(values) < 2:
+            print(f"[WARN] {dataset_label}: only {len(values)} target value(s) readable from "
+                  f"{sample_dir}; cannot derive a target sigma.")
+            return float("nan")
+        sigma = float(np.std(np.asarray(values, dtype=float), ddof=1))
+        if not np.isfinite(sigma) or sigma <= 0:
+            print(f"[WARN] {dataset_label}: target sigma is {sigma!r} over {len(values)} "
+                  "samples; NRMSE cannot be normalized.")
+            return float("nan")
+        print(f"[INFO] {dataset_label}: target sigma = {sigma:.6g} over {len(values)} "
+              f"samples in {len(sample_files)} files.")
+        return sigma
+
+    print(f"[WARN] {dataset_label}: no usable sweep config; cannot derive a target sigma.")
+    return float("nan")
+
+
 def build_selection_record(plan: DatasetPlan, df: "pd.DataFrame", args: argparse.Namespace) -> "SelectionRecord | None":
     """Build the authoritative per-target selection record used by summary outputs."""
     if df is None or df.empty or "model" not in df.columns:
@@ -617,32 +713,41 @@ def build_selection_record(plan: DatasetPlan, df: "pd.DataFrame", args: argparse
         min_eval_samples,
         context_label=f"{plan.dataset_dir.name}/{target_name}",
     )
+    baseline_ids = configured_baseline_ids(args)
+    # A configured baseline is a reference forecast, never the headline model.
+    # Under --treat-mlr-as-baseline this also drops the MLR variants, so the
+    # reported best model is drawn from the ML families alone and its skill is
+    # measured against the baseline set instead of against itself.
+    if model_candidates is not None and not model_candidates.empty and "model" in model_candidates.columns:
+        model_candidates = model_candidates[
+            ~model_candidates["model"].astype(str).str.strip().str.lower().isin(set(baseline_ids))
+        ].copy()
     best_model_row = select_best_row(model_candidates)
     if best_model_row is None:
+        print(
+            f"[WARN] No non-baseline model candidate for {plan.dataset_dir.name} "
+            f"(baseline set: {', '.join(baseline_ids)}); skipping headline selection."
+        )
         return None
 
     best_model_id = _display_model_id(best_model_row.get("model", ""))
-    baseline_ids = configured_baseline_ids(args)
-    is_best_baseline = best_model_id in set(baseline_ids)
-    if is_best_baseline:
-        best_baseline_row = best_model_row
-    else:
-        baseline_rows = candidates[candidates["model"].astype(str).str.strip().str.lower().isin(baseline_ids)].copy()
-        fair_baseline_rows = _filter_baselines_by_sample_floor(baseline_rows, best_model_row)
-        if fair_baseline_rows is None:
-            print(
-                f"[WARN] best-model row for {plan.dataset_dir.name} lacks finite n_test_independent; "
-                "skipping headline selection (cannot enforce baseline sample-count fairness)."
-            )
-            return None
-        best_baseline_row = select_best_row(fair_baseline_rows)
-        if best_baseline_row is None:
-            floor = _best_model_sample_floor(best_model_row)
-            print(
-                f"[WARN] No baseline in {plan.dataset_dir.name} has n_test_independent >= {floor:.0f} "
-                f"(best-model {best_model_id!r}); skipping headline selection."
-            )
-            return None
+    is_best_baseline = False
+    baseline_rows = candidates[candidates["model"].astype(str).str.strip().str.lower().isin(baseline_ids)].copy()
+    fair_baseline_rows = _filter_baselines_by_sample_floor(baseline_rows, best_model_row)
+    if fair_baseline_rows is None:
+        print(
+            f"[WARN] best-model row for {plan.dataset_dir.name} lacks finite n_test_independent; "
+            "skipping headline selection (cannot enforce baseline sample-count fairness)."
+        )
+        return None
+    best_baseline_row = select_best_row(fair_baseline_rows)
+    if best_baseline_row is None:
+        floor = _best_model_sample_floor(best_model_row)
+        print(
+            f"[WARN] No baseline in {plan.dataset_dir.name} has n_test_independent >= {floor:.0f} "
+            f"(best-model {best_model_id!r}); skipping headline selection."
+        )
+        return None
 
     best_baseline_id = _display_model_id(best_baseline_row.get("model", ""))
     same_row = _row_identity_key(best_model_row) == _row_identity_key(best_baseline_row)
@@ -718,20 +823,48 @@ def _annotate_bars_within_ylim(ax, bars, fmt: str, fontsize: int = 8) -> None:
         )
 
 
-def _annotate_ml_bars(ax, bars, vals, ns, fmt: str, fontsize: int = 8) -> None:
-    """Annotate bars with combined value and sample-count label, e.g. '1.23e-02, n=8'."""
+def _ml_target_tick_label(comp_df, dataset: str, base_label: str, metric_key: str) -> str:
+    """Tick label for one target cluster: name plus its independent-sample count.
+
+    The count is *not* constant across the models of a target: model families differ in
+    how much missing data they tolerate, so e.g. Lead is evaluated on 5 independent
+    samples for the GP, MLR and Transformer runs but 21-22 for XGBoost.  A single number
+    here would therefore misreport five of the six bars, so a varying count is shown as a
+    range.  Per-model exactness belongs in the results table, not on 84 rotated bar
+    labels.
+    """
+    # Restrict to the rows that actually produce a bar, so the range never advertises a
+    # model whose value was non-finite and therefore not drawn.
+    rows = comp_df[(comp_df['dataset'] == dataset) & comp_df[metric_key].notna()]
+    ns = [int(v) for v in rows['n_samples'].to_numpy() if np.isfinite(v)]
+    if not ns:
+        return str(base_label)
+    lo, hi = min(ns), max(ns)
+    count = f"(n={lo})" if lo == hi else f"(n={lo}–{hi})"
+    # Second line rather than a longer first one: these labels are rotated 45 degrees, so
+    # halving their length halves the vertical margin the axes must reserve for them.
+    return f"{base_label}\n{count}"
+
+
+def _annotate_ml_bars(ax, bars, vals, ns, fmt: str, fontsize: int = 7) -> None:
+    """Annotate bars with their value, rotated to the width of the bar.
+
+    The sample count is deliberately *not* included here.  It is a property of the target,
+    not of the model, so repeating it on all six bars of a cluster made each annotation
+    roughly four times longer than it needed to be; it now appears once per target in the
+    x tick label.  ``n`` is still accepted so call sites need not change.
+    """
     ymin, ymax = ax.get_ylim()
     yspan = float(ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
     pad = 0.02 * yspan
     use_scientific = _axis_uses_scientific_bar_annotations(ax)
-    for bar, val, n in zip(bars, vals, ns):
+    for bar, val in zip(bars, vals):
         if not np.isfinite(val):
             continue
         h = bar.get_height()
         if not np.isfinite(h):
             continue
-        n_str = f", n={int(n)}" if np.isfinite(n) else ""
-        label = f"{_format_bar_annotation_value(val, fmt, use_scientific)}{n_str}"
+        label = _format_bar_annotation_value(val, fmt, use_scientific)
         anchor_y = max(float(h), 0.0)
         y_txt = anchor_y + pad
         va = 'bottom'
@@ -1533,7 +1666,22 @@ def _plot_ml_model_comparison(
         print("[INFO] ML comparison: no valid per-model-type data found; skipping.")
         return
 
-    comp_df = pd.DataFrame(records)
+    render_ml_comparison_figures(pd.DataFrame(records), ml_comp_dir)
+
+
+def render_ml_comparison_figures(comp_df: "pd.DataFrame", ml_comp_dir: "Path") -> None:
+    """Draw the clustered ML-comparison bar charts from an assembled metrics frame.
+
+    Split out from :func:`_plot_ml_model_comparison` so that the styling lives in exactly
+    one place.  ``test_ml_comparison_plot.py`` previously held a hand-copied duplicate of
+    this drawing code for fast iteration, which is how the two versions came to disagree
+    about bar width, font size and figure size.
+
+    ``comp_df`` needs the columns ``dataset``, ``target_label``, ``model_display``,
+    ``n_samples`` and one column per metric key.
+    """
+    ml_comp_dir = Path(ml_comp_dir)
+    ml_comp_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine target order: sort by best skill_vs_best per dataset (descending)
     best_skill_per_dataset = (
@@ -1566,13 +1714,23 @@ def _plot_ml_model_comparison(
     # one bar width, so spacing never exceeds the width of a column.
     width = 1.0 / max(n_models + 1, 1)
     offsets = np.array([(i - (n_models - 1) / 2) for i in range(n_models)])
-    _FS = 14  # unified font size for all text elements
+    _FS = plotstyle_font_sizes["tick_value"]
+    _ANNOT_FS = max(6, _FS - 1)
 
+    # Split targets across stacked rows so the value annotations fit at printed size.
+    # All 14 targets in one row is 84 bars, which cannot carry legible rotated labels
+    # across a 6.5 in text block at any font size.
+    max_targets_per_row = max(1, ML_COMPARISON_MAX_BARS_PER_ROW // max(n_models, 1))
+    n_panels = max(1, int(np.ceil(n_targets / max_targets_per_row)))
+    targets_per_panel = int(np.ceil(n_targets / n_panels))
+
+    # nRMSE and RMSE values here are O(1), so fixed decimals read far better than the
+    # scientific notation previously used, and are ~4x shorter.
     metric_specs = [
-        ('rmse',          'RMSE',                    '.2e', False, 'ascending'),
-        ('nrmse',         'nRMSE',                   '.2e', False, 'ascending'),
+        ('rmse',          'RMSE',                    '.2f', False, 'ascending'),
+        ('nrmse',         'nRMSE',                   '.2f', False, 'ascending'),
         ('r2',            'R²',                      '.2f', False, 'descending'),
-        ('skill_vs_best', 'Skill vs. Best Baseline', '.2f', True, 'descending'),
+        ('skill_vs_best', 'Skill vs. Best Reference', '.2f', True, 'descending'),
     ]
     file_names = {
         'rmse':          'ml_comparison_rmse.png',
@@ -1608,90 +1766,111 @@ def _plot_ml_model_comparison(
         # Re-sort ordered_targets based on cluster sort values
         sorted_targets = sorted(ordered_targets, key=lambda x: cluster_sort_vals.get(x[0], np.inf if sort_order == 'ascending' else -np.inf), reverse=(sort_order == 'descending'))
 
-        fig, ax = plt.subplots(figsize=(max(8, n_targets * 0.72 + 1.6), 6))
         # Build proxy Patch handles upfront so labels are always correct.
         legend_handles = [
-            matplotlib.patches.Patch(facecolor=ML_COMPARISON_COLORS[m], label=m)
+            matplotlib.patches.Patch(
+                facecolor=ML_COMPARISON_COLORS[m],
+                label=ML_COMPARISON_LEGEND_LABELS.get(m, m),
+            )
             for m in ordered_model_types
         ]
-        pending_annotations = []
 
-        # Use sorted_targets instead of ordered_targets for this metric
-        sorted_x = np.arange(len(sorted_targets))
+        panels = [
+            sorted_targets[i:i + targets_per_panel]
+            for i in range(0, len(sorted_targets), targets_per_panel)
+        ] or [[]]
 
-        for mi, model_display in enumerate(ordered_model_types):
-            color = ML_COMPARISON_COLORS[model_display]
-            vals = []
-            ns = []
-            bar_x = []
-            for ti, (ds, _lbl) in enumerate(sorted_targets):
-                row_match = comp_df[
-                    (comp_df['dataset'] == ds) & (comp_df['model_display'] == model_display)
-                ]
-                if row_match.empty or not np.isfinite(_safe_float(row_match.iloc[0][metric_key])):
-                    continue
-                bar_x.append(sorted_x[ti] + offsets[mi] * width)
-                vals.append(_safe_float(row_match.iloc[0][metric_key]))
-                ns.append(_safe_float(row_match.iloc[0]['n_samples']))
+        panel_height = 2.6 if len(panels) > 1 else 3.4
+        fig, axes = plt.subplots(
+            len(panels), 1,
+            figsize=(PAGE_WIDTH_IN, panel_height * len(panels) + 0.6),
+        )
+        axes = list(np.atleast_1d(axes).ravel())
 
-            if not bar_x:
-                continue
-
-            bars = ax.bar(bar_x, vals, width, color=color)
-            pending_annotations.append((bars, vals, ns))
-
-        if add_hline:
-            ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
-
+        # Shared y-limits so bar heights are comparable between the stacked panels.
+        all_metric_vals = comp_df[metric_key].dropna().to_numpy(dtype=float)
+        all_metric_vals = all_metric_vals[np.isfinite(all_metric_vals)]
         if metric_key in {'r2', 'skill_vs_best'}:
-            all_vals = comp_df[metric_key].dropna().to_numpy(dtype=float)
-            top = 1.0 if metric_key == 'r2' else max(1.0, float(np.max(all_vals[np.isfinite(all_vals)])) if all_vals.size and np.isfinite(all_vals).any() else 1.0)
-            ymin, ymax = _r2_like_ylim(all_vals, top=top)
-            ax.set_ylim(ymin, ymax)
+            top = 1.0 if metric_key == 'r2' else max(
+                1.0,
+                float(np.max(all_metric_vals)) if all_metric_vals.size else 1.0,
+            )
+            shared_ylim = _r2_like_ylim(all_metric_vals, top=top)
         else:
-            # Constrain y-axis lower limit: never below -1; if all bars positive, floor at 0.
-            ymin_cur, ymax_cur = ax.get_ylim()
-            all_metric_vals = comp_df[metric_key].dropna().to_numpy(dtype=float)
-            all_metric_vals = all_metric_vals[np.isfinite(all_metric_vals)]
-            min_val = float(np.min(all_metric_vals)) if all_metric_vals.size else 0.0
-            if min_val >= 0.0:
-                ax.set_ylim(bottom=-0.1, top=ymax_cur * 1.1)
-            else:
-                ax.set_ylim(bottom=max(ymin_cur, -1.0), top=ymax_cur * 1.1)
+            vmax = float(np.max(all_metric_vals)) if all_metric_vals.size else 1.0
+            vmin = float(np.min(all_metric_vals)) if all_metric_vals.size else 0.0
+            shared_ylim = (-0.1 if vmin >= 0.0 else max(vmin, -1.0), vmax * 1.25)
 
-        for bars, vals, ns in pending_annotations:
-            _annotate_ml_bars(ax, bars, vals, ns, fmt)
+        for ax, panel_targets in zip(axes, panels):
+            pending_annotations = []
+            panel_x = np.arange(len(panel_targets))
 
-        # Tight horizontal bounds with only a small edge margin beyond the outer bars.
-        cluster_half = (n_models - 1) / 2 * width + width / 2
-        if len(sorted_targets) > 0:
-            ax.set_xlim(sorted_x[0] - cluster_half - 0.2 * width, sorted_x[-1] + cluster_half + 0.2 * width)
+            for mi, model_display in enumerate(ordered_model_types):
+                color = ML_COMPARISON_COLORS[model_display]
+                vals = []
+                ns = []
+                bar_x = []
+                for ti, (ds, _lbl) in enumerate(panel_targets):
+                    row_match = comp_df[
+                        (comp_df['dataset'] == ds) & (comp_df['model_display'] == model_display)
+                    ]
+                    if row_match.empty or not np.isfinite(_safe_float(row_match.iloc[0][metric_key])):
+                        continue
+                    bar_x.append(panel_x[ti] + offsets[mi] * width)
+                    vals.append(_safe_float(row_match.iloc[0][metric_key]))
+                    ns.append(_safe_float(row_match.iloc[0]['n_samples']))
 
-        ax.set_ylabel(ylabel, fontsize=_FS)
-        ax.tick_params(axis='y', labelsize=_FS)
-        ax.set_xticks(sorted_x)
-        ax.set_xticklabels(
-            [lbl for _ds, lbl in sorted_targets],
-            rotation=45,
-            ha='right',
+                if not bar_x:
+                    continue
+
+                bars = ax.bar(bar_x, vals, width, color=color)
+                pending_annotations.append((bars, vals, ns))
+
+            if add_hline:
+                ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
+
+            ax.set_ylim(*shared_ylim)
+
+            for bars, vals, ns in pending_annotations:
+                _annotate_ml_bars(ax, bars, vals, ns, fmt, fontsize=_ANNOT_FS)
+
+            # Tight horizontal bounds with only a small edge margin beyond the outer bars.
+            cluster_half = (n_models - 1) / 2 * width + width / 2
+            if len(panel_targets) > 0:
+                ax.set_xlim(
+                    panel_x[0] - cluster_half - 0.2 * width,
+                    panel_x[-1] + cluster_half + 0.2 * width,
+                )
+
+            ax.set_ylabel(ylabel, fontsize=plotstyle_font_sizes["axis_label"])
+            ax.tick_params(axis='y', labelsize=_FS)
+            # At the reduced font size matplotlib otherwise falls back to integer-only
+            # ticks, which is too coarse to read bar heights against.
+            ax.yaxis.set_major_locator(matplotlib.ticker.MaxNLocator(nbins=5, steps=[1, 2, 5, 10]))
+            ax.set_xticks(panel_x)
+            # Sample count belongs to the target, so it is stated once per cluster here
+            # rather than repeated on each of the six bars above it.
+            ax.set_xticklabels(
+                [_ml_target_tick_label(comp_df, ds, lbl, metric_key) for ds, lbl in panel_targets],
+                rotation=45,
+                ha='right',
+                fontsize=_FS,
+            )
+            ax.grid(axis='y', alpha=0.3)
+
+        fig.tight_layout(rect=[0, 0, 1, 0.94])
+        for ax in axes:
+            _expand_ylim_to_fit_annotations(ax)
+
+        # One legend for the whole figure, in the margin above the top panel.
+        legend_above(
+            fig,
+            legend_handles,
+            ncol=min(len(ordered_model_types), 3),
             fontsize=_FS,
         )
-        ax.grid(axis='y', alpha=0.3)
-
-        # Legend in a single row above the plot area
-        ax.legend(
-            handles=legend_handles,
-            loc='lower center',
-            bbox_to_anchor=(0.5, 1.02),
-            ncol=len(ordered_model_types),
-            frameon=False,
-            fontsize=_FS,
-        )
-
-        fig.tight_layout(rect=[0, 0, 1, 0.92])
-        _expand_ylim_to_fit_annotations(ax)
         out_path = ml_comp_dir / file_names[metric_key]
-        fig.savefig(out_path, dpi=180, bbox_inches='tight')
+        save_figure(fig, out_path)
         plt.close(fig)
         print(f"[INFO] Wrote ML comparison figure: {out_path}")
 
@@ -2820,6 +2999,33 @@ def _compute_retraining_stability(
     }
 
 
+# Short codes for the verdict cell of the model-quality matrix, in rank order.
+_VERDICT_MATRIX_CODES = {
+    0: "none",
+    1: "under",
+    2: "dir.",
+    3: "supp.",
+}
+
+
+def _apply_assessment(evidence: dict, assessed: dict, prefix: str) -> None:
+    """Store an ``evidence.assess`` result under *prefix* (e.g. ``vs_naive``).
+
+    Every quantity here comes from one alignment of model and reference losses,
+    so the effect size and its interval always describe the same thing.
+    """
+    evidence[f"skill_ci05_{prefix}"] = _safe_float(assessed.get("skill_ci05"))
+    evidence[f"skill_ci95_{prefix}"] = _safe_float(assessed.get("skill_ci95"))
+    evidence[f"sign_p_exact_{prefix}"] = _safe_float(assessed.get("sign_p"))
+    evidence[f"sign_win_rate_exact_{prefix}"] = _safe_float(assessed.get("sign_win_rate"))
+    evidence[f"min_attainable_p_{prefix}"] = _safe_float(assessed.get("min_attainable_p"))
+    evidence[f"power_attainable_{prefix}"] = bool(assessed.get("power_attainable", False))
+    evidence[f"n_pairs_{prefix}"] = int(assessed.get("sign_n_pairs", 0) or 0)
+    evidence[f"dm_applicable_{prefix}"] = bool(assessed.get("dm_applicable", False))
+    evidence[f"bootstrap_block_len_used_{prefix}"] = int(assessed.get("block_len_used", 0) or 0)
+    evidence[f"verdict_{prefix}"] = str(assessed.get("verdict", ev_mod.NOT_SUPPORTED))
+
+
 def _neutral_self_comparison_evidence(selection: "SelectionRecord | None", args: argparse.Namespace) -> dict:
     """Evidence payload for a best model that is also the configured best baseline."""
     label = selection.best_baseline_label if selection is not None else ""
@@ -2853,19 +3059,29 @@ def _neutral_self_comparison_evidence(selection: "SelectionRecord | None", args:
         "picp_delta_vs_best_baseline": 0.0,
         "nmpiw_delta_vs_best_baseline": 0.0,
         "interval_score_delta_vs_best_baseline": 0.0,
-        "gate_min_raw_vs_best_baseline": True,
+        "gate_min_raw_vs_best_baseline": False,
         "gate_prob_vs_best_baseline": False,
         "gate_lcb_vs_best_baseline": False,
         "gate_dm_vs_best_baseline": False,
         "gate_wilcoxon_vs_best_baseline": False,
         "gate_sign_vs_best_baseline": False,
-        "gate_coverage_vs_best_baseline": True,
+        "gate_coverage_vs_best_baseline": False,
         "gate_dm_q_vs_best_baseline": False,
         "gate_wilcoxon_q_vs_best_baseline": False,
         "gate_sign_q_vs_best_baseline": False,
-        "evidence_score_vs_best_baseline": 1,
-        "evidence_score_overall_min": 1,
-        "evidence_score_overall_mean": 1.0,
+        "evidence_score_vs_best_baseline": float("nan"),
+        "evidence_score_overall_min": float("nan"),
+        "evidence_score_overall_mean": float("nan"),
+        "verdict_vs_best_baseline": ev_mod.NOT_SUPPORTED,
+        "verdict_overall": ev_mod.NOT_SUPPORTED,
+        "verdict_rank_overall": 0,
+        "skill_ci05_vs_best_baseline": float("nan"),
+        "skill_ci95_vs_best_baseline": float("nan"),
+        "sign_p_exact_vs_best_baseline": float("nan"),
+        "sign_win_rate_exact_vs_best_baseline": float("nan"),
+        "min_attainable_p_vs_best_baseline": float("nan"),
+        "power_attainable_vs_best_baseline": False,
+        "n_pairs_vs_best_baseline": 0,
         "interval_alpha": float(getattr(args, "interval_alpha", 0.1)),
         "evidence_alpha": float(getattr(args, "evidence_alpha", 0.05)),
         "bootstrap_mode": str(getattr(args, "bootstrap_mode", "iid")),
@@ -2969,6 +3185,7 @@ def _compute_statistical_evidence(
     gp_pred_var = payload.get("gp_pred_var")
     pval_records: list[tuple[str, str, float]] = []
     baseline_scores: list[int] = []
+    verdicts_by_reference: dict[str, str] = {}
     interval_alpha = float(getattr(args, "interval_alpha", 0.1))
     coverage_tol = float(getattr(args, "coverage_tolerance", 0.03))
     model_int = _interval_proxy_metrics(pred_model, y_test, alpha=interval_alpha)
@@ -3008,6 +3225,17 @@ def _compute_statistical_evidence(
         dm_stat, dm_p = _dm_test_from_diff(mse_diff_group, max_lag=int(args.dm_max_lag))
         w_stat, w_p = _wilcoxon_from_diff(ae_diff_group)
         sign_wins, sign_win_rate, sign_p = _sign_test_from_diff(ae_diff_group)
+        assessed = ev_mod.assess(
+            mse_m, mse_b, group_ids,
+            alpha=float(args.evidence_alpha),
+            n_boot=int(args.bootstrap_iterations),
+            seed=int(args.bootstrap_seed),
+            block_len=int(getattr(args, 'bootstrap_block_len', 3)),
+            moving_block=str(getattr(args, 'bootstrap_mode', 'iid')).lower() == 'moving_block',
+            dm_max_lag=int(args.dm_max_lag),
+        )
+        _apply_assessment(evidence, assessed, f'vs_{bname}')
+        verdicts_by_reference[bname] = assessed['verdict']
         boot = _bootstrap_grouped_skill(
             y_test,
             pred_model,
@@ -3069,7 +3297,11 @@ def _compute_statistical_evidence(
         gate_prob = bool(np.isfinite(evidence[f"bootstrap_prob_skill_gt0_{prefix}"]) and evidence[f"bootstrap_prob_skill_gt0_{prefix}"] >= float(args.evidence_min_prob))
         gate_lcb = bool(np.isfinite(evidence[f"lcb95_skill_{prefix}"]) and evidence[f"lcb95_skill_{prefix}"] > 0)
         gate_dm = bool(np.isfinite(dm_p) and dm_p < float(args.evidence_alpha) and np.isfinite(dm_stat) and dm_stat < 0)
-        gate_wilc = bool(np.isfinite(w_p) and w_p < float(args.evidence_alpha))
+        _wilc_median = float(np.nanmedian(ae_diff_group)) if np.size(ae_diff_group) else float('nan')
+        gate_wilc = bool(
+            np.isfinite(w_p) and w_p < float(args.evidence_alpha)
+            and np.isfinite(_wilc_median) and _wilc_median < 0
+        )
         gate_sign = bool(np.isfinite(sign_p) and sign_p < float(args.evidence_alpha) and np.isfinite(sign_win_rate) and sign_win_rate > 0.5)
         gate_cov = bool(
             np.isfinite(_safe_float(model_int["coverage_deficit"]))
@@ -3084,7 +3316,10 @@ def _compute_statistical_evidence(
         evidence[f"gate_wilcoxon_{prefix}"] = gate_wilc
         evidence[f"gate_sign_{prefix}"] = gate_sign
         evidence[f"gate_coverage_{prefix}"] = gate_cov
-        score = int(gate_lcb) + int(gate_dm) + int(gate_wilc) + int(gate_sign) + int(gate_cov)
+        # gate_cov is excluded: its interval was built from the residuals it
+        # scored, so it was an in-sample identity rather than a test. It stays
+        # in the CSV as a diagnostic. The verdict supersedes this count.
+        score = int(gate_lcb) + int(gate_dm) + int(gate_wilc) + int(gate_sign)
         evidence[f"evidence_score_{prefix}"] = score
         baseline_scores.append(score)
 
@@ -3203,7 +3438,11 @@ def _compute_statistical_evidence(
             evidence["gate_prob_vs_best_baseline"] = bool(np.isfinite(evidence["bootstrap_prob_skill_gt0_vs_best_baseline"]) and evidence["bootstrap_prob_skill_gt0_vs_best_baseline"] >= float(args.evidence_min_prob))
             evidence["gate_lcb_vs_best_baseline"] = bool(np.isfinite(evidence["lcb95_skill_vs_best_baseline"]) and evidence["lcb95_skill_vs_best_baseline"] > 0)
             evidence["gate_dm_vs_best_baseline"] = bool(np.isfinite(dm_p) and dm_p < float(args.evidence_alpha) and np.isfinite(dm_stat) and dm_stat < 0)
-            evidence["gate_wilcoxon_vs_best_baseline"] = bool(np.isfinite(w_p) and w_p < float(args.evidence_alpha))
+            _wilc_median_direct = float(np.nanmedian(ae_diff_group)) if np.size(ae_diff_group) else float("nan")
+            evidence["gate_wilcoxon_vs_best_baseline"] = bool(
+                np.isfinite(w_p) and w_p < float(args.evidence_alpha)
+                and np.isfinite(_wilc_median_direct) and _wilc_median_direct < 0
+            )
             evidence["gate_sign_vs_best_baseline"] = bool(np.isfinite(sign_p) and sign_p < float(args.evidence_alpha) and np.isfinite(sign_win_rate) and sign_win_rate > 0.5)
             evidence["gate_coverage_vs_best_baseline"] = bool(
                 np.isfinite(_safe_float(model_int["coverage_deficit"]))
@@ -3214,21 +3453,47 @@ def _compute_statistical_evidence(
             evidence["gate_dm_q_vs_best_baseline"] = evidence["gate_dm_vs_best_baseline"]
             evidence["gate_wilcoxon_q_vs_best_baseline"] = evidence["gate_wilcoxon_vs_best_baseline"]
             evidence["gate_sign_q_vs_best_baseline"] = evidence["gate_sign_vs_best_baseline"]
-            evidence["evidence_score_vs_best_baseline"] = int(evidence["gate_lcb_vs_best_baseline"]) + int(evidence["gate_dm_vs_best_baseline"]) + int(evidence["gate_wilcoxon_vs_best_baseline"]) + int(evidence["gate_sign_vs_best_baseline"]) + int(evidence["gate_coverage_vs_best_baseline"])
+            evidence["evidence_score_vs_best_baseline"] = (
+                int(evidence["gate_lcb_vs_best_baseline"])
+                + int(evidence["gate_dm_vs_best_baseline"])
+                + int(evidence["gate_wilcoxon_vs_best_baseline"])
+                + int(evidence["gate_sign_vs_best_baseline"])
+            )
+            _direct_assessed = ev_mod.assess(
+                mse_m, mse_b, group_direct,
+                alpha=float(args.evidence_alpha),
+                n_boot=int(args.bootstrap_iterations),
+                seed=int(args.bootstrap_seed),
+                block_len=int(getattr(args, "bootstrap_block_len", 3)),
+                moving_block=str(getattr(args, "bootstrap_mode", "iid")).lower() == "moving_block",
+                dm_max_lag=int(args.dm_max_lag),
+            )
+            _apply_assessment(evidence, _direct_assessed, "vs_best_baseline")
+            verdicts_by_reference["best_baseline"] = _direct_assessed["verdict"]
         except Exception as exc:
             print(f"[WARN] Could not compute direct best-baseline evidence for {plan.dataset_dir.name}: {exc}")
 
     if "skill_vs_best_baseline" not in evidence and selection is not None:
         evidence["skill_vs_best_baseline"] = selection.skill_vs_best_baseline
-    if "evidence_score_vs_best_baseline" in evidence:
-        baseline_scores = [int(evidence["evidence_score_vs_best_baseline"])]
+    _direct_score = _safe_float(evidence.get("evidence_score_vs_best_baseline"))
+    if np.isfinite(_direct_score):
+        baseline_scores.append(int(_direct_score))
 
     if baseline_scores:
         evidence["evidence_score_overall_min"] = int(min(baseline_scores))
         evidence["evidence_score_overall_mean"] = float(np.mean(baseline_scores))
     else:
-        evidence["evidence_score_overall_min"] = 0
-        evidence["evidence_score_overall_mean"] = 0.0
+        evidence["evidence_score_overall_min"] = float("nan")
+        evidence["evidence_score_overall_mean"] = float("nan")
+
+    # A claim must hold against every reference, so the weakest verdict wins.
+    evidence["verdict_overall"] = ev_mod.weakest(verdicts_by_reference.values())
+    evidence["verdict_rank_overall"] = int(
+        ev_mod.VERDICT_ORDER.index(evidence["verdict_overall"])
+    )
+    evidence["verdict_detail"] = "; ".join(
+        f"{k}:{v}" for k, v in sorted(verdicts_by_reference.items())
+    )
     evidence["interval_alpha"] = interval_alpha
     evidence["evidence_alpha"] = float(args.evidence_alpha)
     evidence["bootstrap_mode"] = str(getattr(args, "bootstrap_mode", "iid"))
@@ -3413,6 +3678,12 @@ def _compile_feature_inclusion_heatmap(
     # Font sizing (consistent with existing heatmap)
     heat_font = 8
 
+    # Cells are 0/1 inclusion flags, not measurements, so predictor labels carry no units.
+    # The source qualifier is kept because the predictor pool mixes Surface and SCADA pH
+    # and water temperature, which would otherwise appear as duplicate rows.
+    def _feature_display(feat: str) -> str:
+        return names_label(feat, with_unit=False, qualified=True)
+
     # Annotation helper: show integer for >=1, blank for 0
     def _annotate_inclusion_cells(ax_obj, values: np.ndarray, fontsize: int) -> None:
         for row_i in range(values.shape[0]):
@@ -3445,7 +3716,11 @@ def _compile_feature_inclusion_heatmap(
         sep_col = np.full((left_block.shape[0], 1), np.nan)
         combined_matrix = np.hstack([left_block, sep_col, right_block])
         sep_pos = left_block.shape[1]
-        xticklabels_with_sep = multi_target_features + [""] + single_target_features
+        xticklabels_with_sep = (
+            [_feature_display(f) for f in multi_target_features]
+            + [""]
+            + [_feature_display(f) for f in single_target_features]
+        )
 
         n_total_cols = combined_matrix.shape[1]
         heat_w = max(6, n_total_cols * _cell_w + 3.5)  # +3.5 for y-labels & colorbar
@@ -3485,12 +3760,15 @@ def _compile_feature_inclusion_heatmap(
             cmap="YlGn", vmin=_heat_vmin, vmax=_heat_vmax,
             annot=False,
             cbar_kws={"label": "Number of targets including predictor", "pad": 0.01},
-            xticklabels=all_features,
+            xticklabels=[_feature_display(f) for f in all_features],
             yticklabels=yticklabels_with_total,
             linewidths=0.5, linecolor="#eeeeee", square=True,
         )
         _annotate_inclusion_cells(ax, matrix_with_total, heat_font)
-        ax.set_xticklabels(all_features, rotation=45, ha="right", fontsize=heat_font)
+        ax.set_xticklabels(
+            [_feature_display(f) for f in all_features],
+            rotation=45, ha="right", fontsize=heat_font,
+        )
         ax.set_yticklabels(
             [textwrap.fill(lbl, 20) for lbl in yticklabels_with_total],
             rotation=0, fontsize=heat_font,
@@ -3498,7 +3776,7 @@ def _compile_feature_inclusion_heatmap(
 
     ax.set_xlabel("Predictor", fontsize=heat_font)
     ax.set_ylabel("Target", fontsize=heat_font)
-    ax.set_title("Best Model Feature Inclusion", fontsize=heat_font + 2)
+    # No title: the figure caption in manuscript.tex carries it.
 
     summaries_dir = (data_root / "summaries").resolve()
     namespace = str(sweep_namespace).strip() or "feature_sweeps"
@@ -3506,7 +3784,7 @@ def _compile_feature_inclusion_heatmap(
         summaries_dir = (summaries_dir / namespace).resolve()
     summaries_dir.mkdir(parents=True, exist_ok=True)
     plot_path = summaries_dir / "multi_target_feature_inclusion_heatmap.png"
-    fig.savefig(plot_path, dpi=180, bbox_inches="tight")
+    save_figure(fig, plot_path)
     plt.close(fig)
     return plot_path
 
@@ -3523,6 +3801,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
         "[INFO] Postprocess uses existing stored split files and does not "
         "retroactively rebalance final-top-k train/test splits."
     )
+
+    figures_only = bool(getattr(args, "figures_only", False))
+    if figures_only:
+        print(
+            "[INFO] --figures-only: redrawing summary figures from cached CSV artifacts. "
+            "No MLR refits, baseline re-evaluation, evidence computation or per-row "
+            "artifact regeneration will run."
+        )
 
     sweep_results: dict[str, dict[int, dict[str, tuple[float, int]]]] = {}
     importance_sources_used: set[str] = set()
@@ -3547,48 +3833,32 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
         metrics_csv = output_dir / "feature_sweep_final_metrics.csv"
         if metrics_csv.exists():
             df = pd.read_csv(metrics_csv)
-            if "std_target" not in df.columns or df["std_target"].isnull().all():
-                std_targets = [None] * len(df)
-                for idx, row in df.iterrows():
-                    feature_tag = row.get("feature_tag", "")
-                    row_count_val = int(row.get("row_count", 0))
-                    model = row.get("model", None)
-                    cfg_dir = output_dir / "configs"
-                    # Only compute std_target for the config/model that matches a config file AND model name
-                    cfg_candidates = [p for p in cfg_dir.glob(f"*_r{row_count_val:03d}_{feature_tag}*.yml") if model and model.lower() in p.name.lower()]
-                    if not cfg_candidates:
-                        std_targets[idx] = None
-                        continue
-                    cfg_path = cfg_candidates[0]
-                    with open(cfg_path, "r", encoding="utf-8") as f:
-                        cfg = yaml.safe_load(f)
-                    data_cfg = cfg["data"]
-                    data_dir = Path(train_module._resolve_path_from_config(data_cfg["data_dir"], Path(cfg.get("__config_dir", cfg_path.parent))))
-                    sample_subdir = str(data_cfg.get("sample_subdir", "samples"))
-                    output_columns = list(data_cfg["output_columns"])
-                    output_rows = list(data_cfg["output_rows"])
-                    samples = load_samples(
-                        str(data_dir / sample_subdir),
-                        input_columns=list(data_cfg["input_columns"]),
-                        output_columns=output_columns,
-                        input_rows=slice(data_cfg["input_row_1"], data_cfg["input_row_2"]),
-                        output_rows=output_rows,
-                        fault_tolerant=True,
-                    )
-                    if samples and len(samples) > 0:
-                        outputs = np.array([s[1] for s in samples], dtype=float)
-                        if outputs.ndim == 2 and outputs.shape[1] == 1:
-                            std_target = float(np.std(outputs[:, 0], ddof=1))
-                        elif outputs.ndim == 2:
-                            std_target = float(np.mean(np.std(outputs, axis=0, ddof=1)))
-                        else:
-                            std_target = float(np.std(outputs, ddof=1))
-                        std_targets[idx] = std_target
+            # One sigma per target, applied to every row so that NRMSE is
+            # comparable between methods.  Reading the sample files is cheap
+            # relative to the sweep but pointless when only redrawing figures.
+            if not figures_only:
+                existing = pd.to_numeric(
+                    df.get("std_target", pd.Series(dtype=float)), errors="coerce").dropna()
+                n_distinct = int(existing.round(12).nunique())
+                needs_sigma = (
+                    "std_target" not in df.columns
+                    or df["std_target"].isnull().any()
+                    or n_distinct > 1
+                )
+                if needs_sigma:
+                    if n_distinct > 1:
+                        print(f"[WARN] {plan.dataset_dir.name}: std_target held {n_distinct} "
+                              "distinct values; recomputing a single per-target sigma so "
+                              "NRMSE is comparable between methods.")
+                    sigma = _dataset_target_std(output_dir, plan.dataset_dir.name)
+                    if not np.isfinite(sigma) or sigma <= 0:
+                        print(f"[WARN] {plan.dataset_dir.name}: leaving std_target and nrmse "
+                              "unset; NRMSE for this target is not reportable.")
                     else:
-                        std_targets[idx] = None
-                # Only update std_target for rows where it was computed; leave others empty
-                df["std_target"] = std_targets
-                df.to_csv(metrics_csv, index=False)
+                        df["std_target"] = sigma
+                        if "rmse" in df.columns:
+                            df["nrmse"] = pd.to_numeric(df["rmse"], errors="coerce") / sigma
+                        df.to_csv(metrics_csv, index=False)
 
             try:
                 final_df = pd.read_csv(metrics_csv)
@@ -3602,13 +3872,18 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
         wrote_any = False
         include_row_count_in_plot_names = len(row_counts) > 1
         for row_count in row_counts:
-            written = _regenerate_saved_outputs_for_row(
-                dataset_dir=plan.dataset_dir,
-                target_name=target_name,
-                row_count=row_count,
-                keep_search_plots=bool(args.keep_search_plots),
-                include_row_count_in_plot_names=include_row_count_in_plot_names,
-            )
+            if figures_only:
+                # Per-dataset artifact regeneration re-reads sample files and rewrites
+                # per-row plots; the summary figures do not depend on it.
+                written = {}
+            else:
+                written = _regenerate_saved_outputs_for_row(
+                    dataset_dir=plan.dataset_dir,
+                    target_name=target_name,
+                    row_count=row_count,
+                    keep_search_plots=bool(args.keep_search_plots),
+                    include_row_count_in_plot_names=include_row_count_in_plot_names,
+                )
 
             feature_sensitivities, _, _, importance_source = _load_feature_stats_artifacts_with_source(
                 dataset_dir=plan.dataset_dir,
@@ -3634,10 +3909,16 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                     "missing native feature stats and Shapley fallback artifacts."
                 )
 
-        # Run rolling origin CV and collect best model performance for summary plot
+        # Run rolling origin CV and collect best model performance for summary plot.
+        # This is the expensive part of the loop: it refits the MLR variants, re-runs the
+        # k01 baselines and recomputes the statistical evidence.  In figures-only mode it
+        # is skipped and the resulting records are read back from the summary CSV after
+        # the loop instead.
         try:
             final_metrics_csv = _forecast_sweeps_dir(plan.dataset_dir) / "feature_sweep_final_metrics.csv"
-            if final_metrics_csv.exists():
+            if figures_only:
+                pass
+            elif final_metrics_csv.exists():
                 df = pd.read_csv(final_metrics_csv)
                 if not df.empty:
                     # Filter to the canonical target name for this dataset before any
@@ -3863,6 +4144,27 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
         if wrote_any:
             datasets_with_outputs += 1
+
+    if figures_only and not best_model_performance:
+        # The per-dataset loop did not rebuild these records, so read the ones the last
+        # full run wrote.  Every summary figure downstream is driven by this list.
+        _cached_summaries_dir = _resolve_summaries_dir(
+            data_root=data_root,
+            sweep_namespace=str(getattr(args, "sweep_namespace", "feature_sweeps")),
+        )
+        _cached_perf_csv = _cached_summaries_dir / "summary_best_model_performance.csv"
+        if _cached_perf_csv.exists():
+            best_model_performance = pd.read_csv(_cached_perf_csv).to_dict("records")
+            print(
+                f"[INFO] --figures-only: loaded {len(best_model_performance)} cached "
+                f"best-model record(s) from {_cached_perf_csv}"
+            )
+        else:
+            print(
+                f"[WARN] --figures-only: {_cached_perf_csv} not found. Figures that depend "
+                "on best-model performance will be skipped; run once without "
+                "--figures-only to create it."
+            )
 
     # Generate summary_best_model_performance.png (nRMSE, R2, Rolling CV R2)
     try:
@@ -4115,7 +4417,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             baseline_prob_cols = [_perf_col("bootstrap_prob_skill_gt0_vs_best_baseline")]
             baseline_lcb_cols = [_perf_col("lcb95_skill_vs_best_baseline")]
-            overall_score = _perf_col("evidence_score_overall_min")
+            overall_score = _perf_col("verdict_rank_overall")
             model_picp = _perf_col("model_picp")
             best_baseline_picp = _perf_col("best_baseline_picp")
             nominal_cov = _perf_col("model_nominal_coverage")
@@ -4165,7 +4467,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
             bars_score = conf_axes[3].bar(x, overall_score, width=0.5, color='tab:blue')
             _annotate_bars_within_ylim(conf_axes[3], bars_score, '.0f')
-            conf_axes[3].set_ylabel('Overall Evidence Score\n(Minimum Across Baselines)')
+            conf_axes[3].set_ylabel('Evidence Verdict\n(0 none, 1 underpowered, 2 directional, 3 supported)')
             conf_axes[3].grid(axis='y', alpha=0.3)
             conf_axes[3].set_xticks(x)
             conf_axes[3].set_xticklabels(labels, rotation=45, ha='right')
@@ -4219,7 +4521,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             def _conf_panel_score(ax):
                 bars = ax.bar(x, overall_score, width=0.5, color='tab:blue')
                 _annotate_bars_within_ylim(ax, bars, '.0f')
-                ax.set_ylabel('Overall Evidence Score\n(Minimum Across Baselines)')
+                ax.set_ylabel('Evidence Verdict\n(0 none, 1 underpowered, 2 directional, 3 supported)')
                 ax.grid(axis='y', alpha=0.3)
 
             conf_panels = _save_individual_panels_from_builders(
@@ -4663,7 +4965,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             _sort_p_min = pd.to_numeric(matrix_perf_df[present_p_cols].min(axis=1, skipna=True), errors="coerce").to_numpy(dtype=float) if present_p_cols else np.full(n_rows_mat, np.nan, dtype=float)
             _sort_q_tie = np.where(np.isfinite(_sort_q_min), _sort_q_min, _sort_p_min)
             _sort_score = pd.to_numeric(
-                matrix_perf_df.get("evidence_score_overall_min", pd.Series([0] * n_rows_mat)),
+                matrix_perf_df.get("verdict_rank_overall", pd.Series([0] * n_rows_mat)),
                 errors="coerce",
             ).to_numpy(dtype=float)
             matrix_perf_df["_tier_sort"] = np.where(np.isfinite(_sort_score), _sort_score, np.inf)
@@ -4685,7 +4987,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             q_min = pd.to_numeric(matrix_perf_df[present_q_cols].min(axis=1, skipna=True), errors="coerce").to_numpy(dtype=float) if present_q_cols else np.full(n_rows_mat, np.nan, dtype=float)
             p_min = pd.to_numeric(matrix_perf_df[present_p_cols].min(axis=1, skipna=True), errors="coerce").to_numpy(dtype=float) if present_p_cols else np.full(n_rows_mat, np.nan, dtype=float)
             tier_vals = pd.to_numeric(
-                matrix_perf_df.get("evidence_score_overall_min", pd.Series([0] * n_rows_mat)),
+                matrix_perf_df.get("verdict_rank_overall", pd.Series([0] * n_rows_mat)),
                 errors="coerce",
             ).to_numpy(dtype=float)
 
@@ -4695,53 +4997,45 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 return np.full(n_rows_mat, np.nan, dtype=float)
 
             quality_df = pd.DataFrame({
-                "Test Sample Count": _col_values("n_eval_raw_segments"),
+                "Independent Samples": _col_values("n_pairs_vs_best_baseline"),
                 "R²": _col_values("best_model_r2"),
                 "nRMSE": _col_values("best_model_nrmse"),
-                "Skill vs. Best Baseline": _col_values("skill_vs_best_baseline"),
-                "Coverage Gap (PICP − Nominal)": _col_values("model_coverage_gap"),
-                "Normalized Mean Prediction Interval Width": _col_values("model_nmpiw"),
-                "Minimum 95% Lower Confidence Bound of Skill": _col_values("lcb95_skill_vs_best_baseline"),
-                "Best False Discovery Rate Adjusted q-value": q_min,
-                "Best p-value": p_min,
-                "Evidence Score": tier_vals,
+                "Skill vs. Best Reference": _col_values("skill_vs_best_baseline"),
+                "Skill 95% Lower Bound": _col_values("skill_ci05_vs_best_baseline"),
+                "Paired Win Rate": _col_values("sign_win_rate_exact_vs_best_baseline"),
+                "Exact Sign-Test p": _col_values("sign_p_exact_vs_best_baseline"),
+                "Smallest Attainable p": _col_values("min_attainable_p_vs_best_baseline"),
+                "Verdict": tier_vals,
             }, index=matrix_index)
-
-            # Fallback to p-values if q-values are unavailable.
-            if not np.isfinite(quality_df["Best False Discovery Rate Adjusted q-value"].to_numpy(dtype=float)).any():
-                quality_df["Best False Discovery Rate Adjusted q-value"] = quality_df["Best p-value"]
 
             # Column-wise directional scaling for heatmap coloring only.
             higher_better = {
-                "Test Sample Count": True,
+                "Independent Samples": True,
                 "R²": True,
                 "nRMSE": False,
-                "Skill vs. Best Baseline": True,
-                "Normalized Mean Prediction Interval Width": False,
-                "Minimum 95% Lower Confidence Bound of Skill": True,
-                "Best False Discovery Rate Adjusted q-value": False,
-                "Evidence Score": True,
+                "Skill vs. Best Reference": True,
+                "Skill 95% Lower Bound": True,
+                "Paired Win Rate": True,
+                "Exact Sign-Test p": False,
+                "Smallest Attainable p": False,
+                "Verdict": True,
             }
-            if "Best p-value" in quality_df.columns:
-                higher_better["Best p-value"] = False
 
             non_gate_cols = [
-                "Test Sample Count",
+                "Independent Samples",
                 "Best Model",
                 "Best Baseline",
                 "R²",
                 "nRMSE",
-                "Skill vs. Best Baseline",
-                "Normalized Mean Prediction Interval Width",
+                "Skill vs. Best Reference",
             ]
             gate_cols = [
-                "Coverage Gap (PICP − Nominal)",
-                "Minimum 95% Lower Confidence Bound of Skill",
-                "Best False Discovery Rate Adjusted q-value",
-                "Evidence Score",
+                "Skill 95% Lower Bound",
+                "Paired Win Rate",
+                "Exact Sign-Test p",
+                "Smallest Attainable p",
+                "Verdict",
             ]
-            if np.isfinite(quality_df["Best p-value"].to_numpy(dtype=float)).any():
-                gate_cols.insert(2, "Best p-value")
 
             quality_df['Best Model'] = matrix_perf_df.get('best_model_label', matrix_perf_df.get('model', pd.Series(["Unknown"] * len(matrix_perf_df)))).map(_display_model_type).values
             quality_df['Best Baseline'] = matrix_perf_df.get('best_baseline_label', pd.Series(["Unknown"] * len(matrix_perf_df))).astype(str).values
@@ -4762,7 +5056,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 axis=1,
             ).copy()
 
-            zero_centered_cols = {"Coverage Gap (PICP − Nominal)"}
+            zero_centered_cols: set[str] = set()
             norm = display_df.copy()
             for c in norm.columns:
                 if c in {'Best Model', 'Best Baseline'}:
@@ -4799,9 +5093,14 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             for c in annot.columns:
                 if c in {'Best Model', 'Best Baseline'}:
                     annot[c] = ""  # drawn manually after rectangles
-                elif c in {"Evidence Score", "Test Sample Count"}:
+                elif c == "Verdict":
+                    annot[c] = annot[c].map(
+                        lambda v: "" if not np.isfinite(v)
+                        else _VERDICT_MATRIX_CODES.get(int(round(v)), "")
+                    )
+                elif c == "Independent Samples":
                     annot[c] = annot[c].map(lambda v: "" if not np.isfinite(v) else f"{int(round(v))}")
-                elif c in {"Best False Discovery Rate Adjusted q-value", "Best p-value"}:
+                elif c in {"Exact Sign-Test p", "Smallest Attainable p"}:
                     annot[c] = annot[c].map(lambda v: "" if not np.isfinite(v) else f"{v:.3f}")
                 else:
                     annot[c] = annot[c].map(lambda v: "" if not np.isfinite(v) else f"{v:.2f}")
@@ -4863,7 +5162,7 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             # ax_mat.set_xlabel("Metrics")
             # ax_mat.set_ylabel("Target")
             ax_mat.set_yticklabels(ax_mat.get_yticklabels(), rotation=0, fontsize=8)
-            dm_suffix_cols = {"Best False Discovery Rate Adjusted q-value", "Best p-value"}
+            dm_suffix_cols: set[str] = set()
             wrapped_xlabels = []
             for xt in ax_mat.get_xticklabels():
                 txt = xt.get_text()
@@ -5247,6 +5546,19 @@ def main() -> int:
         help=(
             "Process all dataset folders in --data-root; clears dataset-prefix "
             "filtering and disables dataset-count capping."
+        ),
+    )
+    parser.add_argument(
+        "--figures-only",
+        action="store_true",
+        help=(
+            "Redraw the summary figures from cached CSV artifacts without recomputing "
+            "anything. Skips std_target back-fill, per-row artifact regeneration, MLR "
+            "variant refits, baseline re-evaluation and statistical-evidence "
+            "computation, and reads best-model performance from the existing "
+            "summaries/summary_best_model_performance.csv instead of rebuilding it. "
+            "Use this when only the appearance of a figure has changed; it turns a "
+            "run of tens of minutes into one of seconds."
         ),
     )
     args = parser.parse_args()

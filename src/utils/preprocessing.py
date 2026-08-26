@@ -354,7 +354,8 @@ def add_res(df: pd.DataFrame, columns: list) -> pd.DataFrame:
       - If the value in col is NaN, col_res is NaN.
       - For the first non-NaN value in col, col_res is NaN.
       - Otherwise, col_res is the difference between the current value and the previous non-NaN value.
-    Values in the new column are rounded to 3 decimal places.
+    Values in the new column are rounded to the decimal resolution of the source
+    column, for the reason given in ``_decimal_resolution``.
 
     Parameters:
         df (pd.DataFrame): The input dataframe.
@@ -378,10 +379,33 @@ def add_res(df: pd.DataFrame, columns: list) -> pd.DataFrame:
             if first_non_nan_idx is not None:
                 diffs.iloc[first_non_nan_idx] = np.nan
 
-            # Round to 3 decimal places
-            final_df[f"{col}_res"] = diffs.round(3)
+            # Round to the source column's own resolution, not a fixed 3 dp.
+            final_df[f"{col}_res"] = diffs.round(_decimal_resolution(final_df[col]))
 
     return final_df
+
+
+def _decimal_resolution(series: "pd.Series", max_decimals: int = 12) -> int:
+    """Smallest decimal count that reproduces every observed value in *series*.
+
+    ``add_diff`` rounds its output to suppress the float artifacts of a
+    subtraction (0.0026 - 0.0021 == 0.0004999999999999999).  A fixed precision
+    cannot do that safely, because the right number of decimals depends on the
+    unit the target is reported in: three decimals is ample for a metal in ug/L
+    but quantizes filtered copper in mg/L, whose entire observed range is 0.004,
+    onto a four-level grid and rounds most true differences to exactly zero.
+
+    The difference of two values that are each exact at *d* decimals is itself
+    exact at *d* decimals, so rounding to the source resolution removes the
+    artifact and nothing else.
+    """
+    vals = pd.to_numeric(series, errors="coerce").dropna().to_numpy()
+    if vals.size == 0:
+        return 3
+    for d in range(max_decimals + 1):
+        if np.allclose(np.round(vals, d), vals, rtol=0.0, atol=0.0):
+            return d
+    return max_decimals
 
 
 def add_diff(df: pd.DataFrame, columns: list) -> pd.DataFrame:
@@ -395,7 +419,9 @@ def add_diff(df: pd.DataFrame, columns: list) -> pd.DataFrame:
       - Otherwise, col_diff is the difference between the current observed
         value and the forward-filled state value at the first row of the
         inferred sample window.
-      - Values in the new column are rounded to 3 decimal places.
+      - Values in the new column are rounded to the decimal resolution of the
+        source column, which removes the float artifacts of the subtraction
+        without discarding real variation.
 
     Parameters:
         df (pd.DataFrame): The input dataframe.
@@ -426,7 +452,7 @@ def add_diff(df: pd.DataFrame, columns: list) -> pd.DataFrame:
         lagged_state = final_df[state_col].shift(sample_start_offset)
         diffs = final_df[col] - lagged_state
         diffs = diffs.where(final_df[col].notna(), np.nan)
-        final_df[f"{col}_diff"] = diffs.round(3)
+        final_df[f"{col}_diff"] = diffs.round(_decimal_resolution(final_df[col]))
 
     return final_df
 

@@ -1,80 +1,316 @@
-data_columns = ['Pfl - Temp (C)', 'Pfl - Sp Cond (microS_cm)',
-    'Pfl - pH', 'Pfl - DO (% Sat)', 'Pfl - Turbidity (FNU)', 'Pfl - fDOM (RFU)', 'Pfl - fDOM (QSU)',
-    'Instantaneous atmospheric pressure (mBar)', 'Wind direction 10minRollingAvg (°)_x',
-    'Wind direction 10minRollingAvg (°)_y', 'Hourly average wind direction (°)_x',
-    'Hourly average wind direction (°)_y', 'Average wind speed (m/s)',
-    'Maximum sustained wind speed, 3-second span (m/s)', 'Time of maximum 3s Gust',
-    'Maximum sustained wind speed, 10-minute span (m/s)', 'Time of maximum 10 minute gust',
-    'Hourly average atmospheric pressure at station (mBar)', 'Maximum pressure differential, 3-hour span (mBar)',
-    'Instantaneous atmospheric pressure compensated for temperature, humidity and station elevation (mBar)',
-    'Longwave (IR) radiation (W/m2)', 'Instantaneous sea-level atmospheric pressure (mBar)',
-    'Shortwave (solar) radiation (W/m2)', 'Precipitation (mm/hr)', 'Instantaneous temperature (°C)',
-    'Maximum temperature (°C)', 'Minimum temperature (°C)', 'Average humidity (% relative humidity)',
-    'SCADA - pH', 'SCADA - Temperature (°C)', '01-Farge', '04-Turbiditet', '06-E.coli',
-    '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen', '24-Bly',
-    '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
+"""Canonical display labels for the 31 study parameters.
 
-all_columns = ['TIMESTAMP', 'Segment', 'Interpolated'] + data_columns
+The column names stored in ``Consolidated_sparse.csv`` are the *data contract*: the
+resample YAMLs under ``data/input/splitting/``, the generated per-dataset training
+configs, ``data/input/normalization.json`` and ``utils/plausibility.py`` all key on them.
+They are therefore not renamed.  They do, however, carry logger-era compromises that must
+not reach a printed figure -- ``microS_cm`` for micro-siemens per centimetre, ``W/m2`` for
+an exponent, ``mBar`` for millibar.
 
-outputs = ['01-Farge', '04-Turbiditet', '06-E.coli',
-    '07-Intestinale enterokokker', '08-Kimtall 22°C', '09-Koliforme bakterier 37°C', '21-Arsen', '24-Bly',
-    '32-Kadmium', '36-Kopper filtrert', '37-Krom', '41-Nikkel', 'Sink (Zn)']
+This module is the single display layer between the two.  Plotting code asks for a label;
+it never derives one by string-munging a column name.
 
-state = ['01-Farge_state', '04-Turbiditet_state', '06-E.coli_state',
-    '07-Intestinale enterokokker_state', '08-Kimtall 22°C_state', '09-Koliforme bakterier 37°C_state', '21-Arsen_state',
-             '24-Bly_state', '32-Kadmium_state', '36-Kopper filtrert_state', '37-Krom_state', '41-Nikkel_state', 'Sink (Zn)_state']
+Two rules the registry exists to enforce:
 
+*Units belong to values, not to names.*  A label carries its unit when the figure plots
+measured values in that unit, and drops it when the figure plots a statistic *about* a
+model of that parameter (an R^2, a z-score, an inclusion flag).  That is the
+``with_unit`` argument, not a per-call-site judgement.
 
-residuals = ['01-Farge_res', '04-Turbiditet_res', '06-E.coli_res',
-    '07-Intestinale enterokokker_res', '08-Kimtall 22°C_res', '09-Koliforme bakterier 37°C_res', '21-Arsen_res',
-             '24-Bly_res', '32-Kadmium_res', '36-Kopper filtrert_res', '37-Krom_res', '41-Nikkel_res', 'Sink (Zn)_res']
-
-diffs = ['01-Farge_diff', '04-Turbiditet_diff', '06-E.coli_diff',
-    '07-Intestinale enterokokker_diff', '08-Kimtall 22°C_diff', '09-Koliforme bakterier 37°C_diff', '21-Arsen_diff',
-             '24-Bly_diff', '32-Kadmium_diff', '36-Kopper filtrert_diff', '37-Krom_diff', '41-Nikkel_diff', 'Sink (Zn)_diff']
-
+*Source qualifiers appear only where they disambiguate.*  pH, turbidity and water
+temperature are each measured by more than one dataset, so those carry ``(Surface)`` /
+``(SCADA)`` / ``(lab)``.  Everything else is unique and needs no prefix -- which is why
+``Pfl -`` is dropped rather than expanded.
+"""
+from __future__ import annotations
 
 import re as _re
+from dataclasses import dataclass
 
-# Standalone tokens that represent units and should be dropped from display labels.
-# Evaluated after digits and the characters °, µ, / have been removed.
-_UNIT_TOKENS = {"g", "mg", "mL", "L", "CFU", "C", "FNU"}
+__all__ = [
+    "Param",
+    "PARAMS",
+    "SURFACE",
+    "SCADA",
+    "WEATHER",
+    "SAMPLES",
+    "label",
+    "unit",
+    "axis_label",
+    "clean_target_label",
+    "slug",
+]
+
+SURFACE = "Surface"
+SCADA = "SCADA"
+WEATHER = "Weather"
+SAMPLES = "Samples"
 
 
-def clean_target_label(dataset_name: str, prefix: str = "MC") -> str:
-    """Return a clean display label for a dataset directory name.
+@dataclass(frozen=True)
+class Param:
+    """Display metadata for one stored column.
 
-    Strips (in order):
-      1. Dataset prefix + underscore (e.g. ``MC_``)
-      2. Leading ``ex`` marker
-      3. Trailing ``_diff``, ``_res`` and ``_state`` suffixes
-      4. Trailing parenthesised unit block ``_(...)``
-      5. Underscores → spaces
-      6. Digits and the characters °, µ, /
-      7. Standalone unit-word tokens (g, mg, mL, L, CFU, C, FNU)
-      8. Normalises runs of whitespace; strips leading/trailing spaces
+    ``short`` is for tick labels and legends; ``long`` for axis labels.  ``unit`` is
+    matplotlib mathtext and is ``None`` for dimensionless quantities (pH, colour index),
+    which is different from "unit not yet decided".
 
-    Examples::
+    ``qualifier`` is the source disambiguator (``Surface`` / ``SCADA`` / ``lab``) and is
+    set only on the three quantities measured by more than one dataset.  It is applied by
+    :func:`label` on request rather than baked into ``short``, because whether it is
+    needed depends on the figure: a figure mixing Surface and SCADA pH must distinguish
+    them, whereas one whose every entry is a laboratory target would only add noise.
 
-        clean_target_label('MC_exArsenic_(µg_L)_res')
-        # 'Arsenic'
-        clean_target_label('MC_exColony_Count_22°C_(CFU_mL)_res')
-        # 'Colony Count'
-        clean_target_label('MC_exIntestinal_enterococci_(CFU_100mL)_res')
-        # 'Intestinal enterococci'
+    ``unit_is_identity`` marks the case where the unit is not a property of the values but
+    the only thing distinguishing two otherwise identically-named series -- the two fDOM
+    calibrations.  Such a unit is shown even when ``with_unit=False``, because dropping it
+    would merge two distinct series into one label.
     """
-    lbl = dataset_name
+
+    short: str
+    long: str
+    unit: str | None
+    group: str
+    qualifier: str | None = None
+    unit_is_identity: bool = False
+
+
+def _p(short, unit, group, long=None, qualifier=None, unit_is_identity=False):
+    return Param(short=short, long=long or short, unit=unit, group=group,
+                 qualifier=qualifier, unit_is_identity=unit_is_identity)
+
+
+# --- Surface: EXO sonde on the vertical profiler, ~2.3 m depth --------------------
+# Stored with a "Pfl - " prefix from the datalogger channel map in preprocessing.py.
+_SURFACE: dict[str, Param] = {
+    "Pfl - Water temperature (°C)": _p("Water temp.", "°C", SURFACE,
+                                       "Water temperature", qualifier=SURFACE),
+    "Pfl - Sp Cond (microS_cm)": _p("Specific conductance", r"$\mu$S/cm", SURFACE),
+    "Pfl - pH": _p("pH", None, SURFACE, qualifier=SURFACE),
+    "Pfl - DO (% Sat)": _p("Dissolved oxygen", "% sat.", SURFACE),
+    "Pfl - Turbidity (FNU)": _p("Turbidity", "FNU", SURFACE, qualifier=SURFACE),
+    # The two fDOM series are the same quantity in two calibrations, so the unit is what
+    # tells them apart and is never dropped -- see Param.unit_is_identity.
+    "Pfl - fDOM (RFU)": _p("fDOM", "RFU", SURFACE, unit_is_identity=True),
+    "Pfl - fDOM (QSU)": _p("fDOM", "QSU", SURFACE, unit_is_identity=True),
+    # Present in the raw profiler feed but not in the consolidated predictor set.
+    "Pfl - Cond (microS_cm)": _p("Conductivity", r"$\mu$S/cm", SURFACE),
+    "Pfl - Salinity (ppt)": _p("Salinity", "ppt", SURFACE),
+    "Pfl - Turbidity (NTU)": _p("Turbidity, NTU", "NTU", SURFACE, qualifier=SURFACE),
+    "Pfl - Vertical position (m)": _p("Sonde depth", "m", SURFACE),
+}
+
+# --- SCADA: treatment-plant raw-water intake --------------------------------------
+_SCADA: dict[str, Param] = {
+    "SCADA - pH": _p("pH", None, SCADA, qualifier=SCADA),
+    "SCADA - Temperature (°C)": _p("Water temp.", "°C", SCADA,
+                                   "Water temperature", qualifier=SCADA),
+}
+
+# --- Weather: local station, gap-filled from NORA3 --------------------------------
+_WEATHER: dict[str, Param] = {
+    # x = cos(bearing)*speed, y = sin(bearing)*speed on the meteorological "from"
+    # bearing (utils/preprocessing.py:decompose_direction).  That is not the standard
+    # eastward/northward u/v convention, so the components are named neutrally.
+    "Wind speed x (m/s)": _p("Wind speed, x", "m/s", WEATHER, "Wind speed, x-component"),
+    "Wind speed y (m/s)": _p("Wind speed, y", "m/s", WEATHER, "Wind speed, y-component"),
+    "Atmospheric pressure (mBar)": _p("Atmospheric pressure", "mbar", WEATHER),
+    "Longwave (IR) radiation (W/m2)": _p("Longwave (IR) irradiance", r"W/m$^2$", WEATHER),
+    "Shortwave (solar) radiation (W/m2)": _p("Shortwave (solar) irradiance", r"W/m$^2$",
+                                             WEATHER),
+    # Cumulative, unlike the instantaneous 'Precipitation (mm/hr)' it is derived from.
+    "24hr precipitation total (mm)": _p("Precipitation, 24 h total", "mm", WEATHER),
+    "Precipitation (mm/hr)": _p("Precipitation rate", "mm/h", WEATHER),
+    "Air temperature (°C)": _p("Air temperature", "°C", WEATHER),
+    "Humidity (%)": _p("Relative humidity", "%", WEATHER),
+    "Maximum 3s wind gust (m/s)": _p("Wind gust, 3 s", "m/s", WEATHER),
+}
+
+# --- Samples: Eurofins laboratory analyses (the forecast targets) -----------------
+# Incubation temperatures (22 °C / 37 °C) are part of the method and distinguish the two
+# culture counts; they are never stripped.
+_SAMPLES: dict[str, Param] = {
+    # NOTE: the colour index is reported without a unit anywhere in the pipeline
+    # (data/input/Limits.csv gives a limit of 20 with a blank unit).  Norwegian 'Farge'
+    # for drinking water is conventionally mg Pt/L; flagged for author confirmation.
+    "Color": _p("Color", "mg Pt/L", SAMPLES),
+    "Turbidity (FNU)": _p("Turbidity", "FNU", SAMPLES, qualifier="lab"),
+    "pH": _p("pH", None, SAMPLES, qualifier="lab"),
+    "E.coli (CFU/100mL)": _p("$\\it{E.\\ coli}$", "CFU/100 mL", SAMPLES),
+    "Intestinal enterococci (CFU/100mL)": _p("Intestinal enterococci", "CFU/100 mL",
+                                             SAMPLES),
+    "Colony Count 22°C (CFU/mL)": _p("Colony count, 22 °C", "CFU/mL", SAMPLES),
+    "Total coliforms 37°C (CFU/100mL)": _p("Total coliforms, 37 °C", "CFU/100 mL",
+                                           SAMPLES),
+    "Arsenic (µg/L)": _p("Arsenic", r"$\mu$g/L", SAMPLES),
+    "Lead (µg/L)": _p("Lead", r"$\mu$g/L", SAMPLES),
+    "Cadmium (µg/L)": _p("Cadmium", r"$\mu$g/L", SAMPLES),
+    # mg/L, unlike every other metal here.  A real difference, not a typo.
+    "Copper filtered (mg/L)": _p("Copper, filtered", "mg/L", SAMPLES),
+    "Chromium (µg/L)": _p("Chromium", r"$\mu$g/L", SAMPLES),
+    "Nickel (µg/L)": _p("Nickel", r"$\mu$g/L", SAMPLES),
+    "Zinc (µg/L)": _p("Zinc", r"$\mu$g/L", SAMPLES),
+}
+
+PARAMS: dict[str, Param] = {**_SURFACE, **_SCADA, **_WEATHER, **_SAMPLES}
+
+
+# --- Target representation suffixes -----------------------------------------------
+# A target column may appear as the previous measured value (_state), the change since
+# that value (_diff), or the residual from a reference model (_res).  These change what
+# the number means, so they are rendered as words rather than passed through raw.
+_SUFFIX_TEMPLATES = {
+    "_state": "{}, previous value",
+    "_diff": "Δ{}",
+    "_res": "{}, residual",
+}
+
+# Suffixes that change the quantity enough that the base unit no longer applies as-is.
+# A change and a residual are still in the base unit; a state value certainly is.
+_SUFFIX_KEEPS_UNIT = {"_state": True, "_diff": True, "_res": True}
+
+
+def _split_suffix(col: str) -> tuple[str, str | None]:
+    for sfx in _SUFFIX_TEMPLATES:
+        if col.endswith(sfx):
+            return col[: -len(sfx)], sfx
+    return col, None
+
+
+def slug(col: str) -> str:
+    """Filesystem slug for a column, matching ``d_RunResample.py``.
+
+    Kept here so the reverse lookup in :func:`clean_target_label` cannot drift from the
+    rule that produced the directory names on disk.
+    """
+    return _re.sub(r"[^\w]", "_", col)
+
+
+# slug -> stored column, built forwards from the same rule that created the directories.
+_SLUG_TO_COL: dict[str, str] = {slug(c): c for c in PARAMS}
+
+
+def _lookup(col: str) -> tuple[Param | None, str | None]:
+    base, sfx = _split_suffix(str(col))
+    param = PARAMS.get(base)
+    if param is None:
+        param = PARAMS.get(_SLUG_TO_COL.get(slug(base), ""))
+    return param, sfx
+
+
+def unit(col: str) -> str | None:
+    """Unit string for a column, or ``None`` if the quantity is dimensionless."""
+    param, sfx = _lookup(col)
+    if param is None:
+        return None
+    if sfx is not None and not _SUFFIX_KEEPS_UNIT.get(sfx, True):
+        return None
+    return param.unit
+
+
+def label(
+    col: str,
+    *,
+    with_unit: bool = True,
+    long: bool = False,
+    qualified: bool = True,
+    with_suffix: bool = True,
+) -> str:
+    """Display label for a stored column name.
+
+    ``with_unit=False`` when the figure plots a statistic *about* a model of this
+    parameter rather than values of the parameter itself -- an R^2, an importance
+    z-score, a 0/1 feature-inclusion flag.  Attaching a concentration unit to such a
+    number states something false.
+
+    ``qualified=False`` when every entry in the figure comes from the same source, so
+    that the ``(Surface)`` / ``(lab)`` disambiguator would be noise rather than
+    information.
+
+    ``with_suffix=False`` when every entry in the figure shares the same representation
+    (all residuals, all differences), so that repeating it on each tick adds nothing.
+
+    Unknown columns are returned unchanged rather than mangled, so a gap in the registry
+    is visible in the output instead of silently producing a wrong label.
+    """
+    param, sfx = _lookup(col)
+    if param is None:
+        return str(col)
+
+    text = param.long if long else param.short
+    if qualified and param.qualifier:
+        text = f"{text} ({param.qualifier})"
+    if with_suffix and sfx is not None:
+        text = _SUFFIX_TEMPLATES[sfx].format(text)
+
+    if with_unit or param.unit_is_identity:
+        u = unit(col)
+        if u:
+            text = f"{text} ({u})"
+    return text
+
+
+def axis_label(col: str, *, with_unit: bool = True, qualified: bool = True) -> str:
+    """Long-form label, for axis titles."""
+    return label(col, with_unit=with_unit, long=True, qualified=qualified)
+
+
+def clean_target_label(
+    dataset_name: str,
+    prefix: str = "MC",
+    *,
+    with_suffix: bool = False,
+    qualified: bool = False,
+) -> str:
+    """Display label for a per-target output directory name.
+
+    Directory names are produced by ``d_RunResample.py`` as
+    ``{prefix}_{slug(target)}``, optionally with an ``ex`` marker, e.g.
+    ``MC_Colony_Count_22_C__CFU_mL__res``.  This resolves them by applying the same slug
+    rule *forwards* to the registry and matching, rather than by stripping characters out
+    of the directory name.
+
+    The previous implementation deleted all digits and the characters ``°µ/``, which
+    turned ``Colony Count 22°C (CFU/mL)`` into ``Colony Count`` -- discarding the
+    incubation temperature that distinguishes it from ``Total coliforms 37°C``.
+
+    Labels are returned without units, because this function names a *target* in
+    model-performance figures, where the plotted quantity is a metric rather than a
+    concentration.  For the same reason the representation suffix and the source
+    qualifier are off by default: every target in such a figure shares them, so they
+    would repeat on every tick without distinguishing anything.
+    """
+    name = str(dataset_name)
     bare = prefix.rstrip("_")
-    if lbl.startswith(bare + "_"):
-        lbl = lbl[len(bare) + 1:]
-    if lbl.startswith("ex"):
-        lbl = lbl[2:]
-    for sfx in ("_diff", "_res", "_state"):
-        if lbl.endswith(sfx):
-            lbl = lbl[: -len(sfx)]
-    lbl = _re.sub(r"_\([^)]*\)$", "", lbl)        # trailing _(unit) block
-    lbl = lbl.replace("_", " ")
-    lbl = _re.sub(r"\d+", "", lbl)                 # digits
-    lbl = lbl.translate(str.maketrans("", "", "°µ/"))  # unit characters
-    words = [w for w in lbl.split() if w not in _UNIT_TOKENS]
-    return " ".join(words).strip()
+    if bare and name.startswith(bare + "_"):
+        name = name[len(bare) + 1:]
+    if name.startswith("ex"):
+        name = name[2:]
+
+    # Directory names encode the suffix through the slug rule, so '_res' survives intact
+    # but '(µg/L)' has become '__µg_L_'.  Strip the representation suffix first.
+    sfx = None
+    for candidate in _SUFFIX_TEMPLATES:
+        if name.endswith(candidate):
+            name, sfx = name[: -len(candidate)], candidate
+            break
+
+    col = _SLUG_TO_COL.get(name)
+    if col is None:
+        # Fall back to a slug comparison that ignores runs of separator underscores,
+        # which differ between '(µg/L)' -> '__µg_L_' and hand-written directory names.
+        squashed = _re.sub(r"_+", "_", name).strip("_")
+        for cand_slug, cand_col in _SLUG_TO_COL.items():
+            if _re.sub(r"_+", "_", cand_slug).strip("_") == squashed:
+                col = cand_col
+                break
+    if col is None:
+        return _re.sub(r"_+", " ", name).strip()
+
+    param = PARAMS[col]
+    text = param.short
+    if qualified and param.qualifier:
+        text = f"{text} ({param.qualifier})"
+    if with_suffix and sfx is not None:
+        text = _SUFFIX_TEMPLATES[sfx].format(text)
+    return text

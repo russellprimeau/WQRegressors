@@ -296,6 +296,13 @@ def _build_feature_uncertainty_bundle(data_cfg, hyper_cfg, config_dir, verbose=T
     """
     input_columns = data_cfg["input_columns"]
     seq_len = data_cfg["input_row_2"] - data_cfg["input_row_1"]
+    # The per-feature variance is tiled to match the flattened input, so it has to
+    # follow the aggregation. When the window is averaged to a single row before
+    # training, the flattened input holds one value per predictor rather than one
+    # per predictor per timestep, and tiling across timesteps would leave the
+    # variance vector seq_len times too long for the data it describes.
+    if str(data_cfg.get("input_aggregation", "none")).lower() == "mean":
+        seq_len = 1
 
     n_mc_samples = int(hyper_cfg.get("uncertain_kernel_mc_samples", 64))
     mc_seed = int(hyper_cfg.get("uncertain_kernel_mc_seed", 0))

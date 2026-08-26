@@ -503,7 +503,56 @@ def generate_transformer_config_template(output_dir, forecast_name, input_column
     return str(config_path)
 
 
-def generate_gp_config_template(output_dir, forecast_name, input_columns, output_columns, sample_length, overrides=None):
+# The GP was previously emitted as a single configuration: the flattened window
+# (167 rows x n predictors = up to 835 input dimensions) with ARD and a
+# matern52+linear kernel. That combination cannot be fitted from the 11-52
+# training samples a target supplies -- the saved models show all 835 ARD
+# lengthscales identical to within half a percent and every hyperparameter still
+# at its initial value, because the cross-validated epoch budget halts after a
+# median of 24 of 250 epochs. The unbounded linear term then dominates away from
+# the training data, producing predictions up to 106x outside the target range.
+#
+# These four variants separate the two factors responsible, keeping the previous
+# configuration as gp_01 so the effect of each change is measurable rather than
+# asserted:
+#
+#   gp_01  flattened window, matern52+linear   (previous behaviour, control)
+#   gp_02  flattened window, matern52          (isolates the unbounded linear term)
+#   gp_03  aggregated window, matern52+linear  (isolates the input dimension)
+#   gp_04  aggregated window, matern52         (both changes)
+#
+# Aggregating the window takes the input dimension to one value per predictor, at
+# which point ARD and the epoch budget have something estimable to work with.
+GP_CONFIG_VARIANTS = (
+    {"suffix": "01", "kernel": "matern52+linear", "input_aggregation": "none",
+     "note": "Control: previous configuration, flattened window with a linear kernel term."},
+    {"suffix": "02", "kernel": "matern52", "input_aggregation": "none",
+     "note": "Bounded kernel on the flattened window; isolates the linear term."},
+    {"suffix": "03", "kernel": "matern52+linear", "input_aggregation": "mean",
+     "note": "Aggregated window; isolates the input dimension."},
+    {"suffix": "04", "kernel": "matern52", "input_aggregation": "mean",
+     "note": "Aggregated window and bounded kernel."},
+)
+
+
+def generate_gp_config_templates(output_dir, input_columns, output_columns, sample_length,
+                                 overrides=None):
+    """Emit every GP variant and return their config paths."""
+    paths = []
+    for variant in GP_CONFIG_VARIANTS:
+        paths.append(generate_gp_config_template(
+            output_dir,
+            f"gp_{variant['suffix']}",
+            input_columns,
+            output_columns,
+            sample_length,
+            overrides=overrides,
+            variant=variant,
+        ))
+    return paths
+
+
+def generate_gp_config_template(output_dir, forecast_name, input_columns, output_columns, sample_length, overrides=None, variant=None):
     """
     Generate a template configuration file for Gaussian Process Regressor models.
 
@@ -514,9 +563,12 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
     :param sample_length: Length of each sample (number of rows)
     :return: Path to the generated config file
     """
+    variant = dict(variant or {"suffix": "01", "kernel": "matern52+linear",
+                              "input_aggregation": "none", "note": ""})
+    _suffix = str(variant.get("suffix", "01"))
     config = {
         'model_type': 'gp_regressor',
-        'model_name': 'model_gp_01',
+        'model_name': f'model_gp_{_suffix}',
         'device': 'cuda',  # or 'cpu'
         'matplotlib_backend': 'Agg',
         'data': {
@@ -528,6 +580,7 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
             'input_row_2': sample_length - 1,  # All rows except the last
             'output_columns': output_columns,
             'output_rows': [sample_length - 1],  # Last row is the target
+            'input_aggregation': variant.get('input_aggregation', 'none'),
         },
         'data_split': {
             'random_state': 42,
@@ -540,8 +593,11 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
         },
         'hyperparameters': {
             # Gaussian Process Regressor hyperparameters
-            'kernel': 'matern52+linear',
+            'kernel': variant.get('kernel', 'matern52+linear'),
             'ard': True,
+            # Above this many dimensions per training sample, ARD is dropped for a
+            # single isotropic lengthscale rather than left unfitted.
+            'ard_min_samples_per_dim': 1.0,
             'input_standardize': True,
             'target_standardize': True,
             'use_uncertain_input_kernel': True,
@@ -598,7 +654,8 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
         if 'data_split' in overrides:
             config['data_split'].update(overrides['data_split'])
 
-    config_path = Path(output_dir) / 'config_gp_01.yml'
+    config['_comments']['variant'] = variant.get('note', '')
+    config_path = Path(output_dir) / f'config_gp_{_suffix}.yml'
     with open(config_path, 'w') as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
@@ -1170,14 +1227,14 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
             length,
             overrides=training_config_defaults.get('transformer', {}),
         )
-        gp_config_path = generate_gp_config_template(
+        gp_config_paths = generate_gp_config_templates(
             output_dir,
-            'gp_01',
             predictor_cols,
             target_columns,
             length,
             overrides=training_config_defaults.get('gp', {}),
         )
+        gp_config_path = gp_config_paths[0]
         state_col = next((c for c in predictor_cols if c.endswith("_state")), None)
         if state_col is None:
             if verbose:
@@ -1289,14 +1346,14 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
         length,
         overrides=training_config_defaults.get('transformer', {}),
     )
-    gp_config_path = generate_gp_config_template(
+    gp_config_paths = generate_gp_config_templates(
         output_dir,
-        'gp_01',
         predictor_cols,
         target_columns,
         length,
         overrides=training_config_defaults.get('gp', {}),
     )
+    gp_config_path = gp_config_paths[0]
     state_col = next((c for c in predictor_cols if c.endswith("_state")), None)
     if state_col is None:
         if verbose:

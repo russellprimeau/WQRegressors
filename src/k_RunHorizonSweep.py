@@ -170,22 +170,41 @@ def _resolve_config_for_row(dataset_dir: Path, best: pd.Series) -> 'tuple[Path, 
         configs_dir = sweep_dir / 'configs'
         sweep_namespace = sweep_dir
 
+    expected_key = _model_name_to_key(model_name)
+
+    def _config_model_type(cfg_path: Path) -> str:
+        try:
+            with open(cfg_path, 'r', encoding='utf-8') as fh:
+                return str((yaml.safe_load(fh) or {}).get('model_type', '')).strip().lower()
+        except Exception:
+            return ''
+
+    def _first_matching(pattern: str) -> 'Path | None':
+        # Filename globs alone are ambiguous: "*transformer_01*" also matches
+        # "recurrent_transformer_01", whose output column is the dense forward-filled
+        # _state series rather than the differential target.  Resampling against that
+        # column yields a window for every hour instead of one per laboratory
+        # observation, so confirm model_type before accepting a candidate.
+        untyped = None
+        for cfg in sorted(configs_dir.glob(pattern)):
+            cfg_type = _config_model_type(cfg)
+            if cfg_type:
+                if _MODEL_TYPE_TO_KEY.get(cfg_type) == expected_key:
+                    return cfg
+            elif untyped is None:
+                untyped = cfg
+        return untyped
+
     config_path = None
     row_count_raw = best['row_count']
     row_count_known = pd.notna(row_count_raw)
     if row_count_known:
         row_count_str = f"r{int(row_count_raw):03d}_"
-        for cfg in configs_dir.glob(f"*{mapped_model_name}*{row_count_str}{best['feature_tag']}*.yml"):
-            config_path = cfg
-            break
+        config_path = _first_matching(f"*{mapped_model_name}*{row_count_str}{best['feature_tag']}*.yml")
         if config_path is None:
-            for cfg in configs_dir.glob(f"*{row_count_str}{best['feature_tag']}*.yml"):
-                config_path = cfg
-                break
+            config_path = _first_matching(f"*{row_count_str}{best['feature_tag']}*.yml")
     if config_path is None:
-        for cfg in configs_dir.glob(f"*{mapped_model_name}*{best['feature_tag']}*.yml"):
-            config_path = cfg
-            break
+        config_path = _first_matching(f"*{mapped_model_name}*{best['feature_tag']}*.yml")
     if config_path is None:
         return None
 

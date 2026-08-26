@@ -28,8 +28,9 @@ CLI arguments:
                          (default), or any column present in the summary CSV.
     --dataset-prefix STR Strip this prefix when building dataset display labels
                          (default: MC).
-    --summaries-subdir   Subdirectory under each root that holds the summary CSV
-                         (default: summaries).
+    --summaries-subdir   Subdirectory under a root that holds the summary CSV
+                         (default: summaries).  Repeat to give a different
+                         subdirectory per --root, in the same order.
     --summary-file       Filename of the summary CSV (default:
                          summary_best_model_performance.csv).
     --sort               Sort datasets by the chosen --sort-by key (descending).
@@ -64,6 +65,7 @@ matplotlib.use("Agg")
 # Ensure src/ is on the path when run as ``python src/z3_Compare.py``
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from utils.names import clean_target_label
+from utils.plotstyle import legend_above
 
 # Colour palette matching the other z-scripts (avoids red/orange).
 _SERIES_COLORS = [
@@ -197,7 +199,7 @@ def generate_figure(
     labels: list[str],
     stat_col: str,
     dataset_prefix: str,
-    summaries_subdir: str,
+    summaries_subdirs: list[str],
     summary_file: str,
     sort: bool,
     sort_by: str,
@@ -220,9 +222,9 @@ def generate_figure(
     frames: dict[str, dict[str, float]] = {}
     norm_to_original: dict[str, str] = {}
 
-    for root, label in zip(roots, labels):
+    for root, label, subdir in zip(roots, labels, summaries_subdirs):
         try:
-            df = _load_summary(root, summaries_subdir, summary_file)
+            df = _load_summary(root, subdir, summary_file)
         except (FileNotFoundError, ValueError) as exc:
             print(f"[ERROR] {exc}")
             return 1
@@ -347,7 +349,8 @@ def generate_figure(
     ax.set_ylabel(stat_ylabel, fontsize=font_size)
     ax.grid(axis="y", alpha=0.3)
 
-    # Legend — deduplicate entries and place to minimise overlap with bars
+    # Legend — deduplicate entries; it is placed in the margin above the axes rather than
+    # inside them, so it can never sit on top of a bar or its value annotation.
     handles, leg_labels = ax.get_legend_handles_labels()
     seen: dict[str, int] = {}
     unique_h, unique_l = [], []
@@ -357,57 +360,9 @@ def generate_figure(
             unique_h.append(h)
             unique_l.append(l)
 
-    # Pick the corner whose rectangular region overlaps the least bar area.
-    # We approximate the legend size as a fraction of the axes and score each
-    # candidate location by summing the absolute bar heights that fall inside
-    # that region.
-    x_lo, x_hi = ax.get_xlim()
-    y_lo, y_hi = ax.get_ylim()
-    x_span = x_hi - x_lo
-    y_span_ax = y_hi - y_lo
-    # Rough legend footprint in data coords (overestimate to be safe).
-    leg_w = 0.25 * x_span
-    leg_h = 0.20 * y_span_ax
-
-    _CANDIDATE_LOCS = [
-        ("upper left",  x_lo,            y_hi - leg_h),
-        ("upper right", x_hi - leg_w,    y_hi - leg_h),
-        ("lower left",  x_lo,            y_lo),
-        ("lower right", x_hi - leg_w,    y_lo),
-    ]
-
-    # All bar centres and tops (including text labels above them).
-    bar_xs: list[float] = []
-    bar_tops: list[float] = []
-    bar_bottoms: list[float] = []
-    for j in range(n_roots):
-        offsets_j = x + (j - (n_roots - 1) / 2.0) * bar_w
-        for xi, v in zip(offsets_j, value_matrix[:, j]):
-            if np.isfinite(v):
-                bar_xs.append(float(xi))
-                bar_tops.append(float(v) if v >= 0 else 0.0)
-                bar_bottoms.append(float(v) if v < 0 else 0.0)
-    bar_xs_arr = np.array(bar_xs)
-    bar_tops_arr = np.array(bar_tops)
-    bar_bottoms_arr = np.array(bar_bottoms)
-
-    best_loc = "upper right"
-    best_score = np.inf
-    for loc_name, rx_lo, ry_lo in _CANDIDATE_LOCS:
-        rx_hi = rx_lo + leg_w
-        ry_hi = ry_lo + leg_h
-        in_x = (bar_xs_arr >= rx_lo - bar_w) & (bar_xs_arr <= rx_hi + bar_w)
-        # A bar overlaps vertically if its extent intersects [ry_lo, ry_hi].
-        in_y = (bar_tops_arr >= ry_lo) & (bar_bottoms_arr <= ry_hi)
-        overlap = np.sum(np.abs(bar_tops_arr[in_x & in_y] - bar_bottoms_arr[in_x & in_y]))
-        if overlap < best_score:
-            best_score = overlap
-            best_loc = loc_name
-
-    ax.legend(unique_h, unique_l, fontsize=font_size, framealpha=0.85, loc=best_loc)
-
     fig.tight_layout()
     _expand_ylim_to_fit_annotations(ax)
+    legend_above(ax, unique_h, unique_l, ncol=min(len(unique_h), 4), fontsize=font_size)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
@@ -462,9 +417,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--summaries-subdir",
+        dest="summaries_subdirs",
+        action="append",
         type=str,
-        default="summaries",
-        help="Subdirectory under each root that contains the summary CSV (default: summaries).",
+        metavar="NAME",
+        help=(
+            "Subdirectory under a root that contains the summary CSV (default: summaries). "
+            "Repeat to give a different subdirectory per --root, in the same order; roots "
+            "beyond the last value given fall back to the default. Supply once to apply "
+            "the same subdirectory to every root."
+        ),
     )
     parser.add_argument(
         "--summary-file",
@@ -538,6 +500,17 @@ def main() -> int:
     while len(labels) < len(roots):
         labels.append(roots[len(labels)].name)
 
+    # Summary subdirectory, per root.  Roots do not always agree: a partial re-run can
+    # leave one root's ``summaries/`` holding a subset of the datasets while the complete
+    # set survives alongside it, and the comparison then needs a different subdirectory
+    # for that root alone.
+    supplied_subdirs = list(args.summaries_subdirs or [])
+    if len(supplied_subdirs) == 1:
+        summaries_subdirs = supplied_subdirs * len(roots)
+    else:
+        summaries_subdirs = supplied_subdirs[: len(roots)]
+        summaries_subdirs += ["summaries"] * (len(roots) - len(summaries_subdirs))
+
     # Resolve output path
     stat_slug = args.stat.replace(" ", "_")
     default_filename = f"compare_{stat_slug}.png"
@@ -550,8 +523,8 @@ def main() -> int:
         base_dir = Path(args.output_dir).resolve() if args.output_dir else Path.cwd()
         output_path = base_dir / default_filename
 
-    for root, label in zip(roots, labels):
-        print(f"[INFO] root '{label}': {root}")
+    for root, label, subdir in zip(roots, labels, summaries_subdirs):
+        print(f"[INFO] root '{label}': {root} ({subdir}/)")
     print(f"[INFO] stat  : {args.stat}")
     print(f"[INFO] output: {output_path}")
 
@@ -560,7 +533,7 @@ def main() -> int:
         labels=labels,
         stat_col=args.stat,
         dataset_prefix=args.dataset_prefix,
-        summaries_subdir=args.summaries_subdir,
+        summaries_subdirs=summaries_subdirs,
         summary_file=args.summary_file,
         sort=args.sort,
         sort_by=args.sort_by,
