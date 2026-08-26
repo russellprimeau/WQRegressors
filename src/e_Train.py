@@ -165,7 +165,8 @@ DEFAULT_TRANSFORMER_CONFIG = {
     "loss_threshold": 0.000001,
     "learning_rate": 1e-4,
     "patience": 10,
-    "corr_lambda": 0.1,
+    # Pure MSE is the stable default; correlation regularization remains opt-in.
+    "corr_lambda": 0.0,
     "corr_eps": 1e-8,
     "corr_clip": True,
     # Controls early stopping data source:
@@ -190,8 +191,9 @@ DEFAULT_XGB_CV_TUNING_REGRESSOR = {
     "search_method": "random",
     # When True, tighten HP search bounds based on effective sample size.
     "auto_constrain": True,
-    # "1se" selects the simplest model within 1 SE of the best; "best" selects the best.
-    "selection_rule": "1se",
+    # "best" maximizes the selected CV metric; "1se" is available as a
+    # deliberately more conservative alternative.
+    "selection_rule": "best",
     "optuna_sampler": "tpe",
     "optuna_startup_trials": 10,
     "random_start_trials": 10,
@@ -800,18 +802,16 @@ def _transformer_cv_estimate_epochs(
     fold-validation combined loss and returns the median best_epoch.
     Returns None if too few samples for CV.
     """
-    n = len(train_samples)
-    if n < 2 * n_folds:
+    group_ids = [_base_sample_id(str(sample[2])) for sample in train_samples]
+    n_groups = len(set(group_ids))
+    if n_groups < 2:
         return None
 
-    rng = np.random.default_rng(seed)
-    indices = np.arange(n)
-    rng.shuffle(indices)
-    fold_size = n // n_folds
-    folds_idx = [indices[i * fold_size:(i + 1) * fold_size] for i in range(n_folds)]
-    leftover = indices[n_folds * fold_size:]
-    for li, idx_val in enumerate(leftover):
-        folds_idx[li % n_folds] = np.append(folds_idx[li % n_folds], idx_val)
+    # Keep every MC replicate of a base segment in the same fold.
+    folds_idx = _build_group_folds(group_ids, n_folds, seed)
+    if len(folds_idx) < 2:
+        return None
+    n_folds = len(folds_idx)
 
     num_workers = max(0, int(hyper_cfg.get("num_workers", 0)))
     pin_memory = bool(hyper_cfg.get("pin_memory", device.type == "cuda")) and (device.type == "cuda")
@@ -865,8 +865,8 @@ def _transformer_cv_estimate_epochs(
         return None
     median_ep = int(np.median(fold_best_epochs))
     print(
-        f"[INFO] Transformer CV-estimated epoch budget: {median_ep} "
-        f"(fold best_epochs: {fold_best_epochs})"
+        f"[INFO] Transformer group-CV-estimated epoch budget: {median_ep} "
+        f"(groups={n_groups}, fold best_epochs: {fold_best_epochs})"
     )
     return median_ep
 
@@ -1634,6 +1634,7 @@ def _xgb_cv_tuning_enabled(config: dict) -> bool:
 
 
 def _xgb_samples_to_arrays(samples, cast_y=None):
+    _validate_xgb_scalar_targets(samples)
     X = np.ascontiguousarray(np.array([s[0].flatten() for s in samples], dtype=np.float32))
     if cast_y is not None:
         y = np.ascontiguousarray(np.array([cast_y(s[1].flatten()[0]) for s in samples]))
@@ -1641,6 +1642,22 @@ def _xgb_samples_to_arrays(samples, cast_y=None):
         y = np.ascontiguousarray(np.array([s[1].flatten()[0] for s in samples], dtype=np.float32))
     names = [str(s[2]) for s in samples]
     return X, y, names
+
+
+def _validate_xgb_scalar_targets(samples) -> None:
+    """Reject multi-output targets instead of silently training on index zero."""
+    invalid = [
+        (str(sample[2]), int(np.asarray(sample[1]).size))
+        for sample in samples
+        if np.asarray(sample[1]).size != 1
+    ]
+    if invalid:
+        examples = ", ".join(f"{name} ({size} values)" for name, size in invalid[:3])
+        raise ValueError(
+            "XGBoost currently supports exactly one target value per sample; "
+            f"found multi-output targets, e.g. {examples}. "
+            "Configure one output row and one output column, or add explicit multi-output training."
+        )
 
 
 def _resolve_cv_raw_sample_source(config: dict, train_samples) -> dict:
@@ -2523,7 +2540,7 @@ def _xgb_tune_hyperparameters_cv(
     # Instead of picking the trial with the absolute best mean score, select the
     # simplest model whose score is within 1 standard error of the best.
     # "Simplest" is approximated by the lowest n_estimators × max_depth product.
-    selection_rule = str(cv_cfg.get("selection_rule", "1se")).lower()
+    selection_rule = str(cv_cfg.get("selection_rule", "best")).lower()
     if selection_rule == "1se" and len(trial_results) >= 2:
         n_folds_for_se = int(len(folds))
         scored_trials = [
@@ -2616,7 +2633,7 @@ def _write_xgb_cv_tuning_cache(cache_path: Path, hyper_cfg: dict, best_params: d
     tuned_hyper = dict(hyper_cfg)
     tuned_hyper.update(best_params)
     payload = {
-        "artifact_version": 1,
+        "artifact_version": 2,
         "tuned_hyperparameters": tuned_hyper,
         "best_params": best_params,
         "cv_summary": summary,
@@ -2625,6 +2642,16 @@ def _write_xgb_cv_tuning_cache(cache_path: Path, hyper_cfg: dict, best_params: d
     with open(cache_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     return cache_path
+
+
+def _xgb_cv_cache_matches_config(cached: dict, cv_cfg: dict) -> bool:
+    """Return whether cached tuning used the same model-selection policy."""
+    if int(cached.get("artifact_version", 0)) < 2:
+        return False
+    cached_summary = cached.get("cv_summary") or {}
+    cached_rule = str(cached_summary.get("selection_rule", "")).lower()
+    requested_rule = str(cv_cfg.get("selection_rule", "best")).lower()
+    return cached_rule == requested_rule
 
 
 def run_xgb_cv_tuning_only(
@@ -2653,11 +2680,13 @@ def run_xgb_cv_tuning_only(
             with open(cache_path, "r", encoding="utf-8") as f:
                 cached = json.load(f)
             cached_params = cached.get("tuned_hyperparameters") or cached.get("best_params")
-            if isinstance(cached_params, dict) and cached_params:
+            if isinstance(cached_params, dict) and cached_params and _xgb_cv_cache_matches_config(cached, cv_cfg):
                 best_params = dict(cached_params)
                 summary = cached.get("cv_summary", {}) or {"enabled": False}
                 summary["source"] = "cache"
                 print(f"[INFO] Using cached CV hyperparameters from {cache_path}")
+            elif isinstance(cached_params, dict) and cached_params:
+                print(f"[INFO] Ignoring incompatible CV cache at {cache_path}; retuning.")
         except Exception as exc:
             print(f"[WARN] Failed to read CV cache {cache_path}: {exc}")
 
@@ -2878,6 +2907,9 @@ def _train_xgb_model(
 
     data_cfg = config["data"]
     hyper_cfg = _resolve_xgb_runtime_hyperparameters(config["hyperparameters"], config.get("device", "cpu"))
+
+    _validate_xgb_scalar_targets(train_samples)
+    _validate_xgb_scalar_targets(test_samples)
 
     X_train = np.ascontiguousarray(np.array([s[0].flatten() for s in train_samples], dtype=np.float32))
     X_test = np.ascontiguousarray(np.array([s[0].flatten() for s in test_samples], dtype=np.float32))
@@ -3208,11 +3240,13 @@ def _train_xgb_model_cv_tuned(
             with open(cache_path, "r", encoding="utf-8") as f:
                 cached = json.load(f)
             cached_params = cached.get("tuned_hyperparameters") or cached.get("best_params")
-            if isinstance(cached_params, dict) and cached_params:
+            if isinstance(cached_params, dict) and cached_params and _xgb_cv_cache_matches_config(cached, cv_cfg):
                 best_params = dict(cached_params)
                 summary = cached.get("cv_summary", {}) or {"enabled": False}
                 summary["source"] = "cache"
                 print(f"[INFO] Using cached CV hyperparameters from {cache_path}")
+            elif isinstance(cached_params, dict) and cached_params:
+                print(f"[INFO] Ignoring incompatible CV cache at {cache_path}; retuning.")
         except Exception as exc:
             print(f"[WARN] Failed to read CV cache {cache_path}: {exc}")
 

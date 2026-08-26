@@ -269,9 +269,33 @@ def _load_feature_sweep_cache(dataset_dir: Path) -> dict | None:
         return None
 
 
+def _apply_pre_rerun_model_policy(config: dict) -> None:
+    """Apply the performance-focused model settings used by this sweep."""
+    model_type = str(config.get("model_type", "")).lower()
+    hyper_cfg = config.setdefault("hyperparameters", {})
+    if model_type == "transformer":
+        # Batch correlation regularization is noisy on these small MC datasets.
+        hyper_cfg["corr_lambda"] = 0.0
+    elif model_type in {"xgb_regressor", "xgb_classifier"}:
+        cv_cfg = hyper_cfg.setdefault("cv_tuning", {})
+        cv_cfg["enabled"] = True
+        cv_cfg["selection_rule"] = "best"
+
+
+def _feature_sweep_cache_is_compatible(dataset_dir: Path) -> bool:
+    """Require a cache produced by the current best-CV selection policy."""
+    cache_payload = _load_feature_sweep_cache(dataset_dir)
+    if not isinstance(cache_payload, dict):
+        return False
+    return train_module._xgb_cv_cache_matches_config(
+        cache_payload,
+        {"selection_rule": "best"},
+    )
+
+
 def _ensure_feature_sweep_cache(plan: DatasetPlan) -> None:
     cache_path = _feature_sweep_cache_path(plan.dataset_dir)
-    if cache_path.exists():
+    if cache_path.exists() and _feature_sweep_cache_is_compatible(plan.dataset_dir):
         return
     base_cfg = _select_surrogate_config(plan.train_configs)
     if base_cfg is None:
@@ -280,6 +304,7 @@ def _ensure_feature_sweep_cache(plan: DatasetPlan) -> None:
     if str(cfg.get("model_type")) not in {"xgb_regressor", "xgb_classifier"}:
         return
     cfg = train_module.merge_with_defaults(cfg, cfg.get("model_type", "xgb_regressor"))
+    _apply_pre_rerun_model_policy(cfg)
     hyper_cfg = cfg.setdefault("hyperparameters", {})
     cv_cfg = hyper_cfg.get("cv_tuning")
     if isinstance(cv_cfg, dict):
@@ -291,14 +316,14 @@ def _ensure_feature_sweep_cache(plan: DatasetPlan) -> None:
     model_kind = "classifier" if str(cfg.get("model_type")) == "xgb_classifier" else "regressor"
     metric_key = "eval_metric" if model_kind == "classifier" else "metric"
     cast_y = (lambda v: int(round(v))) if model_kind == "classifier" else None
-    print(f"[INFO] Feature sweep CV tuning (full features) -> {cache_path}")
+    print(f"[INFO] Feature sweep CV tuning (full features, selection_rule=best) -> {cache_path}")
     train_module.run_xgb_cv_tuning_only(
         config=cfg,
         train_samples=train_samples,
         model_kind=model_kind,
         metric_key=metric_key,
         cast_y=cast_y,
-        use_cache=True,
+        use_cache=False,
         write_cache=True,
     )
 
@@ -674,6 +699,7 @@ def _prepare_variant_config(
 ) -> Path:
     cfg = train_module.load_config(str(base_config_path))
     cfg_copy = copy.deepcopy(cfg)
+    _apply_pre_rerun_model_policy(cfg_copy)
 
     if "data" not in cfg_copy:
         raise ValueError(f"Missing data section in {base_config_path}")

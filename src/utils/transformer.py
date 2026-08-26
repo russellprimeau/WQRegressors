@@ -1,4 +1,5 @@
 import os
+import copy
 from pathlib import Path
 import matplotlib.pyplot as plt
 import torch
@@ -43,7 +44,7 @@ def _batch_pearson_corr(y_pred, y_true, eps=1e-8, clip=True):
 
 def train_model(directory, model, forecast_name, trainloader, testloader, device, num_epochs=100, learning_rate=1e-3,
                 loss_threshold=1e-3, patience=5, model_subdir='transformer',
-                corr_lambda=0.1, corr_eps=1e-8, corr_clip=True,
+                corr_lambda=0.0, corr_eps=1e-8, corr_clip=True,
                 max_epochs_override=None, skip_plot=False):
     """Train transformer model.
 
@@ -68,6 +69,7 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
     val_combined_losses = []
     best_val_combined = float('inf')
     best_val_epoch = None
+    best_model_state = None
     patience_counter = 0
     stop_reason_code = None
     stop_reason_text = None
@@ -132,6 +134,16 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
             f"val_mse={avg_val_mse:.6f}, val_corr={avg_val_corr:.6f}, val_combined={avg_val_combined:.6f}"
         )
 
+        # Snapshot before any stop condition so the final observed epoch can
+        # still be selected when it is the best validation checkpoint.
+        improved_validation = avg_val_combined < best_val_combined
+        if improved_validation:
+            best_val_combined = avg_val_combined
+            best_val_epoch = int(epoch + 1)
+            # Keep an independent copy: state_dict tensors otherwise share storage.
+            best_model_state = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+
         # Early stopping condition
         if loss_threshold is not None and avg_train_combined <= loss_threshold:
             stop_reason_code = "train_combined_threshold_reached"
@@ -147,11 +159,7 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
             )
             break
 
-        if avg_val_combined < best_val_combined:
-            best_val_combined = avg_val_combined
-            best_val_epoch = int(epoch + 1)
-            patience_counter = 0
-        elif not use_fixed_budget:
+        if not improved_validation and not use_fixed_budget:
             patience_counter += 1
             if patience_counter >= patience:
                 stop_reason_code = "validation_combined_patience_exhausted"
@@ -172,6 +180,14 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
             f"Scheduled stop: {'CV epoch budget' if use_fixed_budget else 'all configured epochs'} exhausted "
             f"({int(effective_num_epochs)}/{int(effective_num_epochs)} epochs)."
         )
+
+    # Internal-CV folds may safely select their best validation checkpoint.  A
+    # fixed epoch budget is used for final fitting after CV, where testloader is
+    # the external test split and must not participate in model selection.
+    checkpoint_restored = False
+    if not use_fixed_budget and best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        checkpoint_restored = True
 
     # Plot all objective terms for train/validation to inspect optimization behavior.
     if not skip_plot:
@@ -216,6 +232,7 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
         "observed": {
             "best_val_combined": None if not val_combined_losses else float(min(val_combined_losses)),
             "best_val_epoch": None if best_val_epoch is None else int(best_val_epoch),
+            "checkpoint_restored": bool(checkpoint_restored),
             "final_train_combined": None if not train_combined_losses else float(train_combined_losses[-1]),
             "final_val_combined": None if not val_combined_losses else float(val_combined_losses[-1]),
             "epochs_executed": int(len(train_combined_losses)),

@@ -310,8 +310,8 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
 
     Notes:
     - XGBoost configs now include optional train-set-only CV tuning settings
-      under hyperparameters.cv_tuning (including param_space). These are
-      disabled by default and can be enabled by pipeline logic when needed.
+       under hyperparameters.cv_tuning (including param_space). These are
+       enabled by default for predictive-performance-focused runs.
     """
     # Create the template configuration
     config = {
@@ -358,12 +358,13 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
             'train_loss_min_relative_improvement': 0.01,
             # Optional CV tuning for regularization (train-set only).
             'cv_tuning': {
-                'enabled': False,
+                'enabled': True,
                 'n_folds': 5,
                 'n_trials': 250,
                 'seed': 21,
                 'parallel_jobs': 1,
                 'metric': 'rmse_r2',
+                'selection_rule': 'best',
                 'search_method': 'optuna',
                 'optuna_sampler': 'tpe',
                 'random_start_trials': 30,
@@ -467,8 +468,8 @@ def generate_transformer_config_template(output_dir, forecast_name, input_column
             'num_epochs': 100,
             'loss_threshold': 0.000001,
             'patience': 10,
-            # Composite objective: combined_loss = mse_loss - corr_lambda * pearson_corr
-            'corr_lambda': 0.1,
+            # Pure MSE is the default; correlation regularization is opt-in.
+            'corr_lambda': 0.0,
             'corr_eps': 1e-8,
             'corr_clip': True,
         },
