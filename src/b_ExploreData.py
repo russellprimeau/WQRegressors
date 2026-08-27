@@ -1128,8 +1128,93 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
         w = predictor_valid_for_split.iloc[idx - (window - 1): idx + 1].to_numpy(dtype=bool)
         return int(np.count_nonzero(w))
 
+    def _target_exceed_mask(col: str, series: pd.Series) -> pd.Series:
+        """Rows of a measured target that fall outside its strictest legal limits."""
+        spec = all_limit_specs.get(col)
+        if spec is None:
+            return pd.Series(False, index=series.index)
+        upper_limit, lower_limit = _limit_bounds(spec)
+        return pd.Series(
+            limit_exceedance_mask(series, upper=upper_limit, lower=lower_limit),
+            index=series.index,
+        )
+
+    def _plot_measurements_by_limit_status(ax, series, color, exceed_mask) -> None:
+        """Draw a measured target series, marking out-of-limit points distinctly.
+
+        At this row height a point sitting just the wrong side of a threshold line is
+        not distinguishable from a compliant one, so compliance is carried by the
+        marker itself rather than left to be read off against the line.
+        """
+        valid = series.notna()
+        exceed = exceed_mask.reindex(series.index, fill_value=False)
+        inside = valid & (~exceed)
+        outside = valid & exceed
+        ax.plot(
+            series.index[inside], series.values[inside],
+            linestyle="", marker="o", markersize=4.5, color=color,
+            markeredgecolor="black", markeredgewidth=0.35, alpha=0.95,
+        )
+        ax.plot(
+            series.index[outside], series.values[outside],
+            linestyle="", marker="x", markersize=4.0, markeredgewidth=0.9, color="#ff0000",
+        )
+
+    def _fitted_legend(fig, handles, figure_name, fontsize=None):
+        """Place a legend above the plot, capped at the row-label size and two rows.
+
+        These figures are saved with ``bbox_inches="tight"``, so a legend row wider than
+        the figure does not overflow the canvas: it widens it, and every panel then
+        shrinks when the page scales the result down to the text block.  The legend is
+        drawn once, measured, and folded onto a second row when it does not fit.
+        """
+        label_pt = _row_label_font_size(figure_name)
+        pt = label_pt if fontsize is None else min(fontsize, label_pt)
+        legend = legend_above(fig, handles, fontsize=pt)
+        if len(handles) < 2:
+            return legend
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        if legend.get_window_extent(renderer).width <= fig.bbox.width:
+            return legend
+        legend.remove()
+        return legend_above(
+            fig, handles, ncol=int(np.ceil(len(handles) / 2.0)), fontsize=pt,
+        )
+
+    def _limit_status_handles() -> list:
+        return [
+            plt.Line2D(
+                [0], [0], color="black", linestyle="", marker="o",
+                markersize=4.5, markeredgecolor="black", markeredgewidth=0.35,
+                label="Measurement inside limits",
+            ),
+            plt.Line2D(
+                [0], [0], color="#ff0000", linestyle="", marker="x",
+                markersize=4.0, markeredgewidth=0.9,
+                label="Measurement outside limits",
+            ),
+        ]
+
+    # The target rows carry the longest names in the study.  At the 17-character wrap
+    # used for the other categories, "Intestinal enterococci (CFU/100 mL)" and
+    # "Total coliforms, 37 C (CFU/100 mL)" spill onto a third line, which crowds a row
+    # only 0.88 in tall.  Those two figures therefore wrap each label at the first width
+    # that yields at most two lines, and draw the labels one step smaller so the wider
+    # text does not eat into the plotting area.
+    TARGET_FIGURES = {"Target", "Target_diff"}
+    base_label_wrap = 17
+    max_label_lines = 2
+
+    def _wrap_to_max_lines(text: str, width: int, max_lines: int) -> str:
+        wrapped = textwrap.fill(text, width=width)
+        while len(wrapped.splitlines()) > max_lines and width < 60:
+            width += 1
+            wrapped = textwrap.fill(text, width=width)
+        return wrapped
+
     label_map = {}
-    global_max_label_line_len = 0
+    label_line_len = {}
     for figure_name, cols in category_columns.items():
         if not cols:
             continue
@@ -1144,12 +1229,15 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
             names_label(c, with_unit=True, qualified=False, with_suffix=keep_suffix)
             for c in cols
         ]
-        wrapped_labels = [textwrap.fill(lbl, width=17) for lbl in labels]
+        if figure_name in TARGET_FIGURES:
+            wrapped_labels = [_wrap_to_max_lines(lbl, base_label_wrap, max_label_lines) for lbl in labels]
+        else:
+            wrapped_labels = [textwrap.fill(lbl, width=base_label_wrap) for lbl in labels]
         label_map[figure_name] = wrapped_labels
-        for lbl in wrapped_labels:
-            line_max = max(len(line) for line in lbl.splitlines()) if lbl else 0
-            if line_max > global_max_label_line_len:
-                global_max_label_line_len = line_max
+        label_line_len[figure_name] = max(
+            (max(len(line) for line in lbl.splitlines()) if lbl else 0)
+            for lbl in wrapped_labels
+        )
 
     # Shared layout constants across all category figures:
     # fixed width + fixed left/right margins => identical absolute subplot width.
@@ -1164,10 +1252,22 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
     y_label_font_size = int(round(font_size * 1.3))
     x_label_font_size = int(round(font_size * 1.3))
     y_value_font_size = font_size
+    # 15 pt here prints at 7.5 pt, still clear of the 7 pt floor enforced by plotstyle.
+    target_y_label_font_size = int(round(font_size * 1.1))
     y_label_pad = 8
+
+    def _row_label_font_size(figure_name: str) -> int:
+        return target_y_label_font_size if figure_name in TARGET_FIGURES else y_label_font_size
+
     # Shared figure margin: estimate required left inches from wrapped label width.
-    est_char_width_in = max(0.045, 0.0055 * y_label_font_size)
-    left_margin_in = (global_max_label_line_len * est_char_width_in) + 0.55
+    # Each category is costed at the font it is actually drawn with, and the widest
+    # requirement wins, so every figure keeps the same absolute subplot width.
+    left_margin_in = max(
+        (
+            label_line_len[f] * max(0.045, 0.0055 * _row_label_font_size(f))
+        ) + 0.55
+        for f in label_line_len
+    ) if label_line_len else 0.55
     shared_left_margin = left_margin_in / fig_width
     shared_left_margin = max(0.14, min(0.26, shared_left_margin))
     shared_right_margin = 0.995
@@ -1309,7 +1409,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                         second_end = series.index[valid_idx[-1]] + pd.Timedelta(minutes=30)
                     overlay_spans[(panel_idx, row_idx)] = (first_start, first_end, second_start, second_end)
 
-            ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=y_label_font_size, labelpad=y_label_pad)
+            ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=_row_label_font_size(figure_name), labelpad=y_label_pad)
             ax.grid(axis="y", linestyle="--", alpha=0.25, linewidth=0.4)
             ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=3))
             ax.tick_params(axis="y", labelsize=font_size)
@@ -1446,16 +1546,8 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                             color="#ff0000",
                         )
                     else:
-                        ax.plot(
-                            series.index,
-                            series.values,
-                            linestyle="",
-                            marker="o",
-                            markersize=4.5,
-                            color=series_color,
-                            markeredgecolor=series_color,
-                            markeredgewidth=0.0,
-                            alpha=0.95,
+                        _plot_measurements_by_limit_status(
+                            ax, series, series_color, _target_exceed_mask(col, series)
                         )
                     if figure_name == "Target" and col in all_limit_specs:
                         upper_limit, lower_limit = _limit_bounds(all_limit_specs[col])
@@ -1596,7 +1688,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                         span_info = (first_start, first_end, second_start, second_end)
                 overlay_spans.append(span_info)
 
-                ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=y_label_font_size, labelpad=y_label_pad)
+                ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=_row_label_font_size(figure_name), labelpad=y_label_pad)
                 ax.grid(axis="y", linestyle="--", alpha=0.25, linewidth=0.4)
                 ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=3))
                 if i < n_rows - 1:
@@ -1626,7 +1718,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                 ax_raster.set_xlim(start_date, end_date)
                 ax_raster.set_ylabel(
                     "Predictor\nFeature Count", rotation=0, ha="right", va="center",
-                    fontsize=y_label_font_size, labelpad=y_label_pad,
+                    fontsize=_row_label_font_size(figure_name), labelpad=y_label_pad,
                 )
                 ax_raster.yaxis.set_label_coords(-0.05, 0.5)
                 ax_raster.set_yticks([])
@@ -1662,19 +1754,9 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                     legend_handles = [measured_handle, sigma1_handle, sigma2_handle, calib_handle]
                 else:
                     legend_handles = [calib_handle]
-                legend_above(fig, legend_handles, fontsize=font_size)
+                _fitted_legend(fig, legend_handles, figure_name, fontsize=font_size)
             elif figure_name == "Target_diff":
-                _inside_handle = plt.Line2D(
-                    [0], [0], color="black", linestyle="", marker="o",
-                    markersize=4.5, markeredgecolor="black", markeredgewidth=0.35,
-                    label="Measurement inside limits",
-                )
-                _beyond_handle = plt.Line2D(
-                    [0], [0], color="#ff0000", linestyle="", marker="x",
-                    markersize=4.0, markeredgewidth=0.9,
-                    label="Measurement beyond limits",
-                )
-                legend_above(fig, [_inside_handle, _beyond_handle], fontsize=y_label_font_size)
+                _fitted_legend(fig, _limit_status_handles(), figure_name)
             elif figure_name == "Target":
                 _upper_handle = plt.Line2D(
                     [0], [0], color="#ff0000", linewidth=0.7, linestyle="-",
@@ -1684,7 +1766,9 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                     [0], [0], color="#2ca02c", linewidth=0.7, linestyle="-",
                     label="Strictest legal threshold (lower bound)",
                 )
-                legend_above(fig, [_upper_handle, _lower_handle], fontsize=y_label_font_size)
+                _fitted_legend(
+                    fig, _limit_status_handles() + [_upper_handle, _lower_handle], figure_name
+                )
             out_path = out_dir / f"{figure_name}_{variant_suffix}.png"
             fig.savefig(out_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
             # --- No-raster variant for Target timeseries ---
@@ -1706,10 +1790,8 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                     if _nr_finite.size > 0:
                         _nr_y_low = float(np.min(_nr_finite))
                         _nr_y_high = float(np.max(_nr_finite))
-                    _nr_ax.plot(
-                        _nr_ser.index, _nr_ser.values,
-                        linestyle="", marker="o", markersize=4.5,
-                        color=_nr_clr, markeredgecolor=_nr_clr, markeredgewidth=0.0, alpha=0.95,
+                    _plot_measurements_by_limit_status(
+                        _nr_ax, _nr_ser, _nr_clr, _target_exceed_mask(_nr_col, _nr_ser)
                     )
                     if _nr_col in all_limit_specs:
                         _nr_upper, _nr_lower = _limit_bounds(all_limit_specs[_nr_col])
@@ -1732,7 +1814,7 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                         else:
                             _nr_y_pad = max(0.08 * _nr_y_span, 0.03 * max(abs(_nr_y_low), abs(_nr_y_high), 1.0))
                         _nr_ax.set_ylim(_nr_y_low - _nr_y_pad, _nr_y_high + _nr_y_pad)
-                    _nr_ax.set_ylabel(_nr_label, rotation=0, ha="right", va="center", fontsize=y_label_font_size, labelpad=y_label_pad)
+                    _nr_ax.set_ylabel(_nr_label, rotation=0, ha="right", va="center", fontsize=_row_label_font_size(figure_name), labelpad=y_label_pad)
                     _nr_ax.grid(axis="y", linestyle="--", alpha=0.25, linewidth=0.4)
                     _nr_ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=3))
                     _nr_ax.tick_params(axis="y", labelsize=y_value_font_size)
@@ -1746,13 +1828,13 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                 _nr_top = max(0.86, min(0.995, 1.0 - (top_margin_in / _nr_fig_h)))
                 _nr_bottom = max(0.08, min(0.30, bottom_margin_in / _nr_fig_h))
                 _nr_fig.subplots_adjust(left=shared_left_margin, right=shared_right_margin, top=_nr_top, bottom=_nr_bottom, hspace=shared_hspace)
-                legend_above(
+                _fitted_legend(
                     _nr_fig,
-                    [
+                    _limit_status_handles() + [
                         plt.Line2D([0], [0], color="#ff0000", linewidth=0.7, linestyle="-", label="Strictest legal threshold (upper bound)"),
                         plt.Line2D([0], [0], color="#2ca02c", linewidth=0.7, linestyle="-", label="Strictest legal threshold (lower bound)"),
                     ],
-                    fontsize=y_label_font_size,
+                    figure_name,
                 )
                 _nr_out_path = out_dir / "Target_timeseries_no_raster.png"
                 _nr_fig.savefig(_nr_out_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
@@ -1845,12 +1927,13 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                         left=shared_left_margin, right=shared_right_margin,
                         top=_as_top, bottom=_as_bottom, hspace=shared_hspace,
                     )
-                    legend_above(
+                    _fitted_legend(
                         _as_fig,
                         [
                             plt.Line2D([0], [0], color=_PRIMARY_BLUE, linewidth=1.0, linestyle="-", label="Sensor"),
                             plt.Line2D([0], [0], color=_ALT_ORANGE, linewidth=1.0, linestyle="-", label="Analysis"),
                         ],
+                        figure_name,
                         fontsize=font_size,
                     )
                     _as_out_path = out_dir / "Weather_timeseries_alt_source.png"
@@ -1890,16 +1973,6 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                 if figure_name == "Target_diff":
                     if fig.legends:
                         fig.legends[0].remove()
-                    _inside_handle = plt.Line2D(
-                        [0], [0], color="black", linestyle="", marker="o",
-                        markersize=4.5, markeredgecolor="black", markeredgewidth=0.35,
-                        label="Measurement inside limits",
-                    )
-                    _beyond_handle = plt.Line2D(
-                        [0], [0], color="#ff0000", linestyle="", marker="x",
-                        markersize=4.0, markeredgewidth=0.9,
-                        label="Measurement beyond limits",
-                    )
                     _train_handle = plt.Rectangle(
                         (0, 0), 1, 1, facecolor="#66bb66", alpha=0.24,
                         label="Training set",
@@ -1908,10 +1981,10 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                         (0, 0), 1, 1, facecolor="#f4a3c2", alpha=0.24,
                         label="Test set",
                     )
-                    legend_above(
+                    _fitted_legend(
                         fig,
-                        [_inside_handle, _beyond_handle, _train_handle, _test_handle],
-                        fontsize=y_label_font_size,
+                        _limit_status_handles() + [_train_handle, _test_handle],
+                        figure_name,
                     )
                 elif figure_name == "Target":
                     if fig.legends:
@@ -1932,160 +2005,197 @@ def write_category_timeseries_columns(repo_root: Path) -> None:
                         (0, 0), 1, 1, facecolor="#f4a3c2", alpha=0.24,
                         label="Test set",
                     )
-                    legend_above(
+                    # Six entries on one row would be wider than the plotting area, and
+                    # ``bbox_inches="tight"`` would stretch the saved canvas to fit them.
+                    _fitted_legend(
                         fig,
-                        [_upper_handle, _lower_handle, _train_handle, _test_handle],
-                        fontsize=y_label_font_size,
+                        _limit_status_handles() + [_upper_handle, _lower_handle, _train_handle, _test_handle],
+                        figure_name,
                     )
                 overlay_out_path = out_dir / f"{figure_name}_timeseries_overlay.png"
                 fig.savefig(overlay_out_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
                 # --- Add normalized overlay for Target_diff ---
                 if figure_name == "Target_diff":
-                    # Min-max normalize each Target_diff column to [0,1]
-                    norm_df = df.copy()
-                    for col in cols:
-                        series = pd.to_numeric(df[col], errors="coerce")
-                        col_min = series.min()
-                        col_max = series.max()
-                        if pd.isna(col_min) or pd.isna(col_max) or col_max == col_min:
-                            norm_df[col] = 0.5
-                        else:
-                            norm_df[col] = (series - col_min) / (col_max - col_min)
-                    if _add_raster:
-                        _norm_h_ratios = [_raster_row_h / row_height] + [1.0] * len(cols)
-                        fig_norm, _all_ax_norm = plt.subplots(
-                            len(cols) + 1, 1, sharex=True, figsize=(fig_width, fig_h),
-                            gridspec_kw={"hspace": shared_hspace, "height_ratios": _norm_h_ratios},
-                        )
-                        ax_norm_raster = _all_ax_norm[0]
-                        axes_norm = list(_all_ax_norm[1:])
-                    else:
-                        ax_norm_raster = None
-                        fig_norm, axes_norm = plt.subplots(
-                            len(cols), 1, sharex=True, figsize=(fig_width, fig_h), gridspec_kw={"hspace": shared_hspace}
-                        )
-                        if len(cols) == 1:
-                            axes_norm = [axes_norm]
                     palette_norm = _safe_series_colors(len(cols))
-                    # Every series is rescaled to [0, 1] here, which the caption states.  The
-                    # row label still names the parameter in its own units, because that is
-                    # what identifies the series and matches the other target figures; the
-                    # 0 / 0.5 / 1 tick values make the rescaling evident on the axis itself.
-                    for i, (ax, col, label) in enumerate(zip(axes_norm, cols, wrapped_labels)):
-                        # Compute normalization
-                        series_raw = pd.to_numeric(df[col], errors="coerce")
-                        col_min = series_raw.min()
-                        col_max = series_raw.max()
-                        if pd.isna(col_min) or pd.isna(col_max) or col_max == col_min:
-                            series_norm = pd.Series(0.5, index=series_raw.index)
+
+                    def _write_overlay_norm(sel_idx: list, out_name: str, ellipsis_marker: bool) -> None:
+                        """Draw the normalized train/test overlay for a subset of the rows.
+
+                        ``sel_idx`` indexes ``cols`` / ``wrapped_labels`` / ``overlay_spans``,
+                        so the abbreviated variant is the same figure with fewer rows and the
+                        same series colours.  ``ellipsis_marker`` hangs an ellipsis under the
+                        last row label, standing in for the omitted parameters.
+
+                        Every series is rescaled to [0, 1] here, which the caption states.  The
+                        row label still names the parameter in its own units, because that is
+                        what identifies the series and matches the other target figures; the
+                        0 / 0.5 / 1 tick values make the rescaling evident on the axis itself.
+                        """
+                        n_rows_norm = len(sel_idx)
+                        _row_ratios = [1.0] * n_rows_norm
+                        _fig_h = max(min_fig_height, row_height * n_rows_norm)
+                        if _add_raster:
+                            _fig_h = _fig_h + _raster_row_h
+                            _h_ratios = [_raster_row_h / row_height] + _row_ratios
+                            fig_norm, _all_ax_norm = plt.subplots(
+                                n_rows_norm + 1, 1, sharex=True, figsize=(fig_width, _fig_h),
+                                gridspec_kw={"hspace": shared_hspace, "height_ratios": _h_ratios},
+                            )
+                            ax_norm_raster = _all_ax_norm[0]
+                            axes_norm = list(_all_ax_norm[1:])
                         else:
-                            series_norm = ((series_raw - col_min) / (col_max - col_min))
-                        series_color = palette_norm[i]
-                        valid_mask = series_norm.notna()
-                        # Limit checking
-                        base_target_col = _strip_target_delta_suffix(col)
-                        target_col_match = all_cols_by_norm.get(_norm_col(base_target_col))
-                        exceed_mask = pd.Series(False, index=series_norm.index)
-                        if target_col_match in all_limit_specs:
-                            target_series = pd.to_numeric(df[target_col_match], errors="coerce")
-                            limit_spec = all_limit_specs.get(target_col_match)
-                            upper_limit, lower_limit = _limit_bounds(limit_spec)
-                            exceed_mask = pd.Series(
-                                limit_exceedance_mask(target_series, upper=upper_limit, lower=lower_limit),
-                                index=series_norm.index,
+                            ax_norm_raster = None
+                            fig_norm, _axes_raw = plt.subplots(
+                                n_rows_norm, 1, sharex=True, figsize=(fig_width, _fig_h),
+                                gridspec_kw={"hspace": shared_hspace, "height_ratios": _row_ratios},
                             )
-                        normal_mask = valid_mask & (~exceed_mask.reindex(series_norm.index, fill_value=False))
-                        exceed_plot_mask = valid_mask & exceed_mask.reindex(series_norm.index, fill_value=False)
-                        # Plot normal values
-                        ax.plot(
-                            series_norm.index[normal_mask],
-                            series_norm.values[normal_mask],
-                            linestyle="", marker="o", markersize=4.5, color=series_color,
-                            markeredgecolor="black", markeredgewidth=0.35, alpha=0.95,
+                            axes_norm = [_axes_raw] if n_rows_norm == 1 else list(_axes_raw)
+
+                        for row, orig_i in enumerate(sel_idx):
+                            ax = axes_norm[row]
+                            col = cols[orig_i]
+                            label = wrapped_labels[orig_i]
+                            # Compute normalization
+                            series_raw = pd.to_numeric(df[col], errors="coerce")
+                            col_min = series_raw.min()
+                            col_max = series_raw.max()
+                            if pd.isna(col_min) or pd.isna(col_max) or col_max == col_min:
+                                series_norm = pd.Series(0.5, index=series_raw.index)
+                            else:
+                                series_norm = ((series_raw - col_min) / (col_max - col_min))
+                            series_color = palette_norm[orig_i]
+                            # Limit status is read off the measured series this row differences.
+                            base_target_col = _strip_target_delta_suffix(col)
+                            target_col_match = all_cols_by_norm.get(_norm_col(base_target_col))
+                            if target_col_match is None:
+                                exceed_mask = pd.Series(False, index=series_norm.index)
+                            else:
+                                exceed_mask = _target_exceed_mask(
+                                    target_col_match,
+                                    pd.to_numeric(df[target_col_match], errors="coerce"),
+                                )
+                            _plot_measurements_by_limit_status(ax, series_norm, series_color, exceed_mask)
+                            # The 0 and 1 ticks are the extremes of the normalized range, so at a
+                            # tight ylim their labels sit on the axes edges and collide with the
+                            # labels of the neighbouring subplot across the narrow hspace
+                            # ("1.0" over "0.0").  Padding the limits insets both labels far
+                            # enough to clear, which is how the un-normalized panels avoid the
+                            # same collision.
+                            ax.set_ylim(-0.20, 1.20)
+                            ax.set_ylabel(
+                                label, rotation=0, ha="right", va="center",
+                                fontsize=_row_label_font_size(figure_name), labelpad=y_label_pad,
+                            )
+                            ax.yaxis.set_major_locator(mticker.FixedLocator([0, 0.5, 1]))
+                            ax.grid(axis="y", linestyle="--", alpha=0.25, linewidth=0.4)
+                            if row < n_rows_norm - 1:
+                                ax.tick_params(axis="x", which="both", labelbottom=False)
+
+                        axes_norm[-1].set_xticks(quarter_ticks)
+                        axes_norm[-1].set_xticklabels(
+                            [dt.strftime("%Y-%m-%d") for dt in quarter_ticks],
+                            rotation=25, ha="right", fontsize=x_label_font_size,
                         )
-                        # Plot out-of-limit values as red 'x'
-                        ax.plot(
-                            series_norm.index[exceed_plot_mask],
-                            series_norm.values[exceed_plot_mask],
-                            linestyle="", marker="x", markersize=4.0, markeredgewidth=0.9, color="#ff0000",
+                        axes_norm[-1].set_xlim(start_date, end_date)
+                        for ax in axes_norm:
+                            ax.tick_params(axis="y", labelsize=y_value_font_size)
+                            ax.tick_params(axis="x", labelsize=x_label_font_size)
+                        _norm_top = max(0.86, min(0.995, 1.0 - (top_margin_in / _fig_h)))
+                        _norm_bottom = max(0.08, min(0.30, bottom_margin_in / _fig_h))
+                        fig_norm.subplots_adjust(
+                            left=shared_left_margin, right=shared_right_margin, top=_norm_top,
+                            bottom=_norm_bottom, hspace=shared_hspace,
                         )
-                        # The 0 and 1 ticks are the extremes of the normalized range, so at a
-                        # tight ylim their labels sit on the axes edges and collide with the
-                        # neighbouring subplot's across the narrow hspace ("1.0" over "0.0").
-                        # Padding the limits insets both labels far enough to clear, which is
-                        # how the un-normalized panels avoid the same collision.
-                        ax.set_ylim(-0.20, 1.20)
-                        ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=y_label_font_size, labelpad=y_label_pad)
-                        ax.yaxis.set_major_locator(mticker.FixedLocator([0, 0.5, 1]))
-                        ax.grid(axis="y", linestyle="--", alpha=0.25, linewidth=0.4)
-                        if i < len(cols) - 1:
-                            ax.tick_params(axis="x", which="both", labelbottom=False)
-                    axes_norm[-1].set_xticks(quarter_ticks)
-                    axes_norm[-1].set_xticklabels([dt.strftime("%Y-%m-%d") for dt in quarter_ticks], rotation=25, ha="right", fontsize=x_label_font_size)
-                    axes_norm[-1].set_xlim(start_date, end_date)
-                    for ax in axes_norm:
-                        ax.tick_params(axis="y", labelsize=y_value_font_size)
-                        ax.tick_params(axis="x", labelsize=x_label_font_size)
-                    fig_norm.subplots_adjust(
-                        left=shared_left_margin, right=shared_right_margin, top=shared_top_margin,
-                        bottom=shared_bottom_margin, hspace=shared_hspace
-                    )
-                    # Overlay spans (same as original)
-                    for ax, span_info in zip(axes_norm, overlay_spans):
-                        if span_info is None:
-                            continue
-                        first_start, first_end, second_start, second_end = span_info
-                        ax.axvspan(
-                            first_start, first_end, ymin=0.03, ymax=0.97, color="#66bb66", alpha=0.24, zorder=0.3
-                        )
-                        if second_start is not None and second_end is not None:
+                        if ellipsis_marker:
+                            # Marks the omitted parameters without taking a row of its own: a
+                            # row-shaped gap would detach the date axis from the series it
+                            # labels.  The marker instead hangs under the last row label, in
+                            # the label column, where it reads as "and further rows below".
+                            # Mathtext cdots rather than U+2026, which is absent from the
+                            # default font and renders as three empty boxes.
+                            # Anchored to the drawn extent of the row label rather than to the
+                            # axes box, because the y tick values occupy the space between the
+                            # two and a labelpad offset would land the marker on top of them.
+                            fig_norm.canvas.draw()
+                            _lbl_box = axes_norm[-1].yaxis.label.get_window_extent(
+                                renderer=fig_norm.canvas.get_renderer()
+                            ).transformed(fig_norm.transFigure.inverted())
+                            fig_norm.text(
+                                0.5 * (_lbl_box.x0 + _lbl_box.x1),
+                                _lbl_box.y0 - 0.015,
+                                r"$\cdots$",
+                                ha="center", va="top",
+                                fontsize=font_size * 3.0, color="#444444",
+                            )
+                        # Overlay spans (same as original)
+                        for row, orig_i in enumerate(sel_idx):
+                            span_info = overlay_spans[orig_i]
+                            if span_info is None:
+                                continue
+                            ax = axes_norm[row]
+                            first_start, first_end, second_start, second_end = span_info
                             ax.axvspan(
-                                second_start, second_end, ymin=0.03, ymax=0.97, color="#f4a3c2", alpha=0.24, zorder=0.3
+                                first_start, first_end, ymin=0.03, ymax=0.97, color="#66bb66", alpha=0.24, zorder=0.3
                             )
-                    if ax_norm_raster is not None:
-                        _im_norm = ax_norm_raster.pcolormesh(
-                            _x_edges_float, [0, 1], _pred_counts.to_numpy().reshape(1, -1),
-                            cmap="Blues", vmin=0, vmax=_raster_vmax, rasterized=True,
+                            if second_start is not None and second_end is not None:
+                                ax.axvspan(
+                                    second_start, second_end, ymin=0.03, ymax=0.97, color="#f4a3c2", alpha=0.24, zorder=0.3
+                                )
+                        if ax_norm_raster is not None:
+                            _im_norm = ax_norm_raster.pcolormesh(
+                                _x_edges_float, [0, 1], _pred_counts.to_numpy().reshape(1, -1),
+                                cmap="Blues", vmin=0, vmax=_raster_vmax, rasterized=True,
+                            )
+                            _cax_norm = ax_norm_raster.inset_axes([1.01, 0.1, 0.018, 0.80])
+                            _cb_norm = fig_norm.colorbar(_im_norm, cax=_cax_norm)
+                            _cb_norm.set_ticks([0, _raster_vmax // 2, _raster_vmax])
+                            _cb_norm.ax.tick_params(labelsize=font_size)
+                            ax_norm_raster.set_xlim(start_date, end_date)
+                            ax_norm_raster.set_ylabel(
+                                "Predictor\nFeature Count", rotation=0, ha="right", va="center",
+                                fontsize=_row_label_font_size(figure_name), labelpad=y_label_pad,
+                            )
+                            ax_norm_raster.yaxis.set_label_coords(-0.05, 0.5)
+                            ax_norm_raster.set_yticks([])
+                            ax_norm_raster.tick_params(axis="x", which="both", labelbottom=False)
+                        _train_handle = plt.Rectangle(
+                            (0, 0), 1, 1, facecolor="#66bb66", alpha=0.24,
+                            label="Training set",
                         )
-                        _cax_norm = ax_norm_raster.inset_axes([1.01, 0.1, 0.018, 0.80])
-                        _cb_norm = fig_norm.colorbar(_im_norm, cax=_cax_norm)
-                        _cb_norm.set_ticks([0, _raster_vmax // 2, _raster_vmax])
-                        _cb_norm.ax.tick_params(labelsize=font_size)
-                        ax_norm_raster.set_xlim(start_date, end_date)
-                        ax_norm_raster.set_ylabel(
-                            "Predictor\nFeature Count", rotation=0, ha="right", va="center",
-                            fontsize=y_label_font_size, labelpad=y_label_pad,
+                        _test_handle = plt.Rectangle(
+                            (0, 0), 1, 1, facecolor="#f4a3c2", alpha=0.24,
+                            label="Test set",
                         )
-                        ax_norm_raster.yaxis.set_label_coords(-0.05, 0.5)
-                        ax_norm_raster.set_yticks([])
-                        ax_norm_raster.tick_params(axis="x", which="both", labelbottom=False)
-                    _inside_handle = plt.Line2D(
-                        [0], [0], color="black", linestyle="", marker="o",
-                        markersize=4.5, markeredgecolor="black", markeredgewidth=0.35,
-                        label="Measurement inside limits",
+                        _fitted_legend(
+                            fig_norm,
+                            _limit_status_handles() + [_train_handle, _test_handle],
+                            figure_name,
+                        )
+                        overlay_norm_out_path = out_dir / out_name
+                        fig_norm.savefig(overlay_norm_out_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
+                        plt.close(fig_norm)
+                        print(f"Wrote chart to: {overlay_norm_out_path}")
+
+                    _write_overlay_norm(
+                        list(range(len(cols))), "Target_diff_timeseries_overlay_norm.png", False
                     )
-                    _beyond_handle = plt.Line2D(
-                        [0], [0], color="#ff0000", linestyle="", marker="x",
-                        markersize=4.0, markeredgewidth=0.9,
-                        label="Measurement beyond limits",
+                    # Abbreviated variant: the full figure costs most of a page and largely
+                    # restates Target_timeseries_no_raster.  Two representative rows plus an
+                    # ellipsis carry the same point about the split and the coverage raster.
+                    _abbrev_prefixes = ("colonycount", "zinc")
+                    _abbrev_idx = []
+                    for _prefix in _abbrev_prefixes:
+                        for _i, _c in enumerate(cols):
+                            if _norm_col(_strip_target_delta_suffix(_c)).startswith(_prefix):
+                                _abbrev_idx.append(_i)
+                    if not _abbrev_idx:
+                        raise KeyError(
+                            "Abbreviated overlay figure found none of the expected target "
+                            f"columns {_abbrev_prefixes} among: {cols}"
+                        )
+                    _write_overlay_norm(
+                        _abbrev_idx, "Target_diff_timeseries_overlay_norm_abbrev.png", True
                     )
-                    _train_handle = plt.Rectangle(
-                        (0, 0), 1, 1, facecolor="#66bb66", alpha=0.24,
-                        label="Training set",
-                    )
-                    _test_handle = plt.Rectangle(
-                        (0, 0), 1, 1, facecolor="#f4a3c2", alpha=0.24,
-                        label="Test set",
-                    )
-                    legend_above(
-                        fig_norm,
-                        [_inside_handle, _beyond_handle, _train_handle, _test_handle],
-                        fontsize=y_label_font_size,
-                    )
-                    overlay_norm_out_path = out_dir / "Target_diff_timeseries_overlay_norm.png"
-                    fig_norm.savefig(overlay_norm_out_path, dpi=220, bbox_inches="tight", pad_inches=0.02)
-                    plt.close(fig_norm)
-                    print(f"Wrote chart to: {overlay_norm_out_path}")
             plt.close(fig)
             print(f"Wrote chart to: {out_path}")
             if figure_name in {"Target", "Target_diff"} and variant_suffix == "timeseries":
