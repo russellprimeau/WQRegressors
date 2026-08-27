@@ -1927,6 +1927,9 @@ def evaluate_single_config(config_path, save_plots_override=None):
             examples=int(eval_cfg.get("debug_examples", 10)),
             sample_subdir=sample_subdir
         )
+        preds_naive, _ = _clip_to_target_support(preds_naive, "Naive baseline")
+        preds_seasonal, _ = _clip_to_target_support(preds_seasonal, "Seasonal baseline")
+        preds_linear, _ = _clip_to_target_support(preds_linear, "Linear baseline")
         baseline_pairs = [
             (preds_naive, targets_naive),
             (preds_seasonal, targets_seasonal),

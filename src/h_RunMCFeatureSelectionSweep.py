@@ -947,6 +947,9 @@ def _append_mlr_baseline_outputs(
             examples=0,
             sample_subdir=sample_subdir,
         )
+        preds_naive, _ = eval_module._clip_to_target_support(preds_naive, "Naive baseline")
+        preds_seasonal, _ = eval_module._clip_to_target_support(preds_seasonal, "Seasonal baseline")
+        preds_linear, _ = eval_module._clip_to_target_support(preds_linear, "Linear baseline")
     except Exception as exc:
         print(f"[WARN] MLR baseline evaluation failed: {exc}")
         return [], [], []
@@ -1120,6 +1123,7 @@ def _write_mlr_artifacts(
 ) -> Path:
     mlr_dir = _mlr_artifact_dir(output_dir, subset_label, model_prefix=model_prefix)
     mlr_dir.mkdir(parents=True, exist_ok=True)
+    preds, _ = eval_module._clip_to_target_support(preds, f"{model_prefix.upper().replace('_', '-')} model")
 
     model_config = {
         "model_type": model_prefix,

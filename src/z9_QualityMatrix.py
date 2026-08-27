@@ -43,10 +43,10 @@ ML_FAMILIES = {"GP", "XGB", "Transformer"}
 
 VERDICT_RANK = {"supported": 3, "directional": 2, "underpowered": 1, "not_supported": 0}
 VERDICT_SHORT = {"supported": "Supported", "directional": "Directional",
-                 "underpowered": "Underpowered", "not_supported": "None"}
+                 "underpowered": "Underpowered", "not_supported": "Not supported"}
 
-# Accuracy columns describe the target; the skill block describes a claim about a
-# learned model, and only applies where one won.
+# Accuracy columns describe the target; the skill block describes whether the
+# result stands out from the alternatives, which is a question for every target.
 # Family name and value are separate columns: combined into one cell they
 # overflow at any font size that satisfies the printed-size rule.
 ACCURACY_COLS = ["n", "Best", "$R^2$", "nRMSE",
@@ -108,29 +108,27 @@ def build_frame(df: pd.DataFrame, prefix: str) -> tuple[pd.DataFrame, pd.DataFra
             "Ref. $R^2$": r.get("best_ref_r2"),
         }
 
-        if is_ml:
-            text.update({
-                "Skill": _fmt(r.get("skill_vs_best_ref")),
-                "95% LB": _fmt(r.get("aligned_skill_ci05")),
-                "Win rate": _fmt(r.get("aligned_sign_win_rate")),
-                "$p$": _fmt(r.get("aligned_sign_p")),
-                "$p_{\\min}$": _fmt(r.get("aligned_min_attainable_p")),
-                "Verdict": VERDICT_SHORT.get(verdict, "---"),
-            })
-            norm.update({
-                "Skill": r.get("skill_vs_best_ref"),
-                "95% LB": r.get("aligned_skill_ci05"),
-                "Win rate": r.get("aligned_sign_win_rate"),
-                "$p$": r.get("aligned_sign_p"),
-                "$p_{\\min}$": r.get("aligned_min_attainable_p"),
-                "Verdict": VERDICT_RANK.get(verdict, np.nan),
-            })
-        else:
-            # A reference forecast won: there is no learned-model claim to assess,
-            # and a zero here would read as a measured null.
-            for c in SKILL_COLS:
-                text[c] = ""
-                norm[c] = np.nan
+        # The skill block says whether the winning result stands out from the
+        # alternatives or is merely the best of several comparable ones, so it is
+        # populated for every target. Where a reference forecast won, the skill of
+        # the best learned model against it is negative, and its interval says
+        # whether that deficit is resolvable at the available sampling.
+        text.update({
+            "Skill": _fmt(r.get("skill_vs_best_ref")),
+            "95% LB": _fmt(r.get("aligned_skill_ci05")),
+            "Win rate": _fmt(r.get("aligned_sign_win_rate")),
+            "$p$": _fmt(r.get("aligned_sign_p")),
+            "$p_{\\min}$": _fmt(r.get("aligned_min_attainable_p")),
+            "Verdict": VERDICT_SHORT.get(verdict, "---"),
+        })
+        norm.update({
+            "Skill": r.get("skill_vs_best_ref"),
+            "95% LB": r.get("aligned_skill_ci05"),
+            "Win rate": r.get("aligned_sign_win_rate"),
+            "$p$": r.get("aligned_sign_p"),
+            "$p_{\\min}$": r.get("aligned_min_attainable_p"),
+            "Verdict": VERDICT_RANK.get(verdict, np.nan),
+        })
 
         text_rows.append(text)
         norm_rows.append(norm)
@@ -229,7 +227,7 @@ def render(text: pd.DataFrame, norm: pd.DataFrame, output: Path) -> Path:
     mid_skill = (xs[gap_at] + xs[-1] + widths[-1]) / 2
     ax.text(mid_acc, n_rows + 0.45, "accuracy: which method predicts the target",
             ha="center", va="top", fontsize=7.0, style="italic")
-    ax.text(mid_skill, n_rows + 0.45, "reported only where a learned model won",
+    ax.text(mid_skill, n_rows + 0.45, "standing: does that result stand out",
             ha="center", va="top", fontsize=7.0, style="italic")
 
     return save_figure(fig, output)

@@ -188,15 +188,29 @@ def binarize_dataframe(df, output_columns, thresholds_df):
     )
     return binary_df
 
-def decompose_direction(df, directional, magnitude=None):
+def decompose_direction(df, directional, magnitude=None, decimals=None):
     """
     Replace column (directional) storing values of direction in degrees with two new columns representing
     the x and y components, optionally scaled by values from a magnitude column.
     The new columns are inserted at the same position as the original column.
 
+    The components are rounded, because a trigonometric product of two measured
+    values carries none of the precision of a float64.  Wind here is recorded as a
+    direction and a speed each exact to one decimal, so a component holds about
+    three significant figures of real information; leaving it unrounded stored
+    twelve or more decimals, i.e. an order of magnitude more resolution than the
+    instrument has, and made the record overstate what was measured.
+
     Parameters:
     - df: pandas.DataFrame
     - directional: str, name of the column containing degree values
+    - magnitude: str or None, column whose values scale the unit components
+    - decimals: int or None.  None infers the resolution: one guard digit finer
+      than the magnitude column's own decimal resolution, since the magnitude's
+      quantization dominates the component's error (an angular step of 0.1 deg
+      moves a 13 m/s vector by about 0.02 m/s, well inside a 0.1 m/s speed step).
+      With no magnitude the components are unit vectors and four decimals is
+      finer than any plausible direction resolution.
 
     Returns:
     - Modified DataFrame with x and y components replacing the original column
@@ -208,6 +222,12 @@ def decompose_direction(df, directional, magnitude=None):
     if magnitude is not None:
         x_component = x_component * df_copy[magnitude].values
         y_component = y_component * df_copy[magnitude].values
+
+    if decimals is None:
+        decimals = (_decimal_resolution(df_copy[magnitude]) + 1
+                    if magnitude is not None else 4)
+    x_component = np.round(x_component, decimals)
+    y_component = np.round(y_component, decimals)
 
     insert_position = df_copy.columns.get_loc(directional)
     df_copy.drop(columns=[directional], inplace=True)
@@ -306,6 +326,12 @@ def rolling_sum(df, time_col, target_col, interval_hours):
 
     Returns:
         pd.DataFrame: Original dataframe with an added 'rolling_sum' column.
+
+    The sum is rounded to the source column's decimal resolution.  A sum of values
+    each exact at *d* decimals is itself exact at *d* decimals, so this removes the
+    float artifacts of the repeated addition and nothing else -- the same argument
+    that governs ``add_diff``.  Without it a 24-hour total of readings recorded to
+    one decimal was stored with twelve.
     """
     # Ensure time column is datetime
     df = df.copy()
@@ -322,7 +348,8 @@ def rolling_sum(df, time_col, target_col, interval_hours):
         mask = (df[time_col] >= window_start) & (df[time_col] <= current_time)
         rolling_sums.append(df.loc[mask, target_col].sum())
 
-    df["rolling " + target_col] = rolling_sums
+    df["rolling " + target_col] = np.round(rolling_sums,
+                                           _decimal_resolution(df[target_col]))
     return df
 
 def forward_fill_columns(df: pd.DataFrame, columns: list) -> pd.DataFrame:

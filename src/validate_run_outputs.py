@@ -109,6 +109,27 @@ def _count_lines(path: Path) -> int:
         return 0
 
 
+def _has_recoverable_run_artifacts(run_dir: Path) -> bool:
+    """Return True when the run directory contains enough artifacts to matter.
+
+    Empty placeholder directories, or ones that contain only copied split files,
+    do not participate in downstream scoring and should not fail validation as if
+    they were completed evaluations.
+    """
+    if (run_dir / "evaluation_summary.csv").exists():
+        return True
+    if any(run_dir.glob("config_evaluate_*.yml")):
+        return True
+    model_artifacts = (
+        "gp_model.pt",
+        "xgboost_model.json",
+        "transformer_model.pt",
+        "mlr_equation.txt",
+        "model_config.json",
+    )
+    return any((run_dir / name).exists() for name in model_artifacts)
+
+
 def check_target(dataset_dir: Path, families: tuple[str, ...], found: Findings,
                  verbose: bool = False) -> None:
     label = re.sub(r"_diff$|_res$", "", dataset_dir.name.replace("MC_", ""))
@@ -195,7 +216,11 @@ def check_target(dataset_dir: Path, families: tuple[str, ...], found: Findings,
         rl = f"{label}/{run.name}"
         preds_path = run / "predictions.csv"
         if not preds_path.exists():
-            found.error(rl, "no predictions.csv; excluded from the common evaluation set")
+            if _has_recoverable_run_artifacts(run):
+                found.error(rl, "no predictions.csv; excluded from the common evaluation set")
+            else:
+                found.warn(rl, "orphan partial run directory with no evaluation artifacts; "
+                               "ignored for analysis")
             continue
         preds = _read_csv(preds_path)
         if preds is None or preds.empty:

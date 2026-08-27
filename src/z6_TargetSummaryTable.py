@@ -12,12 +12,13 @@ questions.
    encode it, so a reference win is a result rather than a failure. Reference wins
    are marked.
 
-2. *Is the machine-learning advantage defensible?*  The skill score and the
-   verdict from ``utils.evidence``. These are reported **only where a learned
-   model won**: where a reference forecast is the best predictor, the result for
-   that target is the reference, and a skill score would only restate it.
-   "Underpowered" is distinct from "not supported" -- it means no outcome at that
-   sample size could have reached significance.
+2. *Does that result stand out, or is it merely the best of several comparable
+   ones?*  The skill score and the verdict from ``utils.evidence``, reported for
+   **every** target. The bootstrap interval is what carries the answer: above
+   zero the winner stands out, spanning zero it cannot be separated from the
+   alternatives at that sample size, below zero the simpler alternative is
+   reliably better. "Underpowered" is distinct from "not supported" -- it means
+   no outcome at that sample size could have reached significance.
 
 Targets are ordered by the best R^2 achieved, with no banding: a discrete
 threshold would be invented rather than measured.
@@ -176,12 +177,15 @@ def build_rows(df: pd.DataFrame, prefix: str) -> list[dict]:
             r2_median=_f(r, f"{key}_r2_median"),
             n_search=_f(r, "n_search_holdout_scorings"),
             n=_f(r, "n_common"),
-            # Skill and verdict answer "is the learned advantage defensible", which
-            # is only a question where a learned model won.
-            skill=_f(r, "skill_vs_best_ref") if not is_ref else float("nan"),
-            lo=_f(r, "aligned_skill_ci05") if not is_ref else float("nan"),
-            hi=_f(r, "aligned_skill_ci95") if not is_ref else float("nan"),
-            verdict=verdict if not is_ref else None,
+            # Skill measures whether a result stands out from the alternatives or is
+            # merely the best of several comparable ones, which is a question for
+            # every target regardless of which family won it. Where a reference
+            # forecast won, the skill of the best learned model against it is
+            # negative, and the interval says whether that deficit is resolvable.
+            skill=_f(r, "skill_vs_best_ref"),
+            lo=_f(r, "aligned_skill_ci05"),
+            hi=_f(r, "aligned_skill_ci95"),
+            verdict=verdict,
         ))
 
     rows.sort(key=lambda d: -(d["r2"] if pd.notna(d["r2"]) else -9e9))
@@ -204,11 +208,14 @@ def render(rows: list[dict]) -> str:
         r"same test segments. Reported $R^2$ is therefore an optimistically biased "
         r"upper estimate rather than an out-of-sample one, and the bias applies to "
         r"the learned methods and to MLR but not to the naive, seasonal or linear "
-        r"forecasts, which have no configurations to choose among. SS and "
-        r"Verdict are reported only where a learned model won, since where a "
-        r"reference is the best predictor it is itself the result; SS is the skill "
-        r"against the strongest reference (Equation~\ref{eq:skill}) with its 95\% "
-        r"bootstrap interval. Verdict is defined in "
+        r"forecasts, which have no configurations to choose among. SS is the skill "
+        r"of the best learned model against the strongest reference "
+        r"(Equation~\ref{eq:skill}) with its 95\% bootstrap interval, and is "
+        r"reported for every target: an interval above zero identifies a result "
+        r"that stands out from the alternatives, an interval spanning zero one that "
+        r"cannot be distinguished from them at this $n$, and an interval below zero "
+        r"a target on which the simpler alternative is reliably better. Verdict is "
+        r"defined in "
         r"Section~\ref{ch:EvaluationMetrics}; \emph{underpowered} means no outcome "
         r"at that $n$ could have reached $\alpha=0.05$.\label{tab:targets}}",
         r"\begin{tabularx}{\textwidth}{"

@@ -79,6 +79,11 @@ if __name__ == '__main__':
         'Longwave (IR) radiation (W/m2)': (weather_df['Longwave (IR) radiation (W/m2)'] < 0) | (weather_df['Longwave (IR) radiation (W/m2)'] > 750),
         'Shortwave (solar) radiation (W/m2)': (weather_df['Shortwave (solar) radiation (W/m2)'] < 0) | (weather_df['Shortwave (solar) radiation (W/m2)'] > 900),
         'Precipitation (mm/hr)': (weather_df['Precipitation (mm/hr)'] < 0) | ( weather_df['Precipitation (mm/hr)'] > 50),
+        # 'Instantaneous temperature' is the temperature column that actually reaches
+        # the consolidated record; the max/min columns below are scrubbed but unused.
+        # The station writes -99.9 for missing (present in TA_a_Min), so the column
+        # carried downstream needs the same guard even though it has not tripped it yet.
+        'Instantaneous temperature (°C)': (weather_df['Instantaneous temperature (°C)'] < -40) | ( weather_df['Instantaneous temperature (°C)'] > 40),
         'Maximum temperature (°C)': (weather_df['Maximum temperature (°C)'] < -40) | ( weather_df['Maximum temperature (°C)'] > 40),
         'Minimum temperature (°C)': (weather_df['Minimum temperature (°C)'] < -40) | ( weather_df['Minimum temperature (°C)'] > 40),
         'Average humidity (% relative humidity)': (weather_df['Average humidity (% relative humidity)'] < 0) | ( weather_df['Average humidity (% relative humidity)'] > 100)
