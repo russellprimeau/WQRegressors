@@ -9,29 +9,26 @@ questions.
 1. *Which method predicted the target best?*  Whichever of the seven method
    families achieved the highest R^2. The study asks whether the predictors carry
    information about the target, not only whether a machine-learning model can
-   encode it, so a reference win is a result rather than a failure. Reference wins
-   are marked.
+   encode it, so a win by a statistical model is a result rather than a failure.
+   Those wins are marked.
 
 2. *Does that result stand out, or is it merely the best of several comparable
    ones?*  The skill score and the verdict from ``utils.evidence``, reported for
    **every** target. The bootstrap interval is what carries the answer: above
    zero the winner stands out, spanning zero it cannot be separated from the
-   alternatives at that sample size, below zero the simpler alternative is
+   alternatives at that sample size, below zero the statistical model is
    reliably better. "Underpowered" is distinct from "not supported" -- it means
    no outcome at that sample size could have reached significance.
 
 Targets are ordered by the best R^2 achieved, with no banding: a discrete
 threshold would be invented rather than measured.
 
-The selection column records the holdout exposure behind each reported R^2, which
-has two stages. The feature search's objective is test-split R^2, so the candidate
-pool is itself the product of a few hundred consultations of the test segments;
-the retained configurations of the winning family are then scored on those same
-segments and the best is reported. Both numbers are emitted, because reporting
-only the second describes the last step of the selection rather than the
-selection. Reported R^2 is therefore an optimistically biased upper estimate, and
-the bias falls on the learned families and MLR but not on the naive, seasonal or
-linear forecasts, which have no configurations to choose among.
+The holdout exposure behind each reported R^2 is printed to stdout rather than
+carried as a table column, because it is the same story for every target and
+belongs in the body text: the feature search's objective is test-split R^2, so
+the candidate pool is itself the product of a few hundred consultations of the
+test segments, and the retained configurations of the winning family are then
+scored on those same segments and the best reported.
 
 Usage:
     python src/z6_TargetSummaryTable.py
@@ -120,30 +117,22 @@ def _fmt_skill(ss, lo, hi):
     if pd.isna(ss):
         return "---"
     if pd.isna(lo) or pd.isna(hi):
-        return f"{ss:.3f}"
-    return f"{ss:.3f} [{lo:.2f}, {hi:.2f}]"
+        return f"{ss:.2f}"
+    return f"{ss:.2f} [{lo:.2f}, {hi:.2f}]"
 
 
-def _fmt_selection(n, median, n_search):
-    """The holdout exposure behind the reported R^2.
+def _fmt_p(p, p_min):
+    """Sign-test p with the smallest value attainable at this n beside it.
 
-    Two numbers, because the selection has two stages and only reporting both is
-    honest. ``n`` is how many configurations of the winning family were scored on
-    the common set, and the median beside it is their typical R^2, so the headroom
-    of that final choice is visible. ``n_search`` is how many times the feature
-    search itself scored a candidate on the test split -- its objective is
-    test-split R^2 -- which is what produced the pool those configurations were
-    drawn from, and it is the larger number by more than an order of magnitude.
+    A p-value cannot be read without its floor: where p_min exceeds alpha no
+    outcome could have been significant, and reporting the p alone would invite
+    that case to be read as a tested negative.
     """
-    if pd.isna(n) or n is None:
-        left = "---"
-    elif pd.isna(median):
-        left = f"{int(n)}"
-    else:
-        left = f"{int(n)} ({median:.2f})"
-    if pd.isna(n_search) or n_search is None or int(n_search) <= 0:
-        return left
-    return f"{left} / {int(n_search)}"
+    if pd.isna(p):
+        return "---"
+    if pd.isna(p_min):
+        return f"{p:.2f}"
+    return f"{p:.2f} ({p_min:.2f})"
 
 
 def build_rows(df: pd.DataFrame, prefix: str) -> list[dict]:
@@ -185,6 +174,8 @@ def build_rows(df: pd.DataFrame, prefix: str) -> list[dict]:
             skill=_f(r, "skill_vs_best_ref"),
             lo=_f(r, "aligned_skill_ci05"),
             hi=_f(r, "aligned_skill_ci95"),
+            p=_f(r, "aligned_sign_p"),
+            p_min=_f(r, "aligned_min_attainable_p"),
             verdict=verdict,
         ))
 
@@ -195,35 +186,24 @@ def build_rows(df: pd.DataFrame, prefix: str) -> list[dict]:
 def render(rows: list[dict]) -> str:
     out = [
         r"\begin{table}[H]",
-        r"\caption{Best-performing method for each target, ordered by the $R^2$ "
-        r"achieved. Every method is scored on the same test segments for a given "
-        r"target, so the $R^2$ values are directly comparable; $n$ is the size of "
-        r"that common evaluation set. The method with the higher $R^2$ is reported "
-        r"whether it is a machine-learning model or a reference forecast, and rows "
-        r"marked $^\dagger$ were won by a reference. \emph{Sel.} reports the "
-        r"selection exposure behind the $R^2$, as \emph{configurations (median "
-        r"$R^2$) / search scorings}: the reported value is the best of that many "
-        r"configurations of the winning method, drawn from a candidate pool that "
-        r"the feature search produced by scoring that many candidates against the "
-        r"same test segments. Reported $R^2$ is therefore an optimistically biased "
-        r"upper estimate rather than an out-of-sample one, and the bias applies to "
-        r"the learned methods and to MLR but not to the naive, seasonal or linear "
-        r"forecasts, which have no configurations to choose among. SS is the skill "
-        r"of the best learned model against the strongest reference "
-        r"(Equation~\ref{eq:skill}) with its 95\% bootstrap interval, and is "
-        r"reported for every target: an interval above zero identifies a result "
-        r"that stands out from the alternatives, an interval spanning zero one that "
-        r"cannot be distinguished from them at this $n$, and an interval below zero "
-        r"a target on which the simpler alternative is reliably better. Verdict is "
-        r"defined in "
-        r"Section~\ref{ch:EvaluationMetrics}; \emph{underpowered} means no outcome "
-        r"at that $n$ could have reached $\alpha=0.05$.\label{tab:targets}}",
+        r"\caption{Per-target accuracy and statistical support on the common "
+        r"evaluation set.\label{tab:targets}}",
+        r"\small",
         r"\begin{tabularx}{\textwidth}{"
-        r">{\raggedright\arraybackslash}X l c c c l l}",
+        # tabularx: the \hsize coefficients must sum to the number of X columns
+        # (7 here), or the table is set to the wrong total width and the columns
+        # run over one another.  1.75 + 1.0 + 0.5 + 0.35 + 1.55 + 0.85 + 1.0 = 7.0
+        r">{\hsize=1.75\hsize\raggedright\arraybackslash}X"
+        r">{\hsize=1.0\hsize\raggedright\arraybackslash}X"
+        r">{\hsize=0.5\hsize\centering\arraybackslash}X"
+        r">{\hsize=0.35\hsize\centering\arraybackslash}X"
+        r">{\hsize=1.55\hsize\centering\arraybackslash}X"
+        r">{\hsize=0.85\hsize\centering\arraybackslash}X"
+        r">{\hsize=1.0\hsize\raggedright\arraybackslash}X}",
         r"\toprule",
         r"\textbf{Target} & \textbf{Best method} & \textbf{$R^2$} & "
-        r"\textbf{Sel.} & \textbf{$n$} & \textbf{SS (95\% CI)} & "
-        r"\textbf{Verdict}\\",
+        r"\textbf{$n$} & \textbf{SS (95\% CI)} & "
+        r"\textbf{$p$ ($p_{\min}$)} & \textbf{Verdict}\\",
         r"\midrule",
     ]
     for row in rows:
@@ -236,9 +216,9 @@ def render(rows: list[dict]) -> str:
                 row["method"],
                 marker,
                 _fmt(row["r2"]),
-                _fmt_selection(row["n_candidates"], row["r2_median"], row["n_search"]),
                 _fmt_int(row["n"]),
                 _fmt_skill(row["skill"], row["lo"], row["hi"]),
+                _fmt_p(row["p"], row["p_min"]),
                 verdict,
             )
         )
@@ -265,14 +245,25 @@ def main() -> int:
     # Counts only: targets have unrelated dynamics, so nothing is averaged across
     # them.
     n_ref = sum(1 for r in rows if r["is_reference"])
-    print(f"  a reference forecast was the best predictor for {n_ref} of {len(rows)} targets")
+    print(f"  a statistical model was the best predictor for {n_ref} of {len(rows)} targets")
+
+    # The selection exposure is the same story for every target, so it is reported
+    # here for the body text rather than as a table column.
+    cand = [r["n_candidates"] for r in rows if pd.notna(r["n_candidates"])]
+    med = [r["r2_median"] for r in rows if pd.notna(r["r2_median"])]
+    srch = {int(r["n_search"]) for r in rows if pd.notna(r["n_search"])}
+    if cand:
+        print(f"  selection exposure: winner was best of {int(min(cand))}-{int(max(cand))} "
+              f"configurations; their median R2 spans {min(med):+.2f} to {max(med):+.2f}")
+    if srch:
+        print(f"  search scorings per target: {sorted(srch)}")
     for v in list(reversed(ev.VERDICT_ORDER)) + [VERDICT_UNAVAILABLE]:
         n = sum(1 for r in rows if r["verdict"] == v)
         if n:
             print(f"  {n:2d}  verdict: {v}")
     n_blank = sum(1 for r in rows if r["verdict"] is None)
     if n_blank:
-        print(f"  {n_blank:2d}  no verdict (a reference forecast won)")
+        print(f"  {n_blank:2d}  no verdict")
     return 0
 
 
