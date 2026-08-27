@@ -4070,6 +4070,20 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                                 if _nan_mask.any():
                                     df.loc[_nan_mask, _col] = df.loc[_nan_mask, "subset_rank"].map(_by_rank)
 
+                        # Enforce one sigma per target here rather than earlier: MLR rows
+                        # are merged in after the first normalization pass and carry their
+                        # own per-row std_target, which reintroduced the incomparable NRMSE
+                        # this pass exists to remove. This is the last point at which every
+                        # row is present.
+                        _sigma = _dataset_target_std(output_dir, plan.dataset_dir.name)
+                        if np.isfinite(_sigma) and _sigma > 0:
+                            df["std_target"] = _sigma
+                            if "rmse" in df.columns:
+                                df["nrmse"] = pd.to_numeric(df["rmse"], errors="coerce") / _sigma
+                        else:
+                            print(f"[WARN] {plan.dataset_dir.name}: no per-target sigma at final "
+                                  "assembly; NRMSE left as written and may not be comparable.")
+
                         # Recompute min_skill_rmse once across all sources, write once, plot once.
                         df = _recompute_min_skill_rmse(df)
                         df.to_csv(final_metrics_csv, index=False)

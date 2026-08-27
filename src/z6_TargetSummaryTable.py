@@ -1,24 +1,36 @@
-"""
-Emit the per-target results table for the manuscript from a z1 summary CSV.
+"""Emit the per-target results table for the manuscript.
 
-Reads ``summary_best_model_performance.csv`` (written by ``z1_FeaturePostProcess.py``)
-and writes an MDPI-compatible LaTeX ``table`` environment.
+Reads ``common_set_metrics.csv`` (written by ``z8_CommonSetMetrics.py``), in
+which every method for a target is scored on the same test segments. That is the
+only basis on which the two questions below can be answered side by side, because
+an R^2 computed on 5 segments and an R^2 computed on 22 are answers to different
+questions.
 
-Two independent questions are reported side by side, because they have different
-answers and conflating them is what made earlier drafts misleading:
+1. *Which method predicted the target best?*  Whichever of the seven method
+   families achieved the highest R^2. The study asks whether the predictors carry
+   information about the target, not only whether a machine-learning model can
+   encode it, so a reference win is a result rather than a failure. Reference wins
+   are marked.
 
-1. *Which method predicted the target best?*  Whichever of the best
-   machine-learning model or the best reference forecast achieved the higher
-   $R^2$. The study asks whether the predictors carry information about the
-   target, not only whether a machine-learning model can encode it, so a
-   reference win is a result rather than a failure. Reference wins are marked.
+2. *Is the machine-learning advantage defensible?*  The skill score and the
+   verdict from ``utils.evidence``. These are reported **only where a learned
+   model won**: where a reference forecast is the best predictor, the result for
+   that target is the reference, and a skill score would only restate it.
+   "Underpowered" is distinct from "not supported" -- it means no outcome at that
+   sample size could have reached significance.
 
-2. *Is the machine-learning advantage defensible?*  The verdict from
-   ``utils.evidence``: supported, directional, underpowered, or not supported.
-   "Underpowered" is distinct from "not supported" -- it means no outcome at
-   that sample size could have reached significance.
+Targets are ordered by the best R^2 achieved, with no banding: a discrete
+threshold would be invented rather than measured.
 
-Rows are grouped by the first question and the verdict column answers the second.
+The selection column records the holdout exposure behind each reported R^2, which
+has two stages. The feature search's objective is test-split R^2, so the candidate
+pool is itself the product of a few hundred consultations of the test segments;
+the retained configurations of the winning family are then scored on those same
+segments and the best is reported. Both numbers are emitted, because reporting
+only the second describes the last step of the selection rather than the
+selection. Reported R^2 is therefore an optimistically biased upper estimate, and
+the bias falls on the learned families and MLR but not on the naive, seasonal or
+linear forecasts, which have no configurations to choose among.
 
 Usage:
     python src/z6_TargetSummaryTable.py
@@ -34,17 +46,8 @@ import pandas as pd
 from utils.names import clean_target_label
 from utils import evidence as ev
 
-DEFAULT_SUMMARY = Path("data/output/CV19/summaries/summary_best_model_performance.csv")
+DEFAULT_SUMMARY = Path("data/output/CV19/summaries/common_set_metrics.csv")
 DEFAULT_OUTPUT = Path("docs/report/draft/tables/target_summary.tex")
-
-GROUP_ML = 0
-GROUP_REF = 1
-GROUP_NONE = 2
-GROUP_HEADINGS = {
-    GROUP_ML: "Machine learning predicted the target best",
-    GROUP_REF: "A reference forecast predicted the target best",
-    GROUP_NONE: "No method explained variance in the holdout period",
-}
 
 VERDICT_UNAVAILABLE = "__pending__"
 
@@ -52,26 +55,30 @@ VERDICT_TEX = {
     ev.SUPPORTED: "Supported",
     ev.DIRECTIONAL: "Directional",
     ev.UNDERPOWERED: "Underpowered",
-    ev.NOT_SUPPORTED: "None",
+    ev.NOT_SUPPORTED: "Not supported",
     VERDICT_UNAVAILABLE: r"\emph{pending}",
 }
 
+ML_FAMILIES = {"GP", "XGB", "Transformer"}
 
 # The manuscript body is written in pure ASCII with LaTeX escapes (\AA, \upmu,
 # \o), so generated tables must match that convention: a literal U+00B0 or a
 # non-breaking space reaches inputenc as a raw byte and is a common source of
 # build failures on the MDPI class.
+# Written as explicit escapes: several of these are invisible or
+# indistinguishable in a source listing, and a literal non-breaking space keyed
+# by eye is how one slipped through and reached inputenc as a raw byte.
 _TEX_CHAR_MAP = {
-    "°": r"$^\circ$",
-    " ": "~",
-    "–": "--",
-    "—": "---",
-    "‘": "`",
-    "’": "'",
-    "“": "``",
-    "”": "''",
-    "µ": r"$\upmu$",
-    "μ": r"$\upmu$",
+    "°": r"$^\circ$",    # degree sign
+    " ": "~",            # non-breaking space
+    "–": "--",           # en dash
+    "—": "---",          # em dash
+    "‘": "`",            # left single quote
+    "’": "'",            # right single quote
+    "“": "``",           # left double quote
+    "”": "''",           # right double quote
+    "µ": r"$\upmu$",     # micro sign
+    "μ": r"$\upmu$",     # greek small letter mu
 }
 
 
@@ -107,7 +114,8 @@ def _fmt_int(val):
 
 
 def _fmt_skill(ss, lo, hi):
-    """Effect size with its interval, or a dash when no interval was computable."""
+    """Effect size with its interval, or the estimate alone when the bootstrap
+    could not establish one (too few groups, or a degenerate resample)."""
     if pd.isna(ss):
         return "---"
     if pd.isna(lo) or pd.isna(hi):
@@ -115,115 +123,116 @@ def _fmt_skill(ss, lo, hi):
     return f"{ss:.3f} [{lo:.2f}, {hi:.2f}]"
 
 
+def _fmt_selection(n, median, n_search):
+    """The holdout exposure behind the reported R^2.
+
+    Two numbers, because the selection has two stages and only reporting both is
+    honest. ``n`` is how many configurations of the winning family were scored on
+    the common set, and the median beside it is their typical R^2, so the headroom
+    of that final choice is visible. ``n_search`` is how many times the feature
+    search itself scored a candidate on the test split -- its objective is
+    test-split R^2 -- which is what produced the pool those configurations were
+    drawn from, and it is the larger number by more than an order of magnitude.
+    """
+    if pd.isna(n) or n is None:
+        left = "---"
+    elif pd.isna(median):
+        left = f"{int(n)}"
+    else:
+        left = f"{int(n)} ({median:.2f})"
+    if pd.isna(n_search) or n_search is None or int(n_search) <= 0:
+        return left
+    return f"{left} / {int(n_search)}"
+
+
 def build_rows(df: pd.DataFrame, prefix: str) -> list[dict]:
-    has_verdicts = "verdict_overall" in df.columns
-    if not has_verdicts:
-        print(
-            "[WARN] No 'verdict_overall' column in the summary CSV: it predates the "
-            "support-verdict machinery. The Verdict column is emitted as "
-            "'\\emph{pending}' so it cannot be mistaken for a finding. Re-run "
-            "z1_FeaturePostProcess.py, then re-run this script."
+    required = {"best_family", "best_r2", "n_common"}
+    missing = required - set(df.columns)
+    if missing:
+        raise SystemExit(
+            f"summary CSV is missing {sorted(missing)}; this script expects the output of "
+            "z8_CommonSetMetrics.py, in which every method is scored on the same segments."
         )
+    has_verdicts = "aligned_verdict" in df.columns
+    if not has_verdicts:
+        print("[WARN] No 'aligned_verdict' column: the Verdict column is emitted as "
+              "'\\emph{pending}' so it cannot be mistaken for a finding.")
+
     rows = []
     for _, r in df.iterrows():
-        ml_label = str(r.get("best_model_label", "") or "").strip()
-        ref_label = str(r.get("best_baseline_label", "") or "").strip()
-        ml_r2 = _f(r, "best_model_r2")
-        ref_r2 = _f(r, "best_baseline_r2")
-        skill = _f(r, "skill_vs_best_baseline")
-        lo = _f(r, "skill_ci05_vs_best_baseline")
-        hi = _f(r, "skill_ci95_vs_best_baseline")
-        n_pairs = _f(r, "n_pairs_vs_best_baseline")
-        if pd.isna(n_pairs) or n_pairs <= 0:
-            n_pairs = _f(r, "n_test_independent_source")
-        # A summary written before the verdict machinery existed has no verdict
-        # column at all. Emitting the NOT_SUPPORTED default there would render as
-        # a real finding of "no support"; mark it unavailable instead.
-        if has_verdicts:
-            verdict = str(r.get("verdict_overall", ev.NOT_SUPPORTED) or ev.NOT_SUPPORTED)
-        else:
-            verdict = VERDICT_UNAVAILABLE
+        family = str(r.get("best_family", "") or "").strip()
+        is_ref = family not in ML_FAMILIES
+        key = family.lower().replace("-", "")
 
-        ref_wins = bool(pd.notna(ref_r2) and (pd.isna(ml_r2) or ref_r2 > ml_r2))
-        best_label = ref_label if ref_wins else ml_label
-        best_r2 = ref_r2 if ref_wins else ml_r2
+        verdict = (str(r.get("aligned_verdict") or ev.NOT_SUPPORTED)
+                   if has_verdicts else VERDICT_UNAVAILABLE)
 
-        if pd.notna(best_r2) and best_r2 <= 0:
-            group = GROUP_NONE
-        elif ref_wins:
-            group = GROUP_REF
-        else:
-            group = GROUP_ML
+        rows.append(dict(
+            target=_tex_safe(clean_target_label(str(r.get("dataset", "")), prefix)),
+            method=_tex_safe(family or "---"),
+            is_reference=is_ref,
+            r2=_f(r, "best_r2"),
+            n_candidates=_f(r, f"{key}_n_candidates"),
+            r2_median=_f(r, f"{key}_r2_median"),
+            n_search=_f(r, "n_search_holdout_scorings"),
+            n=_f(r, "n_common"),
+            # Skill and verdict answer "is the learned advantage defensible", which
+            # is only a question where a learned model won.
+            skill=_f(r, "skill_vs_best_ref") if not is_ref else float("nan"),
+            lo=_f(r, "aligned_skill_ci05") if not is_ref else float("nan"),
+            hi=_f(r, "aligned_skill_ci95") if not is_ref else float("nan"),
+            verdict=verdict if not is_ref else None,
+        ))
 
-        # R^2 and SS should agree on which side won: on a common evaluation set a
-        # higher R^2 implies a lower RMSE, hence positive skill. A disagreement
-        # means the two were computed on different alignments, so the row cannot
-        # be grouped reliably. Surface it rather than silently mis-filing it.
-        if pd.notna(ml_r2) and pd.notna(ref_r2) and pd.notna(skill):
-            if (ml_r2 > ref_r2) != (skill > 0):
-                print(
-                    f"[WARN] {r.get('dataset', '?')}: R^2 ordering and skill sign "
-                    f"disagree (model R2={ml_r2:.3f}, reference R2={ref_r2:.3f}, "
-                    f"SS={skill:+.3f}). These are computed on different aligned "
-                    f"sets; the grouping of this row is not trustworthy."
-                )
-
-        rows.append(
-            dict(
-                target=_tex_safe(clean_target_label(str(r.get("dataset", "")), prefix)),
-                method=_tex_safe(best_label or "---"),
-                is_reference=ref_wins,
-                r2=best_r2,
-                skill=skill,
-                lo=lo,
-                hi=hi,
-                n=n_pairs,
-                verdict=verdict,
-                group=group,
-            )
-        )
-    rows.sort(key=lambda d: (d["group"], -(d["r2"] if pd.notna(d["r2"]) else -9e9)))
+    rows.sort(key=lambda d: -(d["r2"] if pd.notna(d["r2"]) else -9e9))
     return rows
 
 
 def render(rows: list[dict]) -> str:
     out = [
         r"\begin{table}[H]",
-        r"\caption{Best-performing method for each target on the chronological "
-        r"holdout period, and whether any machine-learning advantage is "
-        r"statistically defensible. The method with the higher $R^2$ is reported "
-        r"whether it is a machine-learning model or a reference forecast; rows "
-        r"marked $^\dagger$ were won by a reference forecast. SS is the skill of "
-        r"the best machine-learning model against the strongest reference "
-        r"(Equation~\ref{eq:skill}) with its 95\% bootstrap interval, so a "
-        r"negative value means a reference was more accurate. $n$ is the number "
-        r"of independent laboratory measurements in the holdout period. Verdict "
-        r"is defined in Section~\ref{ch:EvaluationMetrics}; \emph{underpowered} "
-        r"means no outcome at that $n$ could have reached "
-        r"$\alpha=0.05$.\label{tab:targets}}",
+        r"\caption{Best-performing method for each target, ordered by the $R^2$ "
+        r"achieved. Every method is scored on the same test segments for a given "
+        r"target, so the $R^2$ values are directly comparable; $n$ is the size of "
+        r"that common evaluation set. The method with the higher $R^2$ is reported "
+        r"whether it is a machine-learning model or a reference forecast, and rows "
+        r"marked $^\dagger$ were won by a reference. \emph{Sel.} reports the "
+        r"selection exposure behind the $R^2$, as \emph{configurations (median "
+        r"$R^2$) / search scorings}: the reported value is the best of that many "
+        r"configurations of the winning method, drawn from a candidate pool that "
+        r"the feature search produced by scoring that many candidates against the "
+        r"same test segments. Reported $R^2$ is therefore an optimistically biased "
+        r"upper estimate rather than an out-of-sample one, and the bias applies to "
+        r"the learned methods and to MLR but not to the naive, seasonal or linear "
+        r"forecasts, which have no configurations to choose among. SS and "
+        r"Verdict are reported only where a learned model won, since where a "
+        r"reference is the best predictor it is itself the result; SS is the skill "
+        r"against the strongest reference (Equation~\ref{eq:skill}) with its 95\% "
+        r"bootstrap interval. Verdict is defined in "
+        r"Section~\ref{ch:EvaluationMetrics}; \emph{underpowered} means no outcome "
+        r"at that $n$ could have reached $\alpha=0.05$.\label{tab:targets}}",
         r"\begin{tabularx}{\textwidth}{"
-        r">{\raggedright\arraybackslash}X l c l c l}",
+        r">{\raggedright\arraybackslash}X l c c c l l}",
         r"\toprule",
         r"\textbf{Target} & \textbf{Best method} & \textbf{$R^2$} & "
-        r"\textbf{SS (95\% CI)} & \textbf{$n$} & \textbf{Verdict}\\",
+        r"\textbf{Sel.} & \textbf{$n$} & \textbf{SS (95\% CI)} & "
+        r"\textbf{Verdict}\\",
+        r"\midrule",
     ]
-    current = None
     for row in rows:
-        if row["group"] != current:
-            current = row["group"]
-            out.append(r"\midrule")
-            out.append(r"\multicolumn{6}{l}{\textit{%s}}\\" % GROUP_HEADINGS[current])
         marker = r"$^\dagger$" if row["is_reference"] else ""
+        verdict = "---" if row["verdict"] is None else VERDICT_TEX.get(row["verdict"], "---")
         out.append(
-            "%s & %s%s & %s & %s & %s & %s\\\\"
+            "%s & %s%s & %s & %s & %s & %s & %s\\\\"
             % (
                 row["target"],
                 row["method"],
                 marker,
                 _fmt(row["r2"]),
-                _fmt_skill(row["skill"], row["lo"], row["hi"]),
+                _fmt_selection(row["n_candidates"], row["r2_median"], row["n_search"]),
                 _fmt_int(row["n"]),
-                VERDICT_TEX.get(row["verdict"], "---"),
+                _fmt_skill(row["skill"], row["lo"], row["hi"]),
+                verdict,
             )
         )
     out += [r"\bottomrule", r"\end{tabularx}", r"\end{table}"]
@@ -246,14 +255,17 @@ def main() -> int:
     args.output.write_text(render(rows), encoding="utf-8")
     print(f"[INFO] Wrote {args.output} ({len(rows)} targets)")
 
-    for g, head in GROUP_HEADINGS.items():
-        print(f"  {sum(1 for r in rows if r['group'] == g):2d}  {head}")
-    print(f"  reference forecast won on "
-          f"{sum(1 for r in rows if r['is_reference'])} of {len(rows)} targets")
+    # Counts only: targets have unrelated dynamics, so nothing is averaged across
+    # them.
+    n_ref = sum(1 for r in rows if r["is_reference"])
+    print(f"  a reference forecast was the best predictor for {n_ref} of {len(rows)} targets")
     for v in list(reversed(ev.VERDICT_ORDER)) + [VERDICT_UNAVAILABLE]:
         n = sum(1 for r in rows if r["verdict"] == v)
         if n:
             print(f"  {n:2d}  verdict: {v}")
+    n_blank = sum(1 for r in rows if r["verdict"] is None)
+    if n_blank:
+        print(f"  {n_blank:2d}  no verdict (a reference forecast won)")
     return 0
 
 

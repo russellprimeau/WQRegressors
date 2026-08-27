@@ -289,7 +289,9 @@
       "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python src/z4_Compare.py --root \"C:/Users/Master/Documents/GitHub/WQRegressors/data/output/CV14\" --label \"State in, differential out\" --summaries-subdir summaries_old --root \"C:/Users/Master/Documents/GitHub/WQRegressors/data/output/CV16stateless\" --label \"No state in, differential out\" --summaries-subdir summaries --root \"C:/Users/Master/Documents/GitHub/WQRegressors/data/output/CV18_raw\" --label \"State in, state out\" --summaries-subdir summaries --stat r2 --sort --output \"C:/Users/Master/Documents/GitHub/WQRegressors/data/output/comparisons/all/r2.png\")",
       "Bash(PYTHONIOENCODING=utf-8 timeout 900 .venv/Scripts/python src/z1_FeaturePostProcess.py --data-root \"C:/Users/Master/Documents/GitHub/WQRegressors/data/output/CV19\" --figures-only)",
       "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python src/z2_HorizonPostProcess.py --help)",
-      "Bash(grep -n \"_pred_counts\\\\|_raster_vmax\\\\|predictor_valid_for_split\\\\|_predictor_valid_count_for_overlay\\\\|Predictor\\\\\\\\\\\\\\\\nFeature Count\\\\|first_valid_idx\\\\|window\" src/b_ExploreData.py)"
+      "Bash(grep -n \"_pred_counts\\\\|_raster_vmax\\\\|predictor_valid_for_split\\\\|_predictor_valid_count_for_overlay\\\\|Predictor\\\\\\\\\\\\\\\\nFeature Count\\\\|first_valid_idx\\\\|window\" src/b_ExploreData.py)",
+      "Bash(.venv/Scripts/python -c \"import ast;[ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\) for f in \\('src/z8_CommonSetMetrics.py','src/z6_TargetSummaryTable.py'\\)];print\\('parse OK'\\)\")",
+      "Bash(.venv/Scripts/python src/z8_CommonSetMetrics.py --root data/output/CV19_superseded --output __TRACKED_VAR__/common_set_metrics_archived.csv)"
     ]
   }
 }

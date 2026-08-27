@@ -972,7 +972,8 @@ def _clip_to_target_support(preds, label, bounds=TARGET_SUPPORT):
     return clipped.reshape(arr.shape), n_clipped
 
 
-def _split_size_metadata(train_samples, test_samples, train_drops=None, test_drops=None):
+def _split_size_metadata(train_samples, test_samples, train_drops=None, test_drops=None,
+                         train_files_path=None):
     """Summary columns recording how large each split was and what it lost.
 
     ``n_train_samples`` was declared in the summary schema but never populated by
@@ -983,8 +984,19 @@ def _split_size_metadata(train_samples, test_samples, train_drops=None, test_dro
     quarters of a target's samples, and that has to be visible next to the
     metrics it produced.
     """
+    # The training-set size is a property of the split, not of whether this
+    # evaluation happened to load it. XGBoost and the Transformer only load train
+    # samples when `evaluate_all` is set, which defaults to False, so counting the
+    # loaded samples left the field null for exactly those families.
+    n_train = int(len(train_samples)) if train_samples is not None else None
+    if n_train is None and train_files_path is not None:
+        try:
+            with open(train_files_path, "r", encoding="utf-8", errors="replace") as fh:
+                n_train = sum(1 for line in fh if line.strip())
+        except Exception:
+            n_train = None
     meta = {
-        "n_train_samples": int(len(train_samples)) if train_samples is not None else np.nan,
+        "n_train_samples": n_train if n_train is not None else np.nan,
         "n_test_samples_loaded": int(len(test_samples)) if test_samples is not None else np.nan,
     }
     for prefix, report in (("train", train_drops), ("test", test_drops)):
@@ -1797,7 +1809,8 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 metadata={"kind": "train", "gp_uncertainty_mode": gp_uncertainty_mode,
                           "n_predictions_clipped": n_clipped_train,
                           **_split_size_metadata(train_samples, test_samples,
-                                                 train_drop_report, test_drop_report)},
+                                                 train_drop_report, test_drop_report,
+                                                 split_base_dir / "train_files.txt")},
                 split_files=(train_split_files or []),
             )
             per_set_metrics.append(row_train)
@@ -1821,7 +1834,8 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 metadata={"kind": "test", "gp_uncertainty_mode": gp_uncertainty_mode,
                           "n_predictions_clipped": n_clipped_test,
                           **_split_size_metadata(train_samples, test_samples,
-                                                 train_drop_report, test_drop_report)},
+                                                 train_drop_report, test_drop_report,
+                                                 split_base_dir / "train_files.txt")},
                 split_files=model_split_files,
             )
             per_set_metrics.append(row_test)
@@ -1845,7 +1859,8 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 metadata={"kind": "combined", "gp_uncertainty_mode": gp_uncertainty_mode,
                           "n_predictions_clipped": n_clipped_all,
                           **_split_size_metadata(train_samples, test_samples,
-                                                 train_drop_report, test_drop_report)},
+                                                 train_drop_report, test_drop_report,
+                                                 split_base_dir / "train_files.txt")},
                 split_files=eval_split_files,
             )
             per_set_metrics.append(row_all)
@@ -1931,7 +1946,8 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 len(eval_samples),
                 metadata={"kind": "baseline", "gp_uncertainty_mode": gp_uncertainty_mode,
                           **_split_size_metadata(train_samples, test_samples,
-                                                 train_drop_report, test_drop_report)},
+                                                 train_drop_report, test_drop_report,
+                                                 split_base_dir / "train_files.txt")},
                 split_files=eval_split_files,
             )
             summary_rows.append(row)
