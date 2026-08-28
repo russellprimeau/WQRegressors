@@ -32,10 +32,11 @@ import pandas as pd
 
 from utils.names import clean_target_label
 from utils.plotstyle import PAGE_WIDTH_IN, apply_paper_style, save_figure
+from utils import run_paths as rp
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SUMMARY = Path("data/output/CV19/summaries/common_set_metrics.csv")
-DEFAULT_OUTPUT = Path("data/output/CV19/summaries/method_comparison.png")
+SUMMARY_NAME = "common_set_metrics.csv"
+OUTPUT_NAME = "method_comparison.png"
 
 # Column prefix in common_set_metrics.csv -> display label. Machine-learning
 # models first, then the four statistical models, so the split is visible in the
@@ -120,10 +121,12 @@ def main() -> int:
     ap.add_argument("--dataset-prefix", default="MC")
     args = ap.parse_args()
 
-    summary = args.summary or (REPO_ROOT / DEFAULT_SUMMARY)
+    # The output follows the summary that was actually read, so pointing
+    # --summary at a second results tree cannot overwrite the first tree's figure.
+    summary = rp.resolve_output(args.summary, None, SUMMARY_NAME)
     if not summary.is_file():
         raise SystemExit("common-set metrics not found: %s. Run z8 first." % summary)
-    output = args.output or (REPO_ROOT / DEFAULT_OUTPUT)
+    output = rp.resolve_output(args.output, rp.root_of_summary(summary), OUTPUT_NAME)
     if args.stat != "nrmse" and args.output is None:
         output = output.with_name("method_comparison_%s.png" % args.stat)
 

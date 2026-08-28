@@ -34,10 +34,11 @@ from matplotlib.colors import Normalize, TwoSlopeNorm
 
 from utils.names import clean_target_label
 from utils.plotstyle import PAGE_WIDTH_IN, apply_paper_style, save_figure
+from utils import run_paths as rp
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SUMMARY = Path("data/output/CV19/summaries/common_set_metrics.csv")
-DEFAULT_OUTPUT = Path("data/output/CV19/summaries/summary_model_quality_matrix.png")
+SUMMARY_NAME = "common_set_metrics.csv"
+OUTPUT_NAME = "summary_model_quality_matrix.png"
 
 ML_FAMILIES = {"GP", "XGB", "Transformer"}
 
@@ -241,8 +242,10 @@ def main() -> int:
     ap.add_argument("--dataset-prefix", type=str, default="MC")
     args = ap.parse_args()
 
-    summary = args.summary.resolve() if args.summary else (REPO_ROOT / DEFAULT_SUMMARY)
-    output = args.output.resolve() if args.output else (REPO_ROOT / DEFAULT_OUTPUT)
+    # The output follows the summary that was actually read, so pointing
+    # --summary at a second results tree cannot overwrite the first tree's figure.
+    summary = rp.resolve_output(args.summary, None, SUMMARY_NAME)
+    output = rp.resolve_output(args.output, rp.root_of_summary(summary), OUTPUT_NAME)
     if not summary.exists():
         raise SystemExit(f"summary CSV not found: {summary}. Run z8_CommonSetMetrics.py first.")
 

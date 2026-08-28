@@ -39,10 +39,11 @@ import numpy as np
 import pandas as pd
 
 from utils import evidence as ev
+from utils import run_paths as rp
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_ROOT = Path("data/output/CV19")
-DEFAULT_OUTPUT = Path("data/output/CV19/summaries/common_set_metrics.csv")
+DEFAULT_ROOT = rp.DEFAULT_ROOT
+OUTPUT_NAME = "common_set_metrics.csv"
 
 # Reference forecasts are columns inside every run's predictions.csv rather than
 # runs of their own.
@@ -483,15 +484,17 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", type=Path, default=None)
-    ap.add_argument("--output", type=Path, default=None)
+    ap.add_argument("--output", type=Path, default=None,
+                    help="Defaults to <root>/summaries/%s, so the analysis is written "
+                         "beside the tree it was read from." % OUTPUT_NAME)
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--include-search-runs", action="store_true",
                     help="Also score configurations the search evaluated but did not retain. "
                          "Diagnostic only: it reports a best-of-N the pipeline never made.")
     args = ap.parse_args()
 
-    root = args.root.resolve() if args.root else (REPO_ROOT / DEFAULT_ROOT)
-    output = args.output.resolve() if args.output else (REPO_ROOT / DEFAULT_OUTPUT)
+    root = rp.resolve_root(args.root)
+    output = rp.resolve_output(args.output, root, OUTPUT_NAME)
     if not root.is_dir():
         raise SystemExit(f"Output root not found: {root}")
 

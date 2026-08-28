@@ -53,6 +53,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from utils import run_paths as rp
 
 from z8_CommonSetMetrics import (
     ML_FAMILIES,
@@ -65,7 +66,7 @@ from z8_CommonSetMetrics import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_ROOT = Path("data/output/CV19")
+DEFAULT_ROOT = rp.DEFAULT_ROOT
 
 
 def _r2(y: np.ndarray, p: np.ndarray) -> float:
@@ -177,7 +178,7 @@ def main() -> int:
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
-    root = args.root.resolve() if args.root else (REPO_ROOT / DEFAULT_ROOT)
+    root = rp.resolve_root(args.root)
     output = (args.output.resolve() if args.output
               else root / "summaries" / "temporal_reselect.csv")
     if not root.is_dir():

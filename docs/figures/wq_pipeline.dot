@@ -1,0 +1,282 @@
+// Source of record for the modeling-pipeline figure (manuscript Fig. "modeling_workflow").
+// The differential target formulation is taken as given.  An earlier variant added the
+// input/output structure comparison (absolute vs differential, state in vs not) as a 2x2
+// matrix in stage 3; it cost 0.61 in of height for one idea and was dropped.
+//
+// STRUCTURE.  Five stages in the conventional data-science sequence, indexed by a navy
+// rail down the left edge.  The rail replaces the full-width header bars of the figure
+// this supersedes: those bars cost ~16 pt of height each and made five unrelated stages
+// look like five instances of one thing.  Content boxes are sized to their content, so
+// the silhouette varies stage to stage and there is no stretched-to-fit whitespace.
+//
+// THE FORK IN STAGE 4 IS THE POINT.  The three machine-learning families go through the
+// subset search and rolling-origin cross-validation; the four statistical reference
+// models skip both.  MLR is still fitted, with its own embedded selection, which is why
+// the lane caption reads "no beam search or CV tuning" and not "untuned".  That asymmetry
+// is why reported accuracy carries selection optimism for one lane and not the other, and
+// it is the one piece of topology in this pipeline that a stacked-band layout hides.
+//
+// SCOPE.  A diagram, not a written summary.  Text is headings, noun phrases and numbers;
+// if a cell needs a verb it is saying too much.  No result values, and no repository
+// identifiers -- the audience for this figure will never see the code.  The four-level
+// support verdict is deliberately absent: it classifies results, not data, and belongs
+// with the results table rather than in a pipeline diagram.
+//
+// COLOUR carries one meaning, and it tracks the DATA, not the methods.  Navy = stage
+// index and the sampling hour.  Blue = predictors and the train split.  Amber = the
+// target and the test split, which is why stage 5 is amber throughout.  Neutral grey =
+// absent data, and the reference lane in stage 4.  That lane was amber in an
+// earlier draft, which made amber mean both "test-side data" and "reference method" --
+// two unrelated things sharing one colour, and the reason stage 4 and stage 5 looked
+// like the same category of box.  Blue vs grey in stage 4 now says exactly one thing:
+// tuned vs untuned.  Both splits and both lanes are named in words as well as coloured,
+// for greyscale and colour-vision deficiency.
+//
+// WIDTH IS FIXED, NOT COMPUTED.  Included at \includegraphics[width=1\linewidth] in the
+// 6.5 in MDPI column (src/utils/plotstyle.py: PAGE_WIDTH_IN), so a figure drawn wider is
+// downscaled and its type shrinks with it:
+//     printed_pt = font_pt * 6.5 / fig_width_in
+// Every band is pinned to 460 pt (6.389 in) by the WIDTH attributes in its leading
+// spacer row: a 56 pt rail plus 404 pt of content.  The 7.5 pt detail text then prints
+// at 7.56 pt, clearing plotstyle.MIN_PRINTED_PT = 7.0.  After editing, confirm
+// `dot -Tplain` still reports about 6.396; if it grew, a line overran its column.
+//
+// Graphviz never wraps text -- lines break only at <BR/>.  Capacity at 7.5 pt Arial is
+// about 3.0 pt per character:
+//   404 pt ~134 char   284 pt ~94 char   202 pt ~67 char   138 pt ~46 char   92 pt ~30 char
+//
+// A CELL HOLDS TEXT OR A TABLE, NEVER BOTH.  The single most disruptive rule in the
+// HTML-like grammar, and the reason every compound box here is a nested table rather
+// than a heading followed by a pictogram: mixing them is a syntax error, not a layout
+// bug.  Each pictogram sets its column widths once, in a leading spacer row; its content
+// rows then carry only HEIGHT and BGCOLOR.  CELLSPACING="1" is what makes a grid read as
+// cells rather than as a solid block.
+//
+// BAND HEIGHT IS SET BY PICTOGRAMS AND LABEL CELLS, NOT BY PROSE.  Trimming text often
+// changes nothing.  Measure before and after: in development a whole stage was pinned by
+// the stacked letters of a vertical label, and a global font reduction across the entire
+// figure bought 3 pt.
+//
+// Other traps: BALIGN (not ALIGN) left-aligns the lines inside a cell; FIXEDSIZE pins
+// height as well as width and clips; Arial via Cairo has no U+2208; Graphviz adds no
+// leading around <SUP>/<SUB>, so avoid them and use the precomposed &#178;.
+
+digraph pipeline {
+    graph [rankdir=TB, bgcolor="white", pad="0.03", nodesep="0.10", ranksep="0.10",
+           splines=ortho, fontname="Arial", fontcolor="#16283a", outputorder="edgesfirst"];
+    node  [shape=plain, fontname="Arial", fontcolor="#16283a"];
+    edge  [color="#7d8fa0", penwidth=1.2, arrowsize=0.6];
+
+    // ------------------------------------------------------------ 1  DATA
+    // Colour does the grouping: three blue predictor sources, one amber target source,
+    // one grey source that contributes measurement error rather than a series.
+    data [label=<
+      <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="0" CELLPADDING="0">
+        <TR>
+          <TD WIDTH="56" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+          <TD WIDTH="78" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+          <TD WIDTH="88" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+          <TD WIDTH="84" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+          <TD WIDTH="76" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+          <TD WIDTH="78" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+        </TR>
+        <TR>
+          <TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#1f3d58" CELLPADDING="4"><FONT COLOR="#ffffff" POINT-SIZE="13"><B>1</B></FONT><BR/><FONT COLOR="#b9cdda" POINT-SIZE="7.5"><B>DATA</B></FONT></TD>
+          <TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#eef3f7" BORDER="1" COLOR="#ccd6de" CELLPADDING="4"><FONT POINT-SIZE="7.5"><B>Weather</B></FONT><FONT POINT-SIZE="7.5" COLOR="#3d6a91"><B>&#160;&#160;8</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">station + reanalysis</FONT></TD>
+          <TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#eef3f7" BORDER="1" COLOR="#ccd6de" CELLPADDING="4"><FONT POINT-SIZE="7.5"><B>Surface</B></FONT><FONT POINT-SIZE="7.5" COLOR="#3d6a91"><B>&#160;&#160;7</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">profiler at 2 m</FONT></TD>
+          <TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#eef3f7" BORDER="1" COLOR="#ccd6de" CELLPADDING="4"><FONT POINT-SIZE="7.5"><B>SCADA</B></FONT><FONT POINT-SIZE="7.5" COLOR="#3d6a91"><B>&#160;&#160;2</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">1 min sampling</FONT></TD>
+          <TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#fdf5e9" BORDER="1" COLOR="#e0c48f" CELLPADDING="4"><FONT POINT-SIZE="7.5"><B>Laboratory</B></FONT><FONT POINT-SIZE="7.5" COLOR="#7d4a00"><B>&#160;&#160;14</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">manual raw water sampling</FONT></TD>
+          <TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#f2f4f5" BORDER="1" COLOR="#ccd6de" CELLPADDING="4"><FONT POINT-SIZE="7.5"><B>Calibrations</B></FONT><FONT POINT-SIZE="7.5" COLOR="#5b6d7c"><B>&#160;&#160;6</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">per-channel offsets</FONT></TD>
+        </TR>
+      </TABLE>
+    >];
+
+    // --------------------------------------------------- 2  PREPROCESSING
+    // Each chip sits directly under the source it acts on, so adjacency carries the
+    // mapping and no fan of five arrows is needed to state it.
+    prep [label=<
+      <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="0" CELLPADDING="0">
+        <TR>
+          <TD WIDTH="56" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+          <TD WIDTH="78" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+          <TD WIDTH="88" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+          <TD WIDTH="84" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+          <TD WIDTH="76" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+          <TD WIDTH="78" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+        </TR>
+        <TR>
+          <TD ROWSPAN="2" ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#1f3d58" CELLPADDING="4"><FONT COLOR="#ffffff" POINT-SIZE="13"><B>2</B></FONT><BR/><FONT COLOR="#b9cdda" POINT-SIZE="7.5"><B>PRE-<BR/>PROCESS</B></FONT></TD>
+          <TD ALIGN="LEFT" BGCOLOR="#f7f9fa" BORDER="1" COLOR="#dde5eb" CELLPADDING="3"><FONT POINT-SIZE="7.5" COLOR="#3d6a91">gap-fill, bias adjust</FONT></TD>
+          <TD ALIGN="LEFT" BGCOLOR="#f7f9fa" BORDER="1" COLOR="#dde5eb" CELLPADDING="3"><FONT POINT-SIZE="7.5" COLOR="#3d6a91">plausibility bounds</FONT></TD>
+          <TD ALIGN="LEFT" BGCOLOR="#f7f9fa" BORDER="1" COLOR="#dde5eb" CELLPADDING="3"><FONT POINT-SIZE="7.5" COLOR="#3d6a91">1 min &#8594; hourly</FONT></TD>
+          <TD ALIGN="LEFT" BGCOLOR="#fdf9f2" BORDER="1" COLOR="#ecd9b6" CELLPADDING="3"><FONT POINT-SIZE="7.5" COLOR="#7d4a00">&#916; since previous</FONT></TD>
+          <TD ALIGN="LEFT" BGCOLOR="#f7f9fa" BORDER="1" COLOR="#dde5eb" CELLPADDING="3"><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">per-sensor &#963;</FONT></TD>
+        </TR>
+        <TR>
+          <TD COLSPAN="5" ALIGN="LEFT" BGCOLOR="#e7f0f8" BORDER="1" COLOR="#a9c8de" CELLPADDING="3"><FONT POINT-SIZE="7.5" COLOR="#3d6a91">&#160;common hourly grid&#160;&#160;&#183;&#160;&#160;every series scaled to [0,1]&#160;&#160;&#183;&#160;&#160;17 predictor series, 14 target series</FONT></TD>
+        </TR>
+      </TABLE>
+    >];
+
+    data -> prep;
+
+    // ---------------------------------------------- 3  FEATURE ENGINEERING
+    // The pictogram is the load-bearing element.  Columns are hours; the window ends ON
+    // the sampling hour, which is why the primary evaluation has zero lead time.  The
+    // gapped predictor row is not decoration: incomplete coverage is what costs
+    // laboratory samples, and it is why the method families disagree later about which
+    // samples they can score.  The split is a property of the data rather than a stage of
+    // work, so it is a 14 pt bar inside this stage and not a band of its own.
+    feat [label=<
+      <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="0" CELLPADDING="0">
+        <TR>
+          <TD WIDTH="56" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+          <TD WIDTH="238" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+          <TD WIDTH="164" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+        </TR>
+        <TR>
+          <TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#1f3d58" CELLPADDING="4"><FONT COLOR="#ffffff" POINT-SIZE="13"><B>3</B></FONT><BR/><FONT COLOR="#b9cdda" POINT-SIZE="7.5"><B>FEATURE<BR/>ENGINEERING</B></FONT><BR/><FONT COLOR="#7f9cb2" POINT-SIZE="6.5">per target</FONT></TD>
+          <TD BGCOLOR="#f7f9fa" BORDER="1" COLOR="#ccd6de" CELLPADDING="4" VALIGN="MIDDLE">
+            <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="0">
+              <TR>
+                <TD WIDTH="52" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+                <TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="8" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+              </TR>
+              <TR>
+                <TD ROWSPAN="3" ALIGN="RIGHT" VALIGN="MIDDLE" CELLPADDING="1"><FONT POINT-SIZE="7.5" COLOR="#3d6a91"><B>predictors&#160;</B></FONT></TD>
+                <TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#1f3d58"></TD>
+              </TR>
+              <TR>
+                <TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#eaeff3"></TD><TD HEIGHT="5" BGCOLOR="#eaeff3"></TD><TD HEIGHT="5" BGCOLOR="#eaeff3"></TD><TD HEIGHT="5" BGCOLOR="#eaeff3"></TD><TD HEIGHT="5" BGCOLOR="#eaeff3"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#1f3d58"></TD>
+              </TR>
+              <TR>
+                <TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#a8c6e0"></TD><TD HEIGHT="5" BGCOLOR="#1f3d58"></TD>
+              </TR>
+              <TR>
+                <TD ALIGN="RIGHT" CELLPADDING="1"><FONT POINT-SIZE="7.5" COLOR="#7d4a00"><B>prior value&#160;</B></FONT></TD>
+                <TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD><TD HEIGHT="5" BGCOLOR="#f0dcbc"></TD>
+              </TR>
+              <TR>
+                <TD ALIGN="RIGHT" CELLPADDING="1"><FONT POINT-SIZE="7.5" COLOR="#7d4a00"><B>lab samples&#160;</B></FONT></TD>
+                <TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#b8791a"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#b8791a"></TD>
+              </TR>
+              <TR>
+                <TD></TD>
+                <TD></TD>
+                <TD COLSPAN="17" ALIGN="CENTER" BGCOLOR="#fbeed6" CELLPADDING="1"><FONT POINT-SIZE="7" COLOR="#7d4a00"><B>&#916; target</B></FONT></TD>
+              </TR>
+            </TABLE>
+          </TD>
+          <TD BGCOLOR="#f7f9fa" BORDER="1" COLOR="#ccd6de" CELLPADDING="4" VALIGN="TOP">
+            <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="0" CELLPADDING="0">
+              <TR><TD ALIGN="LEFT" BALIGN="LEFT"><FONT POINT-SIZE="8"><B>Sample dimensions</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c"><B>X</B>: <I>T</I> &#215; <I>d</I>, <I>d</I> &#8804; 17 + 1 state<BR/><I>T</I> = 7 d (10 targets), 28 d (4)<BR/><B>y</B>: change since previous sample</FONT></TD></TR>
+              <TR><TD ALIGN="LEFT" BALIGN="LEFT" CELLPADDING="2"><FONT POINT-SIZE="8"><B>Input uncertainty</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">from calibration offsets<BR/>10 Monte Carlo replicates:<BR/>XGBoost, Transformer<BR/>Uncertain-input kernel: GP</FONT></TD></TR>
+              <TR><TD ALIGN="LEFT" CELLPADDING="2"><FONT POINT-SIZE="8"><B>Chronological split</B></FONT></TD></TR>
+              <TR><TD>
+                <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="0" CELLPADDING="0">
+                  <TR>
+                    <TD WIDTH="104" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+                    <TD WIDTH="45" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+                  </TR>
+                  <TR>
+                    <TD ALIGN="CENTER" BGCOLOR="#cfe0f0" BORDER="1" COLOR="#7ba7cc" CELLPADDING="2"><FONT POINT-SIZE="7" COLOR="#17456e"><B>TRAIN 70 %</B></FONT></TD>
+                    <TD ALIGN="CENTER" BGCOLOR="#f7e3c4" BORDER="1" COLOR="#d0a75a" CELLPADDING="2"><FONT POINT-SIZE="7" COLOR="#7d4a00"><B>TEST 30</B></FONT></TD>
+                  </TR>
+                </TABLE>
+              </TD></TR>
+            </TABLE>
+          </TD>
+        </TR>
+      </TABLE>
+    >];
+
+    prep -> feat;
+
+    // ------------------------------------------------- 4  TRAIN MODEL
+    // Two lanes, and the asymmetry between them is the substance of this stage.
+    models [label=<
+      <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="0" CELLPADDING="0">
+        <TR>
+          <TD WIDTH="56" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+          <TD WIDTH="280" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+          <TD WIDTH="117" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+        </TR>
+        <TR>
+          <TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#1f3d58" CELLPADDING="4"><FONT COLOR="#ffffff" POINT-SIZE="13"><B>4</B></FONT><BR/><FONT COLOR="#b9cdda" POINT-SIZE="7.5"><B>TRAIN<BR/>MODEL</B></FONT><BR/><FONT COLOR="#7f9cb2" POINT-SIZE="6.5">per target</FONT></TD>
+          <TD PORT="ml" BGCOLOR="#e7f0f8" BORDER="1" COLOR="#a9c8de" CELLPADDING="4" VALIGN="TOP">
+            <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="0" CELLPADDING="0">
+              <TR>
+                <TD WIDTH="131" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+                <TD WIDTH="131" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+              </TR>
+              <TR><TD COLSPAN="2" ALIGN="LEFT" CELLPADDING="2"><FONT POINT-SIZE="8" COLOR="#17456e"><B>Machine learning</B></FONT><FONT POINT-SIZE="7" COLOR="#3d6a91">&#160;&#160;&#160;tuned on the train split</FONT></TD></TR>
+              <TR><TD COLSPAN="2" ALIGN="LEFT" CELLPADDING="1"><FONT POINT-SIZE="7" COLOR="#6b8299">feature selection and hyperparameter tuning</FONT></TD></TR>
+              <TR>
+                <TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#dbe8f3" BORDER="1" COLOR="#a9c8de" CELLPADDING="3"><FONT POINT-SIZE="7.5" COLOR="#3d6a91"><B>Predictor-subset search</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#3d6a91">Shapley-seeded beam search<BR/>add, drop, swap, elimination<BR/>objective: held-out accuracy<BR/>&#160;&#160;&#8722; samples lost to gaps</FONT></TD>
+                <TD BGCOLOR="#dbe8f3" BORDER="1" COLOR="#a9c8de" CELLPADDING="3" VALIGN="TOP">
+                  <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="0" CELLPADDING="0">
+                    <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="7.5" COLOR="#3d6a91"><B>Rolling-origin CV</B></FONT></TD></TR>
+                    <TR><TD>
+                      <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="0">
+                        <TR><TD WIDTH="11" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="11" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="11" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="11" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="11" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="11" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="11" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="11" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="11" HEIGHT="1" FIXEDSIZE="TRUE"></TD><TD WIDTH="11" HEIGHT="1" FIXEDSIZE="TRUE"></TD></TR>
+                        <TR><TD HEIGHT="5" BGCOLOR="#7ba7cc"></TD><TD HEIGHT="5" BGCOLOR="#7ba7cc"></TD><TD HEIGHT="5" BGCOLOR="#7ba7cc"></TD><TD HEIGHT="5" BGCOLOR="#d0a75a"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD></TR>
+                        <TR><TD HEIGHT="5" BGCOLOR="#7ba7cc"></TD><TD HEIGHT="5" BGCOLOR="#7ba7cc"></TD><TD HEIGHT="5" BGCOLOR="#7ba7cc"></TD><TD HEIGHT="5" BGCOLOR="#7ba7cc"></TD><TD HEIGHT="5" BGCOLOR="#7ba7cc"></TD><TD HEIGHT="5" BGCOLOR="#d0a75a"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD></TR>
+                        <TR><TD HEIGHT="5" BGCOLOR="#7ba7cc"></TD><TD HEIGHT="5" BGCOLOR="#7ba7cc"></TD><TD HEIGHT="5" BGCOLOR="#7ba7cc"></TD><TD HEIGHT="5" BGCOLOR="#7ba7cc"></TD><TD HEIGHT="5" BGCOLOR="#7ba7cc"></TD><TD HEIGHT="5" BGCOLOR="#7ba7cc"></TD><TD HEIGHT="5" BGCOLOR="#7ba7cc"></TD><TD HEIGHT="5" BGCOLOR="#d0a75a"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD><TD HEIGHT="5" BGCOLOR="#ffffff"></TD></TR>
+                      </TABLE>
+                    </TD></TR>
+                    <TR><TD ALIGN="LEFT" BALIGN="LEFT"><FONT POINT-SIZE="7.5" COLOR="#3d6a91">tunes hyperparameters and epochs<BR/>from the train split alone<BR/>test samples stay unseen</FONT></TD></TR>
+                  </TABLE>
+                </TD>
+              </TR>
+              <TR><TD COLSPAN="2" ALIGN="LEFT" CELLPADDING="1"><FONT POINT-SIZE="7" COLOR="#6b8299">model families</FONT></TD></TR>
+              <TR>
+                <TD COLSPAN="2" CELLPADDING="0">
+                  <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="0" CELLPADDING="0">
+                    <TR>
+                      <TD WIDTH="86" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+                      <TD WIDTH="86" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+                      <TD WIDTH="86" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+                    </TR>
+                    <TR>
+                      <TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#ffffff" BORDER="1" COLOR="#c3d8e8" CELLPADDING="3"><FONT POINT-SIZE="8"><B>XGBoost</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">flattened window<BR/>&#8804; 300 trees, depth &#8804; 7<BR/>tolerates gaps</FONT></TD>
+                      <TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#ffffff" BORDER="1" COLOR="#c3d8e8" CELLPADDING="3"><FONT POINT-SIZE="8"><B>Transformer</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">2 layers, 4 heads<BR/>64-dim, dropout 0.1<BR/>complete windows</FONT></TD>
+                      <TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#ffffff" BORDER="1" COLOR="#c3d8e8" CELLPADDING="3"><FONT POINT-SIZE="8"><B>Gaussian process</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">Mat&#233;rn-5/2 + linear<BR/>uncertain-input kernel<BR/>&#8804; 5000 samples</FONT></TD>
+                    </TR>
+                  </TABLE>
+                </TD>
+              </TR>
+            </TABLE>
+          </TD>
+          <TD PORT="ref" BGCOLOR="#f1f3f5" BORDER="1" COLOR="#c4ccd3" CELLPADDING="4" VALIGN="TOP">
+            <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="0" CELLPADDING="0">
+              <TR><TD WIDTH="110" ALIGN="LEFT" BALIGN="LEFT" CELLPADDING="1"><FONT POINT-SIZE="8" COLOR="#41566a"><B>Statistical reference</B></FONT><BR/><FONT POINT-SIZE="7" COLOR="#8695a3">no beam search or CV tuning</FONT></TD></TR>
+              <TR><TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#ffffff" BORDER="1" COLOR="#d3d9de" CELLPADDING="3"><FONT POINT-SIZE="8"><B>Na&#239;ve</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">persistence</FONT></TD></TR>
+              <TR><TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#ffffff" BORDER="1" COLOR="#d3d9de" CELLPADDING="3"><FONT POINT-SIZE="8"><B>Linear</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">OLS trend on target history</FONT></TD></TR>
+              <TR><TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#ffffff" BORDER="1" COLOR="#d3d9de" CELLPADDING="3"><FONT POINT-SIZE="8"><B>Seasonal</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">annual and diurnal cycle</FONT></TD></TR>
+              <TR><TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#ffffff" BORDER="1" COLOR="#d3d9de" CELLPADDING="3"><FONT POINT-SIZE="8"><B>MLR</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">3 aggregation windows<BR/>Spearman, MI, Lasso, VIF</FONT></TD></TR>
+            </TABLE>
+          </TD>
+        </TR>
+      </TABLE>
+    >];
+
+    feat -> models;
+
+    // ---------------------------------------------------- 5  EVALUATE
+    eval [label=<
+      <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="0" CELLPADDING="0">
+        <TR>
+          <TD WIDTH="56" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+          <TD WIDTH="202" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+          <TD WIDTH="202" HEIGHT="1" FIXEDSIZE="TRUE"></TD>
+        </TR>
+        <TR>
+          <TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#1f3d58" CELLPADDING="4"><FONT COLOR="#ffffff" POINT-SIZE="13"><B>5</B></FONT><BR/><FONT COLOR="#b9cdda" POINT-SIZE="7.5"><B>EVALUATE</B></FONT><BR/><FONT COLOR="#7f9cb2" POINT-SIZE="6.5">test split</FONT></TD>
+          <TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#ffffff" BORDER="1" COLOR="#e0c48f" CELLPADDING="4"><FONT POINT-SIZE="8"><B>Predictions</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">Scored on the same subset of test samples<BR/>per target for all 7 models<BR/>lookahead horizons 0 &#8211; 336 h</FONT></TD>
+          <TD ALIGN="LEFT" BALIGN="LEFT" VALIGN="TOP" BGCOLOR="#ffffff" BORDER="1" COLOR="#e0c48f" CELLPADDING="4"><FONT POINT-SIZE="8"><B>Metrics</B></FONT><BR/><FONT POINT-SIZE="7.5" COLOR="#5b6d7c">absolute: MAE, RMSE, NRMSE, <I>r</I>, <I>R</I>&#178;<BR/>relative skill vs. strongest reference<BR/>block bootstrap CI, paired sign test</FONT></TD>
+        </TR>
+      </TABLE>
+    >];
+
+    models -> eval;
+}

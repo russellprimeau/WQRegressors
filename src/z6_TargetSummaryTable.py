@@ -43,9 +43,10 @@ import pandas as pd
 
 from utils.names import clean_target_label
 from utils import evidence as ev
+from utils import run_paths as rp
 
-DEFAULT_SUMMARY = Path("data/output/CV19/summaries/common_set_metrics.csv")
-DEFAULT_OUTPUT = Path("docs/report/draft/tables/target_summary.tex")
+SUMMARY_NAME = "common_set_metrics.csv"
+TABLE_DIR = Path("docs/report/draft/tables")
 
 VERDICT_UNAVAILABLE = "__pending__"
 
@@ -228,19 +229,36 @@ def render(rows: list[dict]) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--summary", type=Path, default=DEFAULT_SUMMARY)
-    ap.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    ap.add_argument("--summary", type=Path, default=None,
+                    help="Common-set metrics CSV. Defaults to the reporting root's.")
+    ap.add_argument("--output", type=Path, default=None,
+                    help="Defaults to tables/target_summary.tex for the reporting root and "
+                         "tables/target_summary_<root>.tex for any other arm, so a second "
+                         "arm cannot silently replace the manuscript's main table.")
     ap.add_argument("--dataset-prefix", type=str, default="MC")
     args = ap.parse_args()
 
-    if not args.summary.exists():
-        raise SystemExit(f"summary CSV not found: {args.summary}")
-    df = pd.read_csv(args.summary)
+    summary = rp.resolve_output(args.summary, None, SUMMARY_NAME)
+    if not summary.exists():
+        raise SystemExit(f"summary CSV not found: {summary}")
+
+    # The table filename carries the identity of the arm it came from. Both arms
+    # are reported -- the reporting root in the body, the other in supplementary --
+    # and they must not resolve to the same file.
+    root = rp.root_of_summary(summary)
+    if args.output is not None:
+        output = args.output
+    elif rp.is_reporting_root(root):
+        output = rp.REPO_ROOT / TABLE_DIR / "target_summary.tex"
+    else:
+        output = rp.REPO_ROOT / TABLE_DIR / f"target_summary_{root.name}.tex"
+
+    df = pd.read_csv(summary)
     rows = build_rows(df, args.dataset_prefix)
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(render(rows), encoding="utf-8")
-    print(f"[INFO] Wrote {args.output} ({len(rows)} targets)")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(render(rows), encoding="utf-8")
+    print(f"[INFO] Wrote {output} ({len(rows)} targets) from {root.name}")
 
     # Counts only: targets have unrelated dynamics, so nothing is averaged across
     # them.

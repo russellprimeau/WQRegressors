@@ -294,7 +294,11 @@
       "Bash(.venv/Scripts/python src/z8_CommonSetMetrics.py --root data/output/CV19_superseded --output __TRACKED_VAR__/common_set_metrics_archived.csv)",
       "Bash(.venv/Scripts/python src/z7_StructureCompare.py --exclude-model none)",
       "Bash(.venv/Scripts/python src/z6_TargetSummaryTable.py)",
-      "Bash(.venv/Scripts/python src/z9_QualityMatrix.py)"
+      "Bash(.venv/Scripts/python src/z9_QualityMatrix.py)",
+      "Bash(\"/c/Program Files/Graphviz/bin/dot.exe\" -V)",
+      "Bash(\"/c/Program Files/Graphviz/bin/dot.exe\" -Tplain docs/figures/wq_pipeline.dot)",
+      "Bash(\"/c/Program Files/Graphviz/bin/dot.exe\" -Tpng:cairo -Gdpi=150 -o /tmp/wqp_preview.png docs/figures/wq_pipeline.dot)",
+      "Bash(cp /tmp/wqp_preview.png \"C:/Users/Master/AppData/Local/Temp/claude/c--Users-Master-Documents-GitHub-WQRegressors/849c7b65-6a14-4ebf-9e27-4fff45eb1c7a/scratchpad/preview_a.png\")"
     ]
   }
 }

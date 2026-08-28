@@ -3525,21 +3525,20 @@ def _compute_statistical_evidence(
     return evidence
 
 
-def _compile_feature_inclusion_heatmap(
+def _compile_removal_sensitivity_heatmap(
     perf_df: "pd.DataFrame",
     plans: list,
     data_root: Path,
-    target_order: list[str],
     dataset_prefix: str = "MC",
     sweep_namespace: str = "feature_sweeps",
 ) -> Path:
-    """Binary heatmap: 1 if predictor is in the best model's feature set for a target, 0 otherwise."""
+    """Plot raw per-target removal sensitivity for retained predictors and state values."""
     dataset_to_plan = {plan.dataset_dir.name: plan for plan in plans}
     best_per_dataset = perf_df.drop_duplicates(subset="dataset", keep="first")
 
-    # Resolve feature lists per target
-    target_features: dict[str, list[str]] = {}  # target_name -> [feature, ...]
-    target_labels: dict[str, str] = {}  # target_name -> display label
+    target_features: dict[str, list[str]] = {}
+    target_sensitivities: dict[str, dict[str, float]] = {}
+    target_labels: dict[str, str] = {}
 
     for _, row in best_per_dataset.iterrows():
         dataset_name = str(row["dataset"])
@@ -3574,216 +3573,117 @@ def _compile_feature_inclusion_heatmap(
             print(f"[WARN] Could not resolve features for {dataset_name} tag={feature_tag}; skipping.")
             continue
 
+        try:
+            row_count = int(row.get("row_count"))
+        except (TypeError, ValueError):
+            print(f"[WARN] Could not resolve row count for {dataset_name}; skipping.")
+            continue
+        sensitivities, _, _, source = _load_feature_stats_artifacts_with_source(
+            plan.dataset_dir,
+            row_count,
+        )
+        if not sensitivities or source != "native_removal_delta":
+            print(
+                f"[WARN] Could not resolve native removal sensitivities for {dataset_name}; "
+                f"skipping ({source})."
+            )
+            continue
+
         target_name = _derive_target_name(dataset_name, dataset_prefix)
         target_features[target_name] = features_list
+        target_sensitivities[target_name] = {
+            feature: float(value[0])
+            for feature, value in sensitivities.items()
+            if np.isfinite(value[0])
+        }
         target_labels[target_name] = clean_target_label(target_name, dataset_prefix)
 
     if not target_features:
         return Path()
 
-    # Collect all unique features
-    all_features_set: set[str] = set()
-    for feats in target_features.values():
-        all_features_set.update(feats)
-
-    # Canonical feature order from Consolidated_sparse.csv
-    csv_candidates = [
-        data_root / "Consolidated_sparse.csv",
-        data_root.parent / "regression" / "Consolidated_sparse.csv",
-    ]
-    csv_path = next((p for p in csv_candidates if p.exists()), csv_candidates[0])
-    try:
-        with open(csv_path, "r", encoding="utf-8") as f:
-            header = f.readline().strip().split(",")
-        csv_features = [col for col in header if col in all_features_set]
-        all_features = csv_features + [f for f in sorted(all_features_set) if f not in csv_features]
-    except Exception:
-        all_features = sorted(all_features_set)
-
-    if not all_features:
-        return Path()
-
-    # Order targets by R2 rank (target_order), append unmatched
     def _norm(s: str) -> str:
         text = str(s).lower().replace("\u00b5", "u").replace("\u00b0", "deg")
         text = unicodedata.normalize("NFKD", text)
         text = "".join(c for c in text if not unicodedata.combining(c))
         return re.sub(r"[^a-z0-9]", "", text)
 
-    available_keys = set(target_features.keys())
-    used: set[str] = set()
-    targets: list[str] = []
-    yticklabels: list[str] = []
+    def _category(target: str) -> int:
+        key = _norm(target_labels.get(target, target))
+        if any(token in key for token in ("colony", "coli", "enterococci")):
+            return 0
+        if any(token in key for token in ("arsenic", "cadmium", "chromium", "copper", "lead", "nickel", "zinc")):
+            return 1
+        return 2
 
-    for requested in (target_order or []):
-        req_norm = _norm(requested)
-        match = None
-        for key in available_keys - used:
-            key_norm = _norm(key)
-            if key_norm == req_norm or key_norm.endswith(req_norm) or req_norm.endswith(key_norm):
-                match = key
-                break
-        if match is not None:
-            targets.append(match)
-            yticklabels.append(target_labels.get(match, clean_target_label(match, dataset_prefix)))
-            used.add(match)
+    targets = sorted(
+        target_features,
+        key=lambda target: (_category(target), _norm(target)),
+    )
+    yticklabels = [target_labels.get(target, clean_target_label(target, dataset_prefix)) for target in targets]
 
-    for key in sorted(available_keys - used):
-        targets.append(key)
-        yticklabels.append(target_labels.get(key, clean_target_label(key, dataset_prefix)))
+    # Match the retention ordering in Fig. 9. State features are pooled into one
+    # explicit column because each target has its own preceding-value feature.
+    retention_count: dict[str, int] = {}
+    for features in target_features.values():
+        for feature in set(features):
+            if not feature.endswith("_state"):
+                retention_count[feature] = retention_count.get(feature, 0) + 1
+    external_features = sorted(
+        retention_count,
+        key=lambda feature: (-retention_count[feature], names_label(feature, with_unit=False, qualified=True)),
+    )
+    all_features = ["__previous_value__", *external_features]
 
-    # Build binary matrix
-    feature_to_idx = {feat: idx for idx, feat in enumerate(all_features)}
-    matrix = np.zeros((len(targets), len(all_features)), dtype=float)
-    for i, target in enumerate(targets):
-        for feat in target_features[target]:
-            if feat in feature_to_idx:
-                matrix[i, feature_to_idx[feat]] = 1.0
-
-    # Group: multi-target features (>1 target) first, then single-target
-    target_feature_sets = {t: set(target_features[t]) for t in targets}
-    presence_count = {
-        feat: sum(1 for t in targets if feat in target_feature_sets.get(t, set()))
-        for feat in all_features
-    }
-    target_rank = {t: idx for idx, t in enumerate(targets)}
-
-    multi_target_features = [f for f in all_features if not f.endswith("_state")]
-    single_target_features = [f for f in all_features if f.endswith("_state")]
-
-    multi_target_features.sort(key=lambda f: (-presence_count.get(f, 0), f))
-
-    # Sort single-target features by the rank of the target they belong to
-    def _single_sort_key(feat: str) -> tuple:
-        for t in targets:
-            if feat in target_feature_sets.get(t, set()):
-                return (target_rank[t], feat)
-        return (len(targets), feat)
-
-    single_target_features.sort(key=_single_sort_key)
-
-    ordered_features = multi_target_features + single_target_features
-    if ordered_features:
-        ordered_indices = [feature_to_idx[f] for f in ordered_features]
-        matrix = matrix[:, ordered_indices]
-        all_features = ordered_features
-
-    # Recompute indices after reordering
-    multi_idx = list(range(len(multi_target_features)))
-    single_idx = list(range(len(multi_target_features), len(all_features)))
-
-    # Total row
-    total_row = matrix.sum(axis=0)
-
-    # Font sizing (consistent with existing heatmap)
-    heat_font = 8
-
-    # Cells are 0/1 inclusion flags, not measurements, so predictor labels carry no units.
-    # The source qualifier is kept because the predictor pool mixes Surface and SCADA pH
-    # and water temperature, which would otherwise appear as duplicate rows.
     def _feature_display(feat: str) -> str:
+        if feat == "__previous_value__":
+            return "Previous value"
         return names_label(feat, with_unit=False, qualified=True)
 
-    # Annotation helper: show integer for >=1, blank for 0
-    def _annotate_inclusion_cells(ax_obj, values: np.ndarray, fontsize: int) -> None:
-        for row_i in range(values.shape[0]):
-            for col_j in range(values.shape[1]):
-                val = values[row_i, col_j]
-                if not np.isfinite(val) or val < 0.5:
-                    continue
-                ax_obj.text(
-                    col_j + 0.5, row_i + 0.5,
-                    str(int(val)),
-                    ha="center", va="center",
-                    color="black", fontsize=fontsize,
-                    clip_on=True,
-                )
+    matrix = np.full((len(targets), len(all_features)), np.nan, dtype=float)
+    for row_idx, target in enumerate(targets):
+        sensitivities = target_sensitivities[target]
+        state_features = [feature for feature in sensitivities if feature.endswith("_state")]
+        if state_features:
+            matrix[row_idx, 0] = sensitivities.get(state_features[0], np.nan)
+        for col_idx, feature in enumerate(external_features, start=1):
+            matrix[row_idx, col_idx] = sensitivities.get(feature, np.nan)
 
-    n_targets = len(targets)
-    heat_h = max(4, (n_targets + 1) * 0.38)
-    # Shift vmin below zero so that 0-cells map to the near-white tail of the colormap,
-    # clearly distinct from any non-zero value, while the Total row retains a full gradient.
-    _heat_vmin = -0.5
-    _heat_vmax = max(n_targets, 1)
-    _cell_w = 0.32  # inches per cell (square)
-
-    if multi_idx and single_idx:
-        yticklabels_with_total = yticklabels + ["Total"]
-        left_block = np.vstack([matrix[:, multi_idx],
-                                total_row[multi_idx][None, :]])
-        right_block = np.vstack([matrix[:, single_idx],
-                                 total_row[single_idx][None, :]])
-        sep_col = np.full((left_block.shape[0], 1), np.nan)
-        combined_matrix = np.hstack([left_block, sep_col, right_block])
-        sep_pos = left_block.shape[1]
-        xticklabels_with_sep = (
-            [_feature_display(f) for f in multi_target_features]
-            + [""]
-            + [_feature_display(f) for f in single_target_features]
-        )
-
-        n_total_cols = combined_matrix.shape[1]
-        heat_w = max(6, n_total_cols * _cell_w + 3.5)  # +3.5 for y-labels & colorbar
-        fig, ax = plt.subplots(figsize=(heat_w, heat_h), constrained_layout=True)
-
-        sns.heatmap(
-            combined_matrix, ax=ax,
-            cmap="YlGn", vmin=_heat_vmin, vmax=_heat_vmax,
-            annot=False,
-            cbar_kws={"label": "Number of targets including predictor", "pad": 0.01},
-            xticklabels=xticklabels_with_sep,
-            yticklabels=yticklabels_with_total,
-            linewidths=0.5, linecolor="#eeeeee", square=True,
-        )
-        _annotate_inclusion_cells(ax, combined_matrix, heat_font)
-
-        ax.add_patch(plt.Rectangle(
-            (sep_pos, 0), 1, combined_matrix.shape[0],
-            facecolor=ax.get_facecolor(), edgecolor="none", zorder=3,
-        ))
-        ax.set_xticklabels(xticklabels_with_sep, rotation=45, ha="right", fontsize=heat_font)
-        ax.set_yticklabels(
-            [textwrap.fill(lbl, 20) for lbl in yticklabels_with_total],
-            rotation=0, fontsize=heat_font,
-        )
-    else:
-        matrix_with_total = np.vstack([matrix, total_row[None, :]])
-        yticklabels_with_total = yticklabels + ["Total"]
-        n_total_features = max(len(all_features), 1)
-        heat_w = max(6, n_total_features * _cell_w + 3.5)
-        fig, ax = plt.subplots(
-            figsize=(heat_w, heat_h),
-            constrained_layout=True,
-        )
-        sns.heatmap(
-            matrix_with_total, ax=ax,
-            cmap="YlGn", vmin=_heat_vmin, vmax=_heat_vmax,
-            annot=False,
-            cbar_kws={"label": "Number of targets including predictor", "pad": 0.01},
-            xticklabels=[_feature_display(f) for f in all_features],
-            yticklabels=yticklabels_with_total,
-            linewidths=0.5, linecolor="#eeeeee", square=True,
-        )
-        _annotate_inclusion_cells(ax, matrix_with_total, heat_font)
-        ax.set_xticklabels(
-            [_feature_display(f) for f in all_features],
-            rotation=45, ha="right", fontsize=heat_font,
-        )
-        ax.set_yticklabels(
-            [textwrap.fill(lbl, 20) for lbl in yticklabels_with_total],
-            rotation=0, fontsize=heat_font,
-        )
-
+    finite_values = np.abs(matrix[np.isfinite(matrix)])
+    color_limit = float(np.nanmax(finite_values)) if finite_values.size else 1.0
+    color_limit = max(color_limit, np.finfo(float).eps)
+    heat_font = 7
+    fig, ax = plt.subplots(
+        figsize=(PAGE_WIDTH_IN, max(5.2, len(targets) * 0.38 + 1.0)),
+        constrained_layout=True,
+    )
+    cmap = plt.get_cmap("RdBu_r").copy()
+    cmap.set_bad("#f2f2f2")
+    sns.heatmap(
+        matrix,
+        ax=ax,
+        cmap=cmap,
+        vmin=-color_limit,
+        vmax=color_limit,
+        center=0,
+        mask=~np.isfinite(matrix),
+        cbar_kws={"label": "Mean objective increase on removal", "pad": 0.01},
+        xticklabels=[_feature_display(feature) for feature in all_features],
+        yticklabels=yticklabels,
+        linewidths=0.35,
+        linecolor="#eeeeee",
+        square=False,
+    )
+    ax.set_xticklabels([_feature_display(feature) for feature in all_features], rotation=45, ha="right", fontsize=heat_font)
+    ax.set_yticklabels([textwrap.fill(label, 22) for label in yticklabels], rotation=0, fontsize=heat_font)
     ax.set_xlabel("Predictor", fontsize=heat_font)
     ax.set_ylabel("Target", fontsize=heat_font)
-    # No title: the figure caption in manuscript.tex carries it.
 
     summaries_dir = (data_root / "summaries").resolve()
     namespace = str(sweep_namespace).strip() or "feature_sweeps"
     if namespace != "feature_sweeps":
         summaries_dir = (summaries_dir / namespace).resolve()
     summaries_dir.mkdir(parents=True, exist_ok=True)
-    plot_path = summaries_dir / "multi_target_feature_inclusion_heatmap.png"
+    plot_path = summaries_dir / "multi_target_removal_sensitivity_heatmap.png"
     save_figure(fig, plot_path)
     plt.close(fig)
     return plot_path
@@ -5441,21 +5341,20 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
         except Exception as e:
             print(f"[WARN] Failed to regenerate multi-target comparison: {e}")
 
-    # Feature inclusion heatmap (binary: is predictor in best model's feature set?)
+    # Per-target removal-sensitivity heatmap for predictors retained in selected models.
     if best_model_performance:
         try:
-            inclusion_plot = _compile_feature_inclusion_heatmap(
+            sensitivity_plot = _compile_removal_sensitivity_heatmap(
                 perf_df=perf_df,
                 plans=plans,
                 data_root=data_root,
-                target_order=target_order_by_skill,
                 dataset_prefix=args.dataset_prefix,
                 sweep_namespace=str(getattr(args, "sweep_namespace", "feature_sweeps")),
             )
-            if inclusion_plot.exists():
-                print(f"[INFO] Wrote feature inclusion heatmap: {inclusion_plot}")
+            if sensitivity_plot.exists():
+                print(f"[INFO] Wrote removal-sensitivity heatmap: {sensitivity_plot}")
         except Exception as e:
-            print(f"[WARN] Failed to generate feature inclusion heatmap: {e}")
+            print(f"[WARN] Failed to generate removal-sensitivity heatmap: {e}")
             traceback.print_exc()
 
     if datasets_with_outputs == 0:

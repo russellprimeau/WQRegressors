@@ -12,6 +12,7 @@ be compared until they are inverted through `normalization.json`.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
@@ -20,7 +21,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-ROOT = Path("data/output/CV19")
+from utils import run_paths as rp
+
 TOL = 1e-6
 
 
@@ -99,8 +101,16 @@ def check_target(ds: Path) -> dict:
     }
 
 
-def main() -> int:
-    rows = [check_target(ds) for ds in sorted(ROOT.glob("MC_*")) if (ds / "samples").is_dir()]
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--root", type=Path, default=None,
+                    help="Results root to check. Defaults to the reporting root.")
+    args = ap.parse_args(argv)
+    root = rp.resolve_root(args.root)
+    if not root.is_dir():
+        raise SystemExit("results root not found: %s" % root)
+    print("checking %s" % root)
+    rows = [check_target(ds) for ds in sorted(root.glob("MC_*")) if (ds / "samples").is_dir()]
     print("%-30s %6s %8s %8s %8s %8s %8s" % (
         "target", "files", "multi", "vs_FIRST", "vs_prev", "both", "neither"))
     bad = 0

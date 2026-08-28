@@ -31,11 +31,12 @@ import numpy as np
 import pandas as pd
 
 from utils.plotstyle import PAGE_WIDTH_IN, apply_paper_style, save_figure
+from utils import run_paths as rp
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_ROOT = Path("data/output/CV19")
-DEFAULT_SUMMARY = Path("data/output/CV19/summaries/common_set_metrics.csv")
-DEFAULT_OUTPUT = Path("data/output/CV19/summaries/predictor_retention_counts.png")
+DEFAULT_ROOT = rp.DEFAULT_ROOT
+SUMMARY_NAME = "common_set_metrics.csv"
+OUTPUT_NAME = "predictor_retention_counts.png"
 
 STATE_LABEL = "Prior target value"
 PROFILER_PREFIX = "Pfl - "
@@ -123,15 +124,16 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", type=Path, default=None)
     ap.add_argument("--summary", type=Path, default=None)
-    ap.add_argument("--output", type=Path, default=None)
+    ap.add_argument("--output", type=Path, default=None,
+                    help="Defaults to <root>/summaries/%s." % OUTPUT_NAME)
     ap.add_argument("--family", choices=["best", "ml"], default="best",
                     help="'best' counts the winning method of any family; 'ml' counts the "
                          "best learned model even where a reference forecast won.")
     args = ap.parse_args()
 
-    root = args.root.resolve() if args.root else (REPO_ROOT / DEFAULT_ROOT)
-    summary_path = args.summary.resolve() if args.summary else (REPO_ROOT / DEFAULT_SUMMARY)
-    output = args.output.resolve() if args.output else (REPO_ROOT / DEFAULT_OUTPUT)
+    root = rp.resolve_root(args.root)
+    summary_path = rp.resolve_output(args.summary, root, SUMMARY_NAME)
+    output = rp.resolve_output(args.output, root, OUTPUT_NAME)
     if not summary_path.exists():
         raise SystemExit(f"summary not found: {summary_path}. Run z8_CommonSetMetrics.py first.")
 

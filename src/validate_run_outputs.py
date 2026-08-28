@@ -46,9 +46,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from utils import run_paths as rp
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_ROOT = Path("data/output/CV19")
+DEFAULT_ROOT = rp.DEFAULT_ROOT
 
 # Families the analysis expects to be able to compare. Naive/seasonal/linear are
 # columns inside other families' predictions.csv rather than run directories of
@@ -352,7 +353,7 @@ def main() -> int:
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
-    root = args.root.resolve() if args.root else (REPO_ROOT / DEFAULT_ROOT)
+    root = rp.resolve_root(args.root)
     if not root.is_dir():
         raise SystemExit(f"Output root not found: {root}")
 
