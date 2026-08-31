@@ -31,7 +31,7 @@ input_csv: "../../output/regression/Consolidated_sparse.csv"
 
 # ── Output ────────────────────────────────────────────────────────────────────
 # Base directory under which one subdirectory per target will be created.
-output_dir: "../../output/CV20_profilerless"
+output_dir: "../../output/CV22_profilerless"
 
 # Name pattern for each per-target subdirectory.
 # {target_slug} is replaced by the target column name with non-word chars → '_'.
@@ -144,6 +144,14 @@ training_config_defaults:
                 'verbose': False
                 'min_r2': 0.0
                 'r2_penalty': 10.0
+                # Stop a study once further trials stop buying more than noise: no
+                # improvement larger than one standard error of a single trial's score
+                # (fold spread / sqrt(folds)) for this many consecutive trials. 0 always
+                # runs n_trials. 100 rather than something smaller because replaying the
+                # rule against the CV20 studies showed a patience of 60 cuts Cadmium off
+                # before a genuine three-standard-error gain at trial 215.
+                'no_improvement_trials': 100
+                'no_improvement_se': 1.0
                 'param_space':
                     'n_estimators': {'low': 10, 'high': 300, 'type': 'int'}
                     'max_depth': {'low': 2, 'high': 9, 'type': 'int'}
@@ -159,8 +167,17 @@ training_config_defaults:
       num_epochs: 100
       patience: 10
       model_dim: 64
+      # Minimum epochs before a CV fold may conclude it has converged. Patience counts
+      # epochs while the learning rate decides how far one moves, so a short patience
+      # ends training before the optimiser has appreciably changed the model. Set to
+      # 30 of 100 rather than the library default of 50, which would hold every fold
+      # to half its budget; 30% here matches the 50-of-250 proportion used for the GP.
+      early_stop_min_epochs: 30
   gp:
     hyperparameters:
       num_epochs: 250
       patience: 20
       max_train_size: 5000
+      # As above. A quarter of GP runs previously received a CV-derived budget of one
+      # epoch, which left the kernel hyperparameters at their initial values.
+      early_stop_min_epochs: 50

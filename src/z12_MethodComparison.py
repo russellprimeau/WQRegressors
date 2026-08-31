@@ -41,9 +41,12 @@ OUTPUT_NAME = "method_comparison.png"
 # Column prefix in common_set_metrics.csv -> display label. Machine-learning
 # models first, then the four statistical models, so the split is visible in the
 # figure without needing a legend to explain it.
-ML = [("xgb", "XGB"), ("gp", "GP"), ("transformer", "Trans.")]
-STAT = [("mlr", "MLR"), ("mlr12", "MLR-12"), ("mlrall", "MLR-All"),
-        ("naive", "Naive"), ("seasonal", "Seasonal"), ("linear", "Linear")]
+# Each of these four is one family; z8 has already reduced it to its best-scoring
+# configuration on the common set, so a cell is that family's best variant for that
+# target -- the best of three MLR aggregations exactly as it is the best of four GP
+# kernels. The three reference forecasts read only the target's own history.
+ML = [("xgb", "XGB"), ("gp", "GP"), ("transformer", "Trans."), ("mlr", "MLR")]
+STAT = [("naive", "Naive"), ("seasonal", "Seasonal"), ("linear", "Linear")]
 
 STATS = {
     "nrmse": dict(label="nRMSE", cmap="RdYlGn_r", fmt="{:.2f}"),

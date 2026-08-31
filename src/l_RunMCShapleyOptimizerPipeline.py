@@ -1227,7 +1227,7 @@ def _run_pipeline(args: argparse.Namespace, data_root_resolved: Path) -> int:
             print(f"[PIPELINE] DATASET {plan_idx}/{len(plans)}: {plan.dataset_dir.name}")
             print("=" * 100)
 
-            surrogate_cfg = optimizer_module._select_surrogate_config(plan.train_configs)
+            surrogate_cfg = optimizer_module._canonical_probe_config(plan.dataset_dir)
             surrogate_data = train_module.load_config(str(surrogate_cfg))["data"]
             base_span = int(surrogate_data["input_row_2"]) - int(surrogate_data["input_row_1"])
             row_counts = optimizer_module._parse_row_counts(args.row_counts, default_span=base_span)

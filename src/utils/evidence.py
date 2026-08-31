@@ -315,6 +315,164 @@ def grouped_skill_bootstrap(
     return out
 
 
+def r2_bootstrap(
+    y: np.ndarray,
+    preds: np.ndarray,
+    group_ids,
+    *,
+    n_boot: int = 2000,
+    seed: int = 42,
+) -> dict:
+    """Bootstrap interval for the coefficient of determination.
+
+    Resamples whole groups, so the interval reflects uncertainty in which
+    observations happened to be evaluated rather than treating correlated rows as
+    independent. The denominator is recomputed from each resample, because R2 is a
+    statement about the variance of the set actually scored.
+    """
+    y = np.asarray(y, dtype=float).reshape(-1)
+    preds = np.asarray(preds, dtype=float).reshape(-1)
+    gids = list(group_ids)
+    n = min(y.size, preds.size, len(gids))
+    by_group: dict = {}
+    for i in range(n):
+        if np.isfinite(y[i]) and np.isfinite(preds[i]):
+            by_group.setdefault(gids[i], []).append(i)
+    keys = list(by_group)
+    if len(keys) < 3:
+        return {"r2": float("nan"), "ci05": float("nan"), "ci95": float("nan"),
+                "n_groups": len(keys)}
+
+    def _r2(idx) -> float:
+        yy, pp = y[idx], preds[idx]
+        denom = float(np.sum((yy - yy.mean()) ** 2))
+        if denom <= 0:
+            return float("nan")
+        return float(1.0 - np.sum((pp - yy) ** 2) / denom)
+
+    all_idx = np.asarray([i for k in keys for i in by_group[k]], dtype=int)
+    observed = _r2(all_idx)
+
+    rng = np.random.default_rng(seed)
+    vals = []
+    for _ in range(int(n_boot)):
+        drawn = rng.choice(len(keys), size=len(keys), replace=True)
+        idx = np.asarray([i for d in drawn for i in by_group[keys[d]]], dtype=int)
+        v = _r2(idx)
+        if np.isfinite(v):
+            vals.append(v)
+    if len(vals) < int(n_boot) // 4:
+        return {"r2": observed, "ci05": float("nan"), "ci95": float("nan"),
+                "n_groups": len(keys)}
+    return {
+        "r2": observed,
+        "ci05": float(np.percentile(vals, 5)),
+        "ci95": float(np.percentile(vals, 95)),
+        "n_groups": len(keys),
+    }
+
+
+def association_permutation_p(
+    y: np.ndarray,
+    preds: np.ndarray,
+    group_ids,
+    *,
+    n_perm: int = 5000,
+    seed: int = 42,
+) -> float:
+    """One-sided p-value for the hypothesis that the predictions carry no information.
+
+    The null is built by permuting which prediction is paired with which observation,
+    at the group level, and recomputing R2 each time. It asks only whether the model
+    tracks the target -- not whether it beats anything -- and needs no distributional
+    assumption.
+    """
+    y = np.asarray(y, dtype=float).reshape(-1)
+    preds = np.asarray(preds, dtype=float).reshape(-1)
+    gids = list(group_ids)
+    n = min(y.size, preds.size, len(gids))
+    by_group: dict = {}
+    for i in range(n):
+        if np.isfinite(y[i]) and np.isfinite(preds[i]):
+            by_group.setdefault(gids[i], []).append(i)
+    keys = list(by_group)
+    if len(keys) < 4:
+        return float("nan")
+
+    # One value per group, so the permutation shuffles independent units.
+    yg = np.asarray([float(np.mean(y[by_group[k]])) for k in keys])
+    pg = np.asarray([float(np.mean(preds[by_group[k]])) for k in keys])
+    denom = float(np.sum((yg - yg.mean()) ** 2))
+    if denom <= 0:
+        return float("nan")
+
+    def _r2(pred_vec) -> float:
+        return float(1.0 - np.sum((pred_vec - yg) ** 2) / denom)
+
+    observed = _r2(pg)
+    rng = np.random.default_rng(seed)
+    hits = 0
+    for _ in range(int(n_perm)):
+        if _r2(rng.permutation(pg)) >= observed:
+            hits += 1
+    # Add-one correction: a p-value of exactly zero is not attainable from a finite
+    # number of permutations and should not be reported as though it were.
+    return float((hits + 1) / (int(n_perm) + 1))
+
+
+def classify_prediction(
+    r2: float,
+    ci05: float,
+    perm_p: float,
+    n_groups: int,
+    alpha: float = 0.05,
+) -> str:
+    """Verdict on whether a model predicts its target, independent of any baseline.
+
+    The existing `classify` answers a different question -- whether a model beats a
+    reference forecast -- and the two come apart sharply. On the profiler-free run
+    Zinc explains 52% of the variance while losing to the reference on 80% of
+    segments, and Lead explains none of it while beating the reference; ranked by
+    skill alone, Lead is the stronger result. Reporting both keeps "does it predict"
+    separate from "is it better than something simpler".
+    """
+    if not np.isfinite(r2) or r2 <= 0:
+        return NOT_SUPPORTED
+    # A permutation test over k groups cannot return a p-value below 1/(k! + 1);
+    # below five groups it cannot reach a conventional alpha at all.
+    if not np.isfinite(n_groups) or int(n_groups) < 5:
+        return UNDERPOWERED
+    significant = (
+        np.isfinite(perm_p) and perm_p < float(alpha)
+        and np.isfinite(ci05) and ci05 > 0.0
+    )
+    return SUPPORTED if significant else DIRECTIONAL
+
+
+def assess_prediction(
+    y: np.ndarray,
+    preds: np.ndarray,
+    group_ids,
+    *,
+    alpha: float = 0.05,
+    n_boot: int = 2000,
+    n_perm: int = 5000,
+    seed: int = 42,
+) -> dict:
+    """Whether a model predicts its target: effect size, interval, test, verdict."""
+    boot = r2_bootstrap(y, preds, group_ids, n_boot=n_boot, seed=seed)
+    perm_p = association_permutation_p(y, preds, group_ids, n_perm=n_perm, seed=seed)
+    return {
+        "r2": boot["r2"],
+        "r2_ci05": boot["ci05"],
+        "r2_ci95": boot["ci95"],
+        "perm_p": perm_p,
+        "n_groups": boot["n_groups"],
+        "verdict": classify_prediction(
+            boot["r2"], boot["ci05"], perm_p, boot["n_groups"], alpha=alpha),
+    }
+
+
 def classify(
     skill: float,
     ci05: float,

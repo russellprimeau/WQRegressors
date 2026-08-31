@@ -70,7 +70,9 @@ try:
     import gpytorch
 except ImportError:
     gpytorch = None
-from utils.training import write_config, splitter, _base_sample_id, load_samples
+from utils.training import (write_config, splitter, _base_sample_id, load_samples,
+                            reduced_window_shape, parse_input_aggregation,
+                            aggregation_slug)
 from utils.transformer import (
     train_model as train_transformer,
     TimeSeriesTransformer,
@@ -204,6 +206,18 @@ DEFAULT_XGB_CV_TUNING_REGRESSOR = {
     # Preferred: set metric to "rmse_r2" (or "rmse-r2") to enable score = rmse * (1 - r2).
     # Legacy: scalarize_rmse_r2=True with metric=rmse.
     "scalarize_rmse_r2": False,
+    # Adaptive stopping: end the study when `no_improvement_trials` consecutive trials
+    # fail to improve the best score by more than `no_improvement_se` standard errors
+    # of a single trial's score. Set no_improvement_trials to 0 to always run n_trials.
+    #
+    # 100, not something smaller, because the rule was replayed against the finished
+    # CV20 studies: at a patience of 60 it stops at a median of 127 trials but cuts
+    # Cadmium off before a genuine three-standard-error improvement at trial 215,
+    # costing 77.6% of that target's tuning score. The cliff sits between 80 and 100.
+    # At 100 nothing is lost, but the median study then runs 245 of its 250 trials, so
+    # this is a guard against a study that plateaus completely rather than a saving.
+    "no_improvement_trials": 100,
+    "no_improvement_se": 1.0,
     # Optional guardrail to avoid degenerate underfit trials.
     # When set, mean CV score is penalized if mean_r2 < min_r2.
     "min_r2": None,
@@ -471,6 +485,9 @@ DEFAULT_DATA_SPLIT_CONFIG = {
     "fault_tolerant": False,
     "nan_tolerance": 0.8,
     "min_test_independent": None,
+    # False where the split is pinned across runs: rebalancing would move training
+    # segments into a test set that other runs are also scored on.
+    "allow_rebalance": True,
 }
 
 DEFAULT_EVALUATION_CONFIG = {
@@ -667,6 +684,7 @@ def load_and_split_data(config):
         nan_tolerance,
         input_aggregation,
         split_cfg.get("min_test_independent"),
+        split_cfg.get("allow_rebalance", True),
     )
     
     return train_samples, test_samples
@@ -827,6 +845,10 @@ def _transformer_cv_estimate_epochs(
         loader_kwargs["prefetch_factor"] = max(1, int(hyper_cfg.get("prefetch_factor", 2)))
 
     fold_best_epochs: list[int] = []
+    fold_curves: list[list[float]] = []
+    # Minimum optimiser steps before a fold may conclude it has converged.
+    min_epochs = max(1, min(int(hyper_cfg.get("early_stop_min_epochs", 50)),
+                            int(hyper_cfg["num_epochs"])))
     for fi in range(n_folds):
         val_idx = folds_idx[fi]
         train_idx = np.concatenate([folds_idx[fj] for fj in range(n_folds) if fj != fi])
@@ -855,20 +877,46 @@ def _transformer_cv_estimate_epochs(
             hyper_cfg["corr_eps"],
             hyper_cfg["corr_clip"],
             skip_plot=True,
+            min_epochs=min_epochs,
         )
-        best_ep = result.get("observed", {}).get("best_val_epoch")
+        observed = result.get("observed", {}) or {}
+        best_ep = observed.get("best_val_epoch")
         if best_ep is not None:
             fold_best_epochs.append(int(best_ep))
+        curve = observed.get("val_curve") or []
+        if curve:
+            fold_curves.append([float(v) for v in curve])
         del mdl
 
-    if not fold_best_epochs:
+    if not fold_best_epochs and not fold_curves:
         return None
-    median_ep = int(np.median(fold_best_epochs))
-    print(
-        f"[INFO] Transformer group-CV-estimated epoch budget: {median_ep} "
-        f"(groups={n_groups}, fold best_epochs: {fold_best_epochs})"
+
+    if not fold_curves:
+        median_ep = max(1, int(np.median(fold_best_epochs)))
+        print(
+            f"[WARN] Transformer group-CV epoch budget: no validation curves "
+            f"available; falling back to the median fold best_epoch ({median_ep})."
+        )
+        return median_ep
+
+    # Average over the epochs every fold reached. Taking the median of the folds'
+    # own argmins instead collapses to a small number whenever two folds happen to
+    # record their lowest validation loss early, which is what left transformer
+    # budgets at a median of 12 epochs against 250 configured.
+    common = min(len(c) for c in fold_curves)
+    mean_curve = np.mean(
+        np.asarray([c[:common] for c in fold_curves], dtype=float), axis=0
     )
-    return median_ep
+    finite = np.isfinite(mean_curve)
+    if not finite.any():
+        return None
+    pooled_ep = int(np.argmin(np.where(finite, mean_curve, np.inf))) + 1
+    print(
+        f"[INFO] Transformer group-CV-estimated epoch budget: {pooled_ep} "
+        f"(groups={n_groups}; argmin of the {len(fold_curves)}-fold mean validation "
+        f"curve over {common} epoch(s); per-fold best_epochs were {fold_best_epochs})"
+    )
+    return max(1, pooled_ep)
 
 
 def train_transformer_model(config, train_samples, test_samples):
@@ -900,13 +948,25 @@ def train_transformer_model(config, train_samples, test_samples):
     testloader = DataLoader(test_dataset, **loader_kwargs)
 
     model_config = {
-        'input_dim': len(data_cfg["input_columns"]),
+        # Derived from the window as the model actually receives it: an aggregation
+        # such as stats:28 turns 11 predictors into 44 features over 28 timesteps, and
+        # a network built from the raw column count would be the wrong shape.
+        'input_dim': reduced_window_shape(
+            data_cfg["input_row_2"] - data_cfg["input_row_1"],
+            len(data_cfg["input_columns"]),
+            data_cfg.get("input_aggregation", "none"))[1],
         'model_dim': hyper_cfg["model_dim"],
         'num_heads': hyper_cfg["num_heads"],
         'num_layers': hyper_cfg["num_layers"],
         'dropout': hyper_cfg["dropout"],
         'output_dim': len(data_cfg["output_columns"]) * len(data_cfg["output_rows"]),
-        'seq_len': data_cfg["input_row_2"] - data_cfg["input_row_1"],
+        'seq_len': reduced_window_shape(
+            data_cfg["input_row_2"] - data_cfg["input_row_1"],
+            len(data_cfg["input_columns"]),
+            data_cfg.get("input_aggregation", "none"))[0],
+        # Recorded so the results table can say which window representation produced a
+        # row: xgb_02 and xgb_03 are the same family and differ only in this.
+        'input_aggregation': data_cfg.get("input_aggregation", "none"),
         'input_columns': data_cfg["input_columns"],
         'input_row_1': data_cfg["input_row_1"],
         'input_row_2': data_cfg["input_row_2"],
@@ -996,9 +1056,26 @@ def _gp_cv_estimate_epochs(
 ) -> int | None:
     """Estimate optimal GP epoch count via internal k-fold CV (no test exposure).
 
-    Trains GP on each fold with patience-based early stopping on fold-validation
-    RMSE and returns the median best_epoch across folds.  Uses the first output
-    dimension only for efficiency.  Returns None if CV cannot run.
+    Trains a GP on each fold, records the whole fold-validation RMSE curve, and
+    returns the epoch minimising the curve *averaged across folds*. Uses the first
+    output dimension only for efficiency. Returns None if CV cannot run.
+
+    Two details matter, because the previous form of this estimate handed back a budget
+    of one epoch for a quarter of all GP runs:
+
+    * The budget is the argmin of the fold-averaged curve, not the median of the
+      per-fold argmins. A median over three noisy argmins collapses to 1 as soon as two
+      folds happen to record their lowest validation error at the first epoch, even
+      where the averaged curve is still falling steeply. On one pH run the per-fold
+      argmins were 1, 66 and 211.
+    * A fold may not stop before ``early_stop_min_epochs`` steps. Patience counts
+      epochs, while the learning rate decides how far an epoch moves; at the configured
+      0.01 twenty epochs is a very small change in the kernel hyperparameters, so a
+      patience-only rule concluded "no longer improving" before the optimiser had
+      appreciably moved.
+
+    Neither change can cause overtraining. The budget is still the minimum of a
+    held-out error curve, and no test data is involved at any point.
     """
     n_samples = len(X_np)
     if n_samples < 2 * n_folds:
@@ -1009,6 +1086,8 @@ def _gp_cv_estimate_epochs(
     num_epochs = int(hyper_cfg["num_epochs"])
     patience = int(hyper_cfg["patience"])
     lr = float(hyper_cfg["learning_rate"])
+    # Minimum optimiser steps before a fold may conclude it has converged.
+    min_epochs = max(1, min(int(hyper_cfg.get("early_stop_min_epochs", 50)), num_epochs))
 
     # Build simple fold indices (not MC-aware since data is already flattened).
     fold_size = n_samples // n_folds
@@ -1020,8 +1099,12 @@ def _gp_cv_estimate_epochs(
     for li, idx_val in enumerate(leftover):
         folds_idx[li % n_folds] = np.append(folds_idx[li % n_folds], idx_val)
 
-    fold_best_epochs: list[int] = []
-
+    # Build every fold first, then advance them together. Training folds one after
+    # another and pooling their curves afterwards does not work: each fold stops at its
+    # own epoch, so the pooled curve is only as long as the shortest fold and its argmin
+    # gets pinned to that truncation point. Advancing in lockstep gives one curve, one
+    # patience counter, and an argmin taken over exactly the epochs that were evaluated.
+    folds = []
     for fi in range(n_folds):
         val_idx = folds_idx[fi]
         train_idx = np.concatenate([folds_idx[fj] for fj in range(n_folds) if fj != fi])
@@ -1031,7 +1114,6 @@ def _gp_cv_estimate_epochs(
         X_va_np = X_np[val_idx]
         y_va_np = y_col[val_idx]
 
-        # Standardize per fold.
         x_mean = X_tr_np.mean(axis=0)
         x_std = X_tr_np.std(axis=0)
         x_std[x_std < 1e-8] = 1.0
@@ -1067,50 +1149,75 @@ def _gp_cv_estimate_epochs(
             )
         ).to(device)
         apply_gp_constraints_and_priors(mdl, lh, hyper_cfg)
-
         mdl.train()
         lh.train()
-        opt = torch.optim.Adam(mdl.parameters(), lr=lr)
-        mll_fn = gpytorch.mlls.ExactMarginalLogLikelihood(lh, mdl)
 
-        best_val = float("inf")
-        best_ep = 0
-        pat_ctr = 0
-        for ep in range(num_epochs):
-            opt.zero_grad()
-            out = mdl(X_tr_t)
-            loss = -mll_fn(out, y_tr_t)
-            loss.backward()
-            opt.step()
+        folds.append({
+            "mdl": mdl,
+            "lh": lh,
+            "opt": torch.optim.Adam(mdl.parameters(), lr=lr),
+            "mll": gpytorch.mlls.ExactMarginalLogLikelihood(lh, mdl),
+            "X_tr": X_tr_t,
+            "y_tr": y_tr_t,
+            "X_va": X_va_t,
+            "y_va": y_va_np,
+            "y_mean": y_mean,
+            "y_std": y_std_val,
+        })
 
-            mdl.eval()
-            lh.eval()
-            with torch.no_grad(), gpytorch.settings.fast_pred_var():
-                pred = lh(mdl(X_va_t)).mean.detach().cpu().numpy()
-            v_rmse = float(np.sqrt(np.mean((pred * y_std_val + y_mean - y_va_np) ** 2)))
-            mdl.train()
-            lh.train()
-
-            if math.isfinite(v_rmse) and v_rmse < best_val:
-                best_val = v_rmse
-                best_ep = ep + 1
-                pat_ctr = 0
-            else:
-                pat_ctr += 1
-                if pat_ctr >= patience:
-                    break
-
-        fold_best_epochs.append(best_ep)
-        del mdl, lh, opt
-
-    if not fold_best_epochs:
+    if not folds:
         return None
-    median_ep = int(np.median(fold_best_epochs))
+
+    mean_curve: list[float] = []
+    best_mean = float("inf")
+    best_ep = 0
+    pat_ctr = 0
+    for ep in range(num_epochs):
+        fold_rmses = []
+        for st in folds:
+            st["opt"].zero_grad()
+            out = st["mdl"](st["X_tr"])
+            loss = -st["mll"](out, st["y_tr"])
+            loss.backward()
+            st["opt"].step()
+
+            st["mdl"].eval()
+            st["lh"].eval()
+            with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                pred = st["lh"](st["mdl"](st["X_va"])).mean.detach().cpu().numpy()
+            v_rmse = float(np.sqrt(np.mean(
+                (pred * st["y_std"] + st["y_mean"] - st["y_va"]) ** 2)))
+            st["mdl"].train()
+            st["lh"].train()
+            if math.isfinite(v_rmse):
+                fold_rmses.append(v_rmse)
+
+        epoch_mean = float(np.mean(fold_rmses)) if fold_rmses else float("inf")
+        mean_curve.append(epoch_mean)
+
+        if math.isfinite(epoch_mean) and epoch_mean < best_mean:
+            best_mean = epoch_mean
+            best_ep = ep + 1
+            pat_ctr = 0
+        else:
+            pat_ctr += 1
+            # Do not conclude convergence before the optimiser has taken enough steps
+            # for "no improvement" to mean anything at this step size.
+            if pat_ctr >= patience and (ep + 1) >= min_epochs:
+                break
+
+    for st in folds:
+        del st["mdl"], st["lh"], st["opt"], st["mll"]
+    del folds
+
+    if best_ep <= 0:
+        return None
     print(
-        f"[INFO] GP CV-estimated epoch budget: {median_ep} "
-        f"(fold best_epochs: {fold_best_epochs})"
+        f"[INFO] GP CV-estimated epoch budget: {best_ep} "
+        f"(argmin of the {n_folds}-fold mean validation curve over "
+        f"{len(mean_curve)} epoch(s), best mean RMSE {best_mean:.6f})"
     )
-    return median_ep
+    return max(1, best_ep)
 
 
 def train_gp_regressor_model(config, train_samples, test_samples):
@@ -1488,9 +1595,18 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         print(f"Output {output_idx + 1}/{output_dim} - best train NLL: {best_loss:.6f}, test RMSE: {rmse:.6f}")
 
     model_config = {
-        'input_dim': len(data_cfg["input_columns"]),
+        # Derived from the window as the model actually receives it: an aggregation
+        # such as stats:28 turns 11 predictors into 44 features over 28 timesteps, and
+        # a network built from the raw column count would be the wrong shape.
+        'input_dim': reduced_window_shape(
+            data_cfg["input_row_2"] - data_cfg["input_row_1"],
+            len(data_cfg["input_columns"]),
+            data_cfg.get("input_aggregation", "none"))[1],
         'output_dim': output_dim,
-        'seq_len': data_cfg["input_row_2"] - data_cfg["input_row_1"],
+        'seq_len': reduced_window_shape(
+            data_cfg["input_row_2"] - data_cfg["input_row_1"],
+            len(data_cfg["input_columns"]),
+            data_cfg.get("input_aggregation", "none"))[0],
         'input_columns': data_cfg["input_columns"],
         'input_row_1': data_cfg["input_row_1"],
         'input_row_2': data_cfg["input_row_2"],
@@ -1912,7 +2028,15 @@ def _xgb_cv_fold_score(
     metric: str,
     use_early_stopping: bool,
     early_stopping_rounds: int | None,
-) -> tuple[float, float | None]:
+    return_curve: bool = False,
+) -> tuple:
+    """Score one CV fold.
+
+    Returns ``(score, r2, best_iteration)``, and with *return_curve* a fourth element
+    holding the per-round validation metric. The curve is what lets a budget be chosen
+    from the pooled shape of the error across folds rather than from the median of the
+    folds' individual early-stopping points.
+    """
     global _XGB_GPU_CPU_INPUT_WARNING_EMITTED
 
     X_train = X[train_idx]
@@ -2007,11 +2131,25 @@ def _xgb_cv_fold_score(
     # the pool across the many folds/trials of a CV run.
     best_iter = getattr(model, "best_iteration", None)
 
+    curve = None
+    if return_curve:
+        try:
+            results = model.evals_result() or {}
+            # The validation set is the second entry when an eval_set was supplied.
+            key = "validation_1" if "validation_1" in results else "validation_0"
+            series = (results.get(key) or {})
+            if series:
+                curve = list(next(iter(series.values())))
+        except Exception:
+            curve = None
+
     del model
     if use_gpu_arrays:
         del X_train_fit, y_train_fit, X_val_fit, y_val_fit
         _flush_gpu_memory()
 
+    if return_curve:
+        return score, r2, best_iter, curve
     return score, r2, best_iter
 
 
@@ -2404,7 +2542,62 @@ def _xgb_tune_hyperparameters_cv(
                 return mean_score
 
             study = optuna.create_study(direction="minimize", sampler=sampler)
-            study.optimize(_objective, n_trials=n_trials, catch=(xgb.core.XGBoostError,))
+
+            stop_patience = int(cv_cfg.get("no_improvement_trials", 100))
+            se_multiple = float(cv_cfg.get("no_improvement_se", 1.0))
+
+            def _stop_when_gains_are_noise(study_obj, _trial) -> None:
+                """End the study once further trials stop buying more than noise.
+
+                A fixed trial count is the wrong instrument here. Measured across the
+                fourteen targets, trials 201-250 improved the score by less than the
+                standard error of a single trial on nine of them and by three standard
+                errors on others, so any single cutoff is simultaneously wasteful and
+                truncating. What separates the two cases is whether an improvement is
+                larger than the uncertainty of the score being compared: the spread
+                across CV folds divided by the square root of their number.
+
+                Trials continue while gains exceed that; the study stops when
+                `no_improvement_trials` pass without one. It cannot end early on a
+                target that is still genuinely improving.
+                """
+                if stop_patience <= 0:
+                    return
+                completed = [t for t in study_obj.trials
+                             if t.value is not None and math.isfinite(t.value)]
+                if len(completed) <= stop_patience:
+                    return
+
+                values = [t.value for t in completed]
+                best_now = min(values)
+                best_before = min(values[:-stop_patience])
+
+                # Uncertainty of one trial's score, taken from the best trials so far.
+                order = sorted(range(len(completed)), key=lambda i: values[i])[:20]
+                spreads = [completed[i].user_attrs.get("std_score") for i in order]
+                spreads = [v for v in spreads
+                           if isinstance(v, (int, float)) and math.isfinite(v)]
+                if not spreads:
+                    return
+                se = (sum(spreads) / len(spreads)) / math.sqrt(max(1, len(folds)))
+                if se <= 0:
+                    return
+
+                if (best_before - best_now) < se_multiple * se:
+                    print(
+                        f"[CV] Stopping after {len(completed)} trials: the last "
+                        f"{stop_patience} improved the score by "
+                        f"{best_before - best_now:.6f}, below {se_multiple:g} standard "
+                        f"error ({se:.6f}). Further trials would be selecting noise."
+                    )
+                    study_obj.stop()
+
+            study.optimize(
+                _objective,
+                n_trials=n_trials,
+                catch=(xgb.core.XGBoostError,),
+                callbacks=[_stop_when_gains_are_noise],
+            )
             try:
                 best_params = dict(study.best_trial.user_attrs.get("params", {}))
                 best_score = float(study.best_value)
@@ -2589,6 +2782,9 @@ def _xgb_tune_hyperparameters_cv(
         "selection_rule": selection_rule,
         "trials": trial_results,
         "param_space": param_space,
+        "trials_run": len(trial_results),
+        "no_improvement_trials": int(cv_cfg.get("no_improvement_trials", 100)),
+        "no_improvement_se": float(cv_cfg.get("no_improvement_se", 1.0)),
         "score_definition": "rmse*(1-r2)" if use_scalarized_rmse_r2 else metric_raw,
         "r2_guardrail_min": None if r2_min is None else float(r2_min),
         "r2_penalty": float(r2_penalty),
@@ -2625,7 +2821,13 @@ def _resolve_cv_cache_path(config: dict) -> Path:
     if cache_path:
         cfg_dir = config.get("__config_dir", str(Path.cwd()))
         return Path(_resolve_path_from_config(str(cache_path), cfg_dir))
-    return Path(data_cfg["data_dir"], "forecasts", "xgb_cv_tuning_cache.json")
+    # Include the window representation. Without it every XGBoost configuration of a
+    # dataset shares one cache, so `stats:28` inherits hyperparameters tuned on the
+    # 7381-column flattened window -- on pH that was worth 0.84 in R2, purely from
+    # which configuration happened to tune first. An unaggregated window keeps the
+    # original filename so existing caches still resolve.
+    slug = aggregation_slug(data_cfg.get("input_aggregation", "none"))
+    return Path(data_cfg["data_dir"], "forecasts", f"xgb_cv_tuning_cache{slug}.json")
 
 
 def _write_xgb_cv_tuning_cache(cache_path: Path, hyper_cfg: dict, best_params: dict, summary: dict) -> Path:
@@ -2841,9 +3043,16 @@ def _xgb_cv_estimate_n_estimators(
 ) -> int | None:
     """Estimate optimal n_estimators via lightweight internal CV (no test exposure).
 
-    Trains the model with early stopping on each fold's held-out portion and
-    returns the median best_iteration across folds.  Returns None if CV cannot
-    be performed (e.g. too few samples).
+    Trains on each fold's held-out portion and returns the round minimising the
+    validation curve *averaged across folds*. Returns None if CV cannot be performed
+    (e.g. too few samples).
+
+    The median of the folds' own ``best_iteration`` values, which this previously
+    returned, collapses whenever two of three folds happen to early-stop in their first
+    few rounds: 37% of models built fewer than ten trees and the tenth percentile was
+    two, against a tuned ``n_estimators`` of 52. Early stopping fires on a single noisy
+    fold; the averaged curve does not. Boosting is monotone in training error, so the
+    argmin of held-out error remains the point past which further rounds only overfit.
     """
     X, y, names = _xgb_samples_to_arrays(train_samples, cast_y=cast_y)
     if len(names) < 2 * n_folds:
@@ -2863,31 +3072,54 @@ def _xgb_cv_estimate_n_estimators(
         precomputed.append((train_idx, val_idx))
 
     fold_best_iters: list[int] = []
+    fold_curves: list[list[float]] = []
+    # Fit the full round budget on every fold, with no early stopping, so all curves
+    # have the same length and none is cut short by one fold's noise.
+    curve_kwargs = {k: v for k, v in model_kwargs.items() if k != "early_stopping_rounds"}
     for train_idx, val_idx in precomputed:
-        _, _, best_iter = _xgb_cv_fold_score(
+        _, _, best_iter, curve = _xgb_cv_fold_score(
             model_kind,
-            model_kwargs,
+            curve_kwargs,
             X,
             y,
             train_idx,
             val_idx,
             metric,
             use_early_stopping=True,
-            early_stopping_rounds=early_stopping_rounds,
+            early_stopping_rounds=None,
+            return_curve=True,
         )
         if best_iter is not None:
             # best_iteration is 0-indexed; convert to round count for n_estimators.
             fold_best_iters.append(int(best_iter) + 1)
+        if curve:
+            fold_curves.append(list(curve))
 
-    if not fold_best_iters:
-        return None
+    if not fold_curves:
+        if not fold_best_iters:
+            return None
+        fallback = max(1, int(np.median(fold_best_iters)))
+        print(
+            f"[WARN] CV-estimated n_estimators: no validation curves available; "
+            f"falling back to the median fold best_iteration ({fallback})."
+        )
+        return fallback
 
-    median_iter = max(1, int(np.median(fold_best_iters)))
-    print(
-        f"[INFO] CV-estimated n_estimators: {median_iter} "
-        f"(fold best_iterations: {fold_best_iters})"
+    common = min(len(c) for c in fold_curves)
+    mean_curve = np.mean(
+        np.asarray([c[:common] for c in fold_curves], dtype=float), axis=0
     )
-    return median_iter
+    finite = np.isfinite(mean_curve)
+    if not finite.any():
+        return None
+    best_round = int(np.argmin(np.where(finite, mean_curve, np.inf))) + 1
+
+    print(
+        f"[INFO] CV-estimated n_estimators: {best_round} "
+        f"(argmin of the {len(fold_curves)}-fold mean validation curve over "
+        f"{common} round(s))"
+    )
+    return max(1, best_round)
 
 
 def _train_xgb_model(
@@ -2921,9 +3153,21 @@ def _train_xgb_model(
         y_test = np.ascontiguousarray(np.array([s[1].flatten()[0] for s in test_samples], dtype=np.float32))
 
     model_config = {
-        'input_dim': len(data_cfg["input_columns"]),
+        # Derived from the window as the model actually receives it: an aggregation
+        # such as stats:28 turns 11 predictors into 44 features over 28 timesteps, and
+        # a network built from the raw column count would be the wrong shape.
+        'input_dim': reduced_window_shape(
+            data_cfg["input_row_2"] - data_cfg["input_row_1"],
+            len(data_cfg["input_columns"]),
+            data_cfg.get("input_aggregation", "none"))[1],
         'output_dim': len(data_cfg["output_columns"]) * len(data_cfg["output_rows"]),
-        'seq_len': data_cfg["input_row_2"] - data_cfg["input_row_1"],
+        'seq_len': reduced_window_shape(
+            data_cfg["input_row_2"] - data_cfg["input_row_1"],
+            len(data_cfg["input_columns"]),
+            data_cfg.get("input_aggregation", "none"))[0],
+        # Recorded so the results table can say which window representation produced a
+        # row: xgb_02 and xgb_03 are the same family and differ only in this.
+        'input_aggregation': data_cfg.get("input_aggregation", "none"),
         'input_columns': data_cfg["input_columns"],
         'input_row_1': data_cfg["input_row_1"],
         'input_row_2': data_cfg["input_row_2"],
@@ -2981,6 +3225,10 @@ def _train_xgb_model(
             metric,
             early_stopping_rounds=hyper_cfg["early_stopping_rounds"],
             cast_y=cast_y,
+            # Honour the same fold-count setting the GP and transformer estimators use.
+            # Three folds train each CV model on 67% of the data while the reported model
+            # gets 100%, which biases the budget low; five raises that to 80%.
+            n_folds=int(hyper_cfg.get("early_stop_cv_folds", 3)),
         )
         if cv_n_est is not None:
             model_kwargs["n_estimators"] = cv_n_est

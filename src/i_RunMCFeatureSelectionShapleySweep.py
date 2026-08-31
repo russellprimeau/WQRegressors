@@ -866,7 +866,7 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         for plan in plans:
-            surrogate = base._select_surrogate_config(plan.train_configs)
+            surrogate = base._canonical_probe_config(plan.dataset_dir)
             cfg = train_module.load_config(str(surrogate))
             base_span = int(cfg["data"]["input_row_2"]) - int(cfg["data"]["input_row_1"])
             row_counts = base._parse_row_counts(args.row_counts, default_span=base_span)
@@ -879,7 +879,7 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
         print(f"DATASET: {plan.dataset_dir.name}")
         print("=" * 100)
 
-        surrogate_cfg = base._select_surrogate_config(plan.train_configs)
+        surrogate_cfg = base._canonical_probe_config(plan.dataset_dir)
         surrogate_data = train_module.load_config(str(surrogate_cfg))["data"]
         base_span = int(surrogate_data["input_row_2"]) - int(surrogate_data["input_row_1"])
         row_counts = base._parse_row_counts(args.row_counts, default_span=base_span)

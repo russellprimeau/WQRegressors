@@ -45,7 +45,7 @@ def _batch_pearson_corr(y_pred, y_true, eps=1e-8, clip=True):
 def train_model(directory, model, forecast_name, trainloader, testloader, device, num_epochs=100, learning_rate=1e-3,
                 loss_threshold=1e-3, patience=5, model_subdir='transformer',
                 corr_lambda=0.0, corr_eps=1e-8, corr_clip=True,
-                max_epochs_override=None, skip_plot=False):
+                max_epochs_override=None, skip_plot=False, min_epochs=0):
     """Train transformer model.
 
     Parameters
@@ -161,7 +161,10 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
 
         if not improved_validation and not use_fixed_budget:
             patience_counter += 1
-            if patience_counter >= patience:
+            # Patience counts epochs while the learning rate decides how far an epoch
+            # moves, so a short patience can end training before the optimiser has
+            # appreciably changed the model. `min_epochs` sets a floor under that.
+            if patience_counter >= patience and (epoch + 1) >= int(min_epochs or 0):
                 stop_reason_code = "validation_combined_patience_exhausted"
                 stop_epoch = int(epoch + 1)
                 stop_reason_text = (
@@ -236,6 +239,9 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
             "final_train_combined": None if not train_combined_losses else float(train_combined_losses[-1]),
             "final_val_combined": None if not val_combined_losses else float(val_combined_losses[-1]),
             "epochs_executed": int(len(train_combined_losses)),
+            # The whole per-epoch validation curve, so a caller choosing an epoch
+            # budget can use the shape of the error rather than this fold's argmin.
+            "val_curve": [float(v) for v in val_combined_losses],
         },
     }
 

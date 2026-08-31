@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # which arm the paper reports is a one-line edit rather than a shell argument
 # every caller has to remember. The profiler-bearing arm remains on disk and is
 # still analysed, by passing --root explicitly.
-REPORTING_ROOT = Path("data/output/CV20_profilerless")
+REPORTING_ROOT = Path("data/output/CV22_profilerless")
 
 # The alternative arm, retained for the profiler contrast and the supplementary
 # table.

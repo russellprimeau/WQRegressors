@@ -88,7 +88,7 @@ from utils.config_utils import select_best_model_row
 from utils.names import clean_target_label, label as names_label
 from utils import evidence as ev_mod
 from utils.mlr import evaluate_mlr as _evaluate_mlr
-from h_RunMCFeatureSelectionSweep import build_parser, discover_mc_dataset_plans, _derive_target_name, _select_surrogate_config, _parse_row_counts, _available_row_counts_for_postprocess, _regenerate_saved_outputs_for_row, _load_feature_stats_artifacts_with_source, _compile_multi_target_comparison, _resolve_dataset_inclusion, _run_rolling_origin_cv, _ensure_k01_baselines, _write_dataset_evaluation_summary, _forecast_sweeps_dir, _plot_final_metrics_comparison, _feature_tag, _mlr_artifact_dir, _write_mlr_artifacts, _run_mlr_variants_on_existing_split
+from h_RunMCFeatureSelectionSweep import build_parser, discover_mc_dataset_plans, _derive_target_name, _select_surrogate_config, _canonical_probe_config, _parse_row_counts, _available_row_counts_for_postprocess, _regenerate_saved_outputs_for_row, _load_feature_stats_artifacts_with_source, _compile_multi_target_comparison, _resolve_dataset_inclusion, _run_rolling_origin_cv, _ensure_k01_baselines, _write_dataset_evaluation_summary, _forecast_sweeps_dir, _plot_final_metrics_comparison, _feature_tag, _mlr_artifact_dir, _write_mlr_artifacts, _run_mlr_variants_on_existing_split
 
 try:
     from scipy import stats as scipy_stats
@@ -1236,7 +1236,10 @@ def _append_mlr_to_final_metrics(
     if use_preselected_mlr_inputs:
         input_columns = list(model_config.get("input_columns", []) or [])
     else:
-        surrogate_cfg_path = _select_surrogate_config(plan.train_configs)
+        # Only the predictor list is wanted, and every configuration of a dataset
+        # shares it. Resolving by family name raises once a family has more than one
+        # window representation.
+        surrogate_cfg_path = _canonical_probe_config(plan.dataset_dir)
         surrogate_cfg = train_module.load_config(str(surrogate_cfg_path))
         input_columns = list(surrogate_cfg["data"]["input_columns"])
 
@@ -3719,7 +3722,8 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
 
     for plan in plans:
         target_name = _derive_target_name(plan.dataset_dir.name, args.dataset_prefix)
-        surrogate_cfg = _select_surrogate_config(plan.train_configs)
+        # Only the window span is wanted; every configuration of a dataset shares it.
+        surrogate_cfg = _canonical_probe_config(plan.dataset_dir)
         surrogate_data = train_module.load_config(str(surrogate_cfg))['data']
         base_span = int(surrogate_data['input_row_2']) - int(surrogate_data['input_row_1'])
         requested_rows = _parse_row_counts(args.row_counts, default_span=base_span)

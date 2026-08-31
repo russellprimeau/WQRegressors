@@ -44,6 +44,10 @@ from utils import run_paths as rp
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ROOT = rp.DEFAULT_ROOT
 OUTPUT_NAME = "common_set_metrics.csv"
+# Membership of the common evaluation set, one row per (target, segment), in the
+# temporal order the metrics were computed in. Consumed by the horizon sweep so
+# that it scores exactly the segments reported here.
+SEGMENTS_NAME = "common_set_segments.csv"
 
 # Reference forecasts are columns inside every run's predictions.csv rather than
 # runs of their own.
@@ -51,7 +55,13 @@ REFERENCE_COLUMNS = ("Naive", "Seasonal", "Linear")
 META_COLUMNS = {"kind", "sample_file", "gp_uncertainty_mode", "metric_semantics",
                 "metric_contract_version", "target", "mc_n_replicates"}
 
-ML_FAMILIES = ("GP", "XGB", "Transformer")
+# MLR sits here, not with the reference forecasts. The distinction that matters is not
+# "statistical" versus "machine-learning" -- it is whether a method reads the predictors
+# at all. Naive, Seasonal and Linear see only the target's own history; MLR, like the
+# other three, is fitted on the predictor set and selects among it. Grouping MLR with the
+# forecasts it does not resemble made the skill score ask whether one predictor-driven
+# method beat another, which is not the question skill is for.
+ML_FAMILIES = ("GP", "XGB", "Transformer", "MLR")
 
 
 @dataclass
@@ -76,10 +86,8 @@ def _family_of(name: str) -> str | None:
         return "GP"
     if n.startswith("xgb"):
         return "XGB"
-    if n.startswith("mlr_avgall"):
-        return "MLR-All"
-    if n.startswith("mlr_avg12"):
-        return "MLR-12"
+    # The three aggregation variants are variants of one family, exactly as xgb_01..03
+    # are of XGBoost; the per-family maximum below picks the best of them per target.
     if n.startswith("mlr"):
         return "MLR"
     if "transformer" in n and not n.startswith("model_recurrent"):
@@ -116,10 +124,6 @@ def _profiler_tags(sweeps: Path) -> dict[str, bool]:
 def _model_family(model_name: str) -> str | None:
     """Family of a `model` value in feature_sweep_final_metrics.csv."""
     n = str(model_name).strip().lower()
-    if n.startswith("mlr_avgall"):
-        return "MLR-All"
-    if n.startswith("mlr_avg12"):
-        return "MLR-12"
     if n.startswith("mlr"):
         return "MLR"
     if "gp" in n:
@@ -374,6 +378,9 @@ def analyse_target(dataset_dir: Path, verbose: bool = False,
         sigma = sigma_common
 
     row: dict = {
+        # Not a metric: carried out to main() to build the segment-membership file,
+        # and removed before the metrics frame is written.
+        "_segments": list(ordered),
         "dataset": dataset_dir.name,
         "target": label,
         "n_common": len(common),
@@ -466,6 +473,19 @@ def analyse_target(dataset_dir: Path, verbose: bool = False,
                   "sign_direction", "min_attainable_p", "power_attainable", "verdict"):
             row[f"aligned_{k}"] = a.get(k)
 
+        # The assessment above answers "is this better than a simpler alternative"; every
+        # quantity in it is relative to the reference forecast. Whether the model predicts
+        # the target at all is a separate question with a separate answer, and the two come
+        # apart: Zinc explains half the variance while losing to the reference on most
+        # segments, Lead explains none of it while beating the reference. Reported side by
+        # side, neither question can be mistaken for the other.
+        bestf = row["best_family"]
+        bestp = (ml.get(bestf) or ref.get(bestf) or {}).get("preds")
+        if bestp is not None:
+            pa = ev.assess_prediction(y, np.asarray(bestp, dtype=float), ordered)
+            for k in ("r2", "r2_ci05", "r2_ci95", "perm_p", "n_groups", "verdict"):
+                row[f"prediction_{k}"] = pa.get(k)
+
         # On one evaluation set these cannot disagree; if they do, something in
         # the construction is wrong and the target should not be reported.
         if np.isfinite(row["skill_vs_best_ref"]):
@@ -503,9 +523,20 @@ def main() -> int:
     if not rows:
         raise SystemExit(f"No targets could be scored under {root}")
 
+    seg_rows = [
+        {"dataset": r["dataset"], "target": r["target"], "order": i, "sample_file": seg}
+        for r in rows for i, seg in enumerate(r["_segments"])
+    ]
+    for r in rows:
+        del r["_segments"]
+
     df = pd.DataFrame(rows)
     output.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output, index=False)
+
+    seg_out = output.parent / SEGMENTS_NAME
+    pd.DataFrame(seg_rows).to_csv(seg_out, index=False)
+    print("[INFO] Wrote %s (%d segment rows)" % (seg_out, len(seg_rows)))
     print(f"\n[INFO] Wrote {output}")
 
     # Counts only. Targets have unrelated dynamics, so no statistic is averaged

@@ -4,9 +4,27 @@ Beam+swap feature-selection sweeper for MC datasets.
 Search strategy:
 - Surrogate-guided beam backward elimination with swap refinement.
 - Objective: `objective = (1 - r2) + lambda_drop * drop_rate`.
+- `r2` is pooled across rolling-origin cross-validation folds by default
+    (`--cv-folds`, default 5). Scoring candidates on a single 70/30 holdout of 12-47
+    independent samples cannot separate the near-best subsets from one another: in
+    practice subsets sharing fewer than half their features score within 0.01, so the
+    argmin is close to arbitrary and 240 evaluations against one holdout also bias the
+    reported accuracy upward. Folds are fixed for the whole search, so no candidate is
+    ever compared against a different evaluation set. `--cv-folds 0` restores the old
+    single-holdout objective.
+- Selection applies a one-standard-error rule (`--selection-tolerance-se`): among the
+    subsets within one standard error of the best objective, the smallest is chosen.
+    The standard error comes from the spread across folds, so the rule is inert when
+    cross-validation is disabled rather than resting on a fabricated interval.
 - `drop_rate` is computed from raw sample coverage after MC replicate collapse.
 - Search and final sweep-generated train/evaluate runs enforce a minimum of 5
-    independent non-replicate test samples.
+    independent non-replicate test samples. Cross-validation folds are exempt: their
+    membership is pinned, and a rebalance would silently move segments between train
+    and test for one candidate but not the others.
+- The surrogate family (`--surrogate-model`, default `xgb`) scores every candidate and
+    therefore fixes the feature set that *all* families then use. When the reported
+    winner for a target is a different family, that is a real limitation of the design
+    and should be stated rather than left implicit.
 
 Then:
 - Retrain/evaluate all discovered model configs on top-K subsets.
@@ -35,6 +53,11 @@ Key CLI groups (detailed):
     `--max-swap-attempts N`: Cap on swap-refinement attempts.
     `--lambda-drop FLOAT`: Penalty weight for sample drop rate in objective.
     `--seed N`: Random seed for candidate ordering and swap sampling.
+    `--cv-folds N`: Rolling-origin folds per candidate (0 disables; default 5).
+    `--cv-min-train-fraction F`: Segment fraction reserved as the initial training run.
+    `--selection-tolerance-se F`: One-SE band, in standard errors (0 selects the argmin).
+    `--retention-tolerance F`: Objective band defining the near-optimal set.
+    `--surrogate-model NAME`: Model family that scores candidates during the search.
 - Seeded optimizer controls:
     `--seed-subsets-csv PATH`: Seed subset CSV (or directory containing per-row seed CSVs).
     `--seed-subsets-from-shapley`: Load seeds from
@@ -62,7 +85,13 @@ Search/output behavior:
 - Search artifacts are written under `forecasts/feature_sweeps` unless
     `WQ_FEATURE_SWEEP_NAMESPACE` overrides the namespace.
 - Writes `feature_search_trace_r###.csv`, `feature_selected_subsets_r###.csv`,
-    optional `feature_search_pareto_r###.png`, and `feature_sweep_final_metrics.csv`.
+    `feature_retention_frequency_r###.csv`, optional `feature_search_pareto_r###.png`,
+    and `feature_sweep_final_metrics.csv`.
+- `feature_retention_frequency_r###.csv` records how often each predictor appears among
+    the subsets within `--retention-tolerance` of the best objective. Report this rather
+    than the single winning subset: a predictor retained by every near-optimal subset is
+    a result, one retained by 40% of them is a coin flip the search did not resolve.
+    `z14_SelectionStability.py` regenerates it from traces already on disk.
 - Search-phase defaults are intentionally artifact-light:
     candidate runs write required training/evaluation artifacts
     (model outputs, split files, `evaluation_summary.csv`) while plot-heavy
@@ -115,10 +144,34 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from utils.training import load_samples, group_samples_by_segment, SampleComplianceError
+from utils.crossval_rolling_origin import rolling_origin_block_splits
+from utils.selection_stability import selection_stability_from_trace
+from utils.training import aggregation_slug
 from utils.names import clean_target_label, label as names_label
 from utils.plotstyle import PAGE_WIDTH_IN, apply_paper_style, legend_above, save_figure
 
 apply_paper_style()
+
+
+def _force_utf8_console() -> None:
+    """Stop a single unencodable character from aborting a stage.
+
+    On Windows the console encoding defaults to cp1252, which cannot represent an
+    arrow. One such character in a progress message raised UnicodeEncodeError inside a
+    broad ``except Exception``, and the whole MLR k-cluster integration was skipped
+    with nothing but a warning to show for it. Reconfiguring the streams removes the
+    failure mode rather than the characters, so a stage can no longer be lost to a
+    glyph. ``errors="replace"`` keeps output flowing on any stream that still cannot
+    represent something.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_force_utf8_console()
 
 
 SUPPORTED_CONFIG_SUFFIXES = {".yml", ".yaml", ".json"}
@@ -148,6 +201,21 @@ FINAL_METRICS_MODEL_STYLE = {
 }
 
 _EXPECTED_EVAL_METRIC_SEMANTICS = "independent_sample_primary"
+
+# Families the surrogate measurement will not consider. Neither appears in
+# FINAL_METRICS_MODEL_ORDER, so neither is reported: measuring them would spend fits
+# choosing a scorer that could never produce a reported result.
+_SURROGATE_EXCLUDED_TOKENS = ("lstm", "recurrent_transformer", "classifier")
+
+# Model types `_train_single_config` can actually train. A config naming anything else
+# fails at the end of the final stage with "Unknown model_type", after the subset has
+# already been selected -- so it costs time on every target and contributes nothing.
+_TRAINABLE_MODEL_TYPES = {
+    "transformer",
+    "gp_regressor",
+    "xgb_regressor",
+    "xgb_classifier",
+}
 
 # Only these predictors currently carry uncertainty distributions used to
 # generate meaningful Monte Carlo perturbation replicates.
@@ -254,12 +322,24 @@ def _forecast_sweeps_dir(dataset_dir: Path) -> Path:
     return dataset_dir / "forecasts" / _sweep_namespace()
 
 
-def _feature_sweep_cache_path(dataset_dir: Path) -> Path:
-    return _forecast_sweeps_dir(dataset_dir) / "xgb_cv_tuning_cache.json"
+def _feature_sweep_cache_path(dataset_dir: Path, input_aggregation=None) -> Path:
+    """Where the tuned XGBoost hyperparameters for one window representation live.
+
+    One cache per dataset was enough while there was a single XGBoost configuration.
+    With three, they share a dataset but not an input: ``none`` presents 7381 flattened
+    columns, ``stats:28`` presents 44. Hyperparameters tuned on one are not meaningful
+    on the other -- a ``colsample_bytree`` of 0.5 samples 3690 columns in one case and
+    22 in the other -- yet a single cache handed whichever representation tuned first to
+    all of them. On pH that difference was worth 0.84 in R2. The representation is
+    therefore part of the key; ``none`` keeps the original filename so existing caches
+    are still found.
+    """
+    return (_forecast_sweeps_dir(dataset_dir)
+            / f"xgb_cv_tuning_cache{aggregation_slug(input_aggregation)}.json")
 
 
-def _load_feature_sweep_cache(dataset_dir: Path) -> dict | None:
-    cache_path = _feature_sweep_cache_path(dataset_dir)
+def _load_feature_sweep_cache(dataset_dir: Path, input_aggregation=None) -> dict | None:
+    cache_path = _feature_sweep_cache_path(dataset_dir, input_aggregation)
     if not cache_path.exists():
         return None
     try:
@@ -282,9 +362,9 @@ def _apply_pre_rerun_model_policy(config: dict) -> None:
         cv_cfg["selection_rule"] = "best"
 
 
-def _feature_sweep_cache_is_compatible(dataset_dir: Path) -> bool:
+def _feature_sweep_cache_is_compatible(dataset_dir: Path, input_aggregation=None) -> bool:
     """Require a cache produced by the current best-CV selection policy."""
-    cache_payload = _load_feature_sweep_cache(dataset_dir)
+    cache_payload = _load_feature_sweep_cache(dataset_dir, input_aggregation)
     if not isinstance(cache_payload, dict):
         return False
     return train_module._xgb_cv_cache_matches_config(
@@ -293,11 +373,39 @@ def _feature_sweep_cache_is_compatible(dataset_dir: Path) -> bool:
     )
 
 
-def _ensure_feature_sweep_cache(plan: DatasetPlan) -> None:
-    cache_path = _feature_sweep_cache_path(plan.dataset_dir)
-    if cache_path.exists() and _feature_sweep_cache_is_compatible(plan.dataset_dir):
+def _ensure_feature_sweep_cache(plan: DatasetPlan, surrogate_model: str = "xgb") -> None:
+    """Tune XGBoost once per window representation present in this dataset.
+
+    Every XGBoost configuration in the final stage reads the cache for its own
+    representation, so each one needs a cache; tuning only the surrogate's would leave
+    the others to fall back on untuned defaults or, worse, on a cache fitted to a
+    different input shape.
+    """
+    xgb_cfgs = []
+    for cfg_path in plan.train_configs:
+        try:
+            cfg = train_module.load_config(str(cfg_path))
+        except Exception:
+            continue
+        if str(cfg.get("model_type")) in {"xgb_regressor", "xgb_classifier"}:
+            xgb_cfgs.append((cfg_path, str(cfg.get("data", {}).get("input_aggregation", "none"))))
+
+    # The surrogate first, so an interrupted run still leaves the search able to start.
+    try:
+        preferred = _select_surrogate_config(plan.train_configs, surrogate_model)
+    except Exception:
+        preferred = None
+    xgb_cfgs.sort(key=lambda item: item[0] != preferred)
+
+    for cfg_path, aggregation in xgb_cfgs:
+        _ensure_feature_sweep_cache_for(plan, cfg_path, aggregation)
+
+
+def _ensure_feature_sweep_cache_for(plan: DatasetPlan, base_cfg: Path,
+                                    aggregation: str) -> None:
+    cache_path = _feature_sweep_cache_path(plan.dataset_dir, aggregation)
+    if cache_path.exists() and _feature_sweep_cache_is_compatible(plan.dataset_dir, aggregation):
         return
-    base_cfg = _select_surrogate_config(plan.train_configs)
     if base_cfg is None:
         return
     cfg = train_module.load_config(str(base_cfg))
@@ -312,11 +420,30 @@ def _ensure_feature_sweep_cache(plan: DatasetPlan) -> None:
         cv_cfg["cache_path"] = str(cache_path)
     else:
         hyper_cfg["cv_tuning"] = {"enabled": True, "cache_path": str(cache_path)}
+
+    if _pin_split_enabled():
+        # These hyperparameters are used by every candidate and therefore by the
+        # reported models, so they must be tuned on the same training data everything
+        # else is. This config is built straight from the base config rather than
+        # through _prepare_variant_config, so it would otherwise compute its own
+        # split -- and any divergence would tune on segments the results are scored on.
+        data_cfg = cfg["data"]
+        pinned = _materialize_pinned_split(
+            dataset_dir=plan.dataset_dir,
+            sample_subdir=str(data_cfg.get("sample_subdir", "samples")),
+        )
+        split_cfg = cfg.setdefault("data_split", {})
+        split_cfg["reuse_split"] = True
+        split_cfg["split_source"] = str(pinned.resolve())
+        split_cfg["allow_rebalance"] = False
+
     train_samples, _ = train_module.load_and_split_data(cfg)
     model_kind = "classifier" if str(cfg.get("model_type")) == "xgb_classifier" else "regressor"
     metric_key = "eval_metric" if model_kind == "classifier" else "metric"
     cast_y = (lambda v: int(round(v))) if model_kind == "classifier" else None
-    print(f"[INFO] Feature sweep CV tuning (full features, selection_rule=best) -> {cache_path}")
+    print(f"[INFO] Feature sweep CV tuning for {base_cfg.stem.replace('config_', '')} "
+          f"(input_aggregation={aggregation!r}, full features, selection_rule=best) "
+          f"-> {cache_path.name}")
     train_module.run_xgb_cv_tuning_only(
         config=cfg,
         train_samples=train_samples,
@@ -326,6 +453,34 @@ def _ensure_feature_sweep_cache(plan: DatasetPlan) -> None:
         use_cache=False,
         write_cache=True,
     )
+
+
+def _pin_all_sample_subdirs(plan: "DatasetPlan", surrogate_model: str) -> None:
+    """Write every pinned split this dataset will need, before any parallel work starts.
+
+    `_prepare_variant_config` creates a pinned split on first use, which is fine while
+    runs are sequential. With `--parallel-evaluators` above one, several workers can
+    find the same split missing at the same moment and write it concurrently, and an
+    interleaved write would leave a split file that is neither run's. Doing it here,
+    once, in the single main process removes the race rather than locking around it.
+
+    Both subdirectories are covered because the families divide across them: GP and MLR
+    train on `samples`, XGBoost and the Transformer on `mc_replicates`.
+    """
+    subdirs = []
+    for cfg_path in plan.train_configs:
+        try:
+            data_cfg = train_module.load_config(str(cfg_path))["data"]
+        except Exception:
+            continue
+        sub = str(data_cfg.get("sample_subdir", "samples"))
+        if sub not in subdirs:
+            subdirs.append(sub)
+
+    for sub in subdirs:
+        if not (Path(plan.dataset_dir) / sub).is_dir():
+            continue
+        _materialize_pinned_split(dataset_dir=plan.dataset_dir, sample_subdir=sub)
 
 
 @dataclass
@@ -356,6 +511,20 @@ class CandidateResult:
     source: str = "search"
     seeded_input_rank: int | None = None
     training_stop_reason: str | None = None
+    # Rolling-origin cross-validation, when enabled. `cv_folds` is 0 for a
+    # single-holdout evaluation, in which case the spread fields stay NaN and the
+    # one-standard-error rule has nothing to work with.
+    cv_folds: int = 0
+    cv_r2_mean: float = float("nan")
+    cv_r2_se: float = float("nan")
+    cv_objective_se: float = float("nan")
+    # Spread of the model's own predictions on the evaluation set, and whether that
+    # spread has collapsed. A model predicting a constant carries no information about
+    # any predictor, so every feature subset scores identically and the search has
+    # nothing to choose between -- which is what happens on E. coli and Chromium,
+    # where the fitted trees are all single leaves.
+    pred_std: float = float("nan")
+    degenerate: bool = False
 
 
 def _load_training_stop_reason(forecast_dir: Path) -> str | None:
@@ -606,9 +775,66 @@ def _load_seed_subsets(
 
     if out:
         print(f"[INFO] Loaded {len(out)} seed subset(s) from: {seed_csv}")
+        _report_shapley_rank_separation(seed_csv, row_count)
     else:
         print(f"[WARN] No valid seed subsets parsed from {seed_csv}; proceeding with unseeded search.")
     return out
+
+
+def _report_shapley_rank_separation(seed_csv: Path, row_count: int) -> float:
+    """Report how much of the Shapley ranking the attribution actually resolved.
+
+    The seed subsets are nested top-k prefixes of a Shapley ranking, so the ranking's
+    *order* is what the beam search inherits. If adjacent ranks have overlapping 95%
+    confidence intervals then that order is noise at those positions, and seeding from
+    it starts the search somewhere arbitrary while looking principled. This does not
+    change what is loaded -- it states what the seeds are worth, so the run can be
+    judged rather than assumed.
+
+    Args:
+        seed_csv: The loaded seed-subset CSV; the scores file sits beside it.
+        row_count: Row count used to locate `feature_shapley_scores_r###.csv`.
+
+    Returns:
+        Fraction of adjacent rank pairs whose intervals are disjoint. NaN when the
+        scores file is absent or carries no intervals.
+    """
+    scores_csv = Path(seed_csv).parent / f"feature_shapley_scores_r{int(row_count):03d}.csv"
+    if not scores_csv.is_file():
+        print(f"[WARN] No Shapley scores beside the seeds ({scores_csv.name}); "
+              "rank separation unknown, so seed order is unverified.")
+        return float("nan")
+    try:
+        df = pd.read_csv(scores_csv)
+    except Exception as exc:
+        print(f"[WARN] Could not read {scores_csv}: {exc}")
+        return float("nan")
+
+    needed = {"ci95_low", "ci95_high"}
+    if not needed.issubset(df.columns):
+        print(f"[WARN] {scores_csv.name} carries no confidence intervals; "
+              "rank separation cannot be checked.")
+        return float("nan")
+
+    sort_col = "shapley_rank" if "shapley_rank" in df.columns else "shapley_value_est"
+    ascending = sort_col == "shapley_rank"
+    df = df.sort_values(sort_col, ascending=ascending).reset_index(drop=True)
+    lo = pd.to_numeric(df["ci95_low"], errors="coerce").to_numpy(dtype=float)
+    hi = pd.to_numeric(df["ci95_high"], errors="coerce").to_numpy(dtype=float)
+    if len(lo) < 2:
+        return float("nan")
+
+    # Adjacent ranks are separated when the higher-ranked feature's lower bound clears
+    # the next feature's upper bound.
+    pairs = len(lo) - 1
+    disjoint = int(np.sum(np.isfinite(lo[:-1]) & np.isfinite(hi[1:]) & (lo[:-1] > hi[1:])))
+    frac = disjoint / pairs if pairs else float("nan")
+    verdict = "usable" if frac >= 0.5 else "weak -- treat the seed order as arbitrary"
+    print(
+        f"[SEED] Shapley rank separation: {disjoint}/{pairs} adjacent rank pairs have "
+        f"disjoint 95% intervals ({frac:.0%}); {verdict}."
+    )
+    return frac
 
 
 def discover_mc_dataset_plans(
@@ -645,10 +871,17 @@ def discover_mc_dataset_plans(
                 continue
             try:
                 cfg = train_module.load_config(str(path))
-                if "model_name" in cfg or "model_type" in cfg:
-                    train_configs.append(path)
-                else:
+                if "model_name" not in cfg and "model_type" not in cfg:
                     print(f"[WARN] Skipping config without model_name/model_type: {path}")
+                    continue
+                model_type = str(cfg.get("model_type", "")).strip()
+                if model_type and model_type not in _TRAINABLE_MODEL_TYPES:
+                    print(
+                        f"[WARN] Skipping {path.name}: model_type '{model_type}' is not "
+                        "implemented by this sweep and would fail after selection."
+                    )
+                    continue
+                train_configs.append(path)
             except Exception as e:
                 print(f"[WARN] Could not load config {path}: {e}")
         if not train_configs:
@@ -696,6 +929,9 @@ def _prepare_variant_config(
     feature_tag: str,
     tmp_dir: Path,
     forced_data_dir: Path | None = None,
+    cv_fold_dir: Path | None = None,
+    cv_fold_index: int | None = None,
+    pin_split: bool | None = None,
 ) -> Path:
     cfg = train_module.load_config(str(base_config_path))
     cfg_copy = copy.deepcopy(cfg)
@@ -757,9 +993,47 @@ def _prepare_variant_config(
     split_cfg.setdefault("test_size", 0.3)
     split_cfg["min_test_independent"] = int(FINAL_TOPK_MIN_TEST_SAMPLES)
 
+    variant_suffix = ""
+    pin = _pin_split_enabled() if pin_split is None else bool(pin_split)
+    if cv_fold_dir is None and pin:
+        # One split per target, reused by every run. Without this each run recomputes
+        # its own boundary from its own valid-sample count, so families are not
+        # compared on the same test set and the common-set intersection silently
+        # discards the segments they disagree about.
+        try:
+            pinned = _materialize_pinned_split(
+                dataset_dir=Path(resolved_data_dir),
+                sample_subdir=str(data_cfg.get("sample_subdir", "samples")),
+            )
+        except Exception as exc:
+            # Reverting to a per-run split here would reintroduce the drift this
+            # exists to remove, and would do it quietly, one run at a time.
+            raise RuntimeError(
+                f"Could not pin the split for {Path(resolved_data_dir).name}: {exc}. "
+                "Pass --no-pin-split to accept per-run boundaries instead."
+            ) from exc
+        split_cfg["reuse_split"] = True
+        split_cfg["split_source"] = str(pinned.resolve())
+        split_cfg["allow_rebalance"] = False
+
+    if cv_fold_dir is not None:
+        # Pin this evaluation to one rolling-origin fold. The fold list is fixed for
+        # the whole search, so `min_test_independent` must not be allowed to rebalance
+        # it -- a rebalance would move segments between train and test and quietly give
+        # this candidate a different evaluation set from every other candidate.
+        split_cfg["reuse_split"] = True
+        split_cfg["split_source"] = str(Path(cv_fold_dir).resolve())
+        split_cfg["min_test_independent"] = 1
+        # The run directory keeps the candidate's own name, with no per-fold suffix.
+        # Folds of one candidate run sequentially and each fold's predictions are read
+        # before the next overwrites them, so one directory suffices -- and Windows
+        # applies a 260-character path limit that these already-long names leave little
+        # room under. Only the throwaway config file carries the fold number.
+        variant_suffix = f"_cv{int(cv_fold_index or 0):02d}"
+
     cfg_copy.pop("__config_dir", None)
 
-    variant_name = f"{base_config_path.stem}_r{row_count:03d}_{feature_tag}{base_config_path.suffix}"
+    variant_name = f"{base_config_path.stem}_r{row_count:03d}_{feature_tag}{variant_suffix}{base_config_path.suffix}"
     variant_path = tmp_dir / variant_name
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -792,7 +1066,8 @@ def _train_single_config(
         config["save_training_plots"] = False
 
     if model_type in {"xgb_regressor", "xgb_classifier"}:
-        cache_payload = _load_feature_sweep_cache(dataset_dir)
+        _agg = config.get("data", {}).get("input_aggregation", "none")
+        cache_payload = _load_feature_sweep_cache(dataset_dir, _agg)
         if cache_payload is not None:
             tuned = cache_payload.get("tuned_hyperparameters") or cache_payload.get("best_params") or {}
             if isinstance(tuned, dict) and tuned:
@@ -801,9 +1076,12 @@ def _train_single_config(
                 cv_cfg = hyper_cfg.get("cv_tuning")
                 if isinstance(cv_cfg, dict):
                     cv_cfg["enabled"] = False
-                    cv_cfg["cache_path"] = str(_feature_sweep_cache_path(dataset_dir))
+                    cv_cfg["cache_path"] = str(_feature_sweep_cache_path(dataset_dir, _agg))
                 else:
-                    hyper_cfg["cv_tuning"] = {"enabled": False, "cache_path": str(_feature_sweep_cache_path(dataset_dir))}
+                    hyper_cfg["cv_tuning"] = {
+                        "enabled": False,
+                        "cache_path": str(_feature_sweep_cache_path(dataset_dir, _agg)),
+                    }
 
     device = torch.device(config["device"])
     matplotlib.use(config["matplotlib_backend"])
@@ -870,6 +1148,92 @@ def _copy_eval_directory(source_dir: Path, dest_dir: Path) -> None:
     new_cfg = dest_dir / f"config_evaluate_{dest_dir.name}.yml"
     if old_cfg.exists() and old_cfg != new_cfg:
         old_cfg.rename(new_cfg)
+
+
+def _variant_key(base_config_path) -> str:
+    """Registry key identifying one model configuration, not its family.
+
+    The evaluation-reuse cache was keyed on ``model_type``, which is ``gp_regressor``
+    for all four Gaussian process configurations. The first of them to be evaluated
+    registered under that key and the other three matched it, so their directories were
+    filled by copying its results and they were never trained: four rows reporting one
+    model's score under four names. Keying on the configuration stem keeps the reuse --
+    which is sound when the model really is the same -- while making a variant distinct.
+    """
+    return Path(base_config_path).stem.replace("config_", "")
+
+
+_EMPTY_VARIANT_FIELDS = {
+    "variant": "",
+    "input_aggregation": "",
+    "kernel": "",
+    "effective_kernel": "",
+    "effective_ard": "",
+}
+
+
+def _degeneracy_fields(run_dir) -> dict:
+    """``pred_std`` and ``degenerate`` for a finished run, read from its predictions.
+
+    Recorded on every row so the results table can state that a model predicts a
+    constant, rather than leaving it to be inferred from a suspiciously round R2. For
+    a target where every model is degenerate, that is the finding: no predictor set is
+    distinguishable because none of them changes the prediction.
+    """
+    if run_dir is None:
+        return {"pred_std": float("nan"), "degenerate": ""}
+    y, pr = _pooled_predictions(Path(run_dir))
+    if pr.size < 2:
+        return {"pred_std": float("nan"), "degenerate": ""}
+    std, deg = _prediction_spread(y, pr)
+    return {"pred_std": std, "degenerate": bool(deg)}
+
+
+def _model_variant_fields(base_config_path, run_dir=None) -> dict:
+    """The structural identity of a fitted run, for the metrics table.
+
+    ``model`` alone is not an identity. Four Gaussian process configurations share the
+    model type ``gp_regressor`` while differing in how the input window is reduced and
+    which kernel is used, and on one target they span R2 from -4.32 to +0.56. A table
+    recording only ``gp_regressor`` cannot say which model produced a result, and
+    anything downstream that resolves a config from it has to guess -- which is how a
+    run selected as gp_04 was later retrained as gp_01.
+
+    ``variant`` comes from the configuration that was used, so it is always present.
+    The remaining fields are read from the run's own ``model_config.json`` where one
+    exists, so they describe what was actually fitted rather than what was requested --
+    ``effective_ard`` in particular differs from the requested ``ard`` whenever the
+    dimensionality guard fires.
+
+    Args:
+        base_config_path: The training config this run was built from.
+        run_dir: The run's output directory, when it got far enough to have one.
+
+    Returns:
+        ``variant``, ``input_aggregation``, ``kernel``, ``effective_kernel`` and
+        ``effective_ard``; empty strings where a field does not apply to the family.
+    """
+    out = {
+        "variant": Path(base_config_path).stem.replace("config_", "") if base_config_path else "",
+        "input_aggregation": "",
+        "kernel": "",
+        "effective_kernel": "",
+        "effective_ard": "",
+    }
+    if run_dir is None:
+        return out
+    cfg_path = Path(run_dir) / "model_config.json"
+    if not cfg_path.is_file():
+        return out
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return out
+    for key in ("input_aggregation", "kernel", "effective_kernel", "effective_ard"):
+        if key in payload:
+            out[key] = payload[key]
+    return out
 
 
 def _mlr_artifact_dir(output_dir: Path, subset_label: str,
@@ -1007,6 +1371,12 @@ def _evaluate_mlr_with_rebalance(
     4. Repeat up to ``_MAX_REBALANCE_ITERS`` times to handle newly-moved
        samples that are themselves unpredictable.
 
+    Step 3 is skipped where the split is pinned, because moving a training segment
+    into the test set would both break the test set shared with every other model and
+    evaluate this one on data it was fitted on. The exclusions from step 2 still
+    apply and are reported: MLR is then scored on a subset of the shared test set,
+    which is visible in its sample count rather than papered over.
+
     Returns
     -------
     preds, targets, train_samples, test_samples, meta, total_excluded
@@ -1036,6 +1406,15 @@ def _evaluate_mlr_with_rebalance(
             f"[MLR] {n_excl} test sample(s) excluded (unpredictable after "
             f"{aggregation_mode} aggregation) for {model_name}, iteration {iteration + 1}."
         )
+
+        if _pin_split_enabled():
+            print(
+                f"[MLR] Split is pinned: not rebalancing {model_name}. It is scored on "
+                f"{len(test_samples)} of the shared test segments; the {total_excluded} "
+                "excluded one(s) are reported as unscored rather than replaced with "
+                "segments the model trained on."
+            )
+            break
 
         # Re-enforce minimum test guarantee.
         train_names = [str(s[2]) for s in train_samples]
@@ -1530,9 +1909,500 @@ def _objective_from_metrics(r2: float, drop_rate: float, lambda_drop: float) -> 
 
 
 def _candidate_rank_key(item: CandidateResult) -> tuple[float, float, float, str]:
-    """Deterministic subset ranking key for objective minimization and R2 tie-breaks."""
+    """Deterministic subset ranking key for objective minimization and R2 tie-breaks.
+
+    Exact ties are broken toward the *smaller* subset. Two subsets that score
+    identically are not equally good evidence: the smaller one claims less, and with
+    11 candidate predictors against 12-47 independent test samples the larger one is
+    the likelier to be fitting the holdout. This only settles exact ties; near-ties
+    are the business of `_apply_one_se_rule`.
+    """
     r2_tie = -float(item.r2) if np.isfinite(item.r2) else float("inf")
-    return (float(item.objective), r2_tie, -float(item.n_features), str(item.feature_tag))
+    # Degeneracy breaks ties and nothing more. It sits below the objective, so a model
+    # whose predictions do not vary can still win outright if it genuinely scores best;
+    # it only loses to a candidate it could not be separated from, which would otherwise
+    # have been settled arbitrarily.
+    return (float(item.objective), bool(item.degenerate), r2_tie,
+            float(item.n_features), str(item.feature_tag))
+
+
+def _bootstrap_objective_se(
+    y: np.ndarray,
+    p: np.ndarray,
+    n_resamples: int = 400,
+    seed: int = 0,
+) -> float:
+    """Standard error of ``1 - r2`` from resampling the scored points.
+
+    With rolling-origin folds the spread across folds supplies this. Without them the
+    objective is a single number and the one-standard-error rule would have nothing to
+    act on -- yet the uncertainty is real and is precisely why the top few subsets
+    cannot be told apart. Resampling the held-out points the candidate was actually
+    scored on measures that uncertainty without fitting anything again. It is the same
+    device the evidence statistics already use for the skill interval.
+
+    Args:
+        y: Held-out targets.
+        p: Predictions for those targets.
+        n_resamples: Bootstrap replicates.
+        seed: Fixed so the same candidate always yields the same interval.
+
+    Returns:
+        The standard deviation of the resampled objective, or NaN when there are too
+        few points, or when the resampled target variance collapses too often for the
+        spread to mean anything.
+    """
+    if y.size < 4:
+        return float("nan")
+    sst = float(np.sum((y - y.mean()) ** 2))
+    if sst <= 0:
+        return float("nan")
+    rng = np.random.default_rng(seed)
+    n = y.size
+    idx = rng.integers(0, n, size=(int(n_resamples), n))
+    # Resample the squared errors only. Resampling the denominator too lets a draw
+    # with little target variance produce an enormous ratio, which inflated the
+    # estimate by an order of magnitude (Lead: 55.8 against 7.1). The denominator is
+    # a property of the evaluation set, not of the model, so it stays fixed.
+    sq_err = (p - y) ** 2
+    vals = sq_err[idx].mean(axis=1) * n / sst
+    return float(np.std(vals, ddof=1))
+
+
+def _apply_one_se_rule(
+    candidates: list[CandidateResult],
+    best: CandidateResult,
+    tolerance_se: float,
+) -> CandidateResult:
+    """Return the smallest subset statistically indistinguishable from *best*.
+
+    The search objective is an estimate, not a measurement, and the spread between
+    the best few subsets is routinely smaller than the uncertainty of the estimate
+    itself. Selecting the argmin regardless reports a subset the search never
+    actually distinguished from its neighbours. The one-standard-error rule -- the
+    standard remedy -- keeps every candidate within `tolerance_se` standard errors of
+    the best objective and returns the most parsimonious of them.
+
+    The standard error comes from the spread across rolling-origin folds when those
+    are in use, and otherwise from resampling the held-out points the candidate was
+    scored on. Either way it is measured, not assumed; if neither is available *best*
+    is returned unchanged rather than an interval being invented for it.
+
+    Args:
+        candidates: All scored candidates to consider.
+        best: The argmin of the objective.
+        tolerance_se: Width of the acceptance band, in standard errors.
+
+    Returns:
+        The selected candidate, which is *best* itself when nothing smaller qualifies.
+    """
+    if tolerance_se <= 0 or not candidates:
+        return best
+    se = float(best.cv_objective_se)
+    if not np.isfinite(se) or se <= 0:
+        return best
+
+    threshold = float(best.objective) + tolerance_se * se
+    within = [c for c in candidates if np.isfinite(c.objective) and c.objective <= threshold]
+    if not within:
+        return best
+    # Smallest subset first; among equally small ones, the best objective.
+    within.sort(key=lambda c: (int(c.n_features), float(c.objective), str(c.feature_tag)))
+    chosen = within[0]
+    if chosen.feature_tag != best.feature_tag:
+        print(
+            f"[SELECT] One-SE rule: {len(within)} subset(s) within {tolerance_se:.1f} SE "
+            f"({se:.4f}) of the best objective {best.objective:.4f}. "
+            f"Selecting {chosen.n_features} features (objective={chosen.objective:.4f}, "
+            f"r2={chosen.r2:.4f}) over {best.n_features} features "
+            f"(objective={best.objective:.4f}, r2={best.r2:.4f})."
+        )
+    return chosen
+
+
+_SEGMENT_MC_SUFFIX = re.compile(r"_mc_[0-9]+$")
+
+
+def _segment_base(name: str) -> str:
+    """Segment id for a sample file, with any Monte Carlo replicate suffix removed."""
+    return _SEGMENT_MC_SUFFIX.sub("", Path(str(name)).stem)
+
+
+def _segment_order(name: str) -> int:
+    m = re.search(r"([0-9]+)", _segment_base(name))
+    return int(m.group(1)) if m else -1
+
+
+def _pin_split_enabled() -> bool:
+    """Whether every run reuses one pinned split per target.
+
+    Carried in the environment rather than in a module global so that the parallel
+    candidate evaluators, which re-import this module in a fresh process, inherit the
+    setting instead of silently reverting to the default.
+    """
+    raw = str(os.environ.get("WQ_PIN_SPLIT", "1")).strip().lower()
+    return raw not in {"0", "false", "no", ""}
+
+
+def _canonical_probe_config(dataset_dir: Path) -> Path:
+    """The single config whose split defines this target's boundary.
+
+    The boundary must not depend on which model is being prepared. It did: each
+    config was used to compute its own, and because GP trains on `samples` while
+    XGBoost trains on `mc_replicates`, the two disagreed -- 30 training segments
+    against 31, so one family was scored on 12 test segments and the other on 11.
+    Resolving one config here, deterministically, from the dataset directory means
+    every family lands on the same cut.
+    """
+    cfgs = _surrogate_candidates(sorted(Path(dataset_dir).glob("config_*.yml")))
+    if not cfgs:
+        raise FileNotFoundError(f"No training configs in {dataset_dir}")
+
+    # The probe decides *where* the 70/30 boundary falls, not whether the split is
+    # shared: every run reuses the pinned lists, so no run can train on a segment
+    # another one is scored on whichever configuration defined them. What the probe
+    # does control is which samples count as usable, through two settings the families
+    # disagree on -- the window representation (`none` rejects a sample for any missing
+    # value; an aggregation only where a predictor is missing throughout) and
+    # `nan_tolerance` (0.0 for the Gaussian processes, 0.8 for XGBoost).
+    #
+    # The most inclusive pair is chosen, so the boundary reflects the fullest view of
+    # the usable record rather than one family's tolerance. That this matters is not
+    # hypothetical: on Turbidity the boundary moved from 30/12 to 31/11 purely because
+    # the probe fell through from an XGBoost config to a Gaussian process one.
+    def _inclusiveness(path):
+        try:
+            cfg = train_module.load_config(str(path))
+        except Exception:
+            return (1, 1.0)
+        data = cfg.get("data", {}) or {}
+        split = cfg.get("data_split", {}) or {}
+        aggregated = str(data.get("input_aggregation", "none")).strip().lower() not in ("", "none")
+        tol = split.get("nan_tolerance")
+        try:
+            tol = float(tol) if tol is not None else 1.0
+        except (TypeError, ValueError):
+            tol = 1.0
+        # Sorted ascending, so: unaggregated first, then the highest tolerance.
+        return (1 if aggregated else 0, -tol)
+
+    ranked = sorted(cfgs, key=lambda c: _inclusiveness(c) + (c.name,))
+    best = _inclusiveness(ranked[0])
+    tied = [c for c in ranked if _inclusiveness(c) == best]
+    # Among equally inclusive configurations, a stable preference so the boundary is
+    # reproducible rather than dependent on which names happen to exist.
+    for preferred in ("xgb_01", "transformer_01", "gp_01"):
+        for c in tied:
+            if c.stem.replace("config_", "") == preferred:
+                return c
+    return tied[0]
+
+
+def _pinned_split_dir(dataset_dir: Path, sample_subdir: str) -> Path:
+    """Where the one split per target lives, keyed by the subdirectory it names files in.
+
+    Not keyed by row count: the boundary is a point in time, shared by every model of
+    this target whatever window length it reads. A model whose window cannot be filled
+    for some segment simply drops it, which shows up in its own sample count.
+    """
+    return (Path(dataset_dir) / "forecasts" / "pinned_split" / str(sample_subdir))
+
+
+def _materialize_pinned_split(
+    dataset_dir: Path,
+    sample_subdir: str,
+) -> Path:
+    """Fix one train/test boundary per target and write it once, for every run to reuse.
+
+    Each run currently recomputes its own boundary as `train_fraction` of *that run's*
+    valid sample count, and validity depends on the feature subset. For 8 of the 14
+    targets the boundary therefore lands in different places for different runs -- the
+    Total coliforms test set starts at segment 114, 115, 116, 118, 119 or 120 depending
+    on the run. There is consequently no single test set, comparisons across families
+    are not like-for-like, and the common-set intersection discards whatever the runs
+    disagree about.
+
+    Pinning removes the cause. The boundary is computed once, from the full feature
+    set, and every run reuses it. Both lists name *all* segments on their side rather
+    than only the ones the probing feature set could use, so a subset that can use a
+    segment the full set cannot still gets it; `load_samples` drops the rest per run.
+
+    Returns:
+        The directory holding `train_files.txt` and `test_files.txt`.
+
+    Raises:
+        ValueError: When either side of the boundary would be empty.
+    """
+    out_dir = _pinned_split_dir(dataset_dir, sample_subdir)
+    train_file = out_dir / "train_files.txt"
+    test_file = out_dir / "test_files.txt"
+    if train_file.exists() and test_file.exists():
+        return out_dir
+
+    probe = _canonical_probe_config(dataset_dir)
+    cfg = train_module.load_config(str(probe))
+    probe_data = cfg["data"]
+    full_features = tuple(probe_data["input_columns"])
+    row_count = int(probe_data["input_row_2"]) - int(probe_data["input_row_1"])
+    tmp_cfg_dir = _forecast_sweeps_dir(dataset_dir) / "configs"
+    train_segments = _training_portion_segments(
+        dataset_dir=dataset_dir,
+        surrogate_config_path=probe,
+        row_count=row_count,
+        full_features=full_features,
+        tmp_cfg_dir=tmp_cfg_dir,
+    )
+    if not train_segments:
+        raise ValueError(f"Pinned split for {dataset_dir.name} has an empty training side.")
+    boundary = max(_segment_order(seg) for seg in train_segments)
+
+    sample_dir = Path(dataset_dir) / sample_subdir
+    files = sorted(p.name for p in sample_dir.glob("*.csv"))
+    if not files:
+        raise FileNotFoundError(f"No sample files under {sample_dir}")
+
+    train_names, test_names = [], []
+    for name in files:
+        (train_names if _segment_order(name) <= boundary else test_names).append(name)
+    if not train_names or not test_names:
+        raise ValueError(
+            f"Pinned split for {dataset_dir.name} [{sample_subdir}] puts every segment "
+            f"on one side of segment {boundary}."
+        )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _write_split_file_names(train_file, train_names)
+    _write_split_file_names(test_file, test_names)
+    n_train_seg = len({_segment_base(n) for n in train_names})
+    n_test_seg = len({_segment_base(n) for n in test_names})
+    print(
+        f"[PIN] {dataset_dir.name} [{sample_subdir}]: boundary after segment {boundary} "
+        f"(from {probe.stem}); {n_train_seg} training and {n_test_seg} test segment(s). "
+        "Every run of this target reuses this split."
+    )
+    return out_dir
+
+
+def _training_portion_segments(
+    dataset_dir: Path,
+    surrogate_config_path: Path,
+    row_count: int,
+    full_features: tuple[str, ...],
+    tmp_cfg_dir: Path,
+) -> set[str]:
+    """Segments on the training side of the reported split, and only those.
+
+    Feature selection must not see the segments the results table is scored on. It
+    currently does: a search-phase candidate run and the final reported run resolve to
+    the same 70/30 temporal split, so all 240 candidate evaluations land on the same
+    test segments that Table 3 reports. That is the source of the optimistic bias the
+    manuscript discloses, and confining the search to the training side removes it
+    rather than documenting it.
+
+    The boundary is taken from the *full* feature set. Validity is monotone in the
+    number of columns -- dropping a predictor can only make more segments usable -- so
+    the full set has the fewest valid samples and therefore the earliest boundary. Any
+    subset the search tries has a boundary at or after this one, so folds built here
+    can never reach into a candidate's own test segments.
+
+    Returns:
+        Base segment names (no replicate suffix) making up the training portion.
+    """
+    cfg_path = _prepare_variant_config(
+        base_config_path=surrogate_config_path,
+        row_count=row_count,
+        features=full_features,
+        feature_tag="splitprobe",
+        tmp_dir=tmp_cfg_dir,
+        forced_data_dir=dataset_dir,
+        # This probe computes the boundary the pinned split is made from, so it must
+        # compute its own; reusing a pinned split here would be circular.
+        pin_split=False,
+    )
+    cfg = train_module.load_config(str(cfg_path))
+    cfg = train_module.merge_with_defaults(cfg, cfg["model_type"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        train_samples, test_samples = train_module.load_and_split_data(cfg)
+    train_segs = {_segment_base(str(sample[2])) for sample in train_samples}
+    test_segs = {_segment_base(str(sample[2])) for sample in test_samples}
+
+    # The probe trains nothing; it exists only to read the split. Leaving its directory
+    # behind puts a run in the results tree that has split files but no model, which
+    # every downstream scan then has to recognise and skip.
+    try:
+        probe_dir = Path(cfg["data"]["forecast_dir"])
+        if probe_dir.is_dir() and "splitprobe" in probe_dir.name:
+            shutil.rmtree(probe_dir, ignore_errors=True)
+    except Exception:
+        pass
+    overlap = train_segs & test_segs
+    if overlap:
+        raise RuntimeError(
+            f"Reported split places {len(overlap)} segment(s) in both train and test; "
+            "folds cannot be built safely from it."
+        )
+    print(
+        f"[CV] Reported split for {dataset_dir.name}: {len(train_segs)} training "
+        f"segment(s), {len(test_segs)} held back for the results table and excluded "
+        "from feature selection entirely."
+    )
+    return train_segs
+
+
+def _cv_folds_root(dataset_dir: Path, row_count: int) -> Path:
+    """Where the pinned fold split files live.
+
+    Deliberately a sibling of the sweep namespace, not a child of it: the
+    post-processors enumerate every directory under `feature_sweeps` as a candidate
+    run, and a fold directory holding split files but no model would be walked as
+    though it were one.
+    """
+    return Path(dataset_dir) / "forecasts" / "cv_folds" / f"r{int(row_count):03d}"
+
+
+def _cv_folds_dir(dataset_dir: Path, row_count: int, sample_subdir: str) -> Path:
+    """Fold directory for one sample subdirectory.
+
+    GP and MLR train on `samples` while XGBoost and the Transformer train on
+    `mc_replicates`, so the file lists differ even though the segment boundaries do
+    not. Keeping them apart stops one family's list being handed to another.
+    """
+    return _cv_folds_root(dataset_dir, row_count) / str(sample_subdir)
+
+
+def _materialize_cv_folds(
+    dataset_dir: Path,
+    sample_subdir: str,
+    row_count: int,
+    n_folds: int,
+    min_train_fraction: float,
+    eligible_segments: set[str] | None = None,
+) -> list[Path]:
+    """Write one pinned train/test split per rolling-origin fold, and return their dirs.
+
+    Every candidate subset is scored on the *same* folds. That is the point: if the
+    folds moved with the subset, differences between candidates would confound the
+    subset with the evaluation set, which is the defect this whole change exists to
+    remove. Samples a given subset cannot use are dropped by `load_samples` as usual,
+    and that loss is already priced into the objective through `drop_rate`.
+
+    Folds are built over segment groups, never over individual Monte Carlo
+    replicates, so replicates of one segment can never straddle a fold boundary.
+
+    Args:
+        dataset_dir: Dataset directory holding the sample subdirectories.
+        sample_subdir: Subdirectory the surrogate trains on (`samples` or `mc_replicates`).
+        row_count: Lookback row count, used only to namespace the fold directory.
+        n_folds: Requested fold count; reduced when too few segments exist.
+        min_train_fraction: Fraction of segments reserved as the initial training run.
+
+    Returns:
+        Fold directories, in temporal order, each containing `train_files.txt` and
+        `test_files.txt`.
+
+    Raises:
+        FileNotFoundError: When the sample subdirectory holds no CSV files.
+    """
+    sample_dir = Path(dataset_dir) / sample_subdir
+    files = sorted(p.name for p in sample_dir.glob("*.csv"))
+    if not files:
+        raise FileNotFoundError(f"No sample files under {sample_dir}")
+
+    groups: dict[str, list[str]] = {}
+    for name in files:
+        groups.setdefault(_segment_base(name), []).append(name)
+    ordered_keys = sorted(groups, key=_segment_order)
+
+    if eligible_segments is not None:
+        ordered_keys = [k for k in ordered_keys if k in eligible_segments]
+        if len(ordered_keys) < 2:
+            raise ValueError(
+                f"Only {len(ordered_keys)} training segment(s) available under "
+                f"{sample_dir}; cannot build rolling-origin folds."
+            )
+
+    splits = rolling_origin_block_splits(
+        n_groups=len(ordered_keys),
+        n_folds=int(n_folds),
+        min_train_fraction=float(min_train_fraction),
+    )
+
+    root = _cv_folds_dir(dataset_dir, row_count, sample_subdir)
+    root.mkdir(parents=True, exist_ok=True)
+    fold_dirs: list[Path] = []
+    for idx, (n_train_groups, (lo, hi)) in enumerate(splits, start=1):
+        train_names = [n for k in ordered_keys[:n_train_groups] for n in sorted(groups[k])]
+        test_names = [n for k in ordered_keys[lo:hi] for n in sorted(groups[k])]
+        fold_dir = root / f"fold_{idx:02d}"
+        fold_dir.mkdir(parents=True, exist_ok=True)
+        _write_split_file_names(fold_dir / "train_files.txt", train_names)
+        _write_split_file_names(fold_dir / "test_files.txt", test_names)
+        fold_dirs.append(fold_dir)
+
+    scope = "training-portion" if eligible_segments is not None else "all"
+    print(
+        f"[CV] {dataset_dir.name} r{int(row_count):03d} [{sample_subdir}]: "
+        f"{len(fold_dirs)} rolling-origin fold(s) over {len(ordered_keys)} "
+        f"{scope} segments; first fold trains on {splits[0][0]}, "
+        f"scoring {len(ordered_keys) - splits[0][0]} segments in total."
+    )
+    return fold_dirs
+
+
+def _pooled_predictions(forecast_dir: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Held-out targets and predictions from one evaluated run."""
+    pred_csv = Path(forecast_dir) / "predictions.csv"
+    if not pred_csv.is_file():
+        return np.array([]), np.array([])
+    df = pd.read_csv(pred_csv)
+    if "kind" in df.columns:
+        df = df[df["kind"].astype(str) == "test"]
+    if df.empty or "target" not in df.columns:
+        return np.array([]), np.array([])
+    # The model's own prediction column sits immediately after `target`; reference
+    # forecasts and uncertainty columns follow it.
+    after = list(df.columns[df.columns.get_loc("target") + 1:])
+    skip = {"Naive", "Seasonal", "Linear"}
+    pred_col = next(
+        (c for c in after if c not in skip and not str(c).endswith(("_std", "_var"))),
+        None,
+    )
+    if pred_col is None:
+        return np.array([]), np.array([])
+    y = pd.to_numeric(df["target"], errors="coerce").to_numpy(dtype=float)
+    pv = pd.to_numeric(df[pred_col], errors="coerce").to_numpy(dtype=float)
+    ok = np.isfinite(y) & np.isfinite(pv)
+    return y[ok], pv[ok]
+
+
+def _prediction_spread(y: np.ndarray, p: np.ndarray) -> tuple:
+    """``(pred_std, degenerate)`` for one set of held-out predictions.
+
+    Degeneracy is judged against the target's own spread rather than an absolute
+    threshold, so it means the same thing whatever the units. It is deliberately a test
+    of variance, not of accuracy: a model can be inaccurate and still informative, and
+    only a model whose predictions do not vary at all is uninformative by construction.
+    That distinction matters because the existing `min_r2` guardrail tests accuracy and
+    therefore fires on every trial for targets where nothing fits, discriminating
+    nothing.
+    """
+    if p.size < 2:
+        return float("nan"), False
+    ps = float(np.std(p))
+    ys = float(np.std(y)) if y.size >= 2 else 0.0
+    if not np.isfinite(ps):
+        return float("nan"), False
+    threshold = max(1e-12, 1e-4 * ys)
+    return ps, bool(ps < threshold)
+
+
+def _pooled_r2(y: np.ndarray, p: np.ndarray) -> float:
+    if y.size < 2:
+        return float("nan")
+    denom = float(np.sum((y - y.mean()) ** 2))
+    if denom <= 0:
+        return float("nan")
+    return float(1.0 - np.sum((p - y) ** 2) / denom)
 
 
 def _evaluate_candidate(
@@ -1548,7 +2418,17 @@ def _evaluate_candidate(
     disable_training_plots: bool,
     disable_eval_plots: bool,
     suppress_training_logs: bool,
+    cv_fold_dirs: list[Path] | None = None,
 ) -> CandidateResult:
+    """Score one candidate subset.
+
+    With `cv_fold_dirs`, the subset is fitted once per rolling-origin fold and scored
+    on the pooled held-out predictions, and the spread across folds gives the standard
+    error the one-standard-error rule needs. Without it, the subset is scored on the
+    run's single 70/30 holdout -- 12 to 47 independent samples depending on target,
+    which is too few to separate candidates reliably once 240 of them have been tried
+    against it.
+    """
     try:
         uses_uncertainty = _candidate_uses_uncertainty_distributions(tuple(features))
         base_cfg = train_module.load_config(str(surrogate_config_path))
@@ -1572,55 +2452,141 @@ def _evaluate_candidate(
         )
         drop_rate = float(1.0 - (valid_raw / total_raw)) if total_raw > 0 else 1.0
 
-        variant_cfg = _prepare_variant_config(
-            base_config_path=surrogate_config_path,
-            row_count=row_count,
-            features=features,
-            feature_tag=feature_tag,
-            tmp_dir=tmp_cfg_dir,
-            forced_data_dir=dataset_dir,
-        )
-        eval_cfg = _train_single_config(
-            variant_cfg,
-            dataset_dir,
-            disable_training_plots=disable_training_plots,
-            disable_eval_plots=disable_eval_plots,
-            suppress_training_logs=suppress_training_logs,
-        )
         if not uses_uncertainty:
             print(
                 f"[MC-POLICY] {dataset_dir.name} r{int(row_count):03d} {feature_tag}: "
                 "no uncertainty-enabled predictors in subset; evaluating collapsed originals only."
             )
-        _set_eval_overrides(
-            eval_cfg,
-            run_baselines=not disable_baselines_for_search,
-        )
 
-        eval_result = eval_module.evaluate_single_config(
-            str(eval_cfg),
-            save_plots_override=not disable_eval_plots,
-        )
-        if eval_result is None:
-            print(f"[ERROR] Evaluation returned None for config: {eval_cfg}")
-            print(f"         Features: {features}")
-            print(f"         Row count: {row_count}")
-            print(f"         Data dir: {data_dir_resolved}")
-            print(f"         Surrogate config: {surrogate_config_path}")
-            return None
-        model_row = eval_result
+        def _fit_and_score(fold_dir: Path | None, fold_index: int | None) -> tuple[dict, Path]:
+            """Train and evaluate this subset once; return the metric row and its dir."""
+            variant_cfg = _prepare_variant_config(
+                base_config_path=surrogate_config_path,
+                row_count=row_count,
+                features=features,
+                feature_tag=feature_tag,
+                tmp_dir=tmp_cfg_dir,
+                forced_data_dir=dataset_dir,
+                cv_fold_dir=fold_dir,
+                cv_fold_index=fold_index,
+            )
+            eval_cfg_path = _train_single_config(
+                variant_cfg,
+                dataset_dir,
+                disable_training_plots=disable_training_plots,
+                disable_eval_plots=disable_eval_plots,
+                suppress_training_logs=suppress_training_logs,
+            )
+            _set_eval_overrides(
+                eval_cfg_path,
+                run_baselines=not disable_baselines_for_search,
+            )
+            row = eval_module.evaluate_single_config(
+                str(eval_cfg_path),
+                save_plots_override=not disable_eval_plots,
+            )
+            if row is None:
+                raise RuntimeError(f"Evaluation returned None for config: {eval_cfg_path}")
+            ctx = (f"{eval_cfg_path.parent.name} "
+                   f"[{dataset_dir.name} r{int(row_count):03d} {feature_tag}]")
+            _validate_eval_metric_contract(row, context=ctx)
+            return row, eval_cfg_path.parent
 
-        context = f"{eval_cfg.parent.name} [{dataset_dir.name} r{int(row_count):03d} {feature_tag}]"
-        _validate_eval_metric_contract(model_row, context=context)
+        cv_folds_used = 0
+        cv_r2_mean = float("nan")
+        cv_r2_se = float("nan")
+        cv_objective_se = float("nan")
+        pred_std = float("nan")
+        is_degenerate = False
 
-        rmse = _extract_required_independent_metric(model_row, "rmse", context=context)
-        mae = _extract_required_independent_metric(model_row, "mae", context=context)
-        n_test_samples = _extract_required_independent_metric(model_row, "n_test_independent", context=context)
-        r2 = float(pd.to_numeric(model_row.get("r2", np.nan), errors="coerce"))
+        if cv_fold_dirs:
+            fold_rows: list[dict] = []
+            fold_r2s: list[float] = []
+            ys, ps = [], []
+            last_dir: Path | None = None
+            for fold_index, fold_dir in enumerate(cv_fold_dirs, start=1):
+                try:
+                    row, forecast_dir = _fit_and_score(fold_dir, fold_index)
+                except SampleComplianceError as exc:
+                    # A fold this subset cannot satisfy is a property of the subset,
+                    # not an error to swallow: record the shortfall and let the fold
+                    # count fall, rather than scoring the candidate on fewer folds
+                    # than its competitors without saying so.
+                    print(
+                        f"[CV] {feature_tag} fold {fold_index}: not evaluable "
+                        f"({exc.reason}); excluded from this candidate's score."
+                    )
+                    continue
+                # Harvest before the next fold reuses this directory.
+                y_fold, p_fold = _pooled_predictions(forecast_dir)
+                if y_fold.size:
+                    ys.append(y_fold)
+                    ps.append(p_fold)
+                fold_rows.append(row)
+                last_dir = forecast_dir
+                fold_r2s.append(float(pd.to_numeric(row.get("r2", np.nan), errors="coerce")))
+
+            if not fold_rows:
+                print(f"[ERROR] No rolling-origin fold was evaluable for {feature_tag}.")
+                return None
+
+            if not ys:
+                print(f"[ERROR] No held-out predictions recovered for {feature_tag}.")
+                return None
+            y_all = np.concatenate(ys)
+            p_all = np.concatenate(ps)
+
+            # Pooled, not averaged. A fold holding two segments produces an R2 whose
+            # denominator is those two segments' own variance, which is unstable
+            # enough to dominate a mean over folds. Pooling scores every held-out
+            # point against one target variance.
+            r2 = _pooled_r2(y_all, p_all)
+            pred_std, is_degenerate = _prediction_spread(y_all, p_all)
+            err = p_all - y_all
+            rmse = float(np.sqrt(np.mean(err ** 2)))
+            mae = float(np.mean(np.abs(err)))
+            n_test_samples = float(sum(
+                _extract_required_independent_metric(r, "n_test_independent", context=feature_tag)
+                for r in fold_rows
+            ))
+            model_row = fold_rows[-1]
+            cv_folds_used = len(fold_rows)
+
+            finite = [v for v in fold_r2s if np.isfinite(v)]
+            if len(finite) > 1:
+                cv_r2_mean = float(np.mean(finite))
+                cv_r2_se = float(np.std(finite, ddof=1) / np.sqrt(len(finite)))
+                # The objective is (1 - r2) + const, so its standard error is the
+                # standard error of r2.
+                cv_objective_se = cv_r2_se
+            elif finite:
+                cv_r2_mean = float(finite[0])
+
+            eval_dir_for_stop = last_dir
+        else:
+            try:
+                model_row, eval_dir_for_stop = _fit_and_score(None, None)
+            except RuntimeError as exc:
+                print(f"[ERROR] {exc}")
+                print(f"         Features: {features}")
+                print(f"         Row count: {row_count}")
+                print(f"         Data dir: {data_dir_resolved}")
+                print(f"         Surrogate config: {surrogate_config_path}")
+                return None
+            context = f"{eval_dir_for_stop.name} [{dataset_dir.name} r{int(row_count):03d} {feature_tag}]"
+            rmse = _extract_required_independent_metric(model_row, "rmse", context=context)
+            mae = _extract_required_independent_metric(model_row, "mae", context=context)
+            n_test_samples = _extract_required_independent_metric(
+                model_row, "n_test_independent", context=context)
+            r2 = float(pd.to_numeric(model_row.get("r2", np.nan), errors="coerce"))
+            y_hold, p_hold = _pooled_predictions(eval_dir_for_stop)
+            cv_objective_se = _bootstrap_objective_se(y_hold, p_hold)
+            pred_std, is_degenerate = _prediction_spread(y_hold, p_hold)
+
         input_dim = float(model_row.get("input_dim", np.nan))
         target_dim = float(model_row.get("target_dim", np.nan))
         objective = _objective_from_metrics(r2=r2, drop_rate=drop_rate, lambda_drop=lambda_drop)
-        training_stop_reason = _load_training_stop_reason(eval_cfg.parent)
+        training_stop_reason = _load_training_stop_reason(eval_dir_for_stop)
 
         return CandidateResult(
             dataset=dataset_dir.name,
@@ -1641,6 +2607,12 @@ def _evaluate_candidate(
             input_dim=input_dim,
             target_dim=target_dim,
             training_stop_reason=training_stop_reason,
+            cv_folds=int(cv_folds_used),
+            cv_r2_mean=cv_r2_mean,
+            cv_r2_se=cv_r2_se,
+            cv_objective_se=cv_objective_se,
+            pred_std=pred_std,
+            degenerate=bool(is_degenerate),
         )
     except Exception as exc:
         print(f"[ERROR] Exception in _evaluate_candidate for config: {surrogate_config_path}")
@@ -1667,6 +2639,7 @@ def _evaluate_candidate_worker(payload: dict) -> CandidateResult | None:
         disable_training_plots=bool(payload["disable_training_plots"]),
         disable_eval_plots=bool(payload["disable_eval_plots"]),
         suppress_training_logs=bool(payload["suppress_training_logs"]),
+        cv_fold_dirs=[Path(d) for d in payload.get("cv_fold_dirs") or []] or None,
     )
 
 
@@ -1761,6 +2734,46 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
 
     df["model_norm"] = df["model"].apply(_normalize_plot_model)
     df = df[df["model_norm"].isin(FINAL_METRICS_MODEL_ORDER)].copy()
+
+    # One series per model configuration, not per family. A family now spans several
+    # window representations -- xgb_01 reads the flattened window, xgb_02 daily
+    # summaries, xgb_03 six-hourly -- and they are different models, not repeats of one.
+    # Collapsing them into a family bar averaged +0.428 against -1.985 and drew -0.505,
+    # a number no model produced and which hid the best result on the target.
+    if "variant" in df.columns:
+        _variant = df["variant"].fillna("").astype(str).str.strip()
+        df["plot_key"] = _variant.where(_variant != "", df["model_norm"])
+    else:
+        df["plot_key"] = df["model_norm"]
+
+    # Order: families in their established sequence, variants in name order within each.
+    _family_of_key = dict(zip(df["plot_key"], df["model_norm"]))
+    _family_rank = {m: i for i, m in enumerate(FINAL_METRICS_MODEL_ORDER)}
+    plot_order = sorted(
+        dict.fromkeys(df["plot_key"]),
+        key=lambda k: (_family_rank.get(_family_of_key.get(k, k), 99), str(k)),
+    )
+
+    # Shade the variants of a family around its base colour so the family still reads as
+    # a block, while each configuration stays separately identifiable.
+    def _shaded(base_hex: str, position: int, count: int) -> str:
+        if count <= 1:
+            return base_hex
+        r, g, b = (int(base_hex[i:i + 2], 16) for i in (1, 3, 5))
+        # Spread from 70% to 130% of the base luminance.
+        f = 0.70 + 0.60 * (position / max(1, count - 1))
+        return "#%02x%02x%02x" % tuple(min(255, max(0, int(round(c * f)))) for c in (r, g, b))
+
+    plot_style = {}
+    for _fam in dict.fromkeys(_family_of_key.get(k, k) for k in plot_order):
+        _keys = [k for k in plot_order if _family_of_key.get(k, k) == _fam]
+        _base = FINAL_METRICS_MODEL_STYLE.get(_fam, {"label": _fam, "color": "#777777", "hatch": ""})
+        for _i, _k in enumerate(_keys):
+            plot_style[_k] = {
+                "label": _base["label"] if len(_keys) == 1 else str(_k),
+                "color": _shaded(_base["color"], _i, len(_keys)),
+                "hatch": _base.get("hatch", ""),
+            }
     if df.empty:
         raise ValueError("Cannot plot final metrics summary: no recognized model rows found.")
 
@@ -1768,12 +2781,16 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     for metric in metric_cols:
         df[metric] = pd.to_numeric(df[metric], errors="coerce")
 
-    # Collapse potential duplicate rows (for example, baseline rows repeated per ML config).
+    # Collapse genuinely duplicate rows -- a baseline is written once per ML config, with
+    # identical values -- by keeping one whole row rather than averaging across rows. Every
+    # bar is then a single real model, and its metrics are mutually consistent.
     _agg_cols = metric_cols + (["min_skill_rmse"] if "min_skill_rmse" in df.columns else [])
+    _ranked = df.sort_values("r2", ascending=False, na_position="last")
     grouped = (
-        df.groupby(["subset_rank", "model_norm"], as_index=False)[_agg_cols]
-        .mean(numeric_only=True)
+        _ranked.groupby(["subset_rank", "plot_key"], as_index=False)
+        .first()[["subset_rank", "plot_key"] + _agg_cols]
     )
+    grouped = grouped.rename(columns={"plot_key": "model_norm"})
 
     # Build rank → display label mapping.
     # Use combined labels from feature_tag merging when available; fall back to subset_label.
@@ -1798,7 +2815,7 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     r2_pivot = grouped.pivot(index="subset_rank", columns="model_norm", values="r2")
     rmse_pivot = grouped.pivot(index="subset_rank", columns="model_norm", values="rmse")
     finite_max_r2 = {}
-    for model in FINAL_METRICS_MODEL_ORDER:
+    for model in plot_order:
         if model not in r2_pivot.columns:
             continue
         vals = pd.to_numeric(r2_pivot[model], errors="coerce").to_numpy(dtype=float)
@@ -1868,7 +2885,7 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
 
     # Select best model by highest max skill across subsets; fall back to r2 if skill unavailable.
     finite_max_skill = {}
-    for model in FINAL_METRICS_MODEL_ORDER:
+    for model in plot_order:
         if model not in skill_pivot.columns or _is_baseline_model_value(model):
             continue
         vals = pd.to_numeric(skill_pivot[model], errors="coerce").to_numpy(dtype=float)
@@ -1882,8 +2899,8 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         best_model = max(finite_max_r2.items(), key=lambda item: item[1])[0]
 
     # Separate baseline and non-baseline model lists.
-    non_baseline_models = [m for m in FINAL_METRICS_MODEL_ORDER if not _is_baseline_model_value(m)]
-    baseline_models = [m for m in FINAL_METRICS_MODEL_ORDER if _is_baseline_model_value(m)]
+    non_baseline_models = [m for m in plot_order if not _is_baseline_model_value(m)]
+    baseline_models = [m for m in plot_order if _is_baseline_model_value(m)]
 
     # Sort feature clusters by highest skill across ALL non-baseline models,
     # then by highest R² (both descending).
@@ -1912,7 +2929,7 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
     )
 
     # For each subset cluster, order non-baseline model bars by descending local min-skill.
-    model_order_index = {model: idx for idx, model in enumerate(FINAL_METRICS_MODEL_ORDER)}
+    model_order_index = {model: idx for idx, model in enumerate(plot_order)}
 
     models_by_rank: dict[int, list[str]] = {}
     for rank in subset_order:
@@ -1972,7 +2989,7 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
             # Feature clusters: non-baseline models only.
             ordered_models = models_by_rank.get(int(rank), non_baseline_models)
             for i, model in enumerate(ordered_models):
-                style = FINAL_METRICS_MODEL_STYLE[model]
+                style = plot_style[model]
                 if rank in metric_pivot.index and model in metric_pivot.columns:
                     raw_val = metric_pivot.loc[rank, model]
                     val = float(raw_val) if np.isfinite(raw_val) else float("nan")
@@ -2000,7 +3017,7 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         # Baselines cluster (last position).
         j_bl = len(subset_order)
         for i, model in enumerate(baseline_bar_order):
-            style = FINAL_METRICS_MODEL_STYLE[model]
+            style = plot_style[model]
             if model in _baseline_avg.index and metric in _baseline_avg.columns:
                 raw_val = _baseline_avg.loc[model, metric]
                 val = float(raw_val) if np.isfinite(raw_val) else float("nan")
@@ -2096,8 +3113,8 @@ def _plot_final_metrics_comparison(final_df: pd.DataFrame, output_dir: Path) -> 
         ax.tick_params(axis="x", labelbottom=False)
 
     fig.subplots_adjust(top=0.89, hspace=0.16)
-    legend_handles = [legend_handles_by_model[m] for m in FINAL_METRICS_MODEL_ORDER if m in legend_handles_by_model]
-    legend_labels = [legend_labels_by_model[m] for m in FINAL_METRICS_MODEL_ORDER if m in legend_labels_by_model]
+    legend_handles = [legend_handles_by_model[m] for m in plot_order if m in legend_handles_by_model]
+    legend_labels = [legend_labels_by_model[m] for m in plot_order if m in legend_labels_by_model]
     legend_above(fig, legend_handles, legend_labels, fontsize=9)
     fig.savefig(plot_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -2565,6 +3582,11 @@ def _beam_search_subsets(
     parallel_evaluators: int = 1,
     include_row_count_in_plot_names: bool = False,
     seeded_subsets: list[tuple[str, ...]] | None = None,
+    cv_folds: int = 0,
+    cv_min_train_fraction: float = 0.5,
+    selection_tolerance_se: float = 1.0,
+    retention_tolerance: float = 0.02,
+    cv_fold_dirs: list[Path] | None = None,
 ) -> tuple[list[CandidateResult], list[CandidateResult], dict[str, tuple[float, int]]]:
     """Run beam+swap feature-subset search for one dataset and one row-count.
 
@@ -2607,6 +3629,29 @@ def _beam_search_subsets(
     full_features = tuple(base_cfg["data"]["input_columns"])
     if len(full_features) <= min_features:
         raise ValueError(f"min_features={min_features} must be < number of features ({len(full_features)})")
+
+    if int(cv_folds) > 0 and cv_fold_dirs is None:
+        training_segments = _training_portion_segments(
+            dataset_dir=dataset_dir,
+            surrogate_config_path=surrogate_config_path,
+            row_count=row_count,
+            full_features=full_features,
+            tmp_cfg_dir=tmp_cfg_dir,
+        )
+        cv_fold_dirs = _materialize_cv_folds(
+            dataset_dir=dataset_dir,
+            sample_subdir=str(base_cfg["data"].get("sample_subdir", "samples")),
+            row_count=row_count,
+            n_folds=int(cv_folds),
+            min_train_fraction=float(cv_min_train_fraction),
+            eligible_segments=training_segments,
+        )
+    elif int(cv_folds) <= 0:
+        print(
+            "[SEARCH] Rolling-origin CV disabled (--cv-folds 0): candidates are scored on "
+            "the same 70/30 holdout the results table reports, so the search sees the test "
+            "segments and the reported accuracy is an optimistically biased upper estimate."
+        )
 
     rng = np.random.default_rng(seed)
     parallel_workers = max(1, int(parallel_evaluators))
@@ -2678,6 +3723,7 @@ def _beam_search_subsets(
             disable_training_plots=disable_training_plots,
             disable_eval_plots=disable_eval_plots,
             suppress_training_logs=suppress_training_logs,
+            cv_fold_dirs=cv_fold_dirs,
         )
         cache[key] = result
         if result is not None:
@@ -2784,6 +3830,7 @@ def _beam_search_subsets(
                         "disable_training_plots": bool(disable_training_plots),
                         "disable_eval_plots": bool(disable_eval_plots),
                         "suppress_training_logs": bool(suppress_training_logs),
+                        "cv_fold_dirs": [str(d) for d in (cv_fold_dirs or [])],
                     }
                 )
 
@@ -2866,6 +3913,15 @@ def _beam_search_subsets(
         print(f"[SEARCH] Swap refinement: no improvements found (attempts: {attempts}/{max_swap_attempts}, evals: {eval_count}/{effective_eval_budget})")
 
     top_sorted = sorted(trace, key=_candidate_rank_key)
+
+    # The argmin is where the search stopped, not necessarily what it established.
+    # Prefer the smallest subset the objective cannot separate from it.
+    chosen = _apply_one_se_rule(top_sorted, top_sorted[0] if top_sorted else best,
+                                float(selection_tolerance_se))
+    if top_sorted and chosen.feature_tag != top_sorted[0].feature_tag:
+        best = chosen
+        top_sorted = [chosen] + [c for c in top_sorted if c.feature_tag != chosen.feature_tag]
+
     total_elapsed = time.time() - search_start_time
     elapsed_min = int(total_elapsed // 60)
     elapsed_sec = int(total_elapsed % 60)
@@ -2879,6 +3935,16 @@ def _beam_search_subsets(
         counts = feature_improvement_counts[feat]
         avg_delta = float(np.mean(deltas)) if deltas else 0.0
         feature_sensitivities[feat] = (avg_delta, counts)
+
+    try:
+        _write_selection_stability_artifacts(
+            dataset_dir=dataset_dir,
+            row_count=row_count,
+            trace=trace,
+            tolerance=float(retention_tolerance),
+        )
+    except Exception as exc:
+        print(f"[WARN] Could not write selection-stability artifacts: {exc}")
 
     print(f"\n[SEARCH] Recommended feature subset (from search best):")
     print(f"  Features ({best.n_features}): {', '.join(best.features)}")
@@ -2941,12 +4007,201 @@ def _beam_search_subsets(
     return top_sorted, trace, feature_sensitivities
 
 
-def _select_surrogate_config(train_configs: list[Path]) -> Path:
-    for cfg in train_configs:
-        name = cfg.name.lower()
-        if "xgb" in name and "classifier" not in name:
+def _surrogate_candidates(train_configs: list[Path]) -> list[Path]:
+    """Configs eligible to score the search, in the order they were discovered."""
+    return [
+        c for c in train_configs
+        if not any(tok in c.name.lower() for tok in _SURROGATE_EXCLUDED_TOKENS)
+    ]
+
+
+def _select_surrogate_config(train_configs: list[Path], surrogate_model: str = "xgb") -> Path:
+    """Pick the config whose name matches *surrogate_model*.
+
+    `_choose_surrogate_config` picks by measurement instead of by name; this remains
+    for the explicit case and for the XGBoost tuning cache, which is XGBoost-specific
+    by construction.
+    """
+    token = str(surrogate_model).strip().lower()
+    candidates = _surrogate_candidates(train_configs)
+    if token.startswith("auto"):
+        # `auto` and `auto:<prefix>` are resolved by measurement in
+        # `_choose_surrogate_config`; this only supplies a stand-in for the callers
+        # that need any configuration of the right shape (the row-count span, the
+        # tuning order). Keep it inside the requested family so the stand-in is never
+        # mistaken for the choice.
+        prefix = token.split(":", 1)[1].strip() if ":" in token else ""
+        pool = [c for c in candidates
+                if c.stem.replace("config_", "").startswith(prefix)] if prefix else candidates
+        return (pool or candidates or train_configs)[0]
+    if token and token != "":
+        matches = [cfg for cfg in candidates if token in cfg.name.lower()]
+        if not matches:
+            raise ValueError(
+                f"No training config matches --surrogate-model '{surrogate_model}'. "
+                f"Eligible: {', '.join(c.name for c in candidates)}. "
+                "A dataset generated before the window representations were added "
+                "carries only xgb_01: regenerate it with d_RunResample, or name one "
+                "of the configurations listed above."
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"--surrogate-model '{surrogate_model}' matches "
+                f"{len(matches)} configs: {', '.join(c.name for c in matches)}. "
+                "Name one exactly, or use 'auto' to choose by measurement. Taking the "
+                "first match is what silently substituted one variant for another."
+            )
+        return matches[0]
+    for cfg in candidates:
+        if "xgb" in cfg.name.lower():
             return cfg
-    return train_configs[0]
+    return candidates[0] if candidates else train_configs[0]
+
+
+def _choose_surrogate_config(
+    dataset_dir: Path,
+    dataset_prefix: str,
+    train_configs: list[Path],
+    row_count: int,
+    surrogate_model: str,
+    lambda_drop: float,
+    cv_folds: int,
+    cv_min_train_fraction: float,
+    disable_baselines_for_search: bool,
+    disable_training_plots: bool,
+    disable_eval_plots: bool,
+    suppress_training_logs: bool,
+) -> tuple[Path, list[Path] | None]:
+    """Choose the surrogate by measuring the families, not by matching a name.
+
+    Selecting "the first config whose name contains xgb" fixes the scoring family
+    before any evidence exists. That matters because the feature set the surrogate
+    picks is then used by every family: on the profiler-free arm XGBoost scored the
+    candidates while a Gaussian process won 7 of the 14 targets, so most reported
+    subsets were chosen on a family that did not produce the reported result.
+
+    Here each available family is fitted once on the full feature set, under exactly
+    the objective the search will use, and the best one goes on to score the search.
+
+    Args:
+        surrogate_model: `auto` to measure; any other token forces that family.
+
+    Returns:
+        `(config_path, cv_fold_dirs)`. The fold list belongs to the chosen family's
+        sample subdirectory and is reused by the search, so folds are built once.
+
+    Raises:
+        RuntimeError: When no family could be evaluated, rather than falling back to a
+            name match that the measurement was meant to replace.
+    """
+    token = str(surrogate_model).strip().lower()
+    candidates = _surrogate_candidates(train_configs)
+    if not candidates:
+        raise ValueError(f"No usable training configs in {dataset_dir}")
+
+    # `auto:<prefix>` measures only one family. Comparing every configuration would
+    # spend fits ranking families against each other, which is not the question: the
+    # surrogate exists to separate feature subsets, and the evidence that the best
+    # window representation depends on window length is what this is here to settle.
+    auto_prefix = ""
+    if token.startswith("auto:"):
+        auto_prefix = token.split(":", 1)[1].strip()
+        candidates = [c for c in candidates
+                      if c.stem.replace("config_", "").startswith(auto_prefix)]
+        if not candidates:
+            raise ValueError(
+                f"--surrogate-model '{surrogate_model}' matches no configuration. "
+                f"Eligible: {', '.join(c.stem.replace('config_', '') for c in _surrogate_candidates(train_configs))}"
+            )
+
+    tmp_cfg_dir = _forecast_sweeps_dir(dataset_dir) / "configs"
+    target_name = _derive_target_name(dataset_dir.name, dataset_prefix)
+
+    def _folds_for(cfg_path: Path, training_segments: "set[str] | None") -> "list[Path] | None":
+        if int(cv_folds) <= 0:
+            return None
+        cfg = train_module.load_config(str(cfg_path))
+        return _materialize_cv_folds(
+            dataset_dir=dataset_dir,
+            sample_subdir=str(cfg["data"].get("sample_subdir", "samples")),
+            row_count=row_count,
+            n_folds=int(cv_folds),
+            min_train_fraction=float(cv_min_train_fraction),
+            eligible_segments=training_segments,
+        )
+
+    training_segments = None
+    if int(cv_folds) > 0:
+        # The reported split groups by segment and weights by valid-sample count, and
+        # replicates multiply those counts uniformly, so the segment boundary is the
+        # same whichever family probes for it.
+        probe_cfg = candidates[0]
+        probe_features = tuple(
+            train_module.load_config(str(probe_cfg))["data"]["input_columns"]
+        )
+        training_segments = _training_portion_segments(
+            dataset_dir=dataset_dir,
+            surrogate_config_path=probe_cfg,
+            row_count=row_count,
+            full_features=probe_features,
+            tmp_cfg_dir=tmp_cfg_dir,
+        )
+
+    if not token.startswith("auto"):
+        chosen = _select_surrogate_config(train_configs, token)
+        print(f"[SURROGATE] Fixed by --surrogate-model: {chosen.name}")
+        return chosen, _folds_for(chosen, training_segments)
+
+    n_fits = len(candidates) * max(1, int(cv_folds))
+    scope = f" matching '{auto_prefix}'" if auto_prefix else ""
+    print(
+        f"[SURROGATE] Measuring {len(candidates)} configuration(s){scope} on the full "
+        f"feature set to choose which one scores the search ({n_fits} fit(s))."
+    )
+    scored = []
+    for cfg_path in candidates:
+        cfg = train_module.load_config(str(cfg_path))
+        features = tuple(cfg["data"]["input_columns"])
+        try:
+            result = _evaluate_candidate(
+                dataset_dir=dataset_dir,
+                target_name=target_name,
+                surrogate_config_path=cfg_path,
+                row_count=row_count,
+                features=features,
+                feature_tag=_feature_tag(features),
+                lambda_drop=lambda_drop,
+                tmp_cfg_dir=tmp_cfg_dir,
+                disable_baselines_for_search=disable_baselines_for_search,
+                disable_training_plots=disable_training_plots,
+                disable_eval_plots=disable_eval_plots,
+                suppress_training_logs=suppress_training_logs,
+                cv_fold_dirs=_folds_for(cfg_path, training_segments),
+            )
+        except Exception as exc:
+            print(f"[SURROGATE] {cfg_path.name}: failed to evaluate ({exc}); not eligible.")
+            continue
+        if result is None:
+            print(f"[SURROGATE] {cfg_path.name}: no result; not eligible.")
+            continue
+        scored.append((float(result.objective), cfg_path, result))
+        print(f"[SURROGATE]   {cfg_path.name:<38} objective={result.objective:.4f} "
+              f"r2={result.r2:.4f} folds={result.cv_folds}")
+
+    if not scored:
+        raise RuntimeError(
+            f"No family could be evaluated on the full feature set for "
+            f"{dataset_dir.name}; the surrogate cannot be chosen by measurement."
+        )
+    scored.sort(key=lambda item: item[0])
+    best_obj, chosen, best_result = scored[0]
+    runner_up = (f", next best {scored[1][1].name} at {scored[1][0]:.4f}"
+                 if len(scored) > 1 else "")
+    print(
+        f"[SURROGATE] Chosen: {chosen.name} (objective={best_obj:.4f}, "
+        f"r2={best_result.r2:.4f}){runner_up}."
+    )
+    return chosen, _folds_for(chosen, training_segments)
 
 
 def _compile_multi_target_comparison(
@@ -3542,6 +4797,39 @@ def _compile_multi_target_comparison(
     return plot_path
 
 
+def _write_selection_stability_artifacts(
+    dataset_dir: Path,
+    row_count: int,
+    trace: list[CandidateResult],
+    tolerance: float = 0.02,
+) -> Path | None:
+    """Write the near-optimal retention-frequency table for one dataset and row count."""
+    if not trace:
+        return None
+    trace_df = pd.DataFrame([
+        {"features": "|".join(item.features), "objective": item.objective}
+        for item in trace
+    ])
+    table, summary = selection_stability_from_trace(trace_df, tolerance=tolerance)
+    if table.empty:
+        return None
+
+    out_dir = _forecast_sweeps_dir(dataset_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = out_dir / f"feature_retention_frequency_r{int(row_count):03d}.csv"
+    table.to_csv(out_csv, index=False)
+
+    always = table[table["retention_frequency"] >= 1.0]["feature"].tolist()
+    print(
+        f"[STABILITY] {summary['n_near_optimal']} of {summary['n_evaluated']} subsets lie "
+        f"within {tolerance:g} of the best objective. "
+        f"{len(always)} feature(s) appear in all of them: "
+        f"{', '.join(always) if always else 'none'}."
+    )
+    print(f"[STABILITY] Wrote {out_csv}")
+    return out_csv
+
+
 def _write_search_outputs(
     dataset_dir: Path,
     row_count: int,
@@ -3592,6 +4880,12 @@ def _write_search_outputs(
                 "source": item.source,
                 "seeded_input_rank": item.seeded_input_rank,
                 "training_stop_reason": item.training_stop_reason,
+                "cv_folds": item.cv_folds,
+                "cv_r2_mean": item.cv_r2_mean,
+                "cv_r2_se": item.cv_r2_se,
+                "objective_se": item.cv_objective_se,
+                "pred_std": item.pred_std,
+                "degenerate": item.degenerate,
                 "features": "|".join(item.features),
             }
         )
@@ -3757,6 +5051,7 @@ def _evaluate_selected_subsets_all_models(
                 forced_data_dir=dataset_plan.dataset_dir,
             )
 
+            _failure_reason = ""
             try:
                 eval_cfg = _train_single_config(
                     variant_cfg,
@@ -3847,9 +5142,15 @@ def _evaluate_selected_subsets_all_models(
                     f"variant={ctx.get('variant_dir', str(variant_cfg))}"
                 )
                 summary_rows = []
+                _failure_reason = f"compliance:{e.reason}"
             except Exception as e:
                 print(f"[ERROR] Evaluation failed for config {variant_cfg}: {e}")
                 summary_rows = []
+                # Recorded on the row itself. A metrics table showing NaN with no reason
+                # cannot distinguish a model that failed to fit from one never attempted,
+                # and the terminal output holding the explanation is long gone by the
+                # time anyone reads the table.
+                _failure_reason = f"{type(e).__name__}: {str(e).splitlines()[0][:180]}"
 
             if not summary_rows:
                 (print(f"[WARN] No summary_rows > no evaluation results for config {variant_cfg}, writing NaNs for metrics."))
@@ -3871,6 +5172,10 @@ def _evaluate_selected_subsets_all_models(
                     "objective_search": cand.objective,
                     "drop_rate_search": cand.drop_rate,
                     "model": model_name,
+                    **(dict(_EMPTY_VARIANT_FIELDS)
+                       if _is_baseline_model_value(model_name)
+                       else _model_variant_fields(base_cfg)),
+                    "failure_reason": _failure_reason,
                     "gp_uncertainty_mode": "",
                     "n_samples": float('nan'),
                     "n_test_independent": float('nan'),
@@ -3983,6 +5288,11 @@ def _evaluate_selected_subsets_all_models(
                     "objective_search": cand.objective,
                     "drop_rate_search": cand.drop_rate,
                     "model": model_name,
+                    **(dict(_EMPTY_VARIANT_FIELDS)
+                       if _is_baseline_model_value(model_name)
+                       else _model_variant_fields(base_cfg, eval_cfg.parent)),
+                    **_degeneracy_fields(eval_cfg.parent),
+                    "failure_reason": "",
                     "gp_uncertainty_mode": gp_uncertainty_mode,
                     "n_samples": n_samples,
                     "n_test_independent": n_test_independent,
@@ -3999,7 +5309,7 @@ def _evaluate_selected_subsets_all_models(
 
                 if baseline_id is None:
                     rows.append(row_payload)
-                    _eval_registry[(cand.feature_tag, model_name)] = (eval_cfg.parent, row_payload)
+                    _eval_registry[(cand.feature_tag, _variant_key(base_cfg))] = (eval_cfg.parent, row_payload)
                 else:
                     valid_score = n_test_valid if np.isfinite(n_test_valid) else float("-inf")
                     eval_score = n_test_evals if np.isfinite(n_test_evals) else float("-inf")
@@ -4088,6 +5398,9 @@ def _evaluate_selected_subsets_all_models(
                                         "objective_search": cand.objective,
                                         "drop_rate_search": cand.drop_rate,
                                         "model": _mlr_v["model_name"],
+                                        **dict(zip(("pred_std", "degenerate"),
+                                                   _prediction_spread(np.asarray(_ktf, dtype=float).ravel(),
+                                                                      np.asarray(_kpf, dtype=float).ravel()))),
                                         "gp_uncertainty_mode": "",
                                         "n_samples": _kn,
                                         "n_test_independent": _independent_name_count([str(s[2]) for s in _kte_rb]),
@@ -4179,7 +5492,13 @@ def _evaluate_selected_subsets_all_models(
                     _in_agg = str(_dcfg.get("input_aggregation", "none")).lower()
                     _split_dir = _vd
 
-                    _surrogate_path = _select_surrogate_config(dataset_plan.train_configs)
+                    # Only the predictor list is wanted here, which every configuration
+                    # of a dataset shares. Resolving by family name would raise as soon
+                    # as a family has more than one window representation, and the
+                    # enclosing `except Exception` would turn that into a silently
+                    # skipped stage: the MLR-derived subsets l01/m01/s01 disappeared
+                    # from a whole run that way.
+                    _surrogate_path = _canonical_probe_config(dataset_plan.dataset_dir)
                     _surrogate_cfg = train_module.load_config(str(_surrogate_path))
                     _input_cols = list(_surrogate_cfg["data"]["input_columns"])
 
@@ -4208,6 +5527,8 @@ def _evaluate_selected_subsets_all_models(
                         break
                 except Exception as _sp_exc:
                     print(f"[WARN] Spearman pre-filter failed for {_vd.name}: {_sp_exc}")
+                    print("[WARN] The MLR-derived subsets (l01, m01, s01) will be absent "
+                          "for this target if no variant succeeds.")
 
             # --- Phase B & C: for each variant's feature set, evaluate all models + all MLR variants ---
             for _fv_idx, _fv in enumerate(_MLR_VARIANTS):
@@ -4223,7 +5544,7 @@ def _evaluate_selected_subsets_all_models(
                 mlr_subset_label = _fv["subset_label"]
                 mlr_full_tag = f"{mlr_feature_tag}_{mlr_subset_label}"
                 print(f"[INFO] {_fv['model_name']} Spearman pre-filter: {len(_spearman_cols)}/{len(_input_cols)} "
-                      f"base columns pass → {mlr_subset_label} ({mlr_feature_tag})")
+                      f"base columns pass -> {mlr_subset_label} ({mlr_feature_tag})")
 
                 # Phase B: evaluate ALL data-driven (non-MLR) models on this feature set
                 best_baseline_rows_mlr: dict[str, tuple[float, float, dict]] = {}
@@ -4242,7 +5563,7 @@ def _evaluate_selected_subsets_all_models(
                             _base_model_type = yaml.safe_load(open(base_cfg, encoding="utf-8")).get("model_type", "")
                         except Exception:
                             _base_model_type = ""
-                        _dedup_source = _eval_registry.get((mlr_feature_tag, _base_model_type))
+                        _dedup_source = _eval_registry.get((mlr_feature_tag, _variant_key(base_cfg)))
 
                         if _dedup_source is not None:
                             _src_dir, _src_row = _dedup_source
@@ -4251,8 +5572,9 @@ def _evaluate_selected_subsets_all_models(
                             _dest_dir = output_dir / Path(_vc_fn)
                             _copy_eval_directory(_src_dir, _dest_dir)
                             eval_cfg = (_dest_dir / f"config_evaluate_{_dest_dir.name}.yml").resolve()
-                            print(f"[DEDUP] {_base_model_type} on {mlr_subset_label}: "
-                                  f"copied from {_src_dir.name} (same features {mlr_feature_tag})")
+                            print(f"[DEDUP] {_variant_key(base_cfg)} ({_base_model_type}) on "
+                                  f"{mlr_subset_label}: copied from {_src_dir.name} "
+                                  f"(same model, same features {mlr_feature_tag})")
                         else:
                             eval_cfg = _train_single_config(
                                 variant_cfg,
@@ -4380,6 +5702,10 @@ def _evaluate_selected_subsets_all_models(
                                 "objective_search": float("nan"),
                                 "drop_rate_search": float("nan"),
                                 "model": model_name,
+                                **(dict(_EMPTY_VARIANT_FIELDS)
+                                   if _is_baseline_model_value(model_name)
+                                   else _model_variant_fields(base_cfg, eval_cfg.parent)),
+                                **_degeneracy_fields(eval_cfg.parent),
                                 "gp_uncertainty_mode": gp_uncertainty_mode,
                                 "n_samples": n_samples,
                                 "n_test_independent": n_test_independent,
@@ -4396,7 +5722,9 @@ def _evaluate_selected_subsets_all_models(
 
                             if baseline_id is None:
                                 rows.append(row_payload)
-                                _eval_registry.setdefault((mlr_feature_tag, model_name), (eval_cfg.parent, row_payload))
+                                _eval_registry.setdefault(
+                                    (mlr_feature_tag, _variant_key(base_cfg)),
+                                    (eval_cfg.parent, row_payload))
                             else:
                                 valid_score = n_test_valid if np.isfinite(n_test_valid) else float("-inf")
                                 eval_score = n_test_evals if np.isfinite(n_test_evals) else float("-inf")
@@ -4493,6 +5821,10 @@ def _evaluate_selected_subsets_all_models(
                                         "objective_search": float("nan"),
                                         "drop_rate_search": float("nan"),
                                         "model": _mv["model_name"],
+                                        **dict(zip(("pred_std", "degenerate"),
+                                                   _prediction_spread(
+                                                       np.asarray(_res.get("targets", []), dtype=float).ravel(),
+                                                       np.asarray(_res.get("preds", []), dtype=float).ravel()))),
                                         "gp_uncertainty_mode": "",
                                         "n_samples": _res["n_samples"],
                                         "n_test_independent": _res["n_test_independent"],
@@ -4642,9 +5974,34 @@ def _run_rolling_origin_cv(
     resolved_model_type = None
     best_model_name = None
     _matched_base_cfg = None
-    _match = _find_matching_config(best_model_str, plan.train_configs)
-    if _match is not None:
-        resolved_model_type, best_model_name, _matched_base_cfg = _match
+
+    # Prefer the recorded variant. Matching on the model type alone returns the first
+    # configuration of that family, which for a Gaussian process means gp_01 whatever
+    # was actually selected -- the substitution that turned a selected +0.577 into a
+    # retrained -12.952. The variant column exists so this no longer has to guess.
+    best_variant = str(best_row.get("variant", "") or "").strip()
+    if best_variant:
+        exact = [c for c in plan.train_configs
+                 if c.stem.replace("config_", "") == best_variant]
+        if exact:
+            _cfg = train_module.load_config(str(exact[0]))
+            _fn = (_cfg.get("data", {}).get("forecast_name")
+                   or _cfg.get("model_name") or best_variant)
+            resolved_model_type = str(_cfg.get("model_type", ""))
+            best_model_name = _strip_fs_prefix(str(_fn))
+            _matched_base_cfg = exact[0]
+            print(f"[RollingOrigin] Resolved by recorded variant: {best_variant}")
+        else:
+            print(
+                f"[WARN] Rolling origin CV: recorded variant '{best_variant}' has no "
+                "matching config; falling back to model-type matching, which cannot "
+                "distinguish variants of the same family."
+            )
+
+    if resolved_model_type is None:
+        _match = _find_matching_config(best_model_str, plan.train_configs)
+        if _match is not None:
+            resolved_model_type, best_model_name, _matched_base_cfg = _match
 
     # Fall back to treating the raw value as model_type if no config was matched
     if resolved_model_type is None:
@@ -5057,6 +6414,9 @@ def _write_dataset_evaluation_summary(plan: DatasetPlan, final_metrics_csv: Path
 
 
 def run_feature_selection_sweep(args: argparse.Namespace) -> int:
+    # Set before any dataset is touched, and in the environment so that the parallel
+    # candidate evaluators inherit it instead of re-importing the default.
+    os.environ["WQ_PIN_SPLIT"] = "0" if getattr(args, "no_pin_split", False) else "1"
     workspace_root = Path(__file__).resolve().parent.parent
     data_root = Path(args.data_root)
     if not data_root.is_absolute():
@@ -5113,7 +6473,9 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
         return 1
 
     for plan in plans:
-        _ensure_feature_sweep_cache(plan)
+        if not args.no_pin_split:
+            _pin_all_sample_subdirs(plan, args.surrogate_model)
+        _ensure_feature_sweep_cache(plan, args.surrogate_model)
 
     print("\nExecution plan")
     print("-" * 100)
@@ -5127,6 +6489,28 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
     print(f"Eval budget               : {args.eval_budget}")
     print(f"Swap attempts             : {args.max_swap_attempts}")
     print(f"Lambda drop               : {args.lambda_drop}")
+    print(f"Rolling-origin CV folds   : {args.cv_folds}"
+          + ("" if args.cv_folds > 0
+             else "  (candidates scored on the reported holdout)"))
+    print(f"CV initial train fraction : {args.cv_min_train_fraction}")
+    print(f"One-SE selection band     : {args.selection_tolerance_se} SE")
+    print(f"Retention band            : {args.retention_tolerance}")
+    print(f"Surrogate family          : {args.surrogate_model}")
+    print(f"Pinned split per target   : {not args.no_pin_split}"
+          + ("" if not args.no_pin_split else "  (per-run boundaries; they drift)"))
+    if int(args.cv_folds) > 1:
+        fits = int(args.eval_budget) * int(args.cv_folds)
+        print(
+            f"Model fits per target     : up to {fits} "
+            f"({args.eval_budget} candidates x {args.cv_folds} folds)"
+        )
+        if int(args.eval_budget) >= 240:
+            print(
+                "[NOTE] --eval-budget is at its single-holdout default while "
+                f"--cv-folds={args.cv_folds}. Cross-validation buys a separable "
+                "objective, not more candidates: a smaller budget against it beats a "
+                "large one against a single holdout. Consider --eval-budget 80."
+            )
     print(f"Top-K for final models    : {args.final_top_k}")
     print(f"Dry run                   : {args.dry_run}")
     print(f"Keep train plots (search) : {args.keep_training_plots}")
@@ -5147,7 +6531,7 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         for plan in plans:
-            surrogate = _select_surrogate_config(plan.train_configs)
+            surrogate = _select_surrogate_config(plan.train_configs, args.surrogate_model)
             cfg = train_module.load_config(str(surrogate))
             base_span = int(cfg["data"]["input_row_2"]) - int(cfg["data"]["input_row_1"])
             row_counts = _parse_row_counts(args.row_counts, default_span=base_span)
@@ -5160,7 +6544,8 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
         print(f"DATASET: {plan.dataset_dir.name}")
         print("=" * 100)
 
-        surrogate_cfg = _select_surrogate_config(plan.train_configs)
+        surrogate_cfg = _select_surrogate_config(plan.train_configs, args.surrogate_model)
+        chosen_folds = None
         surrogate_data = train_module.load_config(str(surrogate_cfg))["data"]
         base_span = int(surrogate_data["input_row_2"]) - int(surrogate_data["input_row_1"])
         row_counts = _parse_row_counts(args.row_counts, default_span=base_span)
@@ -5175,6 +6560,20 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     explicit_path=explicit_seed_csv,
                     from_shapley=bool(args.seed_subsets_from_shapley),
                     max_seed_subsets=int(args.max_seed_subsets),
+                )
+                surrogate_cfg, chosen_folds = _choose_surrogate_config(
+                    dataset_dir=plan.dataset_dir,
+                    dataset_prefix=args.dataset_prefix,
+                    train_configs=plan.train_configs,
+                    row_count=row_count,
+                    surrogate_model=args.surrogate_model,
+                    lambda_drop=args.lambda_drop,
+                    cv_folds=args.cv_folds,
+                    cv_min_train_fraction=args.cv_min_train_fraction,
+                    disable_baselines_for_search=not search_run_baselines,
+                    disable_training_plots=search_disable_training_plots,
+                    disable_eval_plots=search_disable_eval_plots,
+                    suppress_training_logs=not args.show_training_logs,
                 )
                 top_sorted, trace, _ = _beam_search_subsets(
                     dataset_dir=plan.dataset_dir,
@@ -5197,6 +6596,11 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     parallel_evaluators=parallel_evaluators,
                     include_row_count_in_plot_names=include_row_count_in_plot_names,
                     seeded_subsets=seeded_subsets,
+                    cv_folds=args.cv_folds,
+                    cv_min_train_fraction=args.cv_min_train_fraction,
+                    selection_tolerance_se=args.selection_tolerance_se,
+                    retention_tolerance=args.retention_tolerance,
+                    cv_fold_dirs=chosen_folds,
                 )
                 selected = top_sorted[: args.final_top_k]
                 trace_csv, selected_csv, plot_path = _write_search_outputs(
@@ -5271,7 +6675,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--row-counts", type=str, default=None)
     parser.add_argument("--min-features", type=int, default=4)
-    parser.add_argument("--beam-width", type=int, default=8)
+    parser.add_argument(
+        "--beam-width",
+        type=int,
+        default=6,
+        help=(
+            "Candidates kept each elimination round. Against 11 predictors a width of 8 "
+            "was already near-exhaustive at the first level; extra width buys more "
+            "chances to fit the holdout, not a better subset."
+        ),
+    )
     parser.add_argument("--max-rounds", type=int, default=10)
     parser.add_argument("--no-improve-patience", type=int, default=3)
     parser.add_argument("--eval-budget", type=int, default=240)
@@ -5279,6 +6692,79 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-drop", type=float, default=0.25)
     parser.add_argument("--final-top-k", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--cv-folds",
+        type=int,
+        default=0,
+        help=(
+            "Rolling-origin folds used to score each candidate, built inside the "
+            "training portion so the search never reads a reported-test segment. "
+            "Default 0 keeps the established behaviour: candidates are scored on the "
+            "same holdout the results table reports, which is what lets every "
+            "candidate train on the full 70% and converge, at the cost of an "
+            "optimistically biased reported accuracy. Raising it is only worthwhile "
+            "where the training portion is large enough that the earliest fold still "
+            "fits on a representative share of the data -- with 30 training segments "
+            "a 5-fold split fits the first model on 15."
+        ),
+    )
+    parser.add_argument(
+        "--cv-min-train-fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "Fraction of segments reserved as the initial training run, never scored. "
+            "The rest is divided into --cv-folds contiguous blocks, each predicted from "
+            "the history preceding it."
+        ),
+    )
+    parser.add_argument(
+        "--selection-tolerance-se",
+        type=float,
+        default=0.0,
+        help=(
+            "Width, in standard errors of the objective, of the band within which the "
+            "smallest subset is preferred over the best-scoring one. Default 0 selects "
+            "the argmin. Turning this on is not recommended at these sample sizes: the "
+            "standard error of the objective is 0.26 to 7.8 across the 14 targets while "
+            "the best few subsets differ by 0.002 to 0.16, so any honest band contains "
+            "nearly every candidate and the rule collapses to picking the smallest "
+            "subset allowed. The standard error is written to the trace as "
+            "objective_se, where it is useful as a statement of how little the search "
+            "resolved -- which is what feature_retention_frequency_r###.csv reports."
+        ),
+    )
+    parser.add_argument(
+        "--retention-tolerance",
+        type=float,
+        default=0.02,
+        help=(
+            "Objective band defining the near-optimal set whose per-feature retention "
+            "frequency is written to feature_retention_frequency_r###.csv."
+        ),
+    )
+    parser.add_argument(
+        "--surrogate-model",
+        type=str,
+        default="auto:xgb",
+        help=(
+            "Which family scores candidates during the search. A substring matched "
+            "against the config filenames; it must match exactly one configuration or "
+            "the run stops, so 'gp' is rejected while 'gp_04' is accepted -- the four "
+            "GP configs differ by window aggregation and kernel, and picking among "
+            "them by name is what made one score -12.952 where another scored +0.577. "
+            "'auto' instead fits every eligible configuration once on the full feature "
+            "set and picks the best under the search objective. The chosen family "
+            "fixes the feature set that all families then use, so where the reported "
+            "winner is a different family that should be stated. "
+            "The default is xgb_02, the daily-summary representation, measured against "
+            "the alternatives on four targets: mean best R2 0.172 for xgb_02 against "
+            "0.070 for xgb_01 (flattened) and 0.040 for xgb_03 (daily lag sampling), "
+            "with the widest margin between competing subsets. The gain comes from the "
+            "derived statistics rather than the smaller column count -- xgb_03 has "
+            "fewer columns still and scores worst."
+        ),
+    )
     parser.add_argument(
         "--parallel-evaluators",
         type=int,
@@ -5340,6 +6826,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-training-logs",
         action="store_true",
         help="Show verbose model training logs (epoch metrics, sample-loading details).",
+    )
+    parser.add_argument(
+        "--no-pin-split",
+        action="store_true",
+        help=(
+            "Let every run recompute its own train/test boundary, as before. The "
+            "boundary then depends on how many samples that run's feature subset can "
+            "use, so it moves between runs -- for 8 of the 14 targets it does, by up "
+            "to 6 segments -- and families are no longer scored on the same test set."
+        ),
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--stop-on-error", action="store_true")

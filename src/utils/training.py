@@ -15,6 +15,210 @@ class SampleComplianceError(RuntimeError):
         self.reason = str(reason)
         self.context = dict(context or {})
 
+def aggregation_slug(input_aggregation) -> str:
+    """Filename-safe token for a window representation, or "" for the raw window.
+
+    Anything cached per model has to be keyed by this as well as by the dataset.
+    Hyperparameters tuned on a flattened 7381-column window are not meaningful on a
+    44-column summary of the same data, and a cache that ignores the difference hands
+    whichever representation ran first to all of them.
+    """
+    text = str(input_aggregation or "none").strip().lower()
+    if text in ("", "none"):
+        return ""
+    return "_" + re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+
+
+_DEFAULT_WINDOW_STATS = ("mean", "min", "max", "std")
+
+def _nanslope(a, axis=0):
+    """Least-squares slope per column, in units per row, ignoring missing values.
+
+    Direction of change within a block is physically meaningful for these predictors --
+    falling pressure and rising temperature are not the same state as their reverses --
+    and no combination of mean, min, max and std recovers it.
+    """
+    a = np.asarray(a, dtype=float)
+    if axis != 0:
+        a = np.moveaxis(a, axis, 0)
+    n_rows = a.shape[0]
+    if n_rows < 2:
+        return np.full(a.shape[1:], np.nan)
+    x = np.arange(n_rows, dtype=float)[:, None]
+    valid = np.isfinite(a)
+    counts = valid.sum(axis=0)
+    xf = np.where(valid, x, np.nan)
+    af = np.where(valid, a, np.nan)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        x_mean = np.nanmean(xf, axis=0)
+        a_mean = np.nanmean(af, axis=0)
+        dx = xf - x_mean
+        da = af - a_mean
+        num = np.nansum(dx * da, axis=0)
+        den = np.nansum(dx * dx, axis=0)
+        slope = np.where(den > 0, num / den, np.nan)
+    return np.where(counts >= 2, slope, np.nan)
+
+
+_WINDOW_STAT_FUNCS = {
+    "mean": np.nanmean,
+    "min": np.nanmin,
+    "max": np.nanmax,
+    "std": np.nanstd,
+    "median": np.nanmedian,
+    "sum": np.nansum,
+    "slope": _nanslope,
+    "last": lambda a, axis: np.take(a, -1, axis=axis),
+    "first": lambda a, axis: np.take(a, 0, axis=axis),
+}
+
+
+def parse_input_aggregation(spec):
+    """Parse an ``input_aggregation`` string into ``(mode, params)``.
+
+    Accepted forms::
+
+        none                      the raw window, one row per timestep
+        mean                      one row, the per-predictor mean
+        lag:<hours>               rolling mean over consecutive <hours>-long
+                                  intervals, anchored at the end of the window
+        stats:<n>[:<list>]        <n> equal blocks, each summarised by the named
+                                  statistics (default mean,min,max,std)
+        stats:<n>h[:<list>]       blocks of <n> hours instead of a fixed count
+
+    Prefer the ``h`` form. Window length is not the same for every target -- 671 rows
+    for pH, Colour, Turbidity and intestinal enterococci, 167 for the other ten -- so a
+    fixed block *count* means daily blocks on the long windows and six-hourly blocks on
+    the short ones, and the same configuration name then describes two different
+    representations. An interval keeps the meaning fixed and lets the block count
+    follow the window.
+
+    A 671-hour window of 11 predictors is 7381 columns once flattened, which is the
+    shape XGBoost actually receives against roughly 30 distinct training samples.
+    ``mean`` collapses that to 11 and discards every temporal feature of the window.
+    ``lag`` and ``stats`` sit between the two: ``lag:24`` keeps 28 daily timesteps,
+    ``stats:28`` keeps 28 blocks summarised four ways, so a predictor's level, spread
+    and extremes within each block survive. For a sequence model the result is still a
+    sequence, just a shorter one, which is what makes the 671-step positional
+    embedding affordable.
+    """
+    text = str(spec or "none").strip().lower()
+    if text in ("", "none"):
+        return "none", {}
+    if text == "mean":
+        return "stats", {"blocks": 1, "stats": ("mean",)}
+
+    head, _, rest = text.partition(":")
+    if head == "lag":
+        step = int(rest) if rest else 1
+        if step < 1:
+            raise ValueError(f"input_aggregation 'lag' needs an interval >= 1, got {rest!r}")
+        return "lag", {"step": step}
+    if head == "stats":
+        parts = [x for x in rest.split(":") if x != ""]
+        spec_n = parts[0] if parts else "1"
+        by_interval = spec_n.endswith("h")
+        n = int(spec_n[:-1]) if by_interval else int(spec_n)
+        if n < 1:
+            raise ValueError(f"input_aggregation 'stats' needs a positive size, got {parts!r}")
+        names = tuple(parts[1].split(",")) if len(parts) > 1 else _DEFAULT_WINDOW_STATS
+        unknown = [n for n in names if n not in _WINDOW_STAT_FUNCS]
+        if unknown:
+            raise ValueError(
+                f"Unknown window statistic(s) {unknown}; "
+                f"available: {sorted(_WINDOW_STAT_FUNCS)}"
+            )
+        key = "block_hours" if by_interval else "blocks"
+        return "stats", {key: n, "stats": names}
+
+    raise ValueError(
+        f"Unrecognised input_aggregation {spec!r}. Use none, mean, lag:<step> "
+        "or stats:<blocks>[:<stats>]."
+    )
+
+
+def _stats_block_count(n_rows: int, params: dict) -> int:
+    """How many blocks a window of *n_rows* is divided into under *params*."""
+    n_rows = max(1, int(n_rows))
+    if "block_hours" in params:
+        width = max(1, int(params["block_hours"]))
+        return max(1, int(np.ceil(n_rows / width)))
+    return max(1, min(int(params.get("blocks", 1)), n_rows))
+
+
+def _lag_indices(n_rows: int, step: int) -> np.ndarray:
+    """Row indices for lag subsampling, anchored at the end of the window.
+
+    Sampling forward from the first row leaves a remainder at the end: over 671 rows at
+    a 24-hour step the last row taken is 648, so the most recent 22 hours -- the data
+    closest to the forecast origin, and the most informative for it -- are discarded.
+    A sequence model makes that worse, reading the final timestep as its summary of the
+    window. Anchoring at the end instead puts the remainder at the oldest edge, where
+    dropping it costs least, and guarantees the final row is always included.
+    """
+    n_rows = int(n_rows)
+    step = max(1, int(step))
+    return np.arange(n_rows - 1, -1, -step, dtype=int)[::-1]
+
+
+def _rolling_interval_mean(input_seq: np.ndarray, step: int) -> np.ndarray:
+    """Mean of each consecutive *step*-row interval, anchored at the window end."""
+    n_rows = input_seq.shape[0]
+    edges = _lag_indices(n_rows, step)
+    rows = []
+    with np.errstate(invalid="ignore"):
+        for end in edges:
+            start = max(0, int(end) - int(step) + 1)
+            rows.append(np.nanmean(input_seq[start:int(end) + 1, :], axis=0))
+    return np.asarray(rows, dtype=float)
+
+
+def reduced_window_shape(n_rows, n_features, spec):
+    """The ``(timesteps, features)`` a window becomes under *spec*.
+
+    The transformer reads its ``seq_len`` and ``input_dim`` from configuration rather
+    than from the data, so anything that reshapes the window has to be reflected here
+    or the model is built for the wrong input.
+    """
+    mode, params = parse_input_aggregation(spec)
+    n_rows = int(n_rows)
+    n_features = int(n_features)
+    if mode == "none":
+        return n_rows, n_features
+    if mode == "lag":
+        return len(_lag_indices(n_rows, params["step"])), n_features
+    return _stats_block_count(n_rows, params), n_features * len(params["stats"])
+
+
+def reduce_input_window(input_seq, spec):
+    """Apply *spec* to one ``(timesteps, features)`` window."""
+    mode, params = parse_input_aggregation(spec)
+    if mode == "none":
+        return input_seq
+    if mode == "lag":
+        # The mean over each interval, not the single value at its end. Several
+        # predictors vary strongly through the day, so one reading per day samples a
+        # fixed hour and aliases that variation into whatever phase the window happens
+        # to start on; the interval mean does not.
+        return _rolling_interval_mean(input_seq, params["step"])
+
+    n_rows, n_features = input_seq.shape
+    blocks = _stats_block_count(n_rows, params)
+    names = params["stats"]
+    # Contiguous, near-equal blocks in time order; np.array_split handles a window
+    # length that does not divide evenly without dropping the remainder.
+    chunks = np.array_split(input_seq, blocks, axis=0)
+    out = np.empty((blocks, n_features * len(names)), dtype=float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        for bi, chunk in enumerate(chunks):
+            for si, name in enumerate(names):
+                values = _WINDOW_STAT_FUNCS[name](chunk, axis=0)
+                # A predictor's statistics stay adjacent, so feature importances read
+                # as "this predictor, this statistic" rather than interleaved.
+                out[bi, si::len(names)] = values
+    return out
+
+
 def load_samples(directory, input_columns, output_columns, input_rows, output_rows, file_list=None,
                  fault_tolerant=False, source=None, input_aggregation='none', drop_report=None):
     """Load windowed samples, recording why each rejected sample was rejected.
@@ -68,15 +272,18 @@ def load_samples(directory, input_columns, output_columns, input_rows, output_ro
             report["dropped_files"].append((filename, "too_few_rows"))
             continue  # skip files without enough rows
         input_seq = df.iloc[input_rows, :][input_columns].values
-        if str(input_aggregation).lower() == 'mean':
-            # Require at least one finite value per predictor; otherwise sample is unusable.
+        _agg_mode, _agg_params = parse_input_aggregation(input_aggregation)
+        if _agg_mode == "stats":
+            # A statistic over an all-NaN predictor is NaN however it is computed, so
+            # the sample is unusable; say so here rather than letting it surface later
+            # as an unexplained NaN input.
             predictor_all_nan = np.all(np.isnan(input_seq), axis=0)
             if np.any(predictor_all_nan):
                 report["dropped_all_nan_predictor"] += 1
                 _tally_columns(predictor_all_nan, "all_nan_predictor", filename)
                 continue
-            with np.errstate(invalid='ignore'):
-                input_seq = np.nanmean(input_seq, axis=0, keepdims=True)
+        if _agg_mode != "none":
+            input_seq = reduce_input_window(input_seq, input_aggregation)
         # Handle output_rows as either a list of indices or a starting index for slicing
         if isinstance(output_rows, list):
             output_seq = df.iloc[output_rows, :][output_columns].values
@@ -304,19 +511,34 @@ def write_config(config, data_dir, forecast_name, model_name, config_name='model
 def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns, output_rows, fault_tolerant=True,
              reuse_split=True, split_source=None, split_type='random', test_size=0.3, random_state=10,
              sample_subdir='samples', nan_tolerance=None, input_aggregation='none',
-             min_test_independent=None):
+             min_test_independent=None, allow_rebalance=True):
     ## If specified, reuse a train/test split previously written to file.
     train_samples = []
     test_samples = []
     sample_dir = Path(data_dir, sample_subdir)
 
     if reuse_split:
+        explicit_source = split_source is not None
         try:
             if split_source is None:
                 split_source = Path(data_dir, "forecasts", forecast_name)
             split_source = Path(split_source)
-            train_file = split_source / "train_files.txt"
-            test_file = split_source / "test_files.txt"
+            own_dir = Path(data_dir, "forecasts", forecast_name)
+
+            # A reused split may come from a different run's directory. Copy it into
+            # this run's own directory and work from the copy, for two reasons: the
+            # run has to carry its own split files because that is where evaluation
+            # looks for them, and a rebalance below rewrites these files -- which
+            # must never reach back into the run the split was borrowed from.
+            own_dir.mkdir(parents=True, exist_ok=True)
+            train_file = own_dir / "train_files.txt"
+            test_file = own_dir / "test_files.txt"
+            if split_source.resolve() != own_dir.resolve():
+                train_file.write_text(
+                    (split_source / "train_files.txt").read_text(encoding="utf-8"), encoding="utf-8")
+                test_file.write_text(
+                    (split_source / "test_files.txt").read_text(encoding="utf-8"), encoding="utf-8")
+
             train_file_names = [line.strip() for line in train_file.read_text(encoding="utf-8").splitlines() if line.strip()]
             test_file_names = [line.strip() for line in test_file.read_text(encoding="utf-8").splitlines() if line.strip()]
             train_samples = load_samples(sample_dir, input_columns=input_columns,
@@ -342,6 +564,28 @@ def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns,
                 )
                 before_indep = _independent_count(test_ordered_valid)
                 after_indep = _independent_count(new_test_names)
+                if status == "rebalanced" and not allow_rebalance:
+                    # Rebalancing moves segments from train into test. When the split
+                    # is pinned so that every model is scored on the same segments,
+                    # that would both break the shared test set and put segments the
+                    # model trained on into its own evaluation. Reject the variant
+                    # instead: not meeting the minimum is a property of the feature
+                    # subset, and it must be visible rather than repaired in place.
+                    raise SampleComplianceError(
+                        reason="rebalance_forbidden_on_pinned_split",
+                        message=(
+                            "Reused split is pinned but does not meet "
+                            f"min_test_independent={int(min_test_independent)} "
+                            f"(test_independent={before_indep}); rebalancing would move "
+                            "training segments into the shared test set."
+                        ),
+                        context={
+                            "split_mode": "reuse_pinned",
+                            "split_source": str(split_source),
+                            "test_independent": int(before_indep),
+                            "target_min_independent": int(min_test_independent),
+                        },
+                    )
                 if status == "rebalanced":
                     print(
                         f"Rebalanced reused split for min independent test samples: "
@@ -379,6 +623,13 @@ def splitter(data_dir, forecast_name, input_columns, input_rows, output_columns,
         except SampleComplianceError:
             raise
         except Exception as e:
+            # A caller that named a split_source asked for that exact split; carrying
+            # on with no samples would report a different evaluation set as though it
+            # were the requested one.
+            if explicit_source:
+                raise FileNotFoundError(
+                    f"Could not reuse the split at {split_source}: {e}"
+                ) from e
             print(f"No previous split available for reuse: {e}")
     else:
         ## Generate a new split.

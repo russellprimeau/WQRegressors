@@ -153,6 +153,58 @@ def add_source(df, secondary_df, include_NAs=False, max_gap=6, sparse=False, bin
 
     return merged_df
 
+def interpolate_short_gaps(df, columns, limit, timestamp_col=None):
+    """Linearly fill runs of missing values no longer than *limit*, and only those.
+
+    ``DataFrame.interpolate(limit=n)`` fills the first *n* values of *every* gap,
+    which writes invented readings into the edges of a multi-week outage. Here a run
+    is filled only if the whole run is short enough, so a real outage is left
+    entirely missing and stays visible as one.
+
+    Returns ``(df, report)``; *report* is a DataFrame with one row per column giving
+    how many values were filled, how many remain, and the longest surviving run.
+    """
+    df = df.copy()
+    rows = []
+    for col in columns:
+        if col not in df.columns:
+            continue
+        s = pd.to_numeric(df[col], errors="coerce")
+        na = s.isna()
+        n_before = int(na.sum())
+        if n_before:
+            # Length of the missing run each row belongs to; 0 for present values.
+            run_id = (na != na.shift()).cumsum()
+            run_len = na.groupby(run_id).transform("sum")
+            short = na & (run_len <= limit)
+            s = s.where(~short, s.interpolate(method="linear", limit_direction="both"))
+            df[col] = s
+
+        na_after = s.isna()
+        n_after = int(na_after.sum())
+        longest = 0
+        longest_start = None
+        if n_after:
+            run_id = (na_after != na_after.shift()).cumsum()
+            runs = na_after.groupby(run_id).sum()
+            runs = runs[runs > 0]
+            longest = int(runs.max())
+            first_idx = na_after.groupby(run_id).apply(lambda g: g.index[0] if g.any() else None)
+            longest_start = first_idx.get(runs.idxmax())
+            if timestamp_col is not None and timestamp_col in df.columns:
+                longest_start = df.loc[longest_start, timestamp_col]
+
+        rows.append({
+            "column": col,
+            "missing_before": n_before,
+            "filled": n_before - n_after,
+            "missing_after": n_after,
+            "longest_remaining_run_h": longest,
+            "longest_run_starts": longest_start,
+        })
+    return df, pd.DataFrame(rows)
+
+
 def binarize_dataframe(df, output_columns, thresholds_df):
     """
     Convert values in specified columns of a DataFrame to binary (0 or 1)

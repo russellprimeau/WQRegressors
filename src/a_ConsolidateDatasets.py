@@ -9,7 +9,8 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from utils.preprocessing import (clean_profiler, add_source, decompose_direction, rolling_sum,
-                                 forward_fill_columns, add_res, add_diff, count_segs)
+                                 forward_fill_columns, add_res, add_diff, count_segs,
+                                 interpolate_short_gaps)
 
 ## Configuration Parameters
 # Whether to keep all timesteps (True) or drop rows with missing values (False)
@@ -26,6 +27,12 @@ add_res_cols = True  # Options: True, False
 
 # Whether to add a column with index for continuous segments
 count_segments = False  # Options: True, False
+
+# Longest run of missing hours that is filled by interpolation in the predictor
+# series. Runs longer than this are real outages and are left missing: filling
+# them would invent readings rather than repair an accounting gap. Laboratory
+# columns are never filled -- they are the targets, and sparse by nature.
+gap_fill_limit_hours = 6
 
 
 if __name__ == '__main__':
@@ -174,6 +181,19 @@ if __name__ == '__main__':
         merge1_df = add_source(aligned_dfs[0], aligned_dfs[1], include_NAs=True, max_gap=6, sparse=True)
         merge2_df = add_source(merge1_df, aligned_dfs[2], include_NAs=True, max_gap=6, sparse=True)
         merge3_df = add_source(merge2_df, aligned_dfs[3], include_NAs=True, max_gap=6, sparse=True, binarize=binarize)
+
+        # Fill short gaps in the predictor series. add_source already implements this,
+        # but its call is inside `if not sparse:` and every merge here is sparse, so
+        # it has never run on this path. Everything except the laboratory columns is
+        # eligible: those are the targets and must stay exactly as measured.
+        eurofins_cols_renamed = list(simplified_Eurofins.values())
+        predictor_cols = [c for c in merge3_df.columns if c not in eurofins_cols_renamed]
+        merge3_df, gap_report = interpolate_short_gaps(
+            merge3_df, predictor_cols, gap_fill_limit_hours)
+        print(f"Gap fill (limit {gap_fill_limit_hours} h): "
+              f"{int(gap_report['filled'].sum())} values filled across "
+              f"{int((gap_report['filled'] > 0).sum())} of {len(gap_report)} predictor columns; "
+              f"{int(gap_report['missing_after'].sum())} still missing.")
         
         # Apply forward fill and add_res if requested
         if forward_fill:
@@ -215,6 +235,11 @@ if __name__ == '__main__':
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     final_df.to_csv(Path(output_dir, filename), index=False)
+
+    if sparse:
+        report_path = Path(output_dir, "predictor_gap_report.csv")
+        gap_report.to_csv(report_path, index=False)
+        print(f"Gap report saved to: {report_path}")
 
     print(f"Output saved to: {Path(output_dir, filename)}")
     print(f"Configuration: sparse={sparse}, mode={mode}, forward_fill={forward_fill}, add_res={add_res_cols}, count_segments={count_segments}")

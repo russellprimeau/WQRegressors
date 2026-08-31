@@ -330,7 +330,7 @@ def main() -> int:
         _log(f"[PARALLEL] Workers    : {num_workers}")
         _log(f"[PARALLEL] Partition  : stride 1/{num_workers} — worker i runs plans[i::{num_workers}]")
         device_summary = "  ".join(
-            f"W{i}→{'CUDA:' + _worker_cvd(i) if i < num_gpu_workers else 'CPU'}"
+            f"W{i}->{'CUDA:' + _worker_cvd(i) if i < num_gpu_workers else 'CPU'}"
             for i in range(num_workers)
         )
         _log(f"[PARALLEL] Devices    : {num_gpu_workers}/{num_workers} GPU — {device_summary}")

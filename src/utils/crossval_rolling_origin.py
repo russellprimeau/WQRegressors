@@ -158,3 +158,64 @@ def run_rolling_origin_cv(
 # config = ... # load config dict
 # samples = load_samples(...)
 # run_rolling_origin_cv(config, samples, group_by_segment=True, min_train_size=3)
+
+def rolling_origin_block_splits(
+    n_groups: int,
+    n_folds: int = 5,
+    min_train_fraction: float = 0.5,
+) -> List[Tuple[int, Tuple[int, int]]]:
+    """Expanding-window folds over an ordered group list, in contiguous blocks.
+
+    ``rolling_origin_splits_grouped`` advances one group at a time, which costs one
+    model fit per group -- 39 fits for a 42-segment target. That is affordable once,
+    on a chosen model, but not as the objective of a 240-candidate search. Blocking
+    the held-out groups keeps the expanding-window property, and therefore the
+    temporal ordering, at a fixed and much smaller number of fits.
+
+    The first ``min_train_fraction`` of the groups is training-only and is never
+    scored, so every fold trains on a run of history that precedes everything it
+    predicts. The remainder is divided into ``n_folds`` contiguous blocks; fold *i*
+    trains on all groups before its block and tests on the block itself.
+
+    Args:
+        n_groups: Number of ordered groups (segments) available.
+        n_folds: Requested number of folds. Reduced when too few groups remain.
+        min_train_fraction: Fraction of groups reserved as the initial training run.
+
+    Returns:
+        ``[(n_train_groups, (test_lo, test_hi)), ...]`` with half-open test ranges.
+
+    Raises:
+        ValueError: When no group is left to score after the initial training run.
+
+    Example:
+        ``rolling_origin_block_splits(42, n_folds=5, min_train_fraction=0.5)`` gives
+        five folds training on 21, 25, 29, 33 and 37 groups.
+    """
+    n_groups = int(n_groups)
+    n_folds = max(1, int(n_folds))
+    if n_groups < 2:
+        raise ValueError(f"Need at least 2 groups for rolling-origin folds, got {n_groups}.")
+
+    start = int(np.ceil(n_groups * float(min_train_fraction)))
+    start = max(1, min(start, n_groups - 1))
+    n_scorable = n_groups - start
+    if n_scorable < 1:
+        raise ValueError(
+            f"No groups left to score: {n_groups} groups with "
+            f"min_train_fraction={min_train_fraction} reserves all of them."
+        )
+
+    # A fold that would hold no group is not a fold; drop it rather than emitting an
+    # empty test block that scores nothing and still costs a fit.
+    n_folds = min(n_folds, n_scorable)
+    edges = [start + int(round(i * n_scorable / n_folds)) for i in range(n_folds + 1)]
+    edges[-1] = n_groups
+
+    splits: List[Tuple[int, Tuple[int, int]]] = []
+    for i in range(n_folds):
+        lo, hi = edges[i], edges[i + 1]
+        if hi <= lo:
+            continue
+        splits.append((lo, (lo, hi)))
+    return splits

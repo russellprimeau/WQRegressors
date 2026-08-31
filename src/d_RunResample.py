@@ -414,7 +414,12 @@ def generate_training_config_template(output_dir, forecast_name, input_columns, 
             config['data_split'].update(overrides['data_split'])
 
     # Save as YAML
-    config_path = Path(output_dir) / f'config_{model_type}_01.yml'
+    # Named after the forecast, not the model type. A fixed `_01` meant every window
+    # representation of a family wrote to one file and only the last survived: a run
+    # generated with three XGBoost variants ended up with a single config_xgb_01.yml
+    # holding the third one's settings under the first one's name.
+    _stem = str(forecast_name).strip() or f'{model_type}_01'
+    config_path = Path(output_dir) / f'config_{_stem}.yml'
     with open(config_path, 'w') as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
@@ -497,7 +502,8 @@ def generate_transformer_config_template(output_dir, forecast_name, input_column
             config['data_split'].update(overrides['data_split'])
 
     # Save as YAML
-    config_path = Path(output_dir) / f'config_transformer_01.yml'
+    _stem = str(forecast_name).strip() or 'transformer_01'
+    config_path = Path(output_dir) / f'config_{_stem}.yml'
     with open(config_path, 'w') as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
@@ -524,6 +530,85 @@ def generate_transformer_config_template(output_dir, forecast_name, input_column
 #
 # Aggregating the window takes the input dimension to one value per predictor, at
 # which point ARD and the epoch budget have something estimable to work with.
+# How the input window is presented to the tree and sequence models. The GP variants
+# already contrast a flattened window against a per-predictor mean; these give the
+# other two families the same axis, and two intermediate representations that neither
+# throws the window away nor hands over every hour of it.
+#
+#   none       the window as-is. XGBoost flattens it -- 7381 columns for a 28-day
+#              window against roughly 30 distinct training samples -- and the
+#              transformer carries a positional embedding of one block per hour.
+#   stats:24h  daily blocks, each summarised by mean/min/max/std. Level, spread and
+#              extremes within each day survive; hour-to-hour detail does not.
+#   stats:6h   the same summary at six-hourly resolution: four blocks per day, so
+#              within-day structure survives too, at four times the width.
+#
+# The two summaries differ only in block width, which is the axis the evidence
+# actually turns on. Measured per target, the daily summary beat the raw window on
+# both 671-row targets (pH 0.217 against 0.142, Turbidity 0.204 against 0.027) and
+# lost badly on the 167-row one (Cadmium 0.005 against 0.075) -- where a daily block
+# leaves only seven timesteps. Six-hourly blocks give a short window the resolution it
+# appears to want without imposing it on a long one.
+#
+# Daily rolling means (lag:24) were tried in this slot and dropped: they keep only the
+# level of each day and discard the spread and extremes that the summary retains from
+# the same data, and they finished last on every target that could be resolved.
+#
+# Block width is specified as an interval rather than a count because the window is
+# not the same length for every target -- 671 rows for pH, Colour, Turbidity and
+# intestinal enterococci, 167 for the other ten. A fixed count would make one
+# configuration name mean daily blocks on one target and six-hourly blocks on another.
+_WINDOW_REPRESENTATIONS = (
+    {"suffix": "01", "input_aggregation": "none",
+     "note": "Control: the full window, flattened by the model as before."},
+    {"suffix": "02", "input_aggregation": "stats:24h",
+     "note": "Daily blocks summarised by mean, min, max and standard deviation."},
+    {"suffix": "03", "input_aggregation": "stats:6h",
+     "note": "The same summary at six-hourly resolution."},
+)
+
+
+def generate_xgb_config_templates(output_dir, input_columns, output_columns,
+                                  sample_length, overrides=None):
+    """Emit an XGBoost config per window representation and return their paths."""
+    paths = []
+    for variant in _WINDOW_REPRESENTATIONS:
+        ov = dict(overrides or {})
+        # Overrides are merged by section, so the representation has to be placed in
+        # the data section rather than at the top level or it is silently ignored.
+        ov["data"] = dict(ov.get("data") or {})
+        ov["data"]["input_aggregation"] = variant["input_aggregation"]
+        paths.append(generate_training_config_template(
+            output_dir,
+            f"xgb_{variant['suffix']}",
+            input_columns,
+            output_columns,
+            sample_length,
+            model_type='xgb',
+            overrides=ov,
+        ))
+    return paths
+
+
+def generate_transformer_config_templates(output_dir, input_columns, output_columns,
+                                          sample_length, overrides=None):
+    """Emit a transformer config per window representation and return their paths."""
+    paths = []
+    for variant in _WINDOW_REPRESENTATIONS:
+        ov = dict(overrides or {})
+        ov["data"] = dict(ov.get("data") or {})
+        ov["data"]["input_aggregation"] = variant["input_aggregation"]
+        paths.append(generate_transformer_config_template(
+            output_dir,
+            f"transformer_{variant['suffix']}",
+            input_columns,
+            output_columns,
+            sample_length,
+            overrides=ov,
+        ))
+    return paths
+
+
 GP_CONFIG_VARIANTS = (
     {"suffix": "01", "kernel": "matern52+linear", "input_aggregation": "none",
      "note": "Control: previous configuration, flattened window with a linear kernel term."},
@@ -1211,23 +1296,22 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
     min_rows_needed = length + gap_rows
     if n_rows < min_rows_needed:
         sample_count = 0
-        xgb_config_path = generate_training_config_template(
+        xgb_config_paths = generate_xgb_config_templates(
             output_dir,
-            'xgb_01',
             predictor_cols,
             target_columns,
             length,
-            model_type='xgb',
             overrides=training_config_defaults.get('xgb', {}),
         )
-        transformer_config_path = generate_transformer_config_template(
+        xgb_config_path = xgb_config_paths[0]
+        transformer_config_paths = generate_transformer_config_templates(
             output_dir,
-            'transformer_01',
             predictor_cols,
             target_columns,
             length,
             overrides=training_config_defaults.get('transformer', {}),
         )
+        transformer_config_path = transformer_config_paths[0]
         gp_config_paths = generate_gp_config_templates(
             output_dir,
             predictor_cols,
@@ -1330,23 +1414,22 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
     n_samples = segment_counter - 1
 
     # Generate template configuration files for e_Train.py
-    xgb_config_path = generate_training_config_template(
+    xgb_config_paths = generate_xgb_config_templates(
         output_dir,
-        'xgb_01',
         predictor_cols,
         target_columns,
         length,
-        model_type='xgb',
         overrides=training_config_defaults.get('xgb', {}),
     )
-    transformer_config_path = generate_transformer_config_template(
+    xgb_config_path = xgb_config_paths[0]
+    transformer_config_paths = generate_transformer_config_templates(
         output_dir,
-        'transformer_01',
         predictor_cols,
         target_columns,
         length,
         overrides=training_config_defaults.get('transformer', {}),
     )
+    transformer_config_path = transformer_config_paths[0]
     gp_config_paths = generate_gp_config_templates(
         output_dir,
         predictor_cols,

@@ -48,6 +48,26 @@ from utils import run_paths as rp
 SUMMARY_NAME = "common_set_metrics.csv"
 TABLE_DIR = Path("docs/report/draft/tables")
 
+# Filename, LaTeX label and caption are one decision, not three. The manuscript
+# cites the label and prints the caption, so a table emitted under the wrong
+# combination is a silently mislabelled result rather than a missing one. The
+# default follows the predictor set the reporting root carries; the other arm is
+# requested explicitly.
+VARIANTS = {
+    "main": dict(
+        filename="target_summary.tex",
+        label="tab:targets",
+        caption="Per-target accuracy and statistical support on the common "
+                "evaluation set.",
+    ),
+    "profiler": dict(
+        filename="target_summary_profiler.tex",
+        label="tab:targets_profiler",
+        caption="As Table~\\ref{tab:targets}, for the profiler-bearing "
+                "predictor set.",
+    ),
+}
+
 VERDICT_UNAVAILABLE = "__pending__"
 
 VERDICT_TEX = {
@@ -58,7 +78,9 @@ VERDICT_TEX = {
     VERDICT_UNAVAILABLE: r"\emph{pending}",
 }
 
-ML_FAMILIES = {"GP", "XGB", "Transformer"}
+# MLR is a predictor-driven method like the other three; only Naive, Seasonal and
+# Linear are reference forecasts. See the note in z8_CommonSetMetrics.
+ML_FAMILIES = {"GP", "XGB", "Transformer", "MLR"}
 
 # The manuscript body is written in pure ASCII with LaTeX escapes (\AA, \upmu,
 # \o), so generated tables must match that convention: a literal U+00B0 or a
@@ -100,10 +122,15 @@ def _f(row, key):
         return float("nan")
 
 
+def _math(text):
+    """Wrap a rendered number so its sign cannot be broken off at a line end."""
+    return "$%s$" % text
+
+
 def _fmt(val, places=3):
     if val is None or pd.isna(val):
         return "---"
-    return f"{val:.{places}f}"
+    return _math(f"{val:.{places}f}")
 
 
 def _fmt_int(val):
@@ -118,8 +145,10 @@ def _fmt_skill(ss, lo, hi):
     if pd.isna(ss):
         return "---"
     if pd.isna(lo) or pd.isna(hi):
-        return f"{ss:.2f}"
-    return f"{ss:.2f} [{lo:.2f}, {hi:.2f}]"
+        return _math(f"{ss:.2f}")
+    # The estimate and its interval may break apart between them, but neither may
+    # break internally.
+    return "%s %s" % (_math(f"{ss:.2f}"), _math(f"[{lo:.2f}, {hi:.2f}]"))
 
 
 def _fmt_p(p, p_min):
@@ -129,11 +158,19 @@ def _fmt_p(p, p_min):
     outcome could have been significant, and reporting the p alone would invite
     that case to be read as a tested negative.
     """
+    def one(v):
+        # Two decimals turns 0.001 into "0.00", which asserts an exact zero that
+        # no finite test can produce. Below the display resolution, report the
+        # bound instead of a rounded value.
+        if v < 0.005:
+            return "$<0.01$"
+        return _math(f"{v:.2f}")
+
     if pd.isna(p):
         return "---"
     if pd.isna(p_min):
-        return f"{p:.2f}"
-    return f"{p:.2f} ({p_min:.2f})"
+        return one(p)
+    return f"{one(p)} ({one(p_min)})"
 
 
 def build_rows(df: pd.DataFrame, prefix: str) -> list[dict]:
@@ -157,6 +194,12 @@ def build_rows(df: pd.DataFrame, prefix: str) -> list[dict]:
 
         verdict = (str(r.get("aligned_verdict") or ev.NOT_SUPPORTED)
                    if has_verdicts else VERDICT_UNAVAILABLE)
+        # The two verdicts answer different questions and do not track each other:
+        # with MLR counted as a predictor-driven method rather than a reference, no
+        # target reaches "supported" on skill, while two do on prediction. Reporting
+        # only one of them would let the other be read off it, wrongly.
+        pred_verdict = (str(r.get("prediction_verdict"))
+                        if pd.notna(r.get("prediction_verdict")) else None)
 
         rows.append(dict(
             target=_tex_safe(clean_target_label(str(r.get("dataset", "")), prefix)),
@@ -178,49 +221,57 @@ def build_rows(df: pd.DataFrame, prefix: str) -> list[dict]:
             p=_f(r, "aligned_sign_p"),
             p_min=_f(r, "aligned_min_attainable_p"),
             verdict=verdict,
+            pred_verdict=pred_verdict,
         ))
 
     rows.sort(key=lambda d: -(d["r2"] if pd.notna(d["r2"]) else -9e9))
     return rows
 
 
-def render(rows: list[dict]) -> str:
+def render(rows: list[dict], variant: dict) -> str:
     out = [
         r"\begin{table}[H]",
-        r"\caption{Per-target accuracy and statistical support on the common "
-        r"evaluation set.\label{tab:targets}}",
+        r"\caption{%s\label{%s}}" % (variant["caption"], variant["label"]),
         r"\small",
         r"\begin{tabularx}{\textwidth}{"
-        # tabularx: the \hsize coefficients must sum to the number of X columns
-        # (7 here), or the table is set to the wrong total width and the columns
-        # run over one another.  1.75 + 1.0 + 0.5 + 0.35 + 1.55 + 0.85 + 1.0 = 7.0
-        r">{\hsize=1.75\hsize\raggedright\arraybackslash}X"
-        r">{\hsize=1.0\hsize\raggedright\arraybackslash}X"
-        r">{\hsize=0.5\hsize\centering\arraybackslash}X"
-        r">{\hsize=0.35\hsize\centering\arraybackslash}X"
-        r">{\hsize=1.55\hsize\centering\arraybackslash}X"
-        r">{\hsize=0.85\hsize\centering\arraybackslash}X"
-        r">{\hsize=1.0\hsize\raggedright\arraybackslash}X}",
+        # tabularx: the \\hsize coefficients must sum to the number of X
+        # columns (8 here), or the table is set to the wrong total width and the
+        # columns run over one another.
+        # 1.45 + 0.95 + 0.68 + 0.36 + 1.42 + 0.94 + 1.15 + 1.05 = 8.0
+        #
+        # "Underpowered", "Not supported" and "Transformer" are units that cannot
+        # wrap usefully, so the two verdict columns and the Best-method column have
+        # to hold them outright; the slack comes from Target, whose labels wrap
+        # anyway, and from the skill interval, which can break before its bracket.
+        r">{\hsize=1.45\hsize\raggedright\arraybackslash}X"
+        r">{\hsize=0.95\hsize\raggedright\arraybackslash}X"
+        r">{\hsize=0.68\hsize\centering\arraybackslash}X"
+        r">{\hsize=0.36\hsize\centering\arraybackslash}X"
+        r">{\hsize=1.42\hsize\centering\arraybackslash}X"
+        r">{\hsize=0.94\hsize\centering\arraybackslash}X"
+        r">{\hsize=1.15\hsize\raggedright\arraybackslash}X"
+        r">{\hsize=1.05\hsize\raggedright\arraybackslash}X}"
         r"\toprule",
         r"\textbf{Target} & \textbf{Best method} & \textbf{$R^2$} & "
         r"\textbf{$n$} & \textbf{SS (95\% CI)} & "
-        r"\textbf{$p$ ($p_{\min}$)} & \textbf{Verdict}\\",
+        r"\textbf{$p$ ($p_{\min}$)} & \textbf{Skill} & \textbf{Prediction}\\",
         r"\midrule",
     ]
     for row in rows:
-        marker = r"$^\dagger$" if row["is_reference"] else ""
         verdict = "---" if row["verdict"] is None else VERDICT_TEX.get(row["verdict"], "---")
+        pred = ("---" if row["pred_verdict"] is None
+                else VERDICT_TEX.get(row["pred_verdict"], "---"))
         out.append(
-            "%s & %s%s & %s & %s & %s & %s & %s\\\\"
+            "%s & %s & %s & %s & %s & %s & %s & %s\\\\"
             % (
                 row["target"],
                 row["method"],
-                marker,
                 _fmt(row["r2"]),
                 _fmt_int(row["n"]),
                 _fmt_skill(row["skill"], row["lo"], row["hi"]),
                 _fmt_p(row["p"], row["p_min"]),
                 verdict,
+                pred,
             )
         )
     out += [r"\bottomrule", r"\end{tabularx}", r"\end{table}"]
@@ -232,9 +283,11 @@ def main() -> int:
     ap.add_argument("--summary", type=Path, default=None,
                     help="Common-set metrics CSV. Defaults to the reporting root's.")
     ap.add_argument("--output", type=Path, default=None,
-                    help="Defaults to tables/target_summary.tex for the reporting root and "
-                         "tables/target_summary_<root>.tex for any other arm, so a second "
-                         "arm cannot silently replace the manuscript's main table.")
+                    help="Overrides the variant's filename. Rarely needed.")
+    ap.add_argument("--variant", choices=sorted(VARIANTS), default=None,
+                    help="Which table this is. Defaults to 'main' for the reporting "
+                         "root and 'profiler' for any other arm, so a second arm "
+                         "cannot silently replace the manuscript's main table.")
     ap.add_argument("--dataset-prefix", type=str, default="MC")
     args = ap.parse_args()
 
@@ -242,23 +295,20 @@ def main() -> int:
     if not summary.exists():
         raise SystemExit(f"summary CSV not found: {summary}")
 
-    # The table filename carries the identity of the arm it came from. Both arms
-    # are reported -- the reporting root in the body, the other in supplementary --
-    # and they must not resolve to the same file.
+    # Both arms are reported -- the reporting root in the body, the other in an
+    # appendix -- so they must not resolve to the same file or the same label.
     root = rp.root_of_summary(summary)
-    if args.output is not None:
-        output = args.output
-    elif rp.is_reporting_root(root):
-        output = rp.REPO_ROOT / TABLE_DIR / "target_summary.tex"
-    else:
-        output = rp.REPO_ROOT / TABLE_DIR / f"target_summary_{root.name}.tex"
+    name = args.variant or ("main" if rp.is_reporting_root(root) else "profiler")
+    variant = VARIANTS[name]
+    output = args.output or (rp.REPO_ROOT / TABLE_DIR / variant["filename"])
 
     df = pd.read_csv(summary)
     rows = build_rows(df, args.dataset_prefix)
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(render(rows), encoding="utf-8")
-    print(f"[INFO] Wrote {output} ({len(rows)} targets) from {root.name}")
+    output.write_text(render(rows, variant), encoding="utf-8")
+    print(f"[INFO] Wrote {output} ({len(rows)} targets) from {root.name} "
+          f"as variant '{name}' ({variant['label']})")
 
     # Counts only: targets have unrelated dynamics, so nothing is averaged across
     # them.
@@ -277,6 +327,9 @@ def main() -> int:
         print(f"  search scorings per target: {sorted(srch)}")
     for v in list(reversed(ev.VERDICT_ORDER)) + [VERDICT_UNAVAILABLE]:
         n = sum(1 for r in rows if r["verdict"] == v)
+        m = sum(1 for r in rows if r["pred_verdict"] == v)
+        if m:
+            print(f"  {m:2d}  prediction verdict: {v}")
         if n:
             print(f"  {n:2d}  verdict: {v}")
     n_blank = sum(1 for r in rows if r["verdict"] is None)

@@ -102,3 +102,40 @@ Two statements no longer match the results and are left for the author:
 - The Introduction refers to "simple target-specific baseline models"; the reference set
   includes a tuned multiple linear regression in three aggregation variants, which is not
   simple in the same sense.
+
+## Reporting basis moved to CV22_profilerless
+
+`utils/run_paths.REPORTING_ROOT` now points at `data/output/CV22_profilerless`. Every
+z-script that defaults its root follows it, so the manuscript table, the method
+comparison, the retention counts and the profiler contrast are all built from that arm.
+`data/output/CV19` remains the profiler-bearing arm behind Appendix A and Section 3.2,
+and `data/output/CV20_profilerless` is superseded and no longer feeds the paper.
+
+## MLR reclassified as a predictor-driven method
+
+MLR is counted among the machine-learning methods and is no longer in the skill
+denominator, which is now `{naive, seasonal, linear}` alone. The distinction the paper
+draws is whether a method reads the predictors, not whether it is classical or recent.
+Two consequences, both already reflected in the text:
+
+- The three aggregation variants are now one family with three configurations, scored
+  like the four GP kernels or the three XGBoost variants. `MLR-12` and `MLR-All` no
+  longer exist as separate columns in `common_set_metrics.csv`.
+- Skill is a weaker bar than it was, because the reference set no longer contains a
+  fitted regression on the predictors. Every one of the 14 skill scores is positive, and
+  Section 4 states explicitly what that does and does not establish.
+
+## Outstanding
+
+- **Forecast horizon.** `k_RunHorizonSweep` has not been run on the profiler-free
+  predictor set. Section 3.4, figure `fig:horizon`, the `m_{R^2}` definition in Section
+  2.6, the horizon paragraph in Section 4, research question 4, the lead-time sentence in
+  Section 2.3, and one clause of the abstract are all commented out in
+  `manuscript.tex` pending that run. Each carries a LaTeX comment naming what to restore.
+- **`pdflatex` is not installed here.** Table 3 now has eight `X` columns with `\hsize`
+  coefficients summing to exactly 8.0, and the new Figure `fig:testpred` uses `\subfloat`
+  from the MDPI class. Both need to be checked on the author's build.
+- **The abstract and Introduction otherwise remain the author's.** The framing sentence
+  at the end of the second Introduction paragraph and research question 2 were updated
+  because the MLR reclassification made them factually wrong; nothing else was touched.
+
