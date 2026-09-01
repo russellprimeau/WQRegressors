@@ -4,6 +4,7 @@ and crossval utilities. Extracted to eliminate three duplicate definitions.
 """
 
 import gpytorch
+from linear_operator import to_dense, to_linear_operator
 import torch
 
 
@@ -155,6 +156,36 @@ def describe_effective_kernel(kernel_name: str, use_uncertain_kernel: bool) -> s
     return effective_base
 
 
+class DenseAdditiveKernel(gpytorch.kernels.AdditiveKernel):
+    """``base + linear``, summed as dense matrices.
+
+    gpytorch's ``AdditiveKernel.forward`` accumulates its terms as linear operators.
+    ``LinearKernel`` returns a low-rank ``RootLinearOperator``, so summing it onto the
+    dense Matern term dispatches to ``LinearOperator.add_low_rank``, which represents the
+    result by taking an SVD of the concatenated root. That SVD is an efficiency device --
+    the mathematical result is just the elementwise sum -- and on a near-degenerate design
+    it does not converge:
+
+        torch._C._LinAlgError: linalg.svd: The algorithm failed to converge because the
+        input matrix is ill-conditioned or has too many repeated singular values
+
+    which killed the horizon sweep on E. coli, a target whose differential is mostly
+    zeros. Densifying each term first gives the identical covariance matrix by a route
+    with no SVD in it. The Matern term is already a full matrix and the whole kernel is
+    materialised for the Cholesky factorisation regardless, so nothing is lost: at these
+    training-set sizes there is no low-rank structure left to exploit downstream.
+    """
+
+    def forward(self, x1, x2, diag=False, **params):
+        res = None
+        for kern in self.kernels:
+            term = kern(x1, x2, diag=diag, **params)
+            if not diag:
+                term = to_dense(to_linear_operator(term))
+            res = term if res is None else res + term
+        return res
+
+
 def build_base_kernel(
     kernel_name,
     use_uncertain_kernel,
@@ -219,7 +250,8 @@ def build_base_kernel(
 
     if has_linear and base_name != "linear":
         linear_kernel = gpytorch.kernels.LinearKernel(ard_num_dims=ard_dims)
-        return base_kernel + linear_kernel
+        # DenseAdditiveKernel, not `base_kernel + linear_kernel`: see the class docstring.
+        return DenseAdditiveKernel(base_kernel, linear_kernel)
     return base_kernel
 
 

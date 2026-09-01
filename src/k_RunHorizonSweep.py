@@ -75,6 +75,7 @@ python src/k_RunHorizonSweep.py --data-root data/output/CV14 --dataset-prefix MC
 
 import sys
 import copy
+import hashlib
 import json
 import shutil
 import argparse
@@ -117,10 +118,21 @@ _MODEL_TYPE_TO_KEY = {
     'mlr_avgall': 'mlr_avgall',
 }
 
-# XGB cross-validation tuning is cached once per dataset, and that cache -- not the
-# config -- is what records the hyperparameters the reported model was fitted with.
-# e_Train resolves it as <data_dir>/forecasts/<this name>.
-_CV_TUNING_CACHE = 'xgb_cv_tuning_cache.json'
+# XGB cross-validation tuning is cached once per dataset AND window representation,
+# and that cache -- not the config -- is what records the hyperparameters the reported
+# model was fitted with. e_Train resolves it as
+# <data_dir>/forecasts/xgb_cv_tuning_cache<slug>.json, where the slug comes from
+# input_aggregation and is empty only for the unaggregated window. Hardcoding the
+# unaggregated name meant the four targets won by an aggregated XGBoost configuration
+# were handed no cache at all and re-tuned at every horizon.
+_CV_TUNING_CACHE_STEM = 'xgb_cv_tuning_cache'
+
+
+def _cv_tuning_cache_name(data_cfg: dict) -> str:
+    """The cache filename e_Train will look for, for this window representation."""
+    from utils.training import aggregation_slug
+    slug = aggregation_slug((data_cfg or {}).get('input_aggregation', 'none'))
+    return '%s%s.json' % (_CV_TUNING_CACHE_STEM, slug)
 
 # Per-replicate seed field injected into training config for each model type.
 # These map model_key → hyperparameter key that controls randomness.
@@ -352,6 +364,221 @@ def _model_name_to_key(model_name: str) -> str:
     return _MODEL_TYPE_TO_KEY.get(model_name, 'xgb')
 
 
+# Reference-forecast labels, in the order they are reported.
+_BASELINE_LABELS = ('Naive', 'Seasonal', 'Linear')
+
+
+def _reported_eval_cfg(run_dir, fallback: dict) -> dict:
+    """The `evaluation` section the reported run was actually evaluated with.
+
+    The selected config is the *training* config, whose `evaluation` section carries
+    nulls: `window_hours` and `gap_hours` are both None there, and f_Evaluate's defaults
+    for them (340 h and 0/5 h) are not the values the reported baselines used. e_Train
+    writes the resolved values into `config_evaluate_<run>.yml` beside the run, so the
+    reference forecasts have to be built from that file. Using the training config gave a
+    Linear baseline of R^2 = -1.367 for Cadmium where the results table reports -0.847,
+    from a 340 h trend window instead of 550 h. Naive matched anyway, but only by luck:
+    these targets are sampled weekly to monthly, so a four-hour shift in the cutoff
+    almost never crosses an observation.
+    """
+    run_dir = Path(run_dir)
+    for cand in sorted(run_dir.glob('config_evaluate_*.yml')):
+        try:
+            with open(cand, 'r', encoding='utf-8') as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception:
+            continue
+        ev = cfg.get('evaluation') or {}
+        if ev:
+            return ev
+    print("  [WARN] no config_evaluate_*.yml in %s; reference forecasts fall back to the "
+          "training config, whose baseline parameters are null and will not reproduce the "
+          "reported values." % run_dir.name)
+    return fallback.get('evaluation') or {}
+
+
+def _horizon_baseline_predictions(class_dir, base_cfg_yaml, run_dir, historic_csv,
+                                  horizon, segments, y, output_columns, output_rows):
+    """The three reference forecasts for one horizon, keyed by sample file.
+
+    The horizon truncates the predictor window, and it has to truncate the target's own
+    history by the same amount or the reference would be answering an easier question than
+    the model. ``evaluate_naive`` and ``evaluate_linear`` already take ``gap_hours`` and
+    cut at ``target_time - gap_hours``, so the horizon is added to whatever causal gap the
+    reported evaluation used: the persistence forecast then carries forward the last
+    observation available that far back, and the trend forecast fits its window up to that
+    point and extrapolates further.
+
+    ``evaluate_seasonal`` is left alone. It matches by day-of-year and hour across every
+    year except the target's own (``year_mask = src["year"] != target_year``), so it can
+    never see a measurement inside the truncated span and the horizon does not affect it.
+    That asymmetry is the substance of the comparison rather than a flaw in it: a seasonal
+    forecast is the alternative that does not degrade with lead time.
+
+    The dataset is built directly over the common evaluation set rather than through
+    ``splitter``. The baselines read only ``y`` and the filename, and a reused split
+    cannot be used here anyway: the XGBoost runs list Monte Carlo replicate filenames in
+    their train split, which do not exist under ``samples/``. Building it here also fixes
+    the ordering to the common set, so a baseline cannot be scored against the wrong
+    segment.
+
+    Computed once per horizon, because a reference forecast depends on neither the model
+    nor the replicate.
+    """
+    import f_Evaluate as eval_module
+    from utils.evaluation import (
+        evaluate_linear, evaluate_naive, evaluate_seasonal, load_secondary)
+
+    eval_cfg = _reported_eval_cfg(run_dir, base_cfg_yaml)
+    base_rows = list(output_rows)
+    # Routed through load_secondary exactly as f_Evaluate does: it lengthens the trend
+    # window for the sparsely sampled laboratory targets (340 -> 550 h here) and chooses
+    # the seasonal model's secondary source. Reading evaluation.window_hours directly, or
+    # defaulting it, gives a different Linear forecast from the reported one.
+    secondary_src, trend_window_hours = load_secondary(
+        list(output_columns), int(eval_cfg.get('window_hours', 340)))
+    dataset = [(None, np.asarray([[float(v)]]), sf) for sf, v in zip(segments, y)]
+
+    # f_Evaluate defaults these differently by design (5 for naive, 0 for linear); a
+    # configured value overrides both, and the horizon is added on top of either.
+    gap_naive = int(eval_cfg.get('gap_hours', 5)) + int(horizon)
+    gap_linear = int(eval_cfg.get('gap_hours', 0)) + int(horizon)
+
+    calls = (
+        ('Naive', lambda: evaluate_naive(
+            dataset, str(historic_csv), list(output_columns), str(class_dir),
+            output_rows=base_rows, gap_hours=gap_naive, sample_subdir='samples')),
+        ('Seasonal', lambda: evaluate_seasonal(
+            dataset, str(historic_csv), list(output_columns), str(class_dir),
+            output_rows=base_rows,
+            diurnal_window=int(eval_cfg.get('diurnal_window', 2)),
+            secondary=secondary_src or None, sample_subdir='samples')),
+        ('Linear', lambda: evaluate_linear(
+            str(class_dir), 'baselines', dataset, str(historic_csv),
+            list(output_columns), output_rows=base_rows,
+            window_hours=int(trend_window_hours),
+            gap_hours=gap_linear, debug_plot=False, sample_subdir='samples')),
+    )
+
+    out = {}
+    for label, fn in calls:
+        try:
+            preds, _ = fn()
+        except Exception as exc:
+            print("  [WARN] horizon %dhr: %s reference unavailable (%s: %s); its skill "
+                  "column will be blank."
+                  % (horizon, label, type(exc).__name__, str(exc)[:120]))
+            continue
+        a = np.asarray(preds, dtype=float)
+        a = a.reshape(a.shape[0], -1) if a.size else a.reshape(0, 1)
+        # f_Evaluate clips every baseline to the documented target support before
+        # scoring it, so an unclipped one here would not be the reported forecast. On pH
+        # exactly one segment moved: a persistence-extrapolated 1.083 that the reported
+        # run reports as 1.000, which alone shifted the Linear R2 from -4.05 to -4.83.
+        a, _ = eval_module._clip_to_target_support(a, '%s baseline (horizon)' % label)
+        a = np.asarray(a, dtype=float).reshape(a.shape[0], -1)
+        # evaluate_* skips a sample whose output timestamps cannot be read, which would
+        # shift every later prediction onto the wrong segment. Refuse rather than risk a
+        # misaligned skill score.
+        if a.shape[0] != len(segments):
+            print("  [WARN] horizon %dhr: %s returned %d rows for %d segments; skipping "
+                  "its skill column rather than risk a misalignment."
+                  % (horizon, label, a.shape[0], len(segments)))
+            continue
+        out[label] = {sf: float(v[0]) for sf, v in zip(segments, a)}
+    return out
+
+
+def _baseline_skill(baselines: dict, segments: list, y, rmse_model: float,
+                    sigma: float) -> dict:
+    """Skill of the model against each reference, and against the best of them.
+
+    "Best" is recomputed at every horizon: the persistence and trend forecasts decay as
+    their history is truncated while the seasonal one does not, so the strongest
+    alternative changes along the curve. The label is recorded with the value, because a
+    skill score whose opponent changes is not interpretable without it.
+    """
+    row: dict = {}
+    best_label, best_rmse = None, None
+    for label in _BASELINE_LABELS:
+        table = baselines.get(label)
+        if not table:
+            continue
+        p = np.array([table.get(sf, np.nan) for sf in segments], dtype=float)
+        if not np.isfinite(p).all():
+            continue
+        m = z8._metrics(y, p, sigma)
+        rmse = float(m['rmse'])
+        row['%s_rmse' % label.lower()] = rmse
+        row['%s_r2' % label.lower()] = float(m['r2'])
+        row['skill_v_%s' % label.lower()] = (
+            float(1.0 - rmse_model / rmse) if rmse > 0 else float('nan'))
+        if rmse > 0 and (best_rmse is None or rmse < best_rmse):
+            best_label, best_rmse = label, rmse
+    if best_label is not None:
+        row['best_statistical'] = best_label
+        row['skill_v_best_statistical'] = float(1.0 - rmse_model / best_rmse)
+    return row
+
+
+def _perturbation_is_inert(class_dir, n_mc_replicates: int) -> bool:
+    """True when the Monte Carlo replicates of a segment are byte-identical.
+
+    Uncertainty perturbation only does something for predictors that carry a calibration
+    uncertainty spec. On the profiler-free predictor set none of them do, so every
+    replicate of a segment is an exact copy: the training set is n_mc_replicates times
+    larger than the information in it, the GP's uncertain-input kernel sees zero input
+    variance, and per-replicate MC seeds cannot move the fit. Worth saying out loud,
+    because none of that is visible from the run's outputs.
+    """
+    if int(n_mc_replicates) < 2:
+        return False
+    mc_dir = Path(class_dir) / 'mc_replicates'
+    if not mc_dir.is_dir():
+        return False
+    first = sorted(mc_dir.glob('*_mc_001.csv'))
+    if not first:
+        return False
+    stem = first[0].name.rsplit('_mc_', 1)[0]
+    copies = sorted(mc_dir.glob(stem + '_mc_*.csv'))
+    if len(copies) < 2:
+        return False
+    digests = set()
+    for f in copies:
+        with open(f, 'rb') as fh:
+            digests.add(hashlib.md5(fh.read()).hexdigest())
+    return len(digests) == 1
+
+
+def _reported_xgb_rounds(run_dir) -> int | None:
+    """Boosting rounds the reported XGBoost model actually trained.
+
+    The reported models stop on a CV-derived round budget (`cv_epoch_budget_exhausted`),
+    which e_Train estimates from the training split. That estimator does not fire inside
+    the horizon configs -- every horizon run stops on `n_estimators_exhausted` instead --
+    so without this the horizon model is a different model from the one the results table
+    reports. Measured at horizon 0: Turbidity trained 4 rounds as reported and 204 here,
+    Cadmium 20 against 117, Total coliforms 10 against 77. Cadmium's R^2 moved from +0.428
+    to -0.510 on that difference alone, with the two prediction series correlated at
+    0.995 and differing only in amplitude, which is the signature of over-boosting rather
+    than of a different fit.
+
+    The count is read from the saved booster rather than from any config, because it is
+    the only record of what the model did rather than what it was asked to do.
+    """
+    model = Path(run_dir) / 'xgboost_model.json'
+    if not model.exists():
+        return None
+    try:
+        with open(model, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        n = int(payload['learner']['gradient_booster']['model']
+                ['gbtree_model_param']['num_trees'])
+    except Exception:
+        return None
+    return n if n > 0 else None
+
+
 def _build_horizon_config(winning_config: Path, class_dir: Path, rep_dir: Path,
                           rep_name: str, rep_idx: int, split_source: Path) -> dict:
     """The winning configuration, retargeted at one horizon replicate.
@@ -386,6 +613,54 @@ def _build_horizon_config(winning_config: Path, class_dir: Path, rep_dir: Path,
     # that run's configuration rather than a neighbour of it. Where the winning run
     # left the seed unset, 0 is the base -- the replicates are then reproducible even
     # though replicate 0 cannot reproduce an unseeded fit.
+    # Restore XGBoost's CV-derived round budget, which the tuning cache was suppressing.
+    #
+    # e_Train sets the training budget from an internal CV on the training split, and
+    # every reported model stops on that budget (`cv_epoch_budget_exhausted`). The
+    # estimator only runs when `early_stopping_rounds` is set, and applying the tuning
+    # cache overwrote it, so inside the horizon configs the estimator never fired and the
+    # model trained the cache's full `n_estimators` instead: Turbidity 204 rounds where
+    # the reported model trained 4, Cadmium 117 against 20, Total coliforms 77 against
+    # 10. Cadmium's R^2 moved from +0.428 to -0.510 on that alone, with the two
+    # prediction series correlated at 0.995 and differing only in amplitude -- the
+    # signature of over-boosting rather than of a different fit.
+    #
+    # Inlining the tuned values and switching the cache off lets the estimator run again.
+    # It then re-derives the budget from each horizon's own training data, exactly as it
+    # did for the reported model, so horizon 0 reproduces the results table (Cadmium: 20
+    # rounds, R^2 = +0.4285 against +0.4285) and longer horizons get the budget their own
+    # data supports. GP and the Transformer were never affected: they have no tuning
+    # cache, and their epoch budgets already reproduced at horizon 0 for all nine GP
+    # targets.
+    #
+    # n_estimators is set to the reported count only as a ceiling and fallback, for the
+    # case where the estimator declines to return a budget; when it runs, it wins.
+    rounds = _reported_xgb_rounds(split_source)
+    if rounds is not None and str(cfg.get('model_type', '')).startswith('xgb'):
+        hyper = cfg.setdefault('hyperparameters', {})
+        cache = Path(split_source).parent / _cv_tuning_cache_name(cfg.get('data', {}))
+        tuned: dict = {}
+        if cache.exists():
+            try:
+                with open(cache, 'r', encoding='utf-8') as f:
+                    payload = json.load(f)
+                tuned = (payload.get('tuned_hyperparameters')
+                         or payload.get('best_params') or {})
+            except Exception:
+                tuned = {}
+        else:
+            print("  [WARN] tuning cache %s not found; the horizon model may not match "
+                  "the reported one." % cache.name)
+        hyper.update({k: v for k, v in tuned.items() if k != 'cv_tuning'})
+        if int(hyper.get('n_estimators') or 0) != rounds:
+            print("  [PIN] n_estimators %s -> %d (ceiling: rounds the reported model "
+                  "trained; the CV budget estimator may lower it)"
+                  % (hyper.get('n_estimators'), rounds))
+        hyper['n_estimators'] = rounds
+        cv = dict(hyper.get('cv_tuning') or {})
+        cv['enabled'] = False
+        hyper['cv_tuning'] = cv
+
     seed_field = _MODEL_KEY_TO_SEED_FIELD.get(
         _model_name_to_key(str(cfg.get('model_type', ''))))
     if seed_field:
@@ -396,6 +671,32 @@ def _build_horizon_config(winning_config: Path, class_dir: Path, rep_dir: Path,
     # Reference forecasts are not reported per horizon, so do not compute them.
     cfg.setdefault('evaluation', {})['run_baselines'] = False
     return cfg
+
+
+def _common_set_targets_from_samples(class_dir, segments: list, output_columns,
+                                     output_rows) -> np.ndarray:
+    """Target values for *segments*, read from this horizon's own sample files.
+
+    Taken from the samples rather than from a prediction file so that the reference
+    forecasts can be built before any model has been trained at this horizon.
+    """
+    col = list(output_columns)[0]
+    row = int(list(output_rows)[0])
+    vals = []
+    for sf in segments:
+        t = pd.read_csv(Path(class_dir) / 'samples' / sf,
+                        encoding='utf-8', encoding_errors='replace')
+        vals.append(float(t[col].iloc[row]) if col in t.columns and len(t) > row
+                    else float('nan'))
+    return np.asarray(vals, dtype=float)
+
+
+def _common_set_targets(predictions_csv: Path, segments: list):
+    """Target values on the common set, in the order the metrics use them."""
+    t = pd.read_csv(predictions_csv, encoding='utf-8', encoding_errors='replace')
+    t = t[t['kind'].astype(str) == 'test']
+    targets = t.groupby('sample_file')['target'].mean()
+    return np.array([targets[s] for s in segments], dtype=float)
 
 
 def _score_on_common_set(predictions_csv: Path, segments: list, sigma: float) -> dict:
@@ -626,12 +927,30 @@ def _run_mlr_horizon_rep(
 
 
 
+def _note_failure(failures, dataset, horizon, rep, stage, detail):
+    """Record a replicate that could not be produced, and say so on stdout.
+
+    A single replicate used to abort the whole sweep, so one numerically awkward target
+    cost every target queued behind it. Skipping it instead is only acceptable because
+    nothing here is silent: the reason is printed, collected into horizon_failures.csv,
+    and repeated in a summary at the end, and a horizon that loses every replicate is
+    reported as having no result rather than quietly omitted from the curve.
+    """
+    first = str(detail).strip().splitlines()
+    first = first[-1][:200] if first else ''
+    failures.append({'dataset': dataset, 'horizon': horizon, 'replicate': rep,
+                     'stage': stage, 'reason': first})
+    print("  [SKIP-FAIL] horizon %dhr %s: %s failed -- %s"
+          % (horizon, rep, stage, first))
+
+
 def run_horizon_sweep(
     data_root,
     dataset_prefix,
     resample_config_path,
     preferred_lookaheads=None,
     n_replicates=1,
+    mc_seed_per_replicate=False,
 ):
     resample_cfg = load_config(resample_config_path)
     config_dir = Path(resample_cfg['__config_dir'])
@@ -649,6 +968,7 @@ def run_horizon_sweep(
     df_raw = pd.read_csv(input_csv, parse_dates=['TIMESTAMP'])
     df_raw = df_raw.sort_values('TIMESTAMP').reset_index(drop=True)
 
+    failures: list = []
     selected = _select_from_common_set(data_root, dataset_prefix)
     print("[INFO] %d target(s) taken from the common evaluation set:" % len(selected))
     for s in selected:
@@ -718,15 +1038,24 @@ def run_horizon_sweep(
             # a different model -- for Cadmium that was n_estimators 165 against 249
             # and a learning rate 3.5x lower, and R^2 at horizon 0 of -0.31 where the
             # results table reports +0.33. Copied rather than pointed at, so a rerun
-            # cannot write back into the sweep's cache.
-            src_cache = sel['run_dir'].parent / _CV_TUNING_CACHE
+            # cannot write back into the sweep's cache. The name is derived from the
+            # winning config's window representation, because that is what e_Train will
+            # look for; copying the unaggregated cache under the wrong name is
+            # indistinguishable from having no cache.
+            cache_name = _cv_tuning_cache_name(data_cfg)
+            src_cache = sel['run_dir'].parent / cache_name
             if src_cache.exists():
-                dst_cache = class_dir / 'forecasts' / _CV_TUNING_CACHE
+                dst_cache = class_dir / 'forecasts' / cache_name
                 dst_cache.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(src_cache, dst_cache)
+            elif model_class == 'ml' and str(model_key).startswith('xgb'):
+                # Silently re-tuning is what produced the Cadmium discrepancy; say so.
+                print("  [WARN] no tuning cache %s for %s; XGBoost will re-tune at this "
+                      "horizon and the result will not be comparable with the reported "
+                      "model." % (cache_name, dataset_dir.name))
 
-            if not _class_sweep_complete(class_dir, effective_replicates):
-                print("  [RESAMPLE] horizon %dhr (seed=%d)" % (horizon, random_seed))
+            def _resample(seed: int, label: str) -> None:
+                print("  [RESAMPLE] horizon %dhr %s(seed=%d)" % (horizon, label, seed))
                 try:
                     result = resample_split(
                         df_norm,
@@ -739,7 +1068,7 @@ def run_horizon_sweep(
                         predictor_cols=predictor_cols,
                         use_uncertainty_perturbation=use_uncertainty_perturbation,
                         n_mc_replicates=n_mc_replicates,
-                        random_seed=random_seed,
+                        random_seed=seed,
                         pre_normalized=True,
                         normalization_params=normalization_params,
                         sensor_uncertainties=shared_sensor_uncertainties,
@@ -748,8 +1077,8 @@ def run_horizon_sweep(
                         training_config_defaults={},
                     )
                 except Exception as exc:
-                    raise SystemExit("[FATAL] Resampling failed for horizon %dhr: %s" % (horizon, exc))
-
+                    raise SystemExit("[FATAL] Resampling failed for horizon %dhr: %s"
+                                     % (horizon, exc))
                 if result['n_samples'] == 0:
                     raise SystemExit("[FATAL] horizon %dhr produced no samples." % horizon)
 
@@ -761,6 +1090,31 @@ def run_horizon_sweep(
                     if not cfg_path.name.startswith('config_rep_'):
                         cfg_path.unlink(missing_ok=True)
 
+                if _perturbation_is_inert(class_dir, n_mc_replicates):
+                    print("  [WARN] the %d Monte Carlo replicates of a segment are "
+                          "byte-identical: no retained predictor carries a calibration "
+                          "uncertainty spec, so the perturbation is inert here. The "
+                          "training set is %dx duplicated, and per-replicate MC seeds "
+                          "cannot change the fit."
+                          % (n_mc_replicates, n_mc_replicates))
+
+            # With a per-replicate MC seed the data are regenerated for each replicate,
+            # so the resample moves inside the replicate loop below.
+            if not mc_seed_per_replicate and not _class_sweep_complete(
+                    class_dir, effective_replicates):
+                _resample(random_seed, '')
+
+            # One set of reference forecasts per horizon; they depend on neither the
+            # model nor the replicate. Deferred until after any resample above so the
+            # split and the samples they read are the ones this horizon will be scored on.
+            horizon_baselines: dict = {}
+            if not mc_seed_per_replicate:
+                horizon_baselines = _horizon_baseline_predictions(
+                    class_dir, base_cfg_yaml, sel['run_dir'], input_csv, horizon, segments,
+                    _common_set_targets_from_samples(class_dir, segments, output_columns,
+                                                     data_cfg['output_rows']),
+                    output_columns, data_cfg['output_rows'])
+
             for rep_idx in range(effective_replicates):
                 rep_name = 'rep_%03d' % rep_idx
                 rep_dir = class_dir / 'forecasts' / rep_name
@@ -771,6 +1125,20 @@ def run_horizon_sweep(
                     print("  [SKIP] horizon %dhr %s - already evaluated" % (horizon, rep_name))
                 else:
                     rep_dir.mkdir(parents=True, exist_ok=True)
+                    # A different Monte Carlo draw per replicate: the replicate spread
+                    # then measures how much the propagated measurement uncertainty of
+                    # the predictors moves the forecast, which is the only source of
+                    # variation these models have. Costs one resample per replicate,
+                    # and resampling is the dominant cost of the sweep.
+                    if mc_seed_per_replicate:
+                        _resample(random_seed + rep_idx, '%s ' % rep_name)
+                        horizon_baselines = _horizon_baseline_predictions(
+                            class_dir, base_cfg_yaml, sel['run_dir'], input_csv, horizon,
+                            segments,
+                            _common_set_targets_from_samples(
+                                class_dir, segments, output_columns,
+                                data_cfg['output_rows']),
+                            output_columns, data_cfg['output_rows'])
                     if is_mlr:
                         print("  [MLR] horizon %dhr %s" % (horizon, rep_name))
                         got = _run_mlr_horizon_rep(
@@ -782,9 +1150,9 @@ def run_horizon_sweep(
                             subset_label=sel['run'],
                         )
                         if got is None:
-                            raise SystemExit(
-                                "[FATAL] MLR evaluation failed for %s horizon %dhr %s."
-                                % (dataset_dir.name, horizon, rep_name))
+                            _note_failure(failures, dataset_dir.name, horizon,
+                                          rep_name, 'mlr', 'evaluation returned nothing')
+                            continue
                     else:
                         cfg = _build_horizon_config(
                             base_config, class_dir, rep_dir, rep_name,
@@ -800,9 +1168,9 @@ def run_horizon_sweep(
                                 [sys.executable, 'src/e_Train.py', '--config', str(cfg_path)],
                                 check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                         except subprocess.CalledProcessError as exc:
-                            raise SystemExit("[FATAL] Training failed for %s horizon %dhr %s:\n%s"
-                                             % (dataset_dir.name, horizon, rep_name,
-                                                exc.stderr.decode(errors='replace')))
+                            _note_failure(failures, dataset_dir.name, horizon, rep_name,
+                                          'train', exc.stderr.decode(errors='replace'))
+                            continue
 
                         eval_cfg_path = rep_dir / ('config_evaluate_%s.yml' % rep_name)
                         eval_arg = str(eval_cfg_path) if eval_cfg_path.exists() else str(cfg_path)
@@ -812,12 +1180,14 @@ def run_horizon_sweep(
                                 [sys.executable, 'src/f_Evaluate.py', '--config', eval_arg],
                                 check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                         except subprocess.CalledProcessError as exc:
-                            raise SystemExit("[FATAL] Evaluation failed for %s horizon %dhr %s:\n%s"
-                                             % (dataset_dir.name, horizon, rep_name,
-                                                exc.stderr.decode(errors='replace')))
+                            _note_failure(failures, dataset_dir.name, horizon, rep_name,
+                                          'evaluate', exc.stderr.decode(errors='replace'))
+                            continue
 
                 if not preds_csv.exists():
-                    raise SystemExit("[FATAL] %s not written." % preds_csv)
+                    _note_failure(failures, dataset_dir.name, horizon, rep_name,
+                                  'missing_predictions', str(preds_csv))
+                    continue
 
                 row = {
                     'dataset': dataset_dir.name,
@@ -832,6 +1202,11 @@ def run_horizon_sweep(
                     'input_rows_excluded': horizon,
                 }
                 row.update(_score_on_common_set(preds_csv, segments, sigma))
+                if horizon_baselines:
+                    row.update(_baseline_skill(
+                        horizon_baselines, segments,
+                        _common_set_targets(preds_csv, segments),
+                        float(row['rmse']), sigma))
 
                 # The run's own test split, kept for audit only: it is a different
                 # evaluation set from the one the paper reports.
@@ -846,6 +1221,17 @@ def run_horizon_sweep(
                         row['n_own_split'] = int(n_own) if pd.notna(n_own) else None
                 metrics_rows.append(row)
                 print("       R2(common,%d) = %+.3f" % (row['n_common_scored'], row['r2']))
+
+        got_horizons = {r['horizon'] for r in metrics_rows}
+        lost = [h for h in lookaheads if h not in got_horizons]
+        if lost:
+            print("  [WARN] %s: no usable replicate at horizon(s) %s; these are absent "
+                  "from the curve rather than plotted as zero."
+                  % (dataset_dir.name, ', '.join('%dhr' % h for h in lost)))
+        if not metrics_rows:
+            print("  [WARN] %s: no horizon produced a result; skipping its outputs."
+                  % dataset_dir.name)
+            continue
 
         sweep_dir = dataset_dir / 'horizons' / 'lookahead_sweeps'
         sweep_dir.mkdir(parents=True, exist_ok=True)
@@ -879,6 +1265,36 @@ def run_horizon_sweep(
             fig.savefig(sweep_dir / filename, dpi=150)
             plt.close(fig)
 
+    # Everything that could not be produced, in one place. Printed last so it is the
+    # part of a long log that is still on screen, and written to disk so a sweep that
+    # ran overnight can be audited without the terminal scrollback.
+    summary_dir = Path(data_root) / 'summaries'
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    failures_csv = summary_dir / 'horizon_failures.csv'
+    if failures:
+        pd.DataFrame(failures).to_csv(failures_csv, index=False)
+        by_ds: dict = {}
+        for f in failures:
+            by_ds.setdefault(f['dataset'], []).append(f)
+        print()
+        print('=' * 78)
+        print('[WARN] %d replicate(s) could not be produced, across %d target(s):'
+              % (len(failures), len(by_ds)))
+        for ds, items in sorted(by_ds.items()):
+            hs = sorted({i['horizon'] for i in items})
+            print('  %-40s %2d replicate(s) at horizon(s) %s'
+                  % (ds[:40], len(items), ', '.join('%dhr' % h for h in hs)))
+            print('       first reason: %s' % items[0]['reason'])
+        print('[WARN] Wrote %s' % failures_csv)
+        print('[WARN] Horizon means are computed from the replicates that did succeed; '
+              'check the replicate counts in lookahead_metrics.csv before reporting a '
+              'horizon whose replicates are incomplete.')
+        print('=' * 78)
+    else:
+        failures_csv.unlink(missing_ok=True)
+        print()
+        print('[INFO] Every horizon and replicate completed; no failures to report.')
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
@@ -900,6 +1316,16 @@ if __name__ == '__main__':
         help='Horizon values (hours) to sweep. Default: 0 1 2 6 12 24 48 96 120 167',
     )
     parser.add_argument(
+        '--mc-seed-per-replicate',
+        action='store_true',
+        help='Draw a different Monte Carlo perturbation for each replicate, by offsetting '
+             'the resample seed by the replicate index, so the replicate spread measures '
+             'propagated predictor measurement uncertainty. Off by default because it '
+             'costs one resample per replicate, and because the perturbation is inert '
+             'unless retained predictors carry calibration uncertainty specs -- which on '
+             'the profiler-free predictor set none of them do.',
+    )
+    parser.add_argument(
         '--replicates',
         type=int,
         default=1,
@@ -914,4 +1340,5 @@ if __name__ == '__main__':
         args.resample_config,
         args.horizons,
         n_replicates=args.replicates,
+        mc_seed_per_replicate=args.mc_seed_per_replicate,
     )

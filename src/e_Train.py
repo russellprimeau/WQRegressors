@@ -54,6 +54,7 @@ try:
     import plotly.express as px
 except Exception:
     px = None
+import random
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -919,8 +920,58 @@ def _transformer_cv_estimate_epochs(
     return max(1, pooled_ep)
 
 
+def _seed_model_rng(config: dict, label: str) -> int | None:
+    """Seed the RNGs a fit actually draws from, and say which seed was used.
+
+    Nothing in this file called ``torch.manual_seed``, and the transformer never read
+    ``random_state``, so its weight initialisation and dropout came from PyTorch's global
+    generator -- which is seeded nondeterministically at process start. Two fits of one
+    unchanged config therefore produced different models: measured on a Nickel
+    transformer config, R^2 of +0.4797 against +0.4326 for the identical inputs. That is
+    not seed *variance*, which is a legitimate thing to measure; it is a result that
+    cannot be reproduced from the artifact that claims to define it.
+
+    Seeding here makes a fit a function of its config, which is the precondition for
+    measuring seed variance deliberately (vary the seed, hold everything else) rather
+    than inheriting it by accident. XGBoost is seeded through its own ``random_state``
+    argument and the Gaussian process is deterministic given its data, so this matters
+    most for the transformer -- but it is applied uniformly, because "which families
+    happen to be deterministic today" is not a property worth relying on.
+    """
+    hyper_cfg = config.get("hyperparameters", {}) or {}
+    split_cfg = config.get("data_split", {}) or {}
+    # hyperparameters.random_state is the model seed and is what a multi-seed sweep should
+    # vary. Transformer configs carry no such key -- their only random_state lives under
+    # data_split and governs the split, not the fit -- so it is used as a fallback purely
+    # so that an unmodified config is reproducible. A sweep that wants to vary the model
+    # seed must set hyperparameters.random_state, which leaves the split untouched.
+    seed = hyper_cfg.get("random_state")
+    source = "hyperparameters.random_state"
+    if seed is None:
+        seed = split_cfg.get("random_state")
+        source = "data_split.random_state (fallback)"
+    if seed is None:
+        return None
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Seeding alone does not make a CUDA fit reproducible: cuDNN picks algorithms by
+    # benchmark and some reductions accumulate in nondeterministic order.
+    try:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        pass
+    print(f"[INFO] {label}: seeded torch/numpy/random with {source}={seed}.")
+    return seed
+
+
 def train_transformer_model(config, train_samples, test_samples):
     """Train Transformer model."""
+    _seed_model_rng(config, "Transformer")
     print("\n" + "="*80)
     print("TRAINING TRANSFORMER MODEL")
     print("="*80)
@@ -1222,6 +1273,7 @@ def _gp_cv_estimate_epochs(
 
 def train_gp_regressor_model(config, train_samples, test_samples):
     """Train GPyTorch Gaussian Process Regressor model(s)."""
+    _seed_model_rng(config, "GP")
     if gpytorch is None:
         raise ImportError(
             "gpytorch is not installed. Install it with: pip install gpytorch"
@@ -3196,6 +3248,14 @@ def _train_xgb_model(
         "learning_rate": hyper_cfg["learning_rate"],
         "n_jobs": int(hyper_cfg.get("n_jobs", -1)),
     }
+    # random_state was absent from this dict, so every fit used XGBoost's own default of
+    # 0 whatever the config said. subsample (0.51-0.86) and colsample_bytree (0.40-0.86)
+    # are active, so the seed does change the trees -- it simply never arrived, which is
+    # why the horizon sweep's per-replicate seeds produced bit-identical models. Only the
+    # training path takes it: the Optuna search above is seeded separately and its result
+    # is cached and shared, so it must not vary per replicate.
+    if hyper_cfg.get("random_state") is not None:
+        model_kwargs["random_state"] = int(hyper_cfg["random_state"])
     early_stop_source = str(hyper_cfg.get("early_stop_source", "cv")).lower()
     has_early_stopping = hyper_cfg.get("early_stopping_rounds") is not None
 

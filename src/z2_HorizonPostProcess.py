@@ -1341,7 +1341,7 @@ def _write_aggregate_csv(records: list[tuple[str, pd.DataFrame]], out_path: Path
     """Write lookahead_aggregate.csv for the given records list."""
     _drop_suffix = "_replicate"
     _front_cols = [
-        "dataset", "model_class", "model_name", "lookahead", "replicate",
+        "dataset", "dataset_dir", "model_class", "model_name", "lookahead", "replicate",
         "mae", "rmse", "nrmse", "r2", "pearson_r",
         "skill_v_naive", "skill_v_seasonal", "skill_v_linear", "skill_v_best_baseline",
     ]
@@ -1350,6 +1350,12 @@ def _write_aggregate_csv(records: list[tuple[str, pd.DataFrame]], out_path: Path
         frame = df.copy()
         frame = frame.drop(columns=[c for c in frame.columns if c.endswith(_drop_suffix)],
                            errors="ignore")
+        # k_RunHorizonSweep writes its own "dataset" column holding the directory name,
+        # while everything else in this script keys on the display label. They are
+        # different strings for the same target, so the raw one is kept under a distinct
+        # name rather than being overwritten or inserted alongside a duplicate.
+        if "dataset" in frame.columns:
+            frame = frame.rename(columns={"dataset": "dataset_dir"})
         frame.insert(0, "dataset", lbl)
         _numeric_means = (
             frame.groupby("lookahead", sort=True)

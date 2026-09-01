@@ -230,31 +230,35 @@ def build_rows(df: pd.DataFrame, prefix: str) -> list[dict]:
 
 def render(rows: list[dict], variant: dict) -> str:
     out = [
-        r"\begin{table}[H]",
+        # [!t], not [H]: forced exactly where the \input falls, a 14-row table starting
+        # low on a page runs off the bottom of the text block. [!t] sends it to the
+        # top of the next page, which is where every other float in this paper sits.
+        r"\begin{table}[!t]",
         r"\caption{%s\label{%s}}" % (variant["caption"], variant["label"]),
         r"\small",
         r"\begin{tabularx}{\textwidth}{"
         # tabularx: the \\hsize coefficients must sum to the number of X
-        # columns (8 here), or the table is set to the wrong total width and the
+        # columns (7 here), or the table is set to the wrong total width and the
         # columns run over one another.
-        # 1.45 + 0.95 + 0.68 + 0.36 + 1.42 + 0.94 + 1.15 + 1.05 = 8.0
+        # 1.40 + 0.90 + 0.62 + 0.33 + 1.45 + 1.20 + 1.10 = 7.0
         #
-        # "Underpowered", "Not supported" and "Transformer" are units that cannot
-        # wrap usefully, so the two verdict columns and the Best-method column have
-        # to hold them outright; the slack comes from Target, whose labels wrap
-        # anyway, and from the skill interval, which can break before its bracket.
-        r">{\hsize=1.45\hsize\raggedright\arraybackslash}X"
-        r">{\hsize=0.95\hsize\raggedright\arraybackslash}X"
-        r">{\hsize=0.68\hsize\centering\arraybackslash}X"
-        r">{\hsize=0.36\hsize\centering\arraybackslash}X"
-        r">{\hsize=1.42\hsize\centering\arraybackslash}X"
-        r">{\hsize=0.94\hsize\centering\arraybackslash}X"
-        r">{\hsize=1.15\hsize\raggedright\arraybackslash}X"
-        r">{\hsize=1.05\hsize\raggedright\arraybackslash}X}"
+        # The two verdict columns hold single words that cannot wrap usefully
+        # ("Underpowered", "Transformer"), so the slack comes from Target, whose
+        # labels wrap anyway, and from the skill interval, which can break before
+        # its bracket. The sign-test p and p_min are deliberately not columns here:
+        # both are inputs to the verdicts, which the table already carries, and at
+        # eight columns the table no longer fits the text block.
+        r">{\hsize=1.40\hsize\raggedright\arraybackslash}X"
+        r">{\hsize=0.90\hsize\raggedright\arraybackslash}X"
+        r">{\hsize=0.62\hsize\centering\arraybackslash}X"
+        r">{\hsize=0.33\hsize\centering\arraybackslash}X"
+        r">{\hsize=1.45\hsize\centering\arraybackslash}X"
+        r">{\hsize=1.20\hsize\raggedright\arraybackslash}X"
+        r">{\hsize=1.10\hsize\raggedright\arraybackslash}X}"
         r"\toprule",
         r"\textbf{Target} & \textbf{Best method} & \textbf{$R^2$} & "
         r"\textbf{$n$} & \textbf{SS (95\% CI)} & "
-        r"\textbf{$p$ ($p_{\min}$)} & \textbf{Skill} & \textbf{Prediction}\\",
+        r"\textbf{Skill} & \textbf{Prediction}\\",
         r"\midrule",
     ]
     for row in rows:
@@ -262,14 +266,13 @@ def render(rows: list[dict], variant: dict) -> str:
         pred = ("---" if row["pred_verdict"] is None
                 else VERDICT_TEX.get(row["pred_verdict"], "---"))
         out.append(
-            "%s & %s & %s & %s & %s & %s & %s & %s\\\\"
+            "%s & %s & %s & %s & %s & %s & %s\\\\"
             % (
                 row["target"],
                 row["method"],
                 _fmt(row["r2"]),
                 _fmt_int(row["n"]),
                 _fmt_skill(row["skill"], row["lo"], row["hi"]),
-                _fmt_p(row["p"], row["p_min"]),
                 verdict,
                 pred,
             )

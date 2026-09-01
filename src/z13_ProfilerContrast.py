@@ -46,7 +46,8 @@ import pandas as pd
 
 import z8_CommonSetMetrics as z8
 from utils.names import clean_target_label
-from utils.plotstyle import PAGE_WIDTH_IN, apply_paper_style, save_figure
+from utils.plotstyle import (
+    PAGE_WIDTH_IN, apply_paper_style, legend_above, save_figure)
 from utils import run_paths as rp
 
 # The probe family: the only one whose evaluation coverage is unaffected by
@@ -159,43 +160,59 @@ def analyse(root_with: Path, root_without: Path, prefix: str) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("delta", ascending=False).reset_index(drop=True)
 
 
+IMPROVED_COLOUR = "#1f77b4"
+WORSE_COLOUR = "#d62728"
+NEUTRAL_COLOUR = "0.55"
+
+
 def render(df: pd.DataFrame, output: Path) -> Path:
     apply_paper_style()
     n = len(df)
 
-    fig, ax = plt.subplots(figsize=(PAGE_WIDTH_IN, 0.32 * n + 1.4))
+    # Row pitch and grid match the other stacked per-target figures; every font size
+    # comes from apply_paper_style rather than being set here, so this figure prints at
+    # the same sizes as the method comparison and the retention counts.
+    fig, ax = plt.subplots(figsize=(PAGE_WIDTH_IN, 0.30 * n + 1.5))
 
     # One slope per target: a line running right means dropping the profiler
     # channels improved the fit on segments both predictor sets score. Colour
     # follows the same threshold as the reported counts, so a difference too
-    # small to interpret is not drawn as a direction.
+    # small to interpret is not drawn as a direction. The blue is the one the
+    # prediction time-series figures use for a model series, and the red is the
+    # "worse" end of the method-comparison colour scale.
     for i, r in df.iterrows():
         a, b = float(r["r2_with"]), float(r["r2_without"])
         d = b - a
-        colour = ("#2166ac" if d > MEANINGFUL_DELTA
-                  else "#b2182b" if d < -MEANINGFUL_DELTA else "0.55")
-        ax.plot([a, b], [i, i], color=colour, lw=1.4, zorder=1,
+        colour = (IMPROVED_COLOUR if d > MEANINGFUL_DELTA
+                  else WORSE_COLOUR if d < -MEANINGFUL_DELTA else NEUTRAL_COLOUR)
+        ax.plot([a, b], [i, i], color=colour, lw=1.4, zorder=2,
                 solid_capstyle="round")
-        ax.scatter([b], [i], s=20, color=colour, zorder=2)
+        ax.scatter([b], [i], s=20, color=colour, zorder=3)
         # Drawn last so that it stays visible where the two arms coincide;
         # otherwise those targets read as having only one result.
         ax.scatter([a], [i], s=22, facecolor="none", edgecolor="0.25",
-                   linewidth=1.0, zorder=3)
+                   linewidth=1.0, zorder=4)
 
-    ax.axvline(0.0, color="0.75", lw=0.8, zorder=0)
+    ax.axvline(0.0, color="0.75", lw=0.8, zorder=1)
     ax.set_yticks(range(n))
     ax.set_yticklabels(["%s  (%d)" % (r["target"], int(r["n_shared"]))
-                        for _, r in df.iterrows()], fontsize=7.0)
+                        for _, r in df.iterrows()])
     ax.invert_yaxis()
-    ax.set_xlabel("$R^2$ on the segments both predictor sets score", fontsize=7.5)
-    ax.tick_params(labelsize=7.0)
-    for s in ("top", "right"):
-        ax.spines[s].set_visible(False)
+    ax.set_xlabel("$R^2$ on the segments both predictor sets score")
+    ax.grid(axis="x", linestyle=":", linewidth=0.4, alpha=0.5, zorder=0)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
 
-    ax.scatter([], [], s=22, facecolor="none", edgecolor="0.25", linewidth=1.0,
-               label="profiler-bearing")
-    ax.scatter([], [], s=20, color="#2166ac", label="profiler-free")
-    ax.legend(loc="lower right", frameon=False, fontsize=7.0)
+    # Above the axes, not inside them: at lower right the legend sat on top of the
+    # bottom-ranked target's marker.
+    handles = [
+        plt.Line2D([0], [0], marker="o", linestyle="none", markerfacecolor="none",
+                   markeredgecolor="0.25", markeredgewidth=1.0, markersize=4.6),
+        plt.Line2D([0], [0], marker="o", linestyle="none", color=IMPROVED_COLOUR,
+                   markersize=4.4),
+    ]
+    legend_above(ax, handles, ["profiler-bearing", "profiler-free"], ncol=2)
 
     return save_figure(fig, output)
 
