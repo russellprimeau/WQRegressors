@@ -361,6 +361,186 @@ In place, and inherited by any future sweep because they live in `e_Train`/`gp_u
 Horizon-sweep fixes (tuning-cache filename, CV round budget, truncated-history baselines,
 `--mc-seed-per-replicate`, failure recording) are described in their own sections above.
 
+## Table 3 and the horizon curve disagreed by construction, not by error
+
+Both numbers were correct for what they computed; they computed different things.
+
+The horizon sweep fits a target's winning configuration six times at each horizon, differing
+in **nothing but the model seed** -- verified on Cadmium's horizon-0 replicates, which share
+one predictor set, one aggregation (`stats:6h`), one round budget (20) and one resampled
+`samples/` directory, and differ only in `random_state` 0-5. `z2`/`z16` then plotted the
+**mean of the six R^2 values**. Table 3 reports the **R^2 of the mean prediction**, the
+six-seed ensemble `z17_ApplySeedEnsembles` installed. Squared error is convex in the
+prediction, so by Jensen's inequality these cannot be equal:
+
+    R^2(mean prediction) - mean(R^2) = n * (mean across-seed variance) / SS_tot >= 0
+
+Measured on Cadmium at horizon 0 the two sides agree to six decimals (0.035342): per-seed
+values +0.4285 +0.2035 +0.2331 +0.2768 +0.2738 +0.2566, mean of the R^2s +0.278715, R^2 of
+the mean prediction +0.314058, Table 3 +0.314058. The figure's leftmost point therefore
+disagreed with the results table for exactly the targets whose winner is stochastic, and
+matched for the deterministic ones because their replicates are identical and the two
+aggregations coincide.
+
+**Ensembling is the side converged on.** Only the ensemble has a prediction series behind it,
+so R^2, the skill score and the permutation test all describe one model; and a six-seed
+ensemble is deployable, where "the average score of six models you would still have to choose
+between" is not.
+
+`z18_HorizonEnsembles.py` writes `lookahead_ensemble.csv` per target by averaging the
+replicate prediction vectors already on disk -- **nothing is retrained** -- and
+`z16_HorizonCurves.py` prefers it, falling back to the replicate mean with a warning.
+
+### Residual mismatches after the fix: 11 of 14 exact, 3 explained
+
+| target | Table 3 | horizon 0 | difference | cause |
+|---|---|---|---|---|
+| pH | +0.5348 | +0.5207 | -0.0141 | GP `uncertain_kernel_mc_seed` varies 0-5 across replicates; the reported fit holds it at 0 |
+| Turbidity | +0.2405 | +0.2374 | -0.0031 | same |
+| Lead | +0.0216 | -0.0006 | -0.0223 | signal below its own seed noise (below) |
+
+The GP is deterministic in its optimizer but **not** in its uncertain-input kernel, which
+draws 64 Monte Carlo samples; the horizon sweep varies that draw per replicate. Prediction
+vectors still correlate at 0.99988 (pH) and 0.99999 (Turbidity), with maximum per-point
+differences of 0.004 and 0.0016. This is a real inconsistency in what the two paths hold
+fixed, small enough to disclose rather than re-run.
+
+**Lead is a different matter and is now reported as such.** Its zero-hour ensemble prediction
+has a standard deviation of 0.00192 against a target standard deviation of 0.02255, while the
+spread across its own six seeds is 0.00194 -- *larger than the signal*. The configuration
+returns what is effectively a constant forecast whose variation is entirely seed noise, which
+is why two six-seed ensembles of the same run id disagree by 0.022 and why their prediction
+vectors correlate at 0.00000 despite differing by at most 0.0086. Section 3.4 states this.
+
+## `--seeds` was broken in three ways, and is now consolidated into the main pass
+
+The flag was added to make selection seed-robust. Examined properly, it was doing close to
+the opposite. Three defects, all fixed in `h_RunMCFeatureSelectionSweep.py`.
+
+### 1. Seed replicates were competing as candidates
+
+`z8_CommonSetMetrics.load_runs` scans `feature_sweeps/` indiscriminately: every directory
+with a recognised family prefix and a `predictions.csv` becomes a candidate. The per-seed
+replicate runs landed there, so `--seeds N` added N single-seed draws of every stochastic
+candidate to the pool and let `z8` select the maximum over all of them. That is a
+winner's-curse amplifier -- the flag made selection *more* seed-fragile, not less. In the
+CV23 smoke run, **41 of 119 scoreable directories were replicates**.
+
+### 2. The seed suffix collided with an existing subset label
+
+Replicates were suffixed `_s%02d`. But `_s01` is already a subset label in the
+run-directory convention, beside `_k01`-`_k04`, `_l01` and `_m01`: **CV22 contains 182
+legitimate `_s01` directories**. A seed replicate and a subset run were therefore
+indistinguishable by name, and could collide outright. The CV23 smoke run's 27 `_s01`
+directories were 13 real subset runs plus 14 seed replicates.
+
+Replicates are now suffixed `_seedNN`, which matches no subset pattern, and `z8` excludes
+them by that suffix. They stay inside `feature_sweeps/` because the two resolvers disagree
+about what a forecast name is relative to -- `e_Train` joins it under `forecasts/` verbatim
+while `h_` prepends the sweep namespace -- so a directory prefix puts the replicate in
+`forecasts/feature_sweeps/seed_reps/` for one and `forecasts/seed_reps/` for the other.
+That mismatch is what a first attempt at relocating them hit.
+
+### 3. The reported result was still a single draw
+
+Seed averaging stopped at the beam search. The final per-family re-fit -- the run `z8`
+scores and the results table quotes -- was one fit. So the reported number was still chosen
+from a single draw of a model whose seed moves R^2 by a standard deviation of 0.03 at the
+median and up to 0.44.
+
+That stage now installs the **mean prediction vector** across seeds. Averaging predictions
+rather than scores is the only internally consistent option: there is no prediction series
+whose R^2 is the mean of six others, so a mean R^2 reported beside a significance verdict
+computed from one seed would quote two different models. The ensemble has one prediction
+vector, so R^2, the skill score and the permutation test all describe the same object, and
+it is deployable where "the average score of six models you would still have to choose
+between" is not.
+
+An earlier attempt was reverted for the wrong reason and the claim is withdrawn: the note
+that this "cannot be seed-averaged without restructuring" was too pessimistic. The first
+hook was simply placed before `evaluate_single_config` had written any predictions, and
+trained 27 extra runs only to discard them. The correct hook is immediately after that call.
+
+### The GP is not deterministic, and was being treated as though it were
+
+`v3` measured the GP's seed spread as exactly 0.0000 and concluded it was deterministic. Its
+optimizer is, but its uncertain-input kernel draws 64 Monte Carlo samples per fit from
+`uncertain_kernel_mc_seed`, which `v3` never varied. This is the direct cause of the
+remaining Table 3 / horizon-curve mismatches on pH (0.014) and Turbidity (0.003), whose
+horizon replicates *did* vary it. `_is_stochastic_model` now returns True for a GP with the
+uncertain kernel enabled, and `_seeded_variant_config` sets that seed alongside
+`random_state`.
+
+### Consequence for `z17`
+
+`z17_ApplySeedEnsembles` is now a repair tool for CV22 only, which was fitted before any of
+this existed. New runs need no post-processing step: `--seeds N` produces the ensemble
+in-pass, and `feature_sweep_final_metrics.csv` is recomputed from it rather than left
+holding the single-seed score.
+
+That staleness is real in the current CV22 tree and worth recording: `_pooled_r2` recomputed
+from `predictions.csv` reproduces the reported `r2` for **all 318** untouched runs and for
+**none of the 80** that `z17` overwrote -- a clean 2 x 2. Table 3 is correct, because `z8`
+reads `predictions.csv`; `h_`'s own metrics file is not.
+
+## Verification and provenance, added because assertion kept failing
+
+Sorting the retractions in this record by how the claim was arrived at gives one clean
+split: **every claim that had to be withdrawn was asserted from reading code or from
+plausible reasoning, and every claim that survived was measured first.** A secondary
+pattern compounded it -- generalising a timing or a rate from a single target. Two tools
+exist to move the pipeline's guarantees out of judgement and into commands.
+
+### `src/v4_CheckPipelineInvariants.py`
+
+Encodes each consistency check that had previously been run by hand, once, and re-found
+by hand on the next tree. It imports the pipeline's own `_pooled_r2` and `z8.load_runs`
+rather than reimplementing them: a checker carrying its own copy of the metric can agree
+with itself while disagreeing with the pipeline, which is the failure it exists to catch.
+Non-zero exit on any FAIL, so it can gate a re-run.
+
+| check | catches |
+|---|---|
+| run integrity | fits that failed silently (the 55 GP configs) |
+| metrics vs on-disk predictions | a table describing predictions it no longer matches |
+| candidate pool | seed replicates competing as independent candidates |
+| horizon anchor | the mean-of-R^2 vs R^2-of-mean mismatch, and a missing `z18` run |
+| search discrimination | a surrogate that ranks every subset identically |
+| ensemble provenance | an N-seed row with no single-seed predictions kept |
+| output containment | summaries written from a different root |
+
+Results on the trees as they stand:
+
+    CV22_profilerless   3 pass, 2 warn, 2 FAIL
+    CV23_profiler       6 pass, 0 warn, 1 FAIL
+    CV19                                1 FAIL (exit 1)
+
+CV22's two failures are both already-known and already-recorded: the 8 unrecovered GP
+configs, and Chromium's degenerate surrogate. Its warnings are the 216 rows `z17` left
+stale and the three horizon-anchor residuals (Lead 0.0223, pH 0.0141, Turbidity 0.0031),
+all documented above. **Nothing new or unexplained appeared**, which is the useful result:
+CV22 does not need re-running on suspicion.
+
+The check also surfaced a figure not previously measured: **Lead's search had 185 of 240
+candidates degenerate**, and Color 57 of 232. Lead is the target whose prediction spread
+is smaller than its own seed spread, so the two findings agree.
+
+### `src/utils/provenance.py`
+
+Writes a manifest to `<root>/summaries/run_manifests/` before the work starts -- so a
+crashed run still records what it attempted -- and stamps it with status and duration on
+the way out. Captures argv, all resolved arguments, git commit and **dirty flag**,
+package versions, host and timing.
+
+It exists because nothing recorded a run's settings, so "what did CV22 do?" had to be
+answered by reading directory names against current defaults, and the defaults had moved.
+That produced two wrong answers: whether the reported run used seed replication, and the
+fact that the surrogate is chosen among XGBoost configs only. Both are now single fields
+in the manifest (`candidate_seeds`, `surrogate_scope`).
+
+Manifests accumulate rather than overwrite: a tree is usually built by several
+invocations, and which ones touched it is exactly what gets forgotten.
+
 ## Outstanding
 
 - **Decide what `--replicates` is for on the profiler-free arm.** Section 3.4 states

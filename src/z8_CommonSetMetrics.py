@@ -202,6 +202,13 @@ def load_runs(sweeps: Path) -> list[RunRecord]:
         pf = d / "predictions.csv"
         if family is None or not pf.exists():
             continue
+        # A `_seedNN` directory is one draw of a candidate that is reported as the mean
+        # of its draws, not a candidate of its own. Scoring them here would put N
+        # single-seed fits of every stochastic model into the pool and let the maximum
+        # win, which is the selection bias `--seeds` exists to remove. The suffix cannot
+        # collide with the subset labels `_k01`-`_k04`, `_l01`, `_m01`, `_s01`.
+        if re.search(r"_seed\d+$", d.name):
+            continue
         try:
             t = pd.read_csv(pf, encoding="utf-8", encoding_errors="replace")
         except Exception:

@@ -137,6 +137,7 @@ import yaml
 import e_Train as train_module
 import f_Evaluate as eval_module
 from utils.notifications import notify
+from utils import provenance
 import os
 import unicodedata
 import seaborn as sns
@@ -2408,7 +2409,6 @@ def _pooled_r2(y: np.ndarray, p: np.ndarray) -> float:
 # Families whose fit depends on a random draw. GP and MLR are deterministic given their
 # data -- six seeds of a GP winner reproduce bit-identical predictions on eight of nine
 # targets -- so seeding them costs time and changes nothing.
-_STOCHASTIC_MODEL_TYPES = ("xgb_regressor", "xgb_classifier", "transformer")
 
 # Set once from --seeds/--seed-base. Default 1 reproduces the previous behaviour exactly:
 # one fit per candidate, at whatever seed the config carries.
@@ -2416,22 +2416,75 @@ _CANDIDATE_SEEDS = 1
 _CANDIDATE_SEED_BASE = 0
 
 
-def _seeded_variant_config(variant_cfg: Path, seed: int) -> Path:
-    """A copy of *variant_cfg* fitted at *seed*, writing to its own forecast directory.
+# Suffix marking a seed replicate. Deliberately not `_s%02d`: `_s01` is already a subset
+# label in the run-directory convention, beside `_k01`-`_k04`, `_l01` and `_m01` -- CV22
+# has 182 legitimate `_s01` directories -- so a seed replicate and a subset run were
+# indistinguishable by name and could collide outright. `_seed01` matches no subset
+# pattern, which is what lets `z8_CommonSetMetrics` exclude replicates by name.
+SEED_REPLICATE_RE = r"_seed\d+$"
 
-    ``hyperparameters.random_state`` is the model seed. It reaches XGBoost through the
-    constructor and the transformer through ``_seed_model_rng``; both of those were wired
-    up only recently, and before that every candidate in a sweep was fitted at one
-    unrecorded draw. The forecast name is suffixed so the seeds do not overwrite one
-    another.
+
+def _is_stochastic_model(model_type: str, hyper: dict | None = None) -> bool:
+    """Whether refitting this model at another seed can change its predictions.
+
+    XGBoost and the transformer draw from ``random_state``. The Gaussian process was
+    long treated as deterministic, and its optimizer is, but its uncertain-input kernel
+    draws 64 Monte Carlo samples per fit from ``uncertain_kernel_mc_seed``. That is not
+    a technicality: it is why pH and Turbidity disagreed between Table 3 and the horizon
+    curve, whose replicates varied that draw where the reported fit held it at 0.
+    """
+    mt = str(model_type or "").strip().lower()
+    if mt in ("xgb_regressor", "xgb_classifier", "transformer"):
+        return True
+    if mt == "gp_regressor":
+        return bool((hyper or {}).get("use_uncertain_input_kernel"))
+    return False
+
+
+def _seeded_variant_config(variant_cfg: Path, seed: int) -> Path:
+    """A copy of *variant_cfg* fitted at *seed*, in a directory z8 does not score.
+
+    ``hyperparameters.random_state`` is the model seed, reaching XGBoost through the
+    constructor and the transformer through ``_seed_model_rng``. Where the Gaussian
+    process uses its uncertain-input kernel, ``uncertain_kernel_mc_seed`` is the seed
+    that matters and is set alongside it.
+
+    Two things about *where* these go were wrong and are fixed here.
+
+    The suffix must not be ``_s%02d``. ``_s01`` is already a subset label in the
+    run-directory convention, beside ``_k01``-``_k04``, ``_l01`` and ``_m01`` -- CV22 has
+    182 legitimate ``_s01`` directories -- so a seed replicate and a subset run were
+    indistinguishable by name and could collide outright.
+
+    Second, the replicates must not be *scored* as candidates.
+    ``z8_CommonSetMetrics.load_runs`` scans ``feature_sweeps/`` indiscriminately: it takes
+    every directory with a family prefix and a ``predictions.csv`` as a candidate. Every
+    replicate therefore entered the selection pool in its own right, so ``--seeds N``
+    added N single-seed draws per candidate and let the maximum be chosen -- making
+    selection *more* seed-fragile, the opposite of the flag's purpose. In the CV23 smoke
+    run 41 of 119 scoreable directories were replicates.
+
+    They stay inside ``feature_sweeps/`` because the two resolvers disagree about what a
+    forecast name is relative to -- ``e_Train`` joins it under ``forecasts/`` verbatim
+    while this module prepends the sweep namespace -- so a directory prefix here lands a
+    replicate in ``forecasts/feature_sweeps/seed_reps/`` for one and
+    ``forecasts/seed_reps/`` for the other. ``z8`` excludes them by the ``_seedNN``
+    suffix instead, which is unambiguous by construction.
     """
     with open(variant_cfg, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    cfg.setdefault("hyperparameters", {})["random_state"] = int(seed)
+    hyper = cfg.setdefault("hyperparameters", {})
+    hyper["random_state"] = int(seed)
+    if hyper.get("use_uncertain_input_kernel"):
+        hyper["uncertain_kernel_mc_seed"] = int(seed)
     data_cfg = cfg.setdefault("data", {})
-    base_name = str(data_cfg.get("forecast_name", "candidate"))
-    data_cfg["forecast_name"] = "%s_s%02d" % (base_name, int(seed))
-    out = variant_cfg.with_name("%s_s%02d%s" % (variant_cfg.stem, int(seed), variant_cfg.suffix))
+    # Suffix the final component only, leaving whatever namespace prefix the caller set.
+    name = str(data_cfg.get("forecast_name", "candidate")).replace("\\", "/")
+    head, _, leaf = name.rpartition("/")
+    data_cfg["forecast_name"] = "%s%s_seed%02d" % (
+        head + "/" if head else "", leaf, int(seed))
+    out = variant_cfg.with_name(
+        "%s_seed%02d%s" % (variant_cfg.stem, int(seed), variant_cfg.suffix))
     with open(out, "w", encoding="utf-8") as f:
         yaml.dump(cfg, f, sort_keys=False, allow_unicode=True)
     return out
@@ -2622,7 +2675,13 @@ def _evaluate_candidate(
             model_type = str(base_cfg.get("model_type", "")).strip().lower()
             want = _CANDIDATE_SEEDS if n_seeds is None else int(n_seeds)
             base_seed = _CANDIDATE_SEED_BASE if seed_base is None else int(seed_base)
-            reps = int(want) if int(want) > 1 and model_type in _STOCHASTIC_MODEL_TYPES else 1
+            # Same test as the final stage. The search previously used a literal tuple
+            # that omitted the Gaussian process, so a GP surrogate was selected on one
+            # draw while the final re-fit of the same model was ensembled over N -- the
+            # two stages disagreeing about what is stochastic.
+            reps = (int(want) if int(want) > 1
+                    and _is_stochastic_model(model_type, base_cfg.get("hyperparameters"))
+                    else 1)
             try:
                 if reps > 1:
                     seed_rows: list[dict] = []
@@ -3948,7 +4007,14 @@ def _beam_search_subsets(
             no_improve += 1
             print(f"[SEARCH] Round {_round + 1}: no improvement ({no_improve}/{no_improve_patience}). Best: objective={best.objective:.4f} r2={best.r2:.6f} (evals: {eval_count}/{effective_eval_budget}, ETA: {_format_eta(search_start_time, eval_count, effective_eval_budget)})")
             if no_improve >= no_improve_patience:
-                print(f"[SEARCH] Patience exhausted, stopping.")
+                # This said "stopping" and then carried on: there was no break, so the
+                # loop always ran to max_rounds or budget exhaustion and the knob did
+                # nothing. Stopping here returns the unspent budget to swap refinement,
+                # which at the default budget never got to run at all.
+                print(f"[SEARCH] Patience exhausted after {_round + 1} rounds; stopping "
+                      f"elimination with {effective_eval_budget - eval_count} eval(s) left "
+                      f"for swap refinement.")
+                break
 
     current = best
     all_features_set = set(full_features)
@@ -4235,45 +4301,111 @@ def _choose_surrogate_config(
         f"[SURROGATE] Measuring {len(candidates)} configuration(s){scope} on the full "
         f"feature set to choose which one scores the search ({n_fits} fit(s))."
     )
-    scored = []
-    for cfg_path in candidates:
-        cfg = train_module.load_config(str(cfg_path))
-        features = tuple(cfg["data"]["input_columns"])
-        try:
-            result = _evaluate_candidate(
-                dataset_dir=dataset_dir,
-                target_name=target_name,
-                surrogate_config_path=cfg_path,
-                row_count=row_count,
-                features=features,
-                feature_tag=_feature_tag(features),
-                lambda_drop=lambda_drop,
-                tmp_cfg_dir=tmp_cfg_dir,
-                disable_baselines_for_search=disable_baselines_for_search,
-                disable_training_plots=disable_training_plots,
-                disable_eval_plots=disable_eval_plots,
-                suppress_training_logs=suppress_training_logs,
-                cv_fold_dirs=_folds_for(cfg_path, training_segments),
-            )
-        except Exception as exc:
-            print(f"[SURROGATE] {cfg_path.name}: failed to evaluate ({exc}); not eligible.")
-            continue
-        if result is None:
-            print(f"[SURROGATE] {cfg_path.name}: no result; not eligible.")
-            continue
-        scored.append((float(result.objective), cfg_path, result))
-        print(f"[SURROGATE]   {cfg_path.name:<38} objective={result.objective:.4f} "
-              f"r2={result.r2:.4f} folds={result.cv_folds}")
+    def _measure(cfgs: list) -> list:
+        """Fit each config once on the full feature set and score it."""
+        out = []
+        for cfg_path in cfgs:
+            cfg = train_module.load_config(str(cfg_path))
+            features = tuple(cfg["data"]["input_columns"])
+            try:
+                result = _evaluate_candidate(
+                    dataset_dir=dataset_dir,
+                    target_name=target_name,
+                    surrogate_config_path=cfg_path,
+                    row_count=row_count,
+                    features=features,
+                    feature_tag=_feature_tag(features),
+                    lambda_drop=lambda_drop,
+                    tmp_cfg_dir=tmp_cfg_dir,
+                    disable_baselines_for_search=disable_baselines_for_search,
+                    disable_training_plots=disable_training_plots,
+                    disable_eval_plots=disable_eval_plots,
+                    suppress_training_logs=suppress_training_logs,
+                    cv_fold_dirs=_folds_for(cfg_path, training_segments),
+                )
+            except Exception as exc:
+                print(f"[SURROGATE] {cfg_path.name}: failed to evaluate ({exc}); not eligible.")
+                continue
+            if result is None:
+                print(f"[SURROGATE] {cfg_path.name}: no result; not eligible.")
+                continue
+            out.append((float(result.objective), cfg_path, result))
+            print(f"[SURROGATE]   {cfg_path.name:<38} objective={result.objective:.4f} "
+                  f"r2={result.r2:.4f} folds={result.cv_folds} "
+                  f"{'DEGENERATE' if bool(result.degenerate) else ''}".rstrip())
+        return out
+
+    scored = _measure(candidates)
+
+    # If nothing in the requested family can vary its prediction, the family cannot rank
+    # feature subsets at all and narrowing to it was the wrong call for this target. The
+    # pool is widened and re-measured rather than proceeding with a constant.
+    #
+    # This is a rule, not a special case: it is evaluated for every target, from a
+    # quantity measured before any search happens, and it fires only where the condition
+    # holds. On CV22 that is exactly one target of fourteen -- Chromium, where all three
+    # XGBoost configurations return pred_std 0.00000 on the full feature set. Lead comes
+    # closest and does not qualify: xgb_03 varies (pred_std 0.02315), so the degeneracy
+    # guard below picks it and the pool stays as requested.
+    if scored and not any(not bool(item[2].degenerate) for item in scored) and auto_prefix:
+        extra = [c for c in _surrogate_candidates(train_configs) if c not in candidates]
+        if extra:
+            print(f"[SURROGATE][WARN] every configuration matching '{auto_prefix}' predicts "
+                  f"a constant on the full feature set, so none of them can separate "
+                  f"feature subsets. Widening the pool to all {len(extra)} remaining "
+                  f"configuration(s) rather than searching with a surrogate that would "
+                  f"rank every subset identically.")
+            scored = scored + _measure(extra)
 
     if not scored:
         raise RuntimeError(
             f"No family could be evaluated on the full feature set for "
             f"{dataset_dir.name}; the surrogate cannot be chosen by measurement."
         )
-    scored.sort(key=lambda item: item[0])
-    best_obj, chosen, best_result = scored[0]
-    runner_up = (f", next best {scored[1][1].name} at {scored[1][0]:.4f}"
-                 if len(scored) > 1 else "")
+
+    # A degenerate surrogate predicts a constant, so every feature subset scores
+    # identically and the beam search ranks nothing. This is not hypothetical: CV22's
+    # Chromium search was scored by XGBoost, which returned r2 = -0.0013608598215928 for
+    # all 240 candidates from 4 to 11 features, and the "selected" subset was settled by
+    # the tie-break rule rather than by measurement. The Gaussian process was not
+    # degenerate on that target at all -- gp_03 reached r2 = +0.50 -- so a usable
+    # surrogate existed and was passed over because it scored worse on the full feature
+    # set, which is the one subset where a degenerate constant is hardest to beat.
+    #
+    # Objective alone therefore cannot choose the surrogate: a model that cannot separate
+    # subsets is worthless for the search however well it scores. Usable candidates rank
+    # first; a degenerate one is used only when no family can separate anything.
+    usable = [item for item in scored if not bool(item[2].degenerate)]
+    n_degenerate = len(scored) - len(usable)
+    pool = sorted(usable if usable else scored, key=lambda item: item[0])
+    best_obj, chosen, best_result = pool[0]
+
+    if usable and n_degenerate:
+        argmin_obj, argmin_cfg, argmin_res = min(scored, key=lambda item: item[0])
+        if bool(argmin_res.degenerate):
+            print(
+                f"[SURROGATE][WARN] {argmin_cfg.name} has the best objective "
+                f"({argmin_obj:.4f}) but predicts a constant, so it would rank every "
+                f"feature subset identically and the search would select by tie-break. "
+                f"Using {chosen.name} (objective={best_obj:.4f}) to score the search "
+                f"instead."
+            )
+        else:
+            print(f"[SURROGATE] {n_degenerate} candidate(s) predict a constant and were "
+                  f"excluded from the choice.")
+    elif not usable:
+        # Reported, not silently accepted: the subset this target ends up with was not
+        # established by measurement, and Section 3.2 has to be able to say so.
+        print(
+            f"[SURROGATE][WARN] Every candidate surrogate predicts a constant on the full "
+            f"feature set for {dataset_dir.name}. No family can separate feature subsets "
+            f"here, so the search's selected subset is a tie-break rather than a "
+            f"measurement. Proceeding with {chosen.name}; treat this target's retained "
+            f"predictors as unestablished."
+        )
+
+    runner_up = (f", next best {pool[1][1].name} at {pool[1][0]:.4f}"
+                 if len(pool) > 1 else "")
     print(
         f"[SURROGATE] Chosen: {chosen.name} (objective={best_obj:.4f}, "
         f"r2={best_result.r2:.4f}){runner_up}."
@@ -5089,6 +5221,163 @@ def _ensure_min_test_samples_for_final(
     return False, "rebalanced", len(new_train), len(new_test)
 
 
+def _install_seed_ensemble(
+    variant_cfg: Path,
+    primary_dir: Path,
+    dataset_dir: Path,
+    model_type: str,
+    hyper: dict,
+    n_seeds: int,
+    seed_base: int,
+    *,
+    disable_training_plots: bool,
+    disable_eval_plots: bool,
+    suppress_training_logs: bool,
+) -> dict | None:
+    """Refit the evaluated run at further seeds and install their mean prediction.
+
+    This is what makes ``--seeds`` mean something for the reported result. The final
+    per-family re-fit is the run ``z8`` scores and Table 3 quotes, and until now it was
+    a single draw: the seed averaging stopped at the beam search, so the number the paper
+    reports was still chosen from one draw of a model whose seed moves R^2 by a standard
+    deviation of 0.03 at the median and up to 0.44.
+
+    Averaging *predictions* rather than scores is the only internally consistent choice.
+    There is no prediction series whose R^2 is the mean of six others, so reporting a
+    mean R^2 beside a significance verdict computed from one seed would quote two
+    different models. The ensemble has a single prediction vector, so R^2, the skill
+    score and the permutation test all describe the same thing -- and it is deployable,
+    where "the average score of six models you would still have to choose between" is
+    not. Squared error being convex, the ensemble also scores at or above the mean of the
+    parts, by the across-seed variance term (0.035 on Cadmium at horizon 0).
+
+    Seed *base* is the primary run already trained and evaluated by the caller, so only
+    ``n_seeds - 1`` further fits are needed. The replicates go to ``seed_reps/`` and are
+    never scored as candidates in their own right. The original single-seed predictions
+    are kept beside the ensemble as ``predictions_seed0.csv``, so this is reversible.
+
+    Returns:
+        The metrics recomputed from the ensembled predictions, for the caller to write
+        onto the row, or ``None`` if no ensemble was installed.
+    """
+    if int(n_seeds) <= 1 or not _is_stochastic_model(model_type, hyper):
+        return None
+
+    primary_csv = Path(primary_dir) / "predictions.csv"
+    if not primary_csv.is_file():
+        print("[WARN] seed ensemble: %s has no predictions.csv; left single-seed."
+              % Path(primary_dir).name)
+        return None
+
+    def _keyed(csv_path: Path):
+        """(sorted frame, prediction column, alignment key) for one run."""
+        t = pd.read_csv(csv_path, encoding="utf-8", encoding_errors="replace")
+        if "target" not in t.columns:
+            return None, None, None
+        after = list(t.columns[t.columns.get_loc("target") + 1:])
+        col = next((c for c in after
+                    if c not in {"Naive", "Seasonal", "Linear"}
+                    and not str(c).endswith(("_std", "_var"))), None)
+        if col is None:
+            return None, None, None
+        sort_cols = [c for c in ("kind", "sample_file") if c in t.columns]
+        if sort_cols:
+            t = t.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+        key = tuple(map(tuple, t[sort_cols].astype(str).to_numpy())) if sort_cols else None
+        return t, col, key
+
+    base_frame, base_col, base_key = _keyed(primary_csv)
+    if base_frame is None:
+        print("[WARN] seed ensemble: no prediction column in %s; left single-seed."
+              % Path(primary_dir).name)
+        return None
+
+    vecs = [base_frame[base_col].to_numpy(dtype=float)]
+    for k in range(1, int(n_seeds)):
+        seed = int(seed_base) + k
+        try:
+            seeded_cfg = _seeded_variant_config(variant_cfg, seed)
+            rep_eval_cfg = _train_single_config(
+                seeded_cfg,
+                dataset_dir,
+                disable_training_plots=disable_training_plots,
+                disable_eval_plots=True,
+                suppress_training_logs=suppress_training_logs,
+            )
+            _set_eval_overrides(rep_eval_cfg, run_baselines=False)
+            eval_module.evaluate_single_config(str(rep_eval_cfg), save_plots_override=False)
+            frame, col, key = _keyed(Path(rep_eval_cfg).parent / "predictions.csv")
+        except Exception as exc:
+            # A seed that will not fit is recorded and dropped, not silently absorbed
+            # into a smaller ensemble that still claims n_seeds.
+            print("[WARN] seed ensemble: seed %d of %s failed (%s: %s); excluded."
+                  % (seed, Path(primary_dir).name, type(exc).__name__,
+                     str(exc).splitlines()[0][:120]))
+            continue
+        if frame is None:
+            print("[WARN] seed ensemble: seed %d of %s produced no predictions; excluded."
+                  % (seed, Path(primary_dir).name))
+            continue
+        # Aligning on the row key rather than position: a replicate whose split moved is
+        # not a like-for-like fit and must not be averaged into the ensemble.
+        if key != base_key or len(frame) != len(base_frame):
+            print("[WARN] seed ensemble: seed %d of %s is not row-aligned with the "
+                  "primary fit; excluded." % (seed, Path(primary_dir).name))
+            continue
+        vecs.append(frame[col].to_numpy(dtype=float))
+
+    if len(vecs) < 2:
+        print("[WARN] seed ensemble: %s kept only the primary fit; left single-seed."
+              % Path(primary_dir).name)
+        return None
+
+    backup = Path(primary_dir) / "predictions_seed0.csv"
+    if not backup.exists():
+        shutil.copy2(primary_csv, backup)
+    out = base_frame.copy()
+    out[base_col] = np.mean(vecs, axis=0)
+    out.to_csv(primary_csv, index=False)
+
+    y, p = _pooled_predictions(Path(primary_dir))
+    if y.size < 2:
+        return None
+    resid = y - p
+    std, deg = _prediction_spread(y, p)
+    metrics = {
+        "r2": _pooled_r2(y, p),
+        "rmse": float(np.sqrt(np.mean(resid ** 2))),
+        "mae": float(np.mean(np.abs(resid))),
+        "pred_std": std,
+        "degenerate": bool(deg),
+        "n_seeds_ensembled": len(vecs),
+    }
+    if np.std(y) > 0 and np.std(p) > 0:
+        metrics["pearson_r"] = float(np.corrcoef(y, p)[0, 1])
+    print("[SEED] %s: ensembled %d fits -> R2 %+.4f (was %+.4f)"
+          % (Path(primary_dir).name, len(vecs), metrics["r2"],
+             _pooled_r2(*_pooled_predictions_from(backup))))
+    return metrics
+
+
+def _pooled_predictions_from(pred_csv: Path) -> tuple[np.ndarray, np.ndarray]:
+    """``_pooled_predictions`` against a named file, for reporting the pre-ensemble score."""
+    df = pd.read_csv(pred_csv, encoding="utf-8", encoding_errors="replace")
+    if "kind" in df.columns:
+        df = df[df["kind"].astype(str) == "test"]
+    if df.empty or "target" not in df.columns:
+        return np.array([]), np.array([])
+    after = list(df.columns[df.columns.get_loc("target") + 1:])
+    col = next((c for c in after
+                if c not in {"Naive", "Seasonal", "Linear"}
+                and not str(c).endswith(("_std", "_var"))), None)
+    if col is None:
+        return np.array([]), np.array([])
+    y = pd.to_numeric(df["target"], errors="coerce").to_numpy(dtype=float)
+    pv = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+    ok = np.isfinite(y) & np.isfinite(pv)
+    return y[ok], pv[ok]
+
+
 def _evaluate_selected_subsets_all_models(
     dataset_plan: DatasetPlan,
     dataset_prefix: str,
@@ -5171,6 +5460,45 @@ def _evaluate_selected_subsets_all_models(
                         str(eval_cfg),
                         save_plots_override=not disable_eval_plots,
                     )
+
+                    # --seeds applies here, to the run z8 scores and Table 3 quotes,
+                    # and not only to the beam search that shortlisted it.
+                    _ens_metrics = None
+                    if _CANDIDATE_SEEDS > 1:
+                        try:
+                            with open(variant_cfg, "r", encoding="utf-8") as _vf:
+                                _vcfg = yaml.safe_load(_vf) or {}
+                        except Exception:
+                            _vcfg = {}
+                        _ens_metrics = _install_seed_ensemble(
+                            variant_cfg,
+                            Path(eval_cfg).parent,
+                            dataset_plan.dataset_dir,
+                            str(_vcfg.get("model_type", "")),
+                            _vcfg.get("hyperparameters") or {},
+                            _CANDIDATE_SEEDS,
+                            _CANDIDATE_SEED_BASE,
+                            disable_training_plots=disable_training_plots,
+                            disable_eval_plots=disable_eval_plots,
+                            suppress_training_logs=suppress_training_logs,
+                        )
+
+                    def _apply_ensemble(row):
+                        """Overwrite a model row's scores with the ensemble's.
+
+                        Counts are untouched: the split does not move between seeds, so
+                        n_test_independent and the contract fields stay valid. Baseline
+                        rows are never passed here -- the reference forecasts are not
+                        refitted and their scores are unchanged.
+                        """
+                        if not _ens_metrics or row is None:
+                            return row
+                        for _k in ("r2", "rmse", "mae", "pearson_r"):
+                            if _k in _ens_metrics:
+                                row[_k] = _ens_metrics[_k]
+                        row["n_seeds_ensembled"] = _ens_metrics["n_seeds_ensembled"]
+                        return row
+
                     summary_rows = []
                     eval_summary_csv = Path(eval_cfg).parent / "evaluation_summary.csv"
                     if eval_summary_csv.exists():
@@ -5195,7 +5523,7 @@ def _evaluate_selected_subsets_all_models(
                                             break
 
                             if primary_model_row is not None:
-                                summary_rows.append(primary_model_row)
+                                summary_rows.append(_apply_ensemble(primary_model_row))
 
                             # Add one row per baseline model (Naive/Seasonal/Linear).
                             seen_baselines: set[str] = set()
@@ -5210,7 +5538,7 @@ def _evaluate_selected_subsets_all_models(
                             print(f"[WARN] Could not read evaluation_summary.csv at {eval_summary_csv}: {read_exc}")
 
                     if not summary_rows and eval_result is not None:
-                        summary_rows = [eval_result]
+                        summary_rows = [_apply_ensemble(eval_result)]
             except SampleComplianceError as e:
                 ctx = getattr(e, "context", {}) or {}
                 print(
@@ -5265,6 +5593,7 @@ def _evaluate_selected_subsets_all_models(
                     "r2": float('nan'),
                     "pearson_r": float('nan'),
                     "std_target": float('nan'),
+                    "n_seeds_ensembled": float('nan'),
                 })
                 continue
 
@@ -5382,6 +5711,9 @@ def _evaluate_selected_subsets_all_models(
                     "r2": r2_val,
                     "pearson_r": pearson_val,
                     "std_target": std_target,
+                    # 1 for a single fit; N when the scores above were recomputed from an
+                    # N-seed mean prediction, so a reader can tell which rows are ensembles.
+                    "n_seeds_ensembled": int(srow.get("n_seeds_ensembled", 1) or 1),
                 }
 
                 if baseline_id is None:
@@ -5795,6 +6127,7 @@ def _evaluate_selected_subsets_all_models(
                                 "r2": r2_val,
                                 "pearson_r": pearson_val,
                                 "std_target": std_target,
+                                "n_seeds_ensembled": int(srow.get("n_seeds_ensembled", 1) or 1),
                             }
 
                             if baseline_id is None:
@@ -6630,7 +6963,14 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
 
         for row_count in row_counts:
             try:
-                print(f"\n[SEARCH] rows={row_count} surrogate={surrogate_cfg.name}")
+                # Not naming a surrogate here: `surrogate_cfg` is still the stand-in
+                # from `_select_surrogate_config`, and the one that actually scores the
+                # search is measured a few lines down. With `auto:xgb` the stand-in was
+                # usually an XGBoost config and the line looked right by coincidence;
+                # under plain `auto` it printed config_gp_01 while config_gp_03 did the
+                # scoring. A log naming the wrong surrogate is exactly what later has to
+                # be reverse-engineered.
+                print(f"\n[SEARCH] rows={row_count}")
                 seeded_subsets = _load_seed_subsets(
                     dataset_dir=plan.dataset_dir,
                     row_count=row_count,
@@ -6652,6 +6992,8 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                     disable_eval_plots=search_disable_eval_plots,
                     suppress_training_logs=not args.show_training_logs,
                 )
+                print(f"[SEARCH] rows={row_count} surrogate={surrogate_cfg.name} "
+                      f"(scores every candidate in this search)")
                 top_sorted, trace, _ = _beam_search_subsets(
                     dataset_dir=plan.dataset_dir,
                     dataset_prefix=args.dataset_prefix,
@@ -6767,12 +7109,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-budget", type=int, default=240)
     parser.add_argument(
         "--seeds", type=int, default=1,
-        help="Fit each candidate this many times with different model seeds and select on "
-             "the mean. Only XGBoost and the transformer are refitted -- GP and MLR are "
-             "deterministic given their data. Default 1 reproduces the previous behaviour. "
-             "Six seeds of the reported winners give an R2 standard deviation of 0.03 "
+        help="Fit each stochastic candidate this many times with different model seeds. The "
+             "beam search and surrogate choice select on the mean score; the final per-family "
+             "re-fit -- the run z8 scores and the results table quotes -- installs the mean "
+             "PREDICTION across seeds, so its R2, skill score and significance verdict all "
+             "describe one model. Replicates are suffixed _seedNN and are excluded from "
+             "scoring as candidates. Stochastic means XGBoost, the transformer, and the GP "
+             "when its uncertain-input kernel is enabled; MLR and the plain GP are fitted "
+             "once. Six seeds of the CV22 winners give an R2 standard deviation of 0.03 "
              "(median) and up to 0.44, and three of five XGBoost wins do not survive it, "
-             "so a single draw is not a safe basis for choosing between close candidates.")
+             "so a single draw is not a safe basis for choosing between close candidates. "
+             "Default 1 reproduces the previous behaviour.")
     parser.add_argument(
         "--seed-base", type=int, default=0,
         help="First seed used by --seeds (default 0, which is XGBoost's own default and "
@@ -6948,10 +7295,42 @@ def main() -> int:
     _CANDIDATE_SEEDS = max(1, int(getattr(args, "seeds", 1) or 1))
     _CANDIDATE_SEED_BASE = int(getattr(args, "seed_base", 0) or 0)
     if _CANDIDATE_SEEDS > 1:
-        print("[INFO] Candidate selection uses the mean of %d seeds (from %d) for XGBoost "
-              "and the transformer; GP and MLR are deterministic and fitted once."
-              % (_CANDIDATE_SEEDS, _CANDIDATE_SEED_BASE))
-    return run_feature_selection_sweep(args)
+        print("[INFO] Seed averaging is on: %d seeds from %d. The search selects on the mean "
+              "score; the final re-fit installs the mean prediction, so the reported result "
+              "is a %d-seed ensemble." % (_CANDIDATE_SEEDS, _CANDIDATE_SEED_BASE,
+                                          _CANDIDATE_SEEDS))
+        print("[INFO] Replicates are suffixed _seedNN and excluded from candidate scoring. "
+              "Each ensembled run keeps its single-seed predictions as predictions_seed0.csv.")
+
+    # Written before the work starts, so a crashed run still records what it attempted,
+    # and stamped with the outcome on the way out. The resolved values below are the ones
+    # that were not obvious from the command line and had to be reverse-engineered later.
+    manifest = provenance.write_manifest(
+        Path(args.data_root), Path(__file__).name, args,
+        extra={"candidate_seeds": _CANDIDATE_SEEDS,
+               "candidate_seed_base": _CANDIDATE_SEED_BASE,
+               "surrogate_scope": args.surrogate_model,
+               "resolved_defaults": {
+                   "beam_width": args.beam_width,
+                   "eval_budget": args.eval_budget,
+                   "max_rounds": args.max_rounds,
+                   "no_improve_patience": args.no_improve_patience,
+                   "min_features": args.min_features,
+                   "final_top_k": args.final_top_k,
+                   "cv_folds": args.cv_folds,
+                   "selection_tolerance_se": args.selection_tolerance_se,
+                   "shuffle_seed": args.seed,
+               }})
+    try:
+        rc = run_feature_selection_sweep(args)
+    except BaseException as exc:
+        provenance.finalize_manifest(
+            manifest, "failed", "%s: %s" % (type(exc).__name__,
+                                            str(exc).splitlines()[0][:200] if str(exc) else ""))
+        raise
+    provenance.finalize_manifest(manifest, "completed" if rc == 0 else "nonzero_exit",
+                                 "return code %s" % rc)
+    return rc
 
 
 if __name__ == "__main__":

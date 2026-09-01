@@ -46,9 +46,11 @@ from utils import run_paths as rp  # noqa: E402
 BACKUP_NAME = 'predictions_seed0.csv'
 
 
-def revert(root: Path) -> int:
+def revert(root: Path, only: "tuple[str, ...] | None" = None) -> int:
     n = 0
     for bak in root.glob('MC_*/forecasts/feature_sweeps/*/' + BACKUP_NAME):
+        if only and not any(t.lower() in str(bak).lower() for t in only):
+            continue
         shutil.copy2(bak, bak.with_name('predictions.csv'))
         bak.unlink()
         n += 1
@@ -61,12 +63,16 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--root', type=Path, default=None)
     ap.add_argument('--seeds', type=int, default=6)
+    ap.add_argument('--datasets', default=None, help='Comma-separated dataset names or substrings; only these targets are processed. Without it every target in the root is, which re-fits work already on disk and can perturb values that are currently trusted. Use it when a single target has been re-run and only that target needs its seed ensemble rebuilt, e.g. --datasets Chromium,Lead.')
     ap.add_argument('--revert', action='store_true')
     args = ap.parse_args()
 
     root = rp.resolve_root(args.root)
+    only = tuple(x.strip() for x in (args.datasets or '').split(',') if x.strip())
+    if only:
+        print('[INFO] restricted to target(s) matching: %s' % ', '.join(only))
     if args.revert:
-        return revert(root)
+        return revert(root, only)
 
     refit = root / 'summaries' / 'seed_refit.csv'
     if not refit.is_file():
@@ -76,6 +82,12 @@ def main() -> int:
     # different conditions from the run being replaced, so its ensemble is not a
     # like-for-like substitute.
     rf = rf[rf['reproduces'].astype(bool)]
+    if only:
+        rf = rf[rf['dataset'].astype(str).apply(
+            lambda d: any(t.lower() in d.lower() for t in only))]
+        if rf.empty:
+            raise SystemExit('--datasets %s matched no refitted candidate in %s'
+                             % (args.datasets, refit))
 
     applied = skipped = 0
     for _, c in rf.iterrows():

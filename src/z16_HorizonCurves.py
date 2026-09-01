@@ -33,11 +33,13 @@ import matplotlib.ticker as mticker  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from utils.names import clean_target_label  # noqa: E402
 from utils.plotstyle import apply_paper_style, legend_above, save_figure  # noqa: E402
 from utils import run_paths as rp  # noqa: E402
 
 AGGREGATE = Path("summaries") / "horizons" / "eval_test" / "best" / "lookahead_aggregate.csv"
 OUTPUT_NAME = "horizon_r2.png"
+ENSEMBLE_NAME = "lookahead_ensemble.csv"
 
 FIG_WIDTH_IN = 13.0
 ROW_HEIGHT_IN = 0.72
@@ -54,11 +56,36 @@ REP_STYLE = {"color": "#1f77b4", "marker": ".", "ms": 2.6, "alpha": 0.45,
 
 
 def load(root: Path) -> pd.DataFrame:
+    """Per-horizon scores, preferring the seed ensemble where one exists.
+
+    z2's aggregate holds one row per replicate, and averaging their R^2 is not the
+    quantity Table 3 reports. Squared error is convex in the prediction, so the R^2 of
+    the mean prediction exceeds the mean of the R^2s by the across-seed variance term
+    -- 0.035 on Cadmium at horizon 0, which left this figure's leftmost point
+    disagreeing with the results table for every target whose winner is stochastic.
+    z18 writes the ensemble; it is used when present, with the replicate mean as a
+    fallback that warns.
+    """
+    ens = sorted(root.glob("MC_*/horizons/lookahead_sweeps/" + ENSEMBLE_NAME))
+    if ens:
+        frames = []
+        for f in ens:
+            t = pd.read_csv(f, encoding="utf-8", encoding_errors="replace")
+            # z18 names the column `horizon`; draw() and z2's aggregate use `lookahead`.
+            t = t.rename(columns={"horizon": "lookahead"})
+            t["replicate"] = "0"
+            t["dataset"] = [clean_target_label(str(x), "MC") for x in t["dataset"]]
+            frames.append(t)
+        print("[INFO] using the seed ensemble for %d target(s)" % len(ens))
+        return pd.concat(frames, ignore_index=True)
     path = root / AGGREGATE
     if not path.is_file():
         raise SystemExit(
             "Not found: %s\nRun:\n    python src/z2_HorizonPostProcess.py --data-root %s"
             % (path, root))
+    print("[WARN] no %s found; falling back to the mean of the replicates' R^2, which "
+          "does not match Table 3 for stochastic winners. Run z18_HorizonEnsembles.py."
+          % ENSEMBLE_NAME)
     return pd.read_csv(path, encoding="utf-8", encoding_errors="replace")
 
 
