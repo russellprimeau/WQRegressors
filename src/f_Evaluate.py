@@ -1375,6 +1375,7 @@ def _build_boxplot_error_rows_from_predictions(
     model_label=None,
     baseline_labels=None,
     gp_boxplot_seed=0,
+    gp_synthetic=True,
 ):
     """Build long-form boxplot rows from predictions-table semantics.
 
@@ -1382,7 +1383,11 @@ def _build_boxplot_error_rows_from_predictions(
     - ML model uses mc replicate columns (if present), otherwise model column.
     - For GP models with gp_pred_std_* columns and no MC replicates, synthetic
       samples are drawn from Normal(mean, std) using the mc_n_replicates count
-      (or 10 if unavailable) to produce a comparable distribution.
+      (or 10 if unavailable) to produce a comparable distribution. Pass
+      ``gp_synthetic=False`` to plot the GP's point predictions instead, one per
+      measurement, which is what every other method contributes; the sampled version
+      shows predictive spread as well as error and the two are not comparable on the
+      same axes.
     - Baselines always use their own prediction columns.
     - All row kinds are retained (train/test/combined/etc.).
     """
@@ -1486,7 +1491,11 @@ def _build_boxplot_error_rows_from_predictions(
                 for mc_col in mc_cols:
                     _append_errors(model_col, df[mc_col], target_vals)
             elif gp_std_col is not None:
-                _append_gp_synth_errors(model_col, df[model_col], df[gp_std_col], target_vals, n_samples_series)
+                if gp_synthetic:
+                    _append_gp_synth_errors(model_col, df[model_col], df[gp_std_col],
+                                            target_vals, n_samples_series)
+                else:
+                    _append_errors(model_col, df[model_col], target_vals)
             else:
                 _append_errors(model_col, df[model_col], target_vals)
 
@@ -2058,7 +2067,28 @@ def evaluate_single_config(config_path, save_plots_override=None):
             boxplot_rows,
             directory=data_cfg["data_dir"],
             forecast_name=data_cfg["forecast_name"],
+            title="Error distribution (Gaussian process shown as sampled "
+                  "predictive uncertainty)",
         )
+        # The same plot from point predictions only. A Gaussian process otherwise
+        # contributes ten sampled draws per measurement against every other method's
+        # one, so its box describes predictive spread as well as error; this second
+        # version puts every method on the same footing. Written only when the two
+        # actually differ, which is when a GP posterior standard deviation was used.
+        plain_rows = _build_boxplot_error_rows_from_predictions(
+            predictions_rows,
+            model_label=model_column_label,
+            baseline_labels=baseline_labels,
+            gp_synthetic=False,
+        )
+        if plain_rows is not None and len(plain_rows) != len(boxplot_rows):
+            boxplot_from_error_rows(
+                plain_rows,
+                directory=data_cfg["data_dir"],
+                forecast_name=data_cfg["forecast_name"],
+                filename="boxplot_predictions.png",
+                title="Error distribution (point predictions, one per measurement)",
+            )
 
     # Return the main model summary row (prefer test, then combined, then train)
     # Look for kind == 'test', else 'combined', else 'train', else first row

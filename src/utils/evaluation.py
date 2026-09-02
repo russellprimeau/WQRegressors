@@ -1069,10 +1069,17 @@ def visualizer(
         plt.close()
 
 
-def boxplot_from_error_rows(error_rows_df, directory, forecast_name):
-    """Render boxplot.png from precomputed long-form error rows.
+def boxplot_from_error_rows(error_rows_df, directory, forecast_name,
+                            filename="boxplot.png", title=None):
+    """Render an error-distribution boxplot from long-form error rows.
 
     Expected columns: Dataset, Error, Kind.
+
+    *filename* and *title* exist because two of these are drawn per run. A Gaussian
+    process contributes sampled draws from its predictive distribution rather than its
+    point predictions, so its box holds ten values per measurement where every other
+    method holds one -- a different quantity on shared axes, and worth labelling as such
+    rather than leaving the reader to infer it from a suspiciously smooth box.
     """
     if error_rows_df is None or len(error_rows_df) == 0:
         print("[WARN] Skipping error distribution plot: no rows provided.")
@@ -1130,10 +1137,12 @@ def boxplot_from_error_rows(error_rows_df, directory, forecast_name):
 
     ax.set_ylabel("Error (Prediction - Target)")
     ax.set_xlabel("Model")
+    if title:
+        ax.set_title(title)
     ax.margins(x=0.02)
     plt.tight_layout()
     plt.savefig(
-        Path(directory, "forecasts", forecast_name, "boxplot.png"),
+        Path(directory, "forecasts", forecast_name, filename),
         bbox_inches="tight",
         pad_inches=0.1,
     )
