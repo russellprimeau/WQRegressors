@@ -122,6 +122,7 @@ import io
 import json
 import re
 import shutil
+import subprocess
 import sys
 import textwrap
 import time
@@ -1094,6 +1095,14 @@ def _train_single_config(
         train_samples, test_samples = train_module.load_and_split_data(config)
         print(f"    [TRAIN] {config_path.name}: train={len(train_samples)} test={len(test_samples)}")
 
+    if _MAX_FIT_SCALE > 0 and model_type == "gp_regressor":
+        scale = _fit_scale(config, len(train_samples))
+        if scale > _MAX_FIT_SCALE:
+            raise RuntimeError(
+                "fit refused before training: input_dim * n_train^2 = %.3g exceeds "
+                "--max-fit-scale %.3g (%s). The largest value among fits that have "
+                "succeeded here is 1.19e7." % (scale, _MAX_FIT_SCALE, config_path.name))
+
     def _run_train():
         if model_type == "transformer":
             train_module.train_transformer_model(config, train_samples, test_samples)
@@ -1112,7 +1121,36 @@ def _train_single_config(
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
 
-    if suppress_training_logs:
+    if _FIT_TIMEOUT_S > 0:
+        # The merged config is what the in-process path would have trained, so the child
+        # trains exactly that rather than re-deriving it from the original file.
+        staged = config_path.with_name(config_path.stem + "__timed.yml")
+        with open(staged, "w", encoding="utf-8") as fh:
+            yaml.dump(config, fh, sort_keys=False, allow_unicode=True)
+        try:
+            subprocess.run(
+                [sys.executable, str(Path(__file__).resolve().parent / "e_Train.py"),
+                 "--config", str(staged)],
+                check=True, timeout=_FIT_TIMEOUT_S,
+                stdout=(subprocess.DEVNULL if suppress_training_logs else None),
+                stderr=subprocess.PIPE,
+            )
+        except subprocess.TimeoutExpired:
+            # subprocess.run kills the child before re-raising, which is the whole point:
+            # the memory it was holding is returned and the sweep continues.
+            raise TimeoutError(
+                "fit exceeded --fit-timeout of %d s and was killed (%s)"
+                % (_FIT_TIMEOUT_S, config_path.name))
+        except subprocess.CalledProcessError as exc:
+            tail = (exc.stderr or "").strip().splitlines()
+            raise RuntimeError("training subprocess failed: %s"
+                               % (tail[-1][:200] if tail else "no stderr"))
+        finally:
+            try:
+                staged.unlink()
+            except OSError:
+                pass
+    elif suppress_training_logs:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             _run_train()
     else:
@@ -2412,6 +2450,51 @@ def _pooled_r2(y: np.ndarray, p: np.ndarray) -> float:
 
 # Set once from --seeds/--seed-base. Default 1 reproduces the previous behaviour exactly:
 # one fit per candidate, at whatever seed the config carries.
+# Wall-clock limit for a single fit, in seconds; 0 disables it and trains in-process
+# exactly as before. Training normally runs inside this process, so a fit that will not
+# finish cannot be interrupted: a flat 11-predictor Gaussian process on Total coliforms
+# reached 22.7 GB resident and 21 CPU-minutes without converging, and nothing could stop
+# it. Dimensionality does not predict this -- fits at 7381 input dimensions succeed while
+# that one at 1848 does not -- so the only reliable guard is a real timeout, and the only
+# way to enforce one is to put the fit in a child process that can be killed.
+_FIT_TIMEOUT_S = 0
+
+# Pre-flight ceiling on `input_dim * n_train^2`; 0 disables it, which is the default and
+# the recommended setting.
+#
+# This exists, but the evidence does not support a threshold. Across CV19 and CV22 there
+# are 1014 Gaussian process fits with a recoverable config: 992 succeeded and 22 did not.
+# Twenty-one of the 22 use `matern52+linear` and span 4.5e4 to 2.2e6 -- they are the
+# AdditiveKernel SVD failure that `DenseAdditiveKernel` fixed, and have nothing to do with
+# size. Exactly one failure is attributable to scale (gp_02 on Total coliforms, 2.44e7),
+# and the largest *successful* fit reaches 1.777e7 -- a separation of 1.37x resting on a
+# single observation.
+#
+# An earlier version of this comment claimed 2.05x headroom over a 1.19e7 maximum. That
+# came from sampling 500 fits rather than all of them and was wrong: a ceiling set from it
+# would have refused fits that succeeded. Use `--fit-timeout`, which needs no model of why
+# a fit fails.
+_MAX_FIT_SCALE = 0.0
+
+
+def _fit_scale(config: dict, n_train: int) -> float:
+    """``input_dim * n_train^2`` for a config, or 0 when it does not apply.
+
+    The flattened dimension is features x window rows; an aggregated config reduces the
+    window to one value per feature, which is why the aggregated variants of the same
+    subset fit without difficulty where the flat ones do not.
+    """
+    data_cfg = config.get("data", {}) or {}
+    cols = data_cfg.get("input_columns") or []
+    agg = str(data_cfg.get("input_aggregation", "none") or "none").lower()
+    try:
+        rows = int(data_cfg["input_row_2"]) - int(data_cfg["input_row_1"]) + 1
+    except Exception:
+        rows = 1
+    dims = len(cols) if agg not in ("", "none") else len(cols) * max(1, rows)
+    return float(dims) * float(n_train) ** 2
+
+
 _CANDIDATE_SEEDS = 1
 _CANDIDATE_SEED_BASE = 0
 
@@ -7108,6 +7191,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-improve-patience", type=int, default=3)
     parser.add_argument("--eval-budget", type=int, default=240)
     parser.add_argument(
+        "--max-fit-scale", type=float, default=0.0,
+        help="Refuse a Gaussian process fit whose input_dim * n_train^2 exceeds this, "
+             "before any work is done; 0 (default) disables it. NO VALUE IS RECOMMENDED. "
+             "Of 22 GP failures across CV19 and CV22, 21 are the AdditiveKernel SVD bug "
+             "at scales from 4.5e4 to 2.2e6 -- unrelated to size and already fixed -- and "
+             "only one is attributable to scale, at 2.44e7 against a largest successful "
+             "fit of 1.777e7. One observation and 1.37x separation is not a threshold. "
+             "Use --fit-timeout instead; it does not need to predict why a fit fails.")
+    parser.add_argument(
+        "--fit-timeout", type=int, default=0,
+        help="Seconds a single fit may run before it is killed and recorded as a "
+             "failure; 0 (default) trains in-process with no limit, as before. "
+             "Training is normally in-process, so a fit that will not finish cannot "
+             "be interrupted -- one flat Gaussian process on Total coliforms held "
+             "22.7 GB without converging. Setting this routes each fit through a "
+             "child process that can be killed, at the cost of one interpreter "
+             "start per fit. Recommended for unattended runs; 1800 is a reasonable "
+             "value, being longer than any fit that has ever succeeded here.")
+    parser.add_argument(
         "--seeds", type=int, default=1,
         help="Fit each stochastic candidate this many times with different model seeds. The "
              "beam search and surrogate choice select on the mean score; the final per-family "
@@ -7291,7 +7393,16 @@ def main() -> int:
     # evaluate a candidate sit several frames down, and adding an argument to each of
     # those signatures is more surface than this needs. Parallel workers are handed the
     # value explicitly in their payload, since a spawned process inherits neither.
-    global _CANDIDATE_SEEDS, _CANDIDATE_SEED_BASE
+    global _CANDIDATE_SEEDS, _CANDIDATE_SEED_BASE, _FIT_TIMEOUT_S, _MAX_FIT_SCALE
+    _FIT_TIMEOUT_S = max(0, int(getattr(args, "fit_timeout", 0) or 0))
+    _MAX_FIT_SCALE = max(0.0, float(getattr(args, "max_fit_scale", 0.0) or 0.0))
+    if _MAX_FIT_SCALE:
+        print("[INFO] Gaussian process fits with input_dim * n_train^2 above %.3g are "
+              "refused before training." % _MAX_FIT_SCALE)
+    if _FIT_TIMEOUT_S:
+        print("[INFO] Each fit runs in a child process and is killed after %d s; a fit that "
+              "exceeds it is recorded as a failure instead of stalling the sweep."
+              % _FIT_TIMEOUT_S)
     _CANDIDATE_SEEDS = max(1, int(getattr(args, "seeds", 1) or 1))
     _CANDIDATE_SEED_BASE = int(getattr(args, "seed_base", 0) or 0)
     if _CANDIDATE_SEEDS > 1:
@@ -7308,6 +7419,8 @@ def main() -> int:
     manifest = provenance.write_manifest(
         Path(args.data_root), Path(__file__).name, args,
         extra={"candidate_seeds": _CANDIDATE_SEEDS,
+               "fit_timeout_s": _FIT_TIMEOUT_S,
+               "max_fit_scale": _MAX_FIT_SCALE,
                "candidate_seed_base": _CANDIDATE_SEED_BASE,
                "surrogate_scope": args.surrogate_model,
                "resolved_defaults": {

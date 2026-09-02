@@ -23,14 +23,34 @@ the seed noise of the current best, which is a small fraction of the pool. Gauss
 processes and MLR are deterministic -- measured seed standard deviation is exactly 0.0000
 on eight of nine GP targets -- so only the stochastic families need refitting.
 
-The margin is checked, not assumed
-----------------------------------
-Seed noise is not a single number: across the five XGBoost winners it spans 0.0021
-(Copper, whose winner uses one predictor, leaving ``colsample_bytree`` nothing to sample)
-to 0.4414 (Lead). So candidates are selected with a deliberately generous margin, the
-standard deviation is then *measured* per candidate from its own refits, and afterwards
-every excluded candidate is checked against twice the measured value. Targets that fail
-that check are reported, and can be re-run at a wider margin rather than silently trusted.
+Which candidates are refitted
+-----------------------------
+Seed noise is not one number: across these configurations the measured spread runs from
+0.0024 (Zinc) to 0.2395 (pH), two orders of magnitude. A fixed R2 margin therefore
+over- and under-selects at the same time -- at 0.25 it refitted all 21 of E. coli's
+candidates, whose spread is 0.0036 and which cannot reorder at all, and only 4 of pH's,
+whose spread is 0.24 and which certainly can.
+
+The band is measured instead: ``k * sqrt(2) * sd`` around each family's best, where sd is
+the seed spread of that family's refits and sqrt(2) accounts for both compared values
+being single draws. sd is not known before refitting, so it is bootstrapped -- the
+family's leader is refitted first, the band computed from its spread, everything inside
+refitted, sd recomputed, and the band widened until it stops growing.
+
+Checked against what actually happened: the largest gap between the single-seed leader
+and the eventual seed-mean winner was 0.0988 (Total coliforms), which k=3 clears by
+0.0017. The default k=4 leaves headroom.
+
+The anchor is the family's own best, not the overall best, so a family whose best sits far
+below the winner still gets a seed-robust value of its own -- under a cross-family anchor
+Arsenic and Chromium refitted no XGBoost candidate at all. A candidate that overtakes the
+overall best on the seed mean still takes the win: z17 installs the ensembled predictions
+and z8 re-scores every family against them.
+
+Candidates are deduplicated on (variant, feature_tag). The l01/m01/s01 subset routes
+resolve to the same feature set on 11 of 14 targets, which is 21% of the pool; z17 installs
+one ensemble into every run directory matching the pair, so fitting each separately would
+repeat identical work.
 
 What this does not do
 ---------------------
@@ -40,8 +60,22 @@ have changed that. This makes the *selection* among discovered candidates seed-r
 does not simulate a full re-run.
 
 Usage:
-    python src/v3_SeedVarianceRefit.py --margin 0.25 --seeds 6
-    python src/v3_SeedVarianceRefit.py --dry-run          # cost only, fits nothing
+    # every target in the default root
+    python src/v3_SeedVarianceRefit.py --root data/output/CV22_profilerless --seeds 6
+
+    # only the targets that were re-run, leaving the rest untouched
+    python src/v3_SeedVarianceRefit.py --root data/output/CV22_profilerless \
+        --datasets Chromium,Lead --seeds 6
+
+    # cost only, fits nothing
+    python src/v3_SeedVarianceRefit.py --root data/output/CV22_profilerless --dry-run
+
+    # reproduce the superseded fixed-margin behaviour
+    python src/v3_SeedVarianceRefit.py --root data/output/CV22_profilerless --margin 0.25
+
+Then apply the ensembles and re-score:
+    python src/z17_ApplySeedEnsembles.py --root <root> [--datasets ...] --seeds 6
+    python src/z8_CommonSetMetrics.py    --root <root>
 """
 from __future__ import annotations
 

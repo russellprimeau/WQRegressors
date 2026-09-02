@@ -95,6 +95,30 @@ class UncertainInputMatern52Kernel(gpytorch.kernels.Kernel):
         return self._unit_noise.to(device=device, dtype=dtype) * scale
 
     def forward(self, x1, x2, diag=False, **params):
+        """Expected Matern-5/2 covariance under additive input noise.
+
+        Two things this avoids, both of which were costing real time and memory.
+
+        The Monte Carlo dimension is never materialised against the feature dimension.
+        Forming ``(mc, n1, n2, d)`` directly, as this did, is 64 x 115 x 115 x 1848
+        floats for one Total coliforms configuration -- 6.3 GB for a single intermediate,
+        with several more of the same shape alive at once, which is why that fit reached
+        22.7 GB and never returned. Expanding the square removes it:
+
+            r^2 = sum_d (D_d + e_d)^2 / l_d^2  =  A + 2 B_m + C_m
+            A   = sum_d D_d^2 / l_d^2        (n1, n2)    independent of the draw
+            B_m = sum_d D_d e_md / l_d^2     (mc, n1, n2)  one tensordot
+            C_m = sum_d e_md^2 / l_d^2       (mc,)
+
+        The largest array is then ``(mc, n1, n2)`` -- 3.4 MB for that same configuration.
+        The result is the same quantity, not an approximation of it.
+
+        And a zero-variance draw set is collapsed to one sample. Where no predictor in the
+        subset carries an uncertainty distribution every delta is zero, so all 64 draws are
+        identical and their mean is exactly the plain Matern kernel -- verified to 8.3e-17.
+        That case is 272 of 600 Gaussian process fits on the profiler-free predictor set,
+        every one of which was paying 64 times over for a result it already had.
+        """
         if diag:
             return torch.ones(x1.shape[-2], device=x1.device, dtype=x1.dtype)
 
@@ -104,11 +128,20 @@ class UncertainInputMatern52Kernel(gpytorch.kernels.Kernel):
         lengthscale = torch.clamp(lengthscale, min=1e-10)
 
         deltas = self._delta_samples(device=x1.device, dtype=x1.dtype)
-        base_diff = x1.unsqueeze(-2) - x2.unsqueeze(-3)
-        diff = base_diff.unsqueeze(0) + deltas[:, None, None, :]
+        if not bool(torch.any(deltas != 0)):
+            # Every draw is the zero perturbation; one of them is the whole answer.
+            deltas = deltas[:1]
 
-        scaled = diff / lengthscale
-        r2 = torch.sum(scaled.pow(2), dim=-1)
+        inv_ls2 = lengthscale.pow(-2)
+        base_diff = x1.unsqueeze(-2) - x2.unsqueeze(-3)          # (..., n1, n2, d)
+
+        a = torch.sum(base_diff.pow(2) * inv_ls2, dim=-1)        # (..., n1, n2)
+        weighted = deltas * inv_ls2                              # (mc, d)
+        b = torch.tensordot(weighted, base_diff, dims=([-1], [-1]))   # (mc, ..., n1, n2)
+        c = torch.sum(deltas.pow(2) * inv_ls2, dim=-1)           # (mc,)
+
+        r2 = a.unsqueeze(0) + 2.0 * b + c.reshape((-1,) + (1,) * a.dim())
+        r2 = torch.clamp(r2, min=0.0)
         r = torch.sqrt(torch.clamp(r2, min=1e-12))
 
         sqrt5 = torch.sqrt(torch.tensor(5.0, device=x1.device, dtype=x1.dtype))
