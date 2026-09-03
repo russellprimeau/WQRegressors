@@ -19,9 +19,24 @@ Why this is cheap
 -----------------
 The candidate pool is already on disk with every config, so nothing needs re-searching. A
 candidate can only change a target's outcome if its single-seed score is within roughly
-the seed noise of the current best, which is a small fraction of the pool. Gaussian
-processes and MLR are deterministic -- measured seed standard deviation is exactly 0.0000
-on eight of nine GP targets -- so only the stochastic families need refitting.
+the seed noise of the current best, which is a small fraction of the pool.
+
+An earlier version of this note claimed Gaussian processes were deterministic, on a
+measured seed standard deviation of exactly 0.0000. That measurement was real and the
+conclusion was wrong: it varied ``random_state``, which a Gaussian process does not read.
+Its randomness is the Monte Carlo draw of the uncertain-input kernel, seeded by
+``uncertain_kernel_mc_seed``, and three seeds of pH's winner span 0.012 -- against a 0.018
+gap to the next target in the accuracy ordering. Only MLR is deterministic.
+
+Measured seed standard deviations, for scale:
+
+    XGBoost      0.03 median, up to 0.44
+    GP           0.012 (pH), 0.002 (Turbidity)
+    Transformer  0.42 at 12 held-out measurements, 0.019 at 47
+
+The transformer's spread is dominated by how few measurements the target has rather than by
+the model, and it is the reason no family is exempt on the grounds that its effect looks
+small: that is not knowable before measuring it.
 
 Which candidates are refitted
 -----------------------------
@@ -99,14 +114,29 @@ REFIT_SUBDIR = 'seed_refit'
 # The band can only widen, and the pool is finite, so this is a guard against a
 # pathological sd rather than an expected limit.
 MAX_EXPANSIONS = 6
+# How far the previously reported score may sit from the base-seed refit before the
+# refit is treated as misconfigured rather than merely re-seeded. Absolute floor for a
+# deterministic family; otherwise this many measured seed standard deviations.
+REPRO_TOL_ABS = 0.002
+REPRO_TOL_SD = 4.0
 # A flattened 11-predictor GP on Total coliforms ran 25 minutes on 0.016 s of CPU -- hung,
 # not slow -- and stalled the whole recovery because subprocess.run waits forever by
 # default. A fit that has not finished in this long is not going to.
 FIT_TIMEOUT_S = 1800
-# Model key in feature_sweep_final_metrics.csv -> whether the fit is stochastic.
-FAMILY_KEY = {'xgb': 'xgb_regressor', 'transformer': 'transformer'}
+# Family name -> the `model` value it carries in feature_sweep_final_metrics.csv.
+FAMILY_KEY = {'xgb': 'xgb_regressor', 'transformer': 'transformer',
+              'gp': 'gp_regressor'}
 # Per-fit cost, measured from consecutive prediction-file timestamps in the sweep.
-FIT_SECONDS = {'xgb': 5.1, 'transformer': 27.2}
+FIT_SECONDS = {'xgb': 5.1, 'transformer': 27.2, 'gp': 6.6}
+# The hyperparameter that actually carries the seed, per family. A Gaussian process
+# ignores `random_state` completely -- two fits at 7 and 99 give bit-identical
+# predictions -- because its randomness is the Monte Carlo draw of the uncertain-input
+# kernel, seeded by `uncertain_kernel_mc_seed`. Writing `random_state` for every family,
+# as this script used to, measured a GP's seed spread as exactly zero by varying the one
+# number it does not read.
+SEED_FIELD = {'xgb_regressor': 'random_state', 'xgb_classifier': 'random_state',
+              'transformer': 'random_state',
+              'gp_regressor': 'uncertain_kernel_mc_seed'}
 
 
 def candidates(root: Path, families: tuple[str, ...],
@@ -129,6 +159,11 @@ def candidates(root: Path, families: tuple[str, ...],
     the overall best on the seed mean still wins it: z17 installs the ensembled
     predictions and z8 re-scores every family against them.
 
+    Candidates that re-seeding cannot move are dropped here rather than refitted and
+    found to have zero spread: see `seed_changes_this_fit`. On the profiler-free
+    predictor set that removes 227 of 375 Gaussian process candidates, whose subsets
+    contain no predictor carrying an uncertainty distribution.
+
     *only* restricts the scan to the named targets, so a single re-run target can be
     rebuilt without disturbing work already on disk.
     """
@@ -147,14 +182,71 @@ def candidates(root: Path, families: tuple[str, ...],
             g = d[d['model'].astype(str) == FAMILY_KEY[fam]].dropna(subset=['r2'])
             if g.empty:
                 continue
+            # The family best is taken over every candidate, including any that re-seeding
+            # cannot move: it is the score to beat, not a candidate for refitting.
             fam_best = float(g['r2'].max())
             for _, r in g.iterrows():
+                var = str(r.get('variant', ''))
+                tag = str(r.get('feature_tag', ''))
+                sub = str(r.get('subset_label', ''))
+                rd = run_dir_for(root, ds.name, var, tag, sub)
+                if not seed_changes_this_fit(rd, FAMILY_KEY[fam]):
+                    continue
                 rows.append(dict(
-                    dataset=ds.name, family=fam, variant=str(r.get('variant', '')),
-                    feature_tag=str(r.get('feature_tag', '')),
-                    subset_label=str(r.get('subset_label', '')),
+                    dataset=ds.name, family=fam, variant=var,
+                    feature_tag=tag, subset_label=sub,
                     r2_single=float(r['r2']), target_best=best, family_best=fam_best))
     return pd.DataFrame(rows)
+
+
+def ds_path(root: Path, ds: str) -> Path:
+    """The dataset directory for a dataset name."""
+    return root / ds
+
+
+def run_dir_for(root: Path, ds: str, variant: str, feature_tag: str,
+                subset_label: str) -> "Path | None":
+    """The run directory a metrics row describes, or None if it is not unique."""
+    sweeps = root / ds / 'forecasts' / 'feature_sweeps'
+    if not sweeps.is_dir():
+        return None
+    hits = [p for p in sweeps.iterdir()
+            if p.is_dir() and p.name.startswith(variant) and feature_tag in p.name
+            and p.name.endswith('_' + subset_label)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def seed_changes_this_fit(run_dir: "Path | None", model_type: str) -> bool:
+    """Whether re-seeding this particular fit can change its predictions.
+
+    Family membership is not enough for a Gaussian process. Its randomness enters only
+    through the perturbation applied to predictors that carry an uncertainty
+    distribution, so on a subset containing none of them every Monte Carlo draw is the
+    zero vector and the kernel reduces exactly to the plain Matern -- verified to
+    8.3e-17. Of 375 GP candidates on the profiler-free predictor set, 227 are in that
+    position and refitting them would spend six fits each to reproduce one number.
+
+    The test is per candidate rather than per family, and it reads the fitted artifact
+    rather than intersecting the subset with `UNCERTAINTY_DISTRIBUTION_FEATURES`: that
+    constant lists only the six profiler channels, yet `SCADA - pH` carries a variance
+    of 0.0433 and is not in it, so the constant is not a reliable statement of which
+    predictors are uncertain.
+    """
+    mt = str(model_type or '').lower()
+    if mt in ('xgb_regressor', 'xgb_classifier', 'transformer'):
+        return True
+    if mt != 'gp_regressor' or run_dir is None:
+        return False
+    art = run_dir / 'gp_model.pt'
+    if not art.exists():
+        return False
+    try:
+        import torch
+        payload = torch.load(art, map_location='cpu', weights_only=False)
+        var = np.asarray(payload.get('input_uncertainty_var'))
+    except Exception:
+        return False
+    return bool(var is not None and var.size and (var != 0).any())
 
 
 def find_config(root: Path, ds: str, variant: str, feature_tag: str,
@@ -189,7 +281,13 @@ def _reported_rounds(run_dir: Path) -> int | None:
 
 def _stage_seed_config(base: dict, cfg_path: Path, run_dir: Path, seed: int,
                        out_name: str) -> dict:
-    """Config for one seed, with the tuning cache neutralised.
+    """Config for one seed, with whatever the reported fit re-derives pinned in place.
+
+    Each family needs a different thing held still, and a different field set as the
+    seed. XGBoost re-derives its round budget and reads `random_state`; a Gaussian
+    process re-derives its epoch budget and reads `uncertain_kernel_mc_seed`, ignoring
+    `random_state` entirely. The seed field is looked up in `SEED_FIELD` rather than
+    assumed.
 
     Leaving ``cv_tuning`` enabled makes this measurement meaningless, and the first
     version of this script did exactly that. The cache is applied *after* the config is
@@ -205,30 +303,59 @@ def _stage_seed_config(base: dict, cfg_path: Path, run_dir: Path, seed: int,
     """
     cfg = yaml.safe_load(yaml.dump(base))
     hyper = cfg.setdefault('hyperparameters', {})
-    agg = (cfg.get('data') or {}).get('input_aggregation', 'none')
-    slug = aggregation_slug(agg)
-    cache = cfg_path.parent.parent / ('xgb_cv_tuning_cache%s.json' % slug)
-    if cache.exists():
-        try:
-            with open(cache, 'r', encoding='utf-8') as f:
-                payload = json.load(f)
-            tuned = payload.get('tuned_hyperparameters') or payload.get('best_params') or {}
-            hyper.update({k: v for k, v in tuned.items() if k != 'cv_tuning'})
-        except Exception:
-            pass
-    rounds = _reported_rounds(run_dir)
-    if rounds is not None:
-        hyper['n_estimators'] = rounds
-        # Also silence the CV round-budget estimator. With the cache off it runs again
-        # and re-derives a budget that overrides the pin -- for xgb_01 configs it landed
-        # somewhere else and 13 candidates then failed to reproduce their reported score.
-        # The reported fit trained exactly `rounds` rounds, so training exactly that many
-        # is what reproduces it; the estimator only has a job when the budget is unknown.
-        hyper['early_stopping_rounds'] = None
-    cv = dict(hyper.get('cv_tuning') or {})
-    cv['enabled'] = False
-    hyper['cv_tuning'] = cv
-    hyper['random_state'] = int(seed)
+    model_type = str(cfg.get('model_type', '')).strip().lower()
+
+    if model_type in ('xgb_regressor', 'xgb_classifier'):
+        agg = (cfg.get('data') or {}).get('input_aggregation', 'none')
+        slug = aggregation_slug(agg)
+        cache = cfg_path.parent.parent / ('xgb_cv_tuning_cache%s.json' % slug)
+        if cache.exists():
+            try:
+                with open(cache, 'r', encoding='utf-8') as f:
+                    payload = json.load(f)
+                tuned = payload.get('tuned_hyperparameters') or payload.get('best_params') or {}
+                hyper.update({k: v for k, v in tuned.items() if k != 'cv_tuning'})
+            except Exception:
+                pass
+        rounds = _reported_rounds(run_dir)
+        if rounds is not None:
+            hyper['n_estimators'] = rounds
+            # Also silence the CV round-budget estimator. With the cache off it runs
+            # again and re-derives a budget that overrides the pin -- for xgb_01 configs
+            # it landed somewhere else and 13 candidates then failed to reproduce their
+            # reported score. The reported fit trained exactly `rounds` rounds, so
+            # training exactly that many is what reproduces it; the estimator only has a
+            # job when the budget is unknown.
+            hyper['early_stopping_rounds'] = None
+        cv = dict(hyper.get('cv_tuning') or {})
+        cv['enabled'] = False
+        hyper['cv_tuning'] = cv
+
+    # A Gaussian process needs nothing pinned, and pinning its epoch budget actively
+    # breaks reproduction. That was not obvious and is worth recording, because the
+    # analogy with XGBoost is so close: the budget is CV-derived at fit time, varies from
+    # 1 to 250 across fits, and `_gp_cv_estimate_epochs` even takes `mc_seed` as an
+    # argument. Pinning it looked necessary.
+    #
+    # Measured on a pH candidate whose reported fit trained 64 epochs:
+    #
+    #     reported                      +0.491655   cv_epoch_budget_exhausted
+    #     num_epochs pinned to 64       +0.521807   max_epochs_exhausted
+    #     budget left to be re-derived  +0.491655   cv_epoch_budget_exhausted
+    #
+    # Both trained 64 epochs, so the count was never the problem. `_gp_cv_estimate_epochs`
+    # trains a GP on each fold and so advances the global torch generator before the real
+    # fit begins; skipping it leaves the generator in a different state and the fit lands
+    # somewhere else. Re-deriving the budget is part of what reproduces the fit, not a
+    # confound to remove -- and unlike XGBoost's cached rounds, it is derived from the same
+    # training data by the same procedure every time, so at seed 0 it comes back identical.
+    # Verified on two candidates: +0.534806 against a reported +0.534800, and the exact
+    # match above.
+
+    field = SEED_FIELD.get(model_type)
+    if field is None:
+        raise ValueError('no seed field known for model_type %r' % model_type)
+    hyper[field] = int(seed)
     cfg['data']['forecast_name'] = out_name
     return cfg
 
@@ -302,14 +429,41 @@ def refit_one(root: Path, c, args, z, segs_all, idx: int, total: int):
                r2_sd=float(v.std(ddof=1)) if v.size > 1 else float('nan'),
                r2_min=float(v.min()) if v.size else float('nan'),
                r2_max=float(v.max()) if v.size else float('nan'))
-    # Seed 0 is XGBoost's own default, so it must reproduce the reported score.
-    # Without this check a systematically wrong refit looks like seed variance.
+    # Is the previously reported score consistent with this refit distribution?
+    #
+    # This used to demand that the base seed reproduce the reported value to within
+    # 0.002, which is the right test only when the reported fit was itself seeded. It is
+    # not, for anything fitted before `_seed_model_rng` existed: a transformer's weights
+    # then came from process-start entropy, so no seed reproduces it and every candidate
+    # failed a check it could not pass. Reproducing a stale run is not the goal anyway --
+    # a defensible forward methodology is.
+    #
+    # What the check is actually for is catching a refit that is *misconfigured* rather
+    # than merely re-seeded: v3's first version left the XGBoost tuning cache enabled,
+    # which replaced the hyperparameters wholesale and refitted Cadmium's winner to
+    # -0.805 against a reported +0.428. That is many standard deviations away, whereas a
+    # differently-seeded fit of the same configuration is a draw from the same
+    # distribution and should land within a few.
+    #
+    # So the tolerance is the measured seed spread, floored at the old absolute value so
+    # a deterministic family is still held to it exactly.
     s0 = vals[0] if vals else float('nan')
+    sd = rec['r2_sd']
+    tol = REPRO_TOL_ABS
+    if np.isfinite(sd) and sd > 0:
+        tol = max(REPRO_TOL_ABS, REPRO_TOL_SD * float(sd))
+    gap = abs(s0 - c['r2_single']) if np.isfinite(s0) else float('inf')
     rec['r2_seed0'] = float(s0)
-    rec['reproduces'] = bool(np.isfinite(s0) and abs(s0 - c['r2_single']) < 0.002)
-    print('          seed0 %+.4f vs reported %+.4f %s | mean %+.4f  sd %.4f'
-          % (s0, c['r2_single'], 'OK' if rec['reproduces'] else '<-- MISMATCH',
-             rec['r2_mean'], rec['r2_sd']))
+    rec['repro_gap'] = float(gap)
+    rec['repro_tol'] = float(tol)
+    rec['repro_gap_sd'] = float(gap / sd) if (np.isfinite(sd) and sd > 0) else float('nan')
+    rec['repro_exact'] = bool(np.isfinite(s0) and gap < REPRO_TOL_ABS)
+    rec['reproduces'] = bool(np.isfinite(s0) and gap <= tol)
+    note = 'OK' if rec['reproduces'] else '<-- INCONSISTENT'
+    if rec['reproduces'] and not rec['repro_exact']:
+        note = 'ok (%.1f sd)' % rec['repro_gap_sd']
+    print('          seed0 %+.4f vs reported %+.4f %-16s | mean %+.4f  sd %.4f'
+          % (s0, c['r2_single'], note, rec['r2_mean'], rec['r2_sd']))
     return rec
 
 
@@ -331,9 +485,15 @@ def main() -> int:
     ap.add_argument('--seeds', type=int, default=6)
     ap.add_argument('--base-seed', type=int, default=0,
                     help='Seed 0 reproduces the reported fit, since XGBoost defaults to 0.')
-    ap.add_argument('--families', default='xgb',
-                    help='Comma-separated: xgb,transformer. Default xgb -- the Transformer '
-                         'wins no target and its seeding was only just made to work.')
+    ap.add_argument('--families', default='xgb,gp,transformer',
+                    help='Comma-separated: xgb, gp, transformer. Every family whose fit a '
+                         'seed can move is included by default. A Gaussian process is not '
+                         'exempt -- it ignores random_state but its uncertain-input kernel '
+                         'draws Monte Carlo samples, and three seeds of pH\'s winner span '
+                         '0.012 against a 0.018 gap to the next target. Candidates a seed '
+                         'cannot move are dropped per candidate, not per family, so this '
+                         'costs nothing where it would achieve nothing. MLR is deterministic '
+                         'and has no entry.')
     ap.add_argument('--datasets', default=None, help='Comma-separated dataset names or substrings; only these targets are processed. Without it every target in the root is, which re-fits work already on disk and can perturb values that are currently trusted. Use it when a single target has been re-run and only that target needs its seed ensemble rebuilt, e.g. --datasets Chromium,Lead.')
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--limit', type=int, default=None)
@@ -439,49 +599,119 @@ def main() -> int:
         print('[INFO] seed 0 reproduces the reported score for %d of %d candidates'
               % (ok, len(df)))
         if ok < len(df):
-            print('[WARN] %d candidate(s) do NOT reproduce at seed 0. Their seed spread is'
-                  % (len(df) - ok))
-            print('       not comparable with the reported value and the re-selection below')
-            print('       should not be trusted for the targets involved.')
+            print('[WARN] %d candidate(s) sit further from their previously reported score '
+                  'than' % (len(df) - ok))
+            print('       %.0f measured seed standard deviations, which is more than '
+                  're-seeding the same' % REPRO_TOL_SD)
+            print('       configuration explains. Those are excluded from the re-selection: '
+                  'check the')
+            print('       staged config against the run it replaces before trusting the '
+                  'targets involved.')
+        n_inexact = int(len(df) - df.get('repro_exact', pd.Series([True] * len(df))).sum())
+        if n_inexact:
+            print('[INFO] %d candidate(s) are consistent with their reported score but do not '
+                  'match it' % n_inexact)
+            print('       exactly. That is expected wherever the reported fit predates '
+                  'seeding: an')
+            print('       unseeded transformer cannot be reproduced by any seed, and the '
+                  'ensemble is')
+            print('       the defensible value rather than the draw it replaces.')
 
     # --- re-selection and the margin check -----------------------------------------
     print()
-    print('%-26s %10s %10s %-10s %s' % ('target', 'reported', 'seed-avg', 'new best', 'margin check'))
+    print('%-26s %10s %10s %-18s %s' % ('target', 'reported', 'seed-avg', 'new best', 'margin check'))
     print('-' * 82)
     for ds, g in df.groupby('dataset'):
         rep_best = float(z.loc[ds, 'best_r2'])
         rep_fam = str(z.loc[ds, 'best_family'])
-        det = max(float(z.loc[ds, k]) for k in ('gp_r2', 'mlr_r2')
-                  if k in z.columns and pd.notna(z.loc[ds, k]))
         g = g[g['reproduces']] if 'reproduces' in g.columns else g
-        stoch = g['r2_mean'].max() if len(g) and g['r2_mean'].notna().any() else float('-inf')
-        new_best = max(det, stoch)
-        new_fam = ('deterministic (GP/MLR)' if det >= stoch
-                   else str(g.loc[g['r2_mean'].idxmax(), 'family']))
-        # Median, not max: one candidate with sd 1.04 would otherwise widen the band
-        # for the whole family and tell us nothing.
-        sd = float(g['r2_sd'].median()) if g['r2_sd'].notna().any() else 0.0
-        # How far below the band the nearest *unrefit* candidate sits, in seed standard
-        # deviations. Under the adaptive band nothing within k sd can be excluded -- the
-        # expansion is driven by the same sd -- so this reports the headroom rather than
-        # hunting for a failure. A small number here means the band only just reached far
-        # enough and k deserves raising.
-        refit_keys = {(r['variant'], r['feature_tag'])
-                      for _, r in df[df.dataset == ds].iterrows()}
-        pool = cand[cand.dataset == ds]
-        excluded = pool[[(r['variant'], r['feature_tag']) not in refit_keys
-                         for _, r in pool.iterrows()]]
-        if excluded.empty or sd <= 0:
-            flag = 'all refit' if excluded.empty else 'sd 0 (nothing can move)'
+        # Post-refit best, taken candidate by candidate rather than family by family.
+        #
+        # An earlier version of this block excluded a whole family from the single-seed
+        # pool as soon as any one of its candidates had been refitted. Under the adaptive
+        # band that is almost always wrong: the band admits only the few candidates a
+        # seed could reorder, so a family's actual best is usually *not* among them. On pH
+        # it discarded the Gaussian process winner at +0.5348 because one unrelated GP
+        # candidate at -7.95 had been refitted, and handed the target to MLR at +0.5011.
+        #
+        # A refitted candidate contributes its seed mean; every other candidate keeps its
+        # single-seed score. Both are read per candidate from the sweep's own metrics
+        # table, which lists all of them -- `cand` holds only the ones a seed can move.
+        refit_keys = {(str(r['family']), str(r['variant']), str(r['feature_tag']))
+                      for _, r in g.iterrows()}
+        per_family = {}
+        fm = ds_path(root, ds) / 'forecasts' / 'feature_sweeps' / \
+            'feature_sweep_final_metrics.csv'
+        if fm.is_file():
+            allrows = pd.read_csv(fm, encoding='utf-8', encoding_errors='replace')
+            allrows['r2'] = pd.to_numeric(allrows['r2'], errors='coerce')
+            for fam, key in FAMILY_KEY.items():
+                sub = allrows[allrows['model'].astype(str) == key].dropna(subset=['r2'])
+                for _, r in sub.iterrows():
+                    k = (fam, str(r.get('variant', '')), str(r.get('feature_tag', '')))
+                    if k in refit_keys:
+                        continue
+                    v = float(r['r2'])
+                    if fam not in per_family or v > per_family[fam][0]:
+                        per_family[fam] = (v, 'single seed')
+        # MLR is deterministic and has no refit path, so its reported value stands.
+        if 'mlr_r2' in z.columns and pd.notna(z.loc[ds, 'mlr_r2']):
+            v = float(z.loc[ds, 'mlr_r2'])
+            if 'mlr' not in per_family or v > per_family['mlr'][0]:
+                per_family['mlr'] = (v, 'single seed')
+        for fam, gg in (g.groupby('family') if len(g) else []):
+            if not gg['r2_mean'].notna().any():
+                continue
+            v = float(gg['r2_mean'].max())
+            if fam not in per_family or v > per_family[fam][0]:
+                per_family[fam] = (v, '%d-seed' % int(args.seeds))
+        if per_family:
+            fam_win = max(per_family, key=lambda k: per_family[k][0])
+            new_best, how = per_family[fam_win]
+            new_fam = '%s (%s)' % (fam_win, how)
         else:
-            near = float(excluded['r2_single'].max())
-            gap_sd = (float(pool['family_best'].max()) - near) / (sd * (2 ** 0.5))
-            flag = 'nearest excluded %.1f sd below' % gap_sd
-            if gap_sd < float(args.k):
-                flag = 'EXTEND: excluded candidate only %.1f sd below (k=%g)' % (gap_sd, args.k)
-        print('%-26s %10.4f %10.4f %-10s %s'
+            new_best, new_fam = float('nan'), '-'
+        # Headroom, computed per family. The band is a family-level quantity and the
+        # spreads differ by an order of magnitude between families -- on this target the
+        # median seed sd is 0.009 for the Gaussian process, 0.19 for the transformer and
+        # 0.20 for XGBoost -- so a per-target median mixed across families compares an
+        # excluded candidate of one family against another family's noise scale and
+        # reports nonsense. An earlier version did exactly that and raised EXTEND on pH
+        # by measuring a GP candidate against a transformer's spread.
+        worst = None
+        for fam, gg in df[df.dataset == ds].groupby('family'):
+            fsd = float(gg['r2_sd'].median()) if gg['r2_sd'].notna().any() else 0.0
+            if fsd <= 0:
+                continue
+            # From every candidate actually refitted, not just those that passed the
+            # consistency gate. Taking the keys from the gate-filtered frame makes a
+            # candidate that was refitted and then failed the gate look as though the
+            # band never reached it, which raised a spurious EXTEND on pH: all 18
+            # transformer candidates were inside the +/-2.71 band, but the 5 that failed
+            # the gate were counted as excluded. "Band too narrow" and "refit but
+            # inconsistent" are different problems and are reported separately.
+            keys = {(r['variant'], r['feature_tag'])
+                    for _, r in df[(df.dataset == ds) & (df.family == fam)].iterrows()}
+            pool = cand[(cand.dataset == ds) & (cand.family == fam)]
+            if pool.empty:
+                continue
+            excl = pool[[(r['variant'], r['feature_tag']) not in keys
+                         for _, r in pool.iterrows()]]
+            if excl.empty:
+                continue
+            gap_sd = ((float(pool['family_best'].max()) - float(excl['r2_single'].max()))
+                      / (fsd * (2 ** 0.5)))
+            if worst is None or gap_sd < worst[0]:
+                worst = (gap_sd, fam)
+        if worst is None:
+            flag = 'all refit'
+        elif worst[0] < float(args.k):
+            flag = 'EXTEND: %s candidate only %.1f sd below (k=%g)' % (worst[1], worst[0], args.k)
+        else:
+            flag = 'nearest excluded %.1f sd below (%s)' % (worst[0], worst[1])
+        print('%-26s %10.4f %10.4f %-18s %s'
               % (ds.replace('MC_', '').replace('_diff', '')[:25], rep_best, new_best,
-                 new_fam[:10], flag))
+                 new_fam[:18], flag))
     print()
     print('[INFO] The refit band is k*sqrt(2)*sd around each family best, with sd measured')
     print('       across seeds and the band widened until it stops growing. "EXTEND" would')

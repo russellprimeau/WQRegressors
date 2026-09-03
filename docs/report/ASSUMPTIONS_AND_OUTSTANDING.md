@@ -541,6 +541,468 @@ in the manifest (`candidate_seeds`, `surrogate_scope`).
 Manifests accumulate rather than overwrite: a tree is usually built by several
 invocations, and which ones touched it is exactly what gets forgotten.
 
+## How each model family's training budget is actually set
+
+The Gaussian process budget was already known to be unidentified for 93% of final-stage
+fits. The same question was put to the other two families, and the answers differ from each
+other and from what the code appeared to say.
+
+**The XGBoost results on disk were produced by code that no longer runs, and their
+round budgets are pathological.** Every one of the 3381 stored XGBoost runs -- 294
+final-stage and 3087 search fits -- records a stop reason of the form "CV-derived budget
+exhausted (N rounds from internal CV estimate)", which is emitted only by
+`_xgb_cv_estimate_n_estimators`. Their recorded hyperparameters are Optuna-tuned values,
+not the configs' round base values, so those fits both tuned and then took the budget from
+the CV estimator.
+
+The current code cannot do both. Every final-stage config sets `cv_tuning.enabled: true`,
+which routes through `_train_xgb_model_cv_tuned`; that function nulls
+`early_stopping_rounds`, passes `disable_early_stopping=True` and passes a non-None
+`eval_set_override`, and each of those three independently fails the gate guarding the
+estimator. Verified by instrumenting the estimator with a call marker: it fires with
+`cv_tuning` disabled and does not fire with it enabled. So the estimator is unreachable
+now, and the budget today would be the tuned `n_estimators` instead.
+
+**The stored XGBoost results are therefore not reproducible from their own configs.**
+Re-running Cadmium's reported config unchanged gives 188 rounds and a pooled R2 of -0.8054,
+against the stored 20 rounds and +0.3141. The rebuilt-arm and unchanged-config runs agree
+exactly with each other, so this is not an artifact of the reconstruction. The metric is
+not in question either: pooled R2 recomputed from each reported run's own predictions.csv
+reproduces `xgb_r2` exactly for 12 of 14 targets.
+
+**The budgets those runs used are far too small to be credible.** Across the 3381 fits the
+estimator chose a median of 2 rounds; 2317 fits (69%) got ten rounds or fewer and 2751
+(81%) got twenty or fewer, with a tenth percentile of 1. Per target, the reported models
+were trained for:
+
+    pH                    1 round     R2 +0.3198
+    Arsenic               2           +0.1240
+    Total coliforms       3           +0.1362
+    Intestinal enteroc.   4           +0.0599
+    Turbidity             4           +0.2362
+    Colony count          7           +0.3690
+    Nickel               10           +0.4185
+    Chromium             19           -0.0014
+    Cadmium              20           +0.3141
+    Color               195           +0.2261
+    E. coli             209           +0.1240
+    Copper filtered     231           +0.2940
+    Zinc                238           +0.3079
+
+Nine of the thirteen were trained for twenty boosting rounds or fewer, and pH's +0.3198
+comes from a single round. At the tuned learning rates, which run from about 0.005 to 0.03,
+a one-round model is the base score plus one shrunken tree -- very nearly a constant
+predictor. This is the collapse the estimator's own docstring says was fixed by averaging
+the fold curves rather than taking the median of the folds' `best_iteration`; the measured
+distribution shows it was not fixed, and is worse than the figures that motivated the
+change.
+
+The consequence reaches past the reported table. The same mechanism set the budget for all
+3087 search fits, so the backward-elimination beam search for XGBoost was ranking
+near-constant models against one another, which is the most likely reason its candidate
+rankings were so often inseparable.
+
+**Both mechanisms are leakage-free**, so none of this is a test-contamination problem:
+`_xgb_cv_estimate_n_estimators` and `_xgb_tune_hyperparameters_cv` each receive only
+`train_samples` and neither references `test_samples` or `X_test`.
+
+**The `best_median_iteration` override never fires under either arrangement**, because
+`cv_tuning.use_early_stopping` is false and so no fold produces a `best_iteration`:
+`median_best_iteration` is null in all 8645 trial rows across all 42 tuning studies, and no
+stored run records that override as its stop reason.
+
+**The recorded stop reason could not have revealed any of this on its own.**
+`cv_epoch_budget_exhausted` is reported by both paths -- the tuned path keys it off
+`disable_early_stopping`, which is unconditionally true there. Only the stop reason *text*,
+which names the round count and the mechanism, distinguishes them.
+
+Establishing exactly when the code changed would require reading the commit history, which
+has not been done.
+
+**The XGBoost round budget is unidentified by cross-validation but lands well anyway.**
+Sweeping the round budget to 300 over the same 5 grouped training folds, at each target's
+reported operating point, puts the one-standard-error plateau at 300 of 300 rounds for 11
+of 14 targets and no fewer than 272 of 300 for the rest -- 0 of 14 identified -- with
+per-fold argmins as scattered as [33, 294, 6, 8, 41], and an argmin bearing no relation to
+the tuned budget. As on the Gaussian process, a flat fold curve is not evidence that the
+budget is harmless, so it was tested against the reported metric directly.
+
+**The transformer's estimator is live and reproducible, but barely better determined than
+the GP's.** All 294 final-stage fits were re-run to produce the diagnostics that did not
+exist when the tree was built, with no failures. The estimator ran on every one, and the
+budget is unidentified for **269 of 294 (91.5%)** against the Gaussian process's 93% -- so
+the identifiability rate is essentially the same, and an earlier reading of 0.47 taken from
+the first seven targets alphabetically understated it.
+
+What differs is the degree, not the rate. The 1-SE plateau covers a median 0.64 of the
+scanned range and a maximum of 0.97, and it never covers the whole of it in any of the 294
+fits, where the GP's covered the entire scanned range for 326 of 392. Per-target medians run
+from 0.03 (E. coli, the one target where the budget is usually identified -- 11 of 21 fits)
+to 0.90 (Total coliforms, 0 of 21). Chosen budgets are small but not degenerate: per-target
+medians of 3 to 29 epochs over a scanned range of about 30, with a floor of 2.
+
+The budget is also exactly reproducible, which the GP's tiny-budget XGBoost counterpart is
+not: repeating an identical configuration four times on each of three targets returned the
+same budget every time, with identical per-fold argmins and identical plateau widths --
+spread 0 in 12 of 12.
+
+**The transformer's budget does move its score, but for most targets not by more than
+its own seed noise.** With `fixed_epoch_budget` making a leakage-free pinned budget
+possible, each target's reported transformer configuration was refit at 1, 5, 15, 30 and
+100 epochs, plus a control arm that leaves the config alone so the CV estimator chooses
+exactly as the reported fit did. 84 fits, no failures.
+
+The 1-epoch arm is excluded from the summary below. One epoch is not a budget anyone would
+choose -- the network is essentially untrained and its predictions are wild, reaching
+-164.89 on Lead and -15.05 on Color -- so including it inflates every spread for a reason
+that carries no methodological content. The remaining arms, 5 to 100 epochs, bracket every
+CV-chosen budget, which run from 3 to 37.
+
+Over 5 to 100 epochs the score moves by more than 0.05 on all 14 targets, more than 0.25 on
+10 and more than 1.0 on 5. Long budgets overfit hard on several targets: Cadmium falls to
+-5.60 at 100 epochs against +0.02 at 5, Copper to -4.27, Turbidity to -1.65. Five of the
+fourteen do best at just 5 epochs while the CV estimator picks 22 to 37 for them.
+
+The shortfall of the CV budget against the best budget tried has a median of +0.0965 and a
+mean of +0.2985, against the Gaussian process rule's +0.0110 and +0.0233 -- roughly nine
+and thirteen times worse. But that comparison must be read against the noise floor, and the
+transformer's is large: the control arm differs from the reported score by a median of
+0.0920 and a maximum of 2.3928, and lands within 0.05 for only 3 of 14 targets. The median
+shortfall is therefore about equal to the median noise floor, and **the shortfall exceeds
+that target's own noise floor for only 6 of 14 targets** -- convincingly on Cadmium
+(+1.28 against 0.63), Chromium (+0.19 against 0.06), Arsenic (+0.08 against 0.03) and Zinc
+(+0.04 against 0.001), marginally on Lead and Intestinal enterococci. On three targets the
+control arm beat every fixed budget.
+
+So the honest reading is that the transformer's CV budget is materially worse than the
+Gaussian process's on a minority of targets and indistinguishable from noise on the
+majority, and that a budget ceiling matters more than the exact choice: the damage comes
+from training too long, not from the estimator picking 22 rather than 30.
+
+**The same sweep exposed something independent of budgets: the reported transformer scores
+are single-seed draws with large run-to-run variance.** Refitting a target's reported
+configuration and letting the CV estimator choose the budget, as the reported fit did,
+reproduces the reported score within 0.05 for only 3 of 14 targets, with a median absolute
+gap of 0.0920 and a maximum of 2.3928 (Colony count, where a refit gives -2.2165 against a
+reported +0.1763). The budget is reproducible -- 12 of 12 repeats returned identical
+budgets, argmins and plateau widths -- so this is weight-initialisation and batch-order
+variance in the fit itself, not budget instability. It is the strongest available argument
+for seed-ensembling the transformer rather than reporting one draw.
+
+**The transformer as run is leakage-free, but a pinned budget had no leakage-free
+expression.** `train_transformer` receives `testloader` as its validation loader and
+restores `best_model_state` -- the epoch scoring best on that loader -- whenever
+`max_epochs_override` is None. So the `threshold` source, and the `cv` source when
+estimation fails and falls back to it, would select final weights using the test split.
+That never happened in the reported results: all 297 transformer fits on
+CV22_profilerless record `checkpoint_restored=0` and `cv_epoch_budget_exhausted`, so the
+estimator succeeded every time. But setting `num_epochs` alone does not avoid the restore,
+because it changes how long training runs and not which epoch is kept. A new
+`fixed_epoch_budget` hyperparameter sets the override directly, so the last epoch's weights
+are kept and no test metric is consulted, which both the budget sweep and any reproducible
+fixed-budget run require.
+
+**Two reporting fixes followed from these findings.** XGBoost's estimator now routes
+through the shared `_choose_cv_epoch`, so where it is reachable its budget carries the same
+plateau, per-fold-argmin and `identified` diagnostics as the other two families; the chosen
+round is unchanged, verified against the previous computation on 4000 random fold-curve
+cases with zero mismatches, the only divergence being that a NaN in one fold now uses the
+remaining folds instead of propagating. And the transformer's stop reason now names the
+mechanism that set the budget rather than labelling every fixed budget as CV-derived, so it
+does not repeat XGBoost's uninformative-stop-reason problem.
+
+**Two measurement errors in this work, both corrected.** The first version of the XGBoost
+budget sweep located each target's tuning cache by guessing its filename from
+`sample_subdir`. The cache name is derived from the window aggregation by
+`aggregation_slug` instead, so the guessed name exists for no target: 8 of 14 fell through
+to the unaggregated `xgb_cv_tuning_cache.json` and the other 6 silently received no tuned
+hyperparameters at all, which meant those arms were swept at the config's base settings
+rather than the reported operating point. The sweep now resolves the path through the
+project's own `_resolve_cv_cache_path` and records which cache it used. Separately,
+`xgb_curve.py` called `load_and_split_data` without redirecting `forecast_name`, so it
+wrote `train_files.txt` and `test_files.txt` into 14 real `feature_sweeps` run directories
+and created one that had not existed. All 14 were verified byte-identical against their own
+configs -- the split is read from a pinned split directory rather than re-derived -- so
+only modification times changed; the created directory was removed and the script now
+writes to a scratch forecast name.
+
+**Chromium and Intestinal enterococci have no tuning cache at the resolved path**, so their
+reported XGB fits re-tuned in process and their budget is not recoverable from disk.
+
+## Validation of the new root: what 42 fits across all 14 targets established
+
+One fit per target per family on the staged profiler-free root, no feature search: 42 fits,
+**zero failures**, every budget mechanism recorded as intended -- `cv_round_estimator` on 14
+of 14 XGBoost fits, CV diagnostics on 14 of 14 Gaussian process and 14 of 14 transformer
+fits.
+
+Wall times, which is what a timeout should be set from rather than a guess: the Gaussian
+process is fast (median 7 s, max 8), the transformer moderate (median 27 s, max 56), and
+XGBoost slow because of its Optuna study (median 172 s, max 296). `--fit-timeout 1200`
+covers four times the slowest observed fit; CV22 used 1800, which is also safe.
+
+**The transformer keeps its cross-validated budget.** The plan was to replace it with a
+constant, justified from the estimator's own clustering, and the pre-registered rule was to
+adopt a constant only if the per-target budgets clustered within 25 epochs. They do not:
+across the 14 targets the estimator chose 3, 7, 7, 7, 13, 16, 18, 20, 26, 28, 28, 28, 30 and
+37 epochs, a spread of 34, with only 8 of 14 inside the interquartile range. A single
+constant would be wrong by more than a factor of two at both ends.
+
+Two further reasons not to force it. The measurement is on the FULL feature set, while the
+constant would apply to post-search winners, so the clustering that matters cannot be known
+until a search has run -- CV22's tighter 22-37 range was measured on winners, and that is a
+different population. And the saving is small in absolute terms: the estimator costs about
+13 s on a 27 s fit, and the transformer is fitted only at the final stage, roughly 21 times
+per target, so dropping it would save a few minutes per target rather than the doubling the
+percentage figures suggest. The earlier recommendation to fix the transformer budget is
+therefore withdrawn on this tree, on its own pre-registered criterion.
+
+## Preparing the re-run: the seed split, and two tooling traps
+
+**The search and the final stage now take separate seed counts.** `--seeds N` reached every
+stochastic candidate in the beam search as well as the reported re-fit, so N=6 multiplied
+the search roughly sixfold for the Gaussian process, transformer and XGBoost. `--final-seeds`
+governs the final stage alone and defaults to 0, meaning "follow --seeds", so every
+invocation written before the split behaves exactly as it did. The intended setting for a
+re-run is `--seeds 1 --final-seeds 6`: candidates are ranked on single draws, and only the
+winning configuration of each family is refitted at further seeds. Both values are recorded
+in the provenance manifest.
+
+**`--dry-run` is neither free nor side-effect-free.** The XGBoost CV tuning and the split
+pinning happen during dataset discovery, which runs before the dry-run branch is reached, so
+a dry run spends a 250-trial Optuna study per window aggregation and writes
+`forecasts/pinned_split` and `xgb_cv_tuning_cache*.json` into the root. Two attempts to use
+it as a cheap audit consumed about an hour of CPU between them and had to be killed and
+cleaned up. The flag's help text now says so. A static audit of the generated configs
+answers the same questions for free, and is what the validation tier uses.
+
+**Configs staged outside their own directory need an absolute `data_dir`.** The generated
+configs carry `data_dir: '.'`, resolved against the config file's location, so writing a
+modified copy to a scratch path silently points the data directory at the scratch path. Any
+script that stages a config elsewhere -- and several of the measurement scripts do -- must
+set `data['data_dir']` explicitly.
+
+**The previous run's settings are recoverable.** CV22's provenance manifests record the
+invocations used for its most recent targets: `beam_width 6`, `eval_budget 240`,
+`cv_folds 0`, `max_rounds 10`, `min_features 4`, `final_top_k 4`,
+`surrogate_model auto:xgb`, run one target at a time through `--dataset-prefix ... 
+--limit-datasets 1`, with `--fit-timeout 1800` and `--no-improve-patience 999`. The last of
+those disables the search's early stop, so the patience fix cannot fire under those settings
+and its silence is not a defect. Matching them is what makes the new run comparable.
+
+## Why the GP's epoch budget is unidentified: the feature set is small
+
+Six explanations were refuted before this one, and this is the first that survives its own
+test. The Gaussian process's epoch budget is unidentifiable **because the feature subsets the
+search selects are small**, and the effect has a sharp threshold.
+
+Measured on the CV22 tree with one factor changed -- the same `gp_01` config, the same
+aggregation, the same hyperparameters, the target's own column list truncated to k columns
+with the state feature always kept -- across all 14 targets, 70 fits:
+
+    k    median plateau fraction   budget identified   plateau spans the whole range
+    1           1.000                  0 of 14                 13 of 14
+    2           1.000                  2 of 14                  8 of 14
+    4           1.000                  2 of 14                 10 of 14
+    7           0.020                 12 of 14                  0 of 14
+    11          0.032                 10 of 14                  0 of 14
+
+Spearman correlation between k and the plateau fraction is -0.791 over the 70 fits. Below
+five columns the curve resolves nothing; at seven it resolves a minimum to within about 2%
+of the scanned range on 12 of 14 targets.
+
+That explains the 93% figure directly. The search is a backward elimination toward
+`--min-features 4`, so the winners are small: their column counts are 1, 1, 1, 1, 1, 4, 5,
+5, 5, 6, 7, 7, 9, 9, with 9 of 14 at six columns or fewer. The reported fits sit almost
+entirely on the flat side of the threshold, which is why every survey of them found the
+budget unidentified while the staged full-feature config resolves it on 11 of 14 targets.
+
+**The caveat should therefore be stated narrowly.** It is not that the Gaussian process's
+cross-validated budget does not work; it is that it cannot resolve a budget for a model with
+four or fewer predictors, which is most of what the search selects. A plausible reading is
+that such a model has too little to fit for the epoch count to matter much -- but that
+reading is NOT fully supported: the leakage-free budget sweep found held-out R2 moving by up
+to 1.29 across budgets on Turbidity, whose winner carries seven columns, so on at least some
+targets the budget still matters where it is unidentified.
+
+**One factor remains unisolated.** The 7- and 9-column winners are flat while the ladder's
+k=7 is identified, and those winners are `gp_02`, `gp_03` and `gp_04` rather than `gp_01`, so
+the kernel and aggregation variant modulates the threshold. Isolating that would need the
+same ladder repeated per variant. It is not pursued here because it changes nothing about
+the re-run: the Gaussian process keeps its random-fold cross-validation either way, and the
+diagnostics now record identifiability per fit so the caveat can be quantified rather than
+asserted.
+
+## Duplicate rows leaking across GP folds: a sixth refuted explanation
+
+The Gaussian process's epoch budget is unidentified for 93% of fits, and five explanations
+have already been refuted. A sixth was structural enough to look decisive, and it too
+failed.
+
+The mechanism is real. On a profiler-free predictor set the ten Monte Carlo replicates of a
+segment are exact duplicates, by construction rather than by accident:
+`UNCERTAINTY_DISTRIBUTION_FEATURES` in `h_RunMCFeatureSelectionSweep.py` contains only six
+`Pfl -` channels, so a profiler-free candidate has nothing to perturb. Measured on the
+staged tree, the non-profiler columns are identical across replicates on 236 of 236 segments
+checked. The sweep trains on `mc_replicates`, so Arsenic's 520 training rows are 52 unique
+segments repeated ten times.
+
+And the GP was the only family whose folds ignored that. `_transformer_cv_estimate_epochs`
+and every XGBoost fold builder call `_build_group_folds`, which collapses `_mc_\d+` through
+`_base_sample_id`; the GP's default `random` scheme shuffled flattened row indices, so
+roughly nine of every ten validation rows had an exact duplicate in the training fold. Fold
+validation error cannot respond to overfitting under those conditions, which would explain a
+flat curve without the epoch budget mattering at all.
+
+A `grouped` scheme was added to `_gp_cv_estimate_epochs` and measured against `random` on
+all 14 targets. It changed the chosen budget on 9 of them, so the folds genuinely differ and
+the branch is doing what it claims. The plateau nonetheless narrowed on only 3 targets, was
+identical on 11 and wider on none; the budget became identified on 1 target against 0; and
+the plateau still spans the entire scanned range on 11 of 14. The held-out shortfall, a
+diagnostic that must not be used to choose the scheme, also moved the wrong way -- median
++0.0101 against +0.0025 and mean +0.1056 against +0.0164, with Color going from 0.0000 to
++1.0543.
+
+So the duplication is real, the GP's folds really did split it, and fixing that does not
+make the budget identifiable. `random` stays the default; `grouped` remains available and
+carries its refutation at the call site. The flatness is not yet explained.
+
+Two consequences of the duplication stand regardless, and neither is addressed for this
+run. Exact duplicate rows make the GP kernel matrix rank-deficient -- rank about 52 in a
+520x520 matrix -- which is a plausible contributor to the jitter and convergence failures
+already seen. And an exact GP is cubic in rows, so the tenfold duplication costs roughly a
+thousandfold in the cubic term for no added information, making it the largest single cost
+lever available. Changing it would alter `n_train` and break comparability, so it is
+deliberately left alone and recorded as the next methodological step.
+
+## Is the cross-validated budget worth its cost? Per family, measured
+
+The rule was tested against the only fair alternative: a constant chosen LEAVE-ONE-TARGET-
+OUT, best across the other thirteen and then applied to the held-out one. Picking the best
+constant in hindsight from the same test scores would flatter it exactly as the GP's first
+budget sweep flattered long budgets.
+
+What the cross-validation buys is not average accuracy. It is protection against
+overfitting, which is what this data punishes, and it shows in the worst case rather than in
+any average:
+
+    family / rule                worst R2   ruined(<-0.5)  below 0   best R2
+    GP, CV                        -0.0129         0            1      0.5473
+    GP, best constant (30)        -0.0280         0            2      0.4940
+    GP, constant 300              -1.0431         2            4      0.5473
+    XGB, CV round estimator       -0.0530         0            2      0.3687
+    XGB, Optuna-tuned budget      -0.7075         1            5      0.3476
+    XGB, constant 300             -0.7996         1            6      0.4016
+    transformer, CV               -2.2165         2            8      0.4040
+    transformer, constant 30      -2.1091         2            7      0.4058
+
+Cost, measured back to back on the same configurations in one session, alternating the arms
+so that machine load affects both equally. An earlier figure taken from two different runs
+suggested the GP estimator was free; that was an artifact of comparing across runs and is
+withdrawn:
+
+    GP,          Arsenic  CV  5.2 s   pinned at 30  4.2 s    +1.0 s  (+24%)
+    GP,          Nickel   CV  6.1 s   pinned at 30  4.1 s    +2.1 s  (+51%)
+    transformer, Arsenic  CV 26.8 s   pinned at 30  8.8 s   +18.0 s (+204%)
+    transformer, Nickel   CV 17.5 s   pinned at 30  8.5 s    +8.9 s (+105%)
+
+The XGBoost estimator's cost is small in absolute terms: computing the full 5-fold,
+300-round curve took a median of 3 s per target, against roughly 10 s for a train and
+evaluate cycle.
+
+**Gaussian process: keep the cross-validation.** It beats every constant on both the worst
+case and the best case, is never more than 0.05 behind the best constant on any target, and
+gains more than 0.05 on three (Zinc +0.54, Turbidity +0.18, Cadmium +0.11), for 24-51% more
+time per fit.
+
+**Transformer: replace it with a fixed budget.** A constant of 30 matches the CV rule on
+every column above, and the per-target differences fall inside that target's own seed-noise
+floor, while the estimator costs 105-204% more per fit -- the worst cost for the least
+benefit of the three families. `fixed_epoch_budget` expresses this without falling into the
+weight-restore path that would select on the test split. The constant should be justified
+from the estimator's own clustering, which puts 11 of 14 targets between 22 and 37 epochs,
+and never from the test scores; running the estimator on a calibration subset and then
+fixing the value keeps that grounding at a fraction of the cost.
+
+**XGBoost: keep the round estimator, and make it reachable again.** Its tiny budgets are
+not the liability they first appear: they are the safest rule measured, with no ruined
+targets and two negatives against five or six for either alternative, and a median shortfall
+of +0.0096 against a constant 300's +0.0025. On weak signal, one to twenty rounds acts as
+heavy regularisation -- pH scores +0.2049 at a single round and -0.4168 at three hundred.
+
+This revises the earlier reading of those budgets as simply pathological. What stands is
+narrower: the stored results are not reproducible from their configs, the feature search
+ranked weakly-trained models across 3087 fits, and four targets would gain from more rounds
+(Arsenic +0.17, Colony count +0.14, Copper +0.14).
+
+**Fixed: the round estimator now runs alongside the tuning.** With `cv_tuning.enabled`
+true the estimator had been unreachable, so a re-run would have fallen back to the tuned
+`n_estimators` -- the weakest of the three rules on every risk column. The tuned path now
+calls the estimator itself, on the tuned hyperparameters, and uses its answer as the budget.
+
+It is called explicitly rather than by loosening the gate inside `_train_xgb_model`, because
+that gate also requires a None `eval_set_override` and satisfying it would put the test
+split back into `eval_set`. The explicit call keeps the train-only eval_set and
+`disable_early_stopping=True`, so the leakage posture is unchanged: the estimator receives
+`train_samples` and never sees the test split.
+
+Two deliberate choices, both documented at the call site. The scan runs to the CONFIGURED
+ceiling of 300 rounds rather than to the tuned `n_estimators`, because Optuna's value is a
+hyperparameter tuned jointly with eight others and using it as the ceiling would cap the
+budget at whatever it happened to pick -- 26 of a 300-round space on Arsenic; the measured
+comparison that justifies keeping the rule was run over the full range. Folds and seed
+follow the tuning's own settings, so the budget is estimated on the same partitions the
+hyperparameters were chosen on.
+
+Verified end to end on seven targets. The estimator fires, the tuned hyperparameters
+survive, and `budget_mechanism` records `cv_round_estimator`:
+
+    target            budget   new R2    stored R2   sweep best
+    Cadmium              24    +0.3915    +0.3141     +0.3687
+    Nickel               20    +0.3797    +0.4185     +0.3284
+    Colony count          2    +0.2328    +0.3690     +0.2834
+    Copper filtered      54    +0.1588    +0.2940     +0.4016
+    pH                    1    +0.0983    +0.3198     +0.2049
+    Arsenic              11    +0.0249    +0.1240     +0.1909
+    Turbidity            21    -0.1460    +0.2362     +0.3305
+
+Cadmium moves from -0.8054 before the fix to +0.3915, recovering the whole 1.2 R2 the broken
+path was losing. The others land below their stored values, which is expected and is not a
+regression: the stored numbers were single draws under a tuning cache that has since been
+rewritten, and the differences here are seed and hyperparameter draws rather than a change
+of rule. Exact reproduction of the stored numbers is not achievable and is not the goal.
+
+**The budget mechanism is now recorded, not inferred.** `budget_mechanism` is written into
+every XGBoost stop summary as one of `cv_round_estimator`, `configured_n_estimators`,
+`validation_early_stopping` or `train_loss_plateau`. The stop reason CODE could never carry
+this -- `cv_epoch_budget_exhausted` is reported both by the estimator and by any path that
+merely disables early stopping, and that conflation is precisely why an entire arm's budget
+mechanism went unnoticed. The transformer's stop reason was given the same treatment, so a
+fixed budget no longer reports itself as CV-derived.
+
+**The ninth invariant check was rewritten for the fixed state.** It had failed any run whose
+stop text named the estimator while its config enabled tuning, which was correct for the
+broken code and inverts the moment the bug is fixed -- that combination is now the intended
+one. It compares the recorded `budget_mechanism` against the mechanism the config selects,
+warns when a run asked for the estimator and silently fell back, and reports runs predating
+the field as unverifiable rather than failed. Tested against a synthetic tree covering all
+five cases, including a genuine mismatch, so it is known to discriminate rather than assumed
+to; on the legacy CV22 tree it now reports 3381 runs as predating the field, with 0
+failures.
+
+## The summaries are stale for the two re-run targets
+
+`data/output/CV22_profilerless/summaries/common_set_metrics.csv` was written 2026-09-01 at
+06:55. Lead and Chromium were re-run that evening, between 17:56 and 20:29, after the
+surrogate-degeneracy fix. Every one of their 91 final-stage fits postdates the summary, and
+the summary's rows for them name run directories that no longer exist: for Lead the `gp`,
+`transformer` and `xgb` runs are all absent, and for Chromium the `gp` run is. Only MLR
+still resolves for Lead.
+
+The archived numbers were real when written, but they are not reproducible from the current
+tree and they do not reflect the re-run. `z8` has to be regenerated with an explicit
+`--root` before Table 3 is rebuilt, and doing so will change those two rows.
+
 ## Outstanding
 
 - **Decide what `--replicates` is for on the profiler-free arm.** Section 3.4 states

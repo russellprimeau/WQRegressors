@@ -105,6 +105,105 @@ def score(preds_csv: Path, segments: list, sigma: float) -> dict:
     return {'n_scored': len(keep), 'r2': float(m['r2']), 'rmse': float(m['rmse'])}
 
 
+def backfill_final_metrics(root: Path, only: "tuple[str, ...] | None" = None,
+                           dry_run: bool = False) -> int:
+    """Fill in metrics rows for runs that were recovered after the sweep had finished.
+
+    The sweep writes ``feature_sweep_final_metrics.csv`` when it finishes a target, and a
+    configuration that crashed during it gets a row of NaNs -- correctly, because at that
+    moment there was nothing to score. This script then refits those configurations hours
+    later and they succeed, but until now it never went back to the table, so the row
+    stayed blank while ``predictions.csv`` and ``evaluation_summary.csv`` sat beside it
+    fully populated. Twelve rows in CV22 were in that state, all of them gp_03, with
+    predictions written 7.8 hours after the table.
+
+    The consequence is narrow but real: ``z8`` reads ``predictions.csv`` and so already
+    counted these runs, but ``v3_SeedVarianceRefit`` drops rows with no r2 when it builds
+    its candidate pool, so a recovered candidate silently stops competing.
+
+    Values come from the run's own ``evaluation_summary.csv`` primary row rather than being
+    recomputed here, so a backfilled row carries exactly what the sweep would have written
+    had the fit succeeded the first time.
+    """
+    filled = files = 0
+    for ds in sorted(root.glob('MC_*')):
+        if only and not any(t.lower() in ds.name.lower() for t in only):
+            continue
+        fm = ds / 'forecasts' / 'feature_sweeps' / 'feature_sweep_final_metrics.csv'
+        if not fm.is_file():
+            continue
+        d = pd.read_csv(fm, encoding='utf-8', encoding_errors='replace')
+        if 'r2' not in d.columns:
+            continue
+        sweeps = fm.parent
+        changed = False
+        for i, row in d[pd.to_numeric(d['r2'], errors='coerce').isna()].iterrows():
+            tag = str(row.get('feature_tag', ''))
+            sub = str(row.get('subset_label', ''))
+            var = str(row.get('variant', ''))
+            if not tag or not sub or sub == 'nan':
+                continue
+            hits = [p for p in sweeps.iterdir()
+                    if p.is_dir() and p.name.startswith(var) and tag in p.name
+                    and p.name.endswith('_' + sub)]
+            if len(hits) != 1:
+                continue
+            es = hits[0] / 'evaluation_summary.csv'
+            if not es.is_file():
+                continue
+            try:
+                summ = pd.read_csv(es, encoding='utf-8', encoding_errors='replace')
+            except Exception:
+                continue
+            if summ.empty or 'kind' not in summ.columns:
+                continue
+            kinds = summ['kind'].astype(str).str.lower().str.strip()
+            primary = None
+            for want in ('test', 'combined', 'train'):
+                hit = summ[kinds == want]
+                if not hit.empty:
+                    primary = hit.iloc[0]
+                    break
+            if primary is None:
+                continue
+            for col in ('mae', 'rmse', 'r2', 'pearson_r', 'std_target',
+                        'n_test_independent', 'n_test_valid', 'n_test_evals',
+                        'gp_uncertainty_mode'):
+                if col in d.columns and col in summ.columns and pd.notna(primary.get(col)):
+                    d.at[i, col] = primary[col]
+            if 'n_samples' in d.columns and 'n_test_independent' in summ.columns:
+                d.at[i, 'n_samples'] = primary.get('n_test_independent')
+            # `model` was taken from the training config when the row was a failure, which
+            # spells it `model_gp_03` rather than the model type every other row carries.
+            if 'model' in d.columns:
+                mt = _model_type_of(hits[0])
+                if mt:
+                    d.at[i, 'model'] = mt
+            if 'failure_reason' in d.columns:
+                d.at[i, 'failure_reason'] = ''
+            print('  %s %s %s  r2 %+.4f' % (ds.name.replace('MC_', '')[:26], var, sub,
+                                            float(primary['r2'])))
+            filled += 1
+            changed = True
+        if changed and not dry_run:
+            d.to_csv(fm, index=False)
+            files += 1
+    print('[INFO] %s %d row(s)%s' % ('would backfill' if dry_run else 'backfilled', filled,
+                                     '' if dry_run else ' across %d file(s)' % files))
+    return filled
+
+
+def _model_type_of(run_dir: Path) -> "str | None":
+    """The model type this run actually fitted, from its own evaluate config."""
+    for cfg in run_dir.glob('config_evaluate_*.yml'):
+        try:
+            with open(cfg, 'r', encoding='utf-8') as f:
+                return str((yaml.safe_load(f) or {}).get('model_type') or '') or None
+        except Exception:
+            return None
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -112,9 +211,17 @@ def main() -> int:
     ap.add_argument('--limit', type=int, default=None,
                     help='Run only the first N, for a smoke test.')
     ap.add_argument('--output', type=Path, default=None)
+    ap.add_argument('--backfill-only', action='store_true',
+                    help='Do not refit anything; only fill in metrics rows for runs that were recovered after the sweep wrote its table.')
+    ap.add_argument('--no-backfill', action='store_true',
+                    help='Skip the metrics backfill that normally follows a recovery.')
     args = ap.parse_args()
 
     root = rp.resolve_root(args.root)
+
+    if args.backfill_only:
+
+        return 0 if backfill_final_metrics(root, dry_run=bool(getattr(args, 'dry_run', False))) >= 0 else 1
     summary = root / 'summaries' / 'common_set_metrics.csv'
     met = pd.read_csv(summary).set_index('dataset')
     seg = pd.read_csv(root / 'summaries' / z8.SEGMENTS_NAME,
@@ -186,6 +293,11 @@ def main() -> int:
     out = args.output or (root / 'summaries' / 'gp_recovery.csv')
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out, index=False)
+    if not args.no_backfill:
+        # The rows just recovered are still NaN in the sweep's table until this runs.
+        print()
+        print('[INFO] backfilling metrics rows for the recovered runs')
+        backfill_final_metrics(root)
     print()
     print('[INFO] Wrote %s' % out)
 

@@ -45,7 +45,8 @@ def _batch_pearson_corr(y_pred, y_true, eps=1e-8, clip=True):
 def train_model(directory, model, forecast_name, trainloader, testloader, device, num_epochs=100, learning_rate=1e-3,
                 loss_threshold=1e-3, patience=5, model_subdir='transformer',
                 corr_lambda=0.0, corr_eps=1e-8, corr_clip=True,
-                max_epochs_override=None, skip_plot=False, min_epochs=0):
+                max_epochs_override=None, skip_plot=False, min_epochs=0,
+                budget_source="cv"):
     """Train transformer model.
 
     Parameters
@@ -177,10 +178,22 @@ def train_model(directory, model, forecast_name, trainloader, testloader, device
                 break
 
     if stop_reason_code is None:
-        stop_reason_code = "cv_epoch_budget_exhausted" if use_fixed_budget else "max_epochs_exhausted"
+        # Name where the budget came from rather than calling every fixed budget
+        # "cv_epoch_budget_exhausted". That conflation is what made XGBoost's stop reason
+        # useless as evidence: it reported `cv_epoch_budget_exhausted` for all 294
+        # final-stage fits on a path where the CV estimator is never even called, so the
+        # field could not distinguish one budget mechanism from another.
+        if use_fixed_budget:
+            src = str(budget_source or "cv")
+            stop_reason_code = ("cv_epoch_budget_exhausted" if src == "cv"
+                                else "%s_exhausted" % src)
+            label = "CV epoch budget" if src == "cv" else src.replace("_", " ")
+        else:
+            stop_reason_code = "max_epochs_exhausted"
+            label = "all configured epochs"
         stop_epoch = int(len(train_combined_losses))
         stop_reason_text = (
-            f"Scheduled stop: {'CV epoch budget' if use_fixed_budget else 'all configured epochs'} exhausted "
+            f"Scheduled stop: {label} exhausted "
             f"({int(effective_num_epochs)}/{int(effective_num_epochs)} epochs)."
         )
 

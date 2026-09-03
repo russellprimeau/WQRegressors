@@ -18,25 +18,29 @@ What each check is for, and the incident behind it
 1. run integrity        A run directory with no ``predictions.csv`` is a fit that failed
                         silently. 55 GP configs did this in CV22 before the
                         ``DenseAdditiveKernel`` fix and nothing flagged it.
-2. metrics vs on-disk   ``feature_sweep_final_metrics.csv`` must agree with the
+2. every fit scored    A run that produced predictions must have an r2 in the metrics
+                        table. Twelve CV22 rows, all gp_03, do not: the fits succeeded and
+                        their scores are recomputable, but ``v3`` drops rows with no r2, so
+                        a blank row is a candidate that silently stops competing.
+3. metrics vs on-disk   ``feature_sweep_final_metrics.csv`` must agree with the
    predictions           predictions it claims to describe. In CV22 it does not for the 80
                         runs ``z17`` overwrote after the fact: the table holds the
                         single-seed score, the file holds the ensemble.
-3. candidate pool       ``z8`` scores every directory with a family prefix. Seed
+4. candidate pool       ``z8`` scores every directory with a family prefix. Seed
                         replicates written into ``feature_sweeps/`` therefore competed as
                         independent candidates, so ``--seeds N`` let the maximum of N
                         draws win -- the opposite of what the flag is for.
-4. horizon anchor       Horizon 0 is a refit of the reported configuration, so the curve's
+5. horizon anchor       Horizon 0 is a refit of the reported configuration, so the curve's
                         leftmost point must equal the results table. It did not, because
                         one side averaged R^2 and the other scored the mean prediction.
-5. search discrimination A surrogate that predicts a constant ranks every feature subset
+6. search discrimination A surrogate that predicts a constant ranks every feature subset
                         identically. CV22's Chromium search evaluated 240 candidates that
                         all returned r2 = -0.0013608598215928; the "selected" subset was a
                         tie-break. The code already knew -- it set the degenerate flag 240
                         times -- and said nothing.
-6. ensemble provenance  A row claiming an N-seed ensemble must have the single-seed
+7. ensemble provenance  A row claiming an N-seed ensemble must have the single-seed
                         predictions preserved beside it, and vice versa.
-7. output containment   ``--root`` and ``--output`` defaulted independently, so a run
+8. output containment   ``--root`` and ``--output`` defaulted independently, so a run
                         against one tree wrote its summaries into another's. CV19's
                         summaries were overwritten with CV20's analysis this way.
 
@@ -49,12 +53,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -314,14 +320,139 @@ def check_output_containment(root: Path) -> Result:
     return r
 
 
+def check_scored_every_fit(root: Path) -> Result:
+    """A run that produced predictions must have a score in the metrics table.
+
+    `check_run_integrity` catches a fit that produced nothing. This catches the opposite
+    asymmetry: a fit that produced predictions *and* an evaluation summary, but whose row
+    in `feature_sweep_final_metrics.csv` carries no r2. Twelve rows in CV22 are like this,
+    every one of them gp_03, spread over six targets -- the fits succeeded and their R2 is
+    recomputable from disk (-4.99 to +0.44), but nothing in the sweep's own table says so.
+
+    It went unnoticed because the consequences are invisible from the reported results:
+    `z8` scores `predictions.csv` directly and so already includes these runs, and none of
+    the twelve beats its target's best. But `v3` drops rows with no r2 when it builds the
+    candidate pool, and the sweep's own per-family reporting cannot see them, so a blank
+    row is a candidate that silently stops competing.
+    """
+    r = Result("every fit with predictions has a score in the metrics table")
+    checked = blank = 0
+    for ds, sw in _sweeps(root):
+        fm = sw / "feature_sweep_final_metrics.csv"
+        if not fm.is_file():
+            continue
+        d = pd.read_csv(fm, encoding="utf-8", encoding_errors="replace")
+        if "r2" not in d.columns:
+            continue
+        r2 = pd.to_numeric(d["r2"], errors="coerce")
+        for _, row in d[r2.isna()].iterrows():
+            p = _match_row_to_dir(sw, row)
+            if p is None:
+                continue
+            checked += 1
+            y, pv = h._pooled_predictions(p)
+            if y.size < 2:
+                continue
+            blank += 1
+            r.fails.append(
+                "%s/%s has predictions (r2 = %+.4f on disk) but no r2 in the metrics table"
+                % (ds.name, p.name, h._pooled_r2(y, pv)))
+    r.notes.append("%d unscored row(s) matched a run directory, %d of them have usable "
+                   "predictions" % (checked, blank))
+    return r
+
+
+def check_config_explains_run(root: Path) -> Result:
+    """Does each stored run record a budget mechanism its own config would select?
+
+    The eight checks above all passed on a tree whose XGBoost results could not be
+    regenerated. Every stored run recorded a budget from the CV round estimator while every
+    config enabled `cv_tuning`, which at the time made that estimator unreachable -- so the
+    runs could not be reproduced from the inputs stored beside them, and re-running one
+    moved Cadmium's pooled R2 from +0.3141 to -0.8054. Nothing was corrupt, nothing was
+    unscored, and no summary disagreed with its predictions, which is exactly why it went
+    unnoticed for so long.
+
+    Since the fix, the tuned path calls the estimator itself, so tuned hyperparameters with
+    an estimator-chosen budget is the intended combination and no longer evidence of
+    anything wrong. What is checked instead is the `budget_mechanism` field written at
+    training time against the mechanism the config selects. Runs predating that field are
+    counted as unverifiable, not failed: the artifact simply does not record enough to
+    decide, and calling that a failure would bury real ones.
+    """
+    r = Result("stored runs record a budget mechanism their config explains")
+    checked = mismatched = legacy = 0
+    for ds, sw in _sweeps(root):
+        cfg_dir = sw / "configs"
+        if not cfg_dir.is_dir():
+            continue
+        for run in _run_dirs(sw):
+            if not run.name.startswith("xgb_"):
+                continue
+            ts = run / "training_stop_summary.json"
+            cfg_path = cfg_dir / ("config_%s.yml" % run.name)
+            if not ts.exists() or not cfg_path.exists():
+                continue
+            try:
+                summary = json.loads(ts.read_text(encoding="utf-8"))
+                cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            except Exception as exc:
+                r.warns.append("%s/%s: could not be read (%s)" % (ds.name, run.name, exc))
+                continue
+            hyper = cfg.get("hyperparameters") or {}
+            tuning_on = bool((hyper.get("cv_tuning") or {}).get("enabled", False))
+            source = str(hyper.get("early_stop_source", "cv")).lower()
+            mech = summary.get("budget_mechanism")
+
+            if mech is None:
+                legacy += 1
+                # Still detectable for the legacy tree: estimator text under a config that
+                # could not have reached the estimator.
+                if "from internal CV estimate" in str(summary.get("stop_reason_text") or "") \
+                        and tuning_on:
+                    r.warns.append(
+                        "%s/%s predates budget_mechanism and its stop text names the round "
+                        "estimator, which its config could not reach at the time"
+                        % (ds.name, run.name))
+                continue
+
+            checked += 1
+            expected = "cv_round_estimator" if source == "cv" else "configured_n_estimators"
+            allowed = {expected, "train_loss_plateau", "validation_early_stopping"}
+            if source == "cv":
+                # A fallback to the tuned constant is legitimate when the estimator
+                # declines (too few samples for the fold count), so it is not a mismatch,
+                # but it is worth surfacing because it silently changes the rule.
+                allowed.add("configured_n_estimators")
+                if mech == "configured_n_estimators":
+                    r.warns.append(
+                        "%s/%s asked for the CV round estimator and fell back to the "
+                        "configured n_estimators" % (ds.name, run.name))
+            if mech not in allowed:
+                mismatched += 1
+                r.fails.append(
+                    "%s/%s recorded budget_mechanism=%s, which its config (early_stop_source"
+                    "=%s, cv_tuning=%s) does not select"
+                    % (ds.name, run.name, mech, source, tuning_on))
+    r.notes.append("%d XGBoost run(s) verifiable, %d contradicting their config, "
+                   "%d predating the budget_mechanism field"
+                   % (checked, mismatched, legacy))
+    if legacy and not checked:
+        r.notes.append("this tree predates budget-mechanism recording, so the check can "
+                       "only report the legacy contradiction, not verify the rest")
+    return r
+
+
 CHECKS = (
     check_run_integrity,
+    check_scored_every_fit,
     check_metrics_match_predictions,
     check_candidate_pool,
     check_horizon_anchor,
     check_search_discrimination,
     check_ensemble_provenance,
     check_output_containment,
+    check_config_explains_run,
 )
 
 

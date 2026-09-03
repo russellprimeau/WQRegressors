@@ -2,11 +2,19 @@
 
 Why
 ---
-XGBoost's ``random_state`` never reached the model, so every candidate was fitted at one
-unrecorded draw and each winner was chosen from it. Six seeds of the reported winners give
-an R^2 standard deviation of 0.03 (median) and up to 0.44, and the selection is biased by
-that noise: Turbidity's XGBoost configuration was chosen precisely because it looked best
-at seed 0.
+A candidate fitted once is a single draw from whatever its family's randomness is, and the
+winner was chosen from that draw. XGBoost's ``random_state`` never reached the model, so
+six seeds of the reported winners give an R^2 standard deviation of 0.03 (median) and up to
+0.44; Turbidity's XGBoost configuration was chosen precisely because it looked best at
+seed 0.
+
+This is not confined to XGBoost. A Gaussian process ignores ``random_state`` entirely, but
+its uncertain-input kernel draws Monte Carlo samples seeded by ``uncertain_kernel_mc_seed``,
+and three seeds of pH's winner give a standard deviation of 0.0123 -- against a 0.0180 gap
+between pH and the next target in the accuracy ordering. Since a Gaussian process wins 11
+of 14 targets, that is most of the reported table. ``v3`` refits whichever families are
+asked for; this applies whatever it produced, and the run directory glob below is
+family-agnostic.
 
 ``v3_SeedVarianceRefit`` measures the spread. This applies it, by writing each refitted
 candidate's **mean prediction vector across seeds** into the run directory ``z8`` reads.
@@ -15,11 +23,11 @@ vector, which a mean-of-R^2 cannot give: there is no prediction series whose R^2
 average of six others, so reporting a mean R^2 beside a verdict derived from a single
 seed would be quoting two different models.
 
-The choice does not change any winner. Scored both ways, the seed-mean R^2 and the
-ensemble R^2 select the identical family for all 13 refitted targets; the ensemble is
-simply the one that is internally consistent, and it is slightly higher because averaging
-predictions cancels part of the seed noise (Cadmium +0.279 as a mean of six, +0.314 as an
-ensemble of six).
+Scored both ways, the seed-mean R^2 and the ensemble R^2 selected the identical family for
+all 13 targets refitted in the first XGBoost-only pass; the ensemble is simply the one that
+is internally consistent, and it is slightly higher because averaging predictions cancels
+part of the seed noise (Cadmium +0.279 as a mean of six, +0.314 as an ensemble of six).
+That agreement was measured on that pass and is not a guarantee for a wider one.
 
 The original single-seed predictions are preserved alongside as
 ``predictions_seed0.csv``, so this is reversible.

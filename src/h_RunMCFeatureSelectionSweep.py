@@ -2497,6 +2497,12 @@ def _fit_scale(config: dict, n_train: int) -> float:
 
 _CANDIDATE_SEEDS = 1
 _CANDIDATE_SEED_BASE = 0
+# Seeds for the FINAL per-family re-fit only -- the run z8 scores and the results table
+# quotes. Separate from _CANDIDATE_SEEDS because the two stages answer different questions:
+# the search needs candidates ranked consistently, the final stage needs the reported number
+# to be an ensemble rather than one draw. 0 means "follow _CANDIDATE_SEEDS", which is what
+# every invocation written before this split assumed.
+_FINAL_SEEDS = 0
 
 
 # Suffix marking a seed replicate. Deliberately not `_s%02d`: `_s01` is already a subset
@@ -5544,10 +5550,14 @@ def _evaluate_selected_subsets_all_models(
                         save_plots_override=not disable_eval_plots,
                     )
 
-                    # --seeds applies here, to the run z8 scores and Table 3 quotes,
-                    # and not only to the beam search that shortlisted it.
+                    # --final-seeds applies here, to the run z8 scores and Table 3
+                    # quotes; --seeds governs the beam search that shortlisted it. They are
+                    # deliberately separable: ensembling the reported fit is cheap because
+                    # there is one per family per target, while ensembling every search
+                    # candidate multiplies the whole sweep.
                     _ens_metrics = None
-                    if _CANDIDATE_SEEDS > 1:
+                    _final_seeds = _FINAL_SEEDS or _CANDIDATE_SEEDS
+                    if _final_seeds > 1:
                         try:
                             with open(variant_cfg, "r", encoding="utf-8") as _vf:
                                 _vcfg = yaml.safe_load(_vf) or {}
@@ -5559,7 +5569,7 @@ def _evaluate_selected_subsets_all_models(
                             dataset_plan.dataset_dir,
                             str(_vcfg.get("model_type", "")),
                             _vcfg.get("hyperparameters") or {},
-                            _CANDIDATE_SEEDS,
+                            _final_seeds,
                             _CANDIDATE_SEED_BASE,
                             disable_training_plots=disable_training_plots,
                             disable_eval_plots=disable_eval_plots,
@@ -7223,6 +7233,14 @@ def build_parser() -> argparse.ArgumentParser:
              "so a single draw is not a safe basis for choosing between close candidates. "
              "Default 1 reproduces the previous behaviour.")
     parser.add_argument(
+        "--final-seeds", type=int, default=0,
+        help="Seeds for the FINAL per-family re-fit only -- the run z8 scores and the "
+             "results table quotes. 0 (default) follows --seeds, which is how every "
+             "invocation behaved before the two were separable. Set --seeds 1 "
+             "--final-seeds 6 to ensemble the reported fit without multiplying the search: "
+             "the search then costs what a single-seed search costs, and only the winning "
+             "configuration of each family is refitted at further seeds.")
+    parser.add_argument(
         "--seed-base", type=int, default=0,
         help="First seed used by --seeds (default 0, which is XGBoost's own default and "
              "therefore reproduces a single-seed run as its first replicate).")
@@ -7375,7 +7393,17 @@ def build_parser() -> argparse.ArgumentParser:
             "to 6 segments -- and families are no longer scored on the same test set."
         ),
     )
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Print the per-target plan (surrogate and row counts) and stop before the "
+             "search. NOT free and NOT side-effect-free: the XGBoost CV tuning and the "
+             "split pinning happen during dataset discovery, which runs before this branch "
+             "is reached, so a dry run over 14 targets still spends a 250-trial Optuna "
+             "study per window aggregation and writes forecasts/pinned_split and "
+             "xgb_cv_tuning_cache*.json into the root. Measured: about four minutes and "
+             "several hundred trials on one target before it printed anything. Use "
+             "--limit-datasets 1 if all that is wanted is a look at the plan, and do not "
+             "treat it as a way to audit a root without touching it.")
     parser.add_argument("--stop-on-error", action="store_true")
     parser.add_argument(
         "--notify",
@@ -7394,6 +7422,7 @@ def main() -> int:
     # those signatures is more surface than this needs. Parallel workers are handed the
     # value explicitly in their payload, since a spawned process inherits neither.
     global _CANDIDATE_SEEDS, _CANDIDATE_SEED_BASE, _FIT_TIMEOUT_S, _MAX_FIT_SCALE
+    global _FINAL_SEEDS
     _FIT_TIMEOUT_S = max(0, int(getattr(args, "fit_timeout", 0) or 0))
     _MAX_FIT_SCALE = max(0.0, float(getattr(args, "max_fit_scale", 0.0) or 0.0))
     if _MAX_FIT_SCALE:
@@ -7405,13 +7434,22 @@ def main() -> int:
               % _FIT_TIMEOUT_S)
     _CANDIDATE_SEEDS = max(1, int(getattr(args, "seeds", 1) or 1))
     _CANDIDATE_SEED_BASE = int(getattr(args, "seed_base", 0) or 0)
+    _FINAL_SEEDS = max(0, int(getattr(args, "final_seeds", 0) or 0))
+    _effective_final = _FINAL_SEEDS or _CANDIDATE_SEEDS
     if _CANDIDATE_SEEDS > 1:
-        print("[INFO] Seed averaging is on: %d seeds from %d. The search selects on the mean "
-              "score; the final re-fit installs the mean prediction, so the reported result "
-              "is a %d-seed ensemble." % (_CANDIDATE_SEEDS, _CANDIDATE_SEED_BASE,
-                                          _CANDIDATE_SEEDS))
+        print("[INFO] Search seed averaging is on: %d seeds from %d; candidates are ranked "
+              "on the mean score." % (_CANDIDATE_SEEDS, _CANDIDATE_SEED_BASE))
+    if _effective_final > 1:
+        print("[INFO] The final per-family re-fit installs the mean prediction over %d "
+              "seeds, so the reported result is a %d-seed ensemble.%s"
+              % (_effective_final, _effective_final,
+                 "" if _FINAL_SEEDS else " (following --seeds; set --final-seeds to "
+                 "separate the two stages.)"))
         print("[INFO] Replicates are suffixed _seedNN and excluded from candidate scoring. "
               "Each ensembled run keeps its single-seed predictions as predictions_seed0.csv.")
+    if _CANDIDATE_SEEDS == 1 and _effective_final > 1:
+        print("[INFO] The search runs single-seed; only the winning configuration of each "
+              "family is refitted at further seeds.")
 
     # Written before the work starts, so a crashed run still records what it attempted,
     # and stamped with the outcome on the way out. The resolved values below are the ones
@@ -7419,6 +7457,7 @@ def main() -> int:
     manifest = provenance.write_manifest(
         Path(args.data_root), Path(__file__).name, args,
         extra={"candidate_seeds": _CANDIDATE_SEEDS,
+               "final_seeds": _effective_final,
                "fit_timeout_s": _FIT_TIMEOUT_S,
                "max_fit_scale": _MAX_FIT_SCALE,
                "candidate_seed_base": _CANDIDATE_SEED_BASE,

@@ -462,6 +462,10 @@ DEFAULT_GP_REGRESSOR_CONFIG = {
     # "train_nll" — uses marginal likelihood only (principled for GP; no test exposure).
     # "test"      — original behavior: val_rmse on test set (leaks test info).
     "early_stop_source": "cv",
+    # Available but NOT to be used: see the refutation in the
+    # marginal-likelihood block of train_gp_regressor_model.
+    "mll_rel_tol": 1e-2,
+    "mll_window": 5,
     "early_stop_cv_folds": 3,
     "early_stop_metric": "val_rmse",
     "early_stop_alpha": 0.5,
@@ -796,6 +800,14 @@ def _write_training_stop_summary(config: dict, summary: dict) -> Path:
         "forecast_name": str(data_cfg.get("forecast_name", "")),
     }
     payload.update(_to_json_safe(summary or {}))
+    global _LAST_CV_EPOCH_DIAG
+    if _LAST_CV_EPOCH_DIAG:
+        # An epoch budget of 3 drawn from a curve whose one-standard-error plateau spans
+        # all 50 scanned epochs is not a measurement, and until now the artifact recorded
+        # only the number. Kept here so the identifiability of every fit's budget is
+        # recoverable afterwards without re-running the estimator.
+        payload["cv_epoch_diagnostics"] = _to_json_safe(_LAST_CV_EPOCH_DIAG)
+        _LAST_CV_EPOCH_DIAG = {}
     out_path = save_path / "training_stop_summary.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
@@ -806,6 +818,158 @@ def _write_training_stop_summary(config: dict, summary: dict) -> Path:
 # ===========================================================================================
 # TRANSFORMER TRAINING
 # ===========================================================================================
+
+# Diagnostics from the most recent epoch-budget estimate, so the stop-summary artifact can
+# record how well determined the budget was. Set by `_choose_cv_epoch` and consumed (and
+# cleared) by `_write_training_stop_summary`, which is the single writer for all three
+# families. Cleared on write so a model that never ran the estimator -- XGBoost, or a fit
+# with `early_stop_source` other than "cv" -- cannot inherit a previous fit's record.
+_LAST_CV_EPOCH_DIAG: dict = {}
+
+
+def _choose_cv_epoch(fold_curves, rule: str = "onese", smooth: int = 3,
+                     label: str = "model") -> "tuple[int | None, dict]":
+    """Pick an epoch budget from per-fold validation curves, and say how well determined it is.
+
+    The defaults are ``argmin`` with no smoothing, which reproduces the behaviour this
+    replaced. The one-standard-error rule is available and is NOT the default, because on
+    real data it collapses: on pH the standard error at the minimum (0.035) exceeds the
+    entire descent of the validation curve, so all 75 scanned epochs lie within one
+    standard error of the optimum and the rule selects epoch 1 -- training essentially
+    nothing. That is the rule behaving correctly on a curve that cannot resolve its own
+    minimum, not a defect in the rule.
+
+    Simulated curves suggested a 3.9x reduction in the spread of the chosen epoch from
+    the one-standard-error rule with five folds. That simulation was wrong: it held fold
+    noise constant regardless of fold count, when in reality more folds means smaller
+    validation sets. pH trains on 30 samples, so five folds leaves six validation points
+    per fold and the per-fold argmins came back [1, 111, 111, 1, 79]. Raising the fold
+    count makes small-sample targets worse.
+
+    What survives is the diagnostics. A budget of 55 drawn from a curve whose 1-SE plateau
+    spans all 75 epochs is not a measurement, and the previous log line -- "epoch budget:
+    55" -- gave no way to tell.
+
+    The budget these curves decide is what keeps the reported fit from overfitting a small
+    training set without ever consulting the held-out data, so it matters that it is chosen
+    stably. Taking the raw argmin of the fold-averaged curve is not stable: an argmin is a
+    high-variance statistic, and these curves are nearly flat over their first several
+    epochs, which is exactly where the minimum tends to land. One transformer target chose
+    3 epochs from folds whose own best epochs were 4, 19 and 15.
+
+    Two standard remedies, neither of which costs a single extra fit:
+
+    * Smooth the averaged curve over ``smooth`` epochs before locating the minimum, so a
+      single noisy epoch cannot claim it.
+    * Take the *smallest* epoch whose smoothed mean is within one standard error of the
+      minimum, the standard error being measured across folds at the minimum. This is the
+      same one-standard-error rule already used to choose among feature subsets, and it
+      errs toward fewer epochs -- the conservative direction when the risk being managed
+      is overfitting.
+
+    Returns the chosen epoch (1-based) and a diagnostics dict. The diagnostics exist
+    because a budget of 3 chosen from a plateau two epochs wide is a different claim from
+    one chosen from a plateau twenty epochs wide, and nothing previously distinguished
+    them.
+    """
+    import numpy as _np
+
+    curves = [c for c in (fold_curves or []) if c is not None and len(c)]
+    if not curves:
+        return None, {}
+    common = min(len(c) for c in curves)
+    if common < 1:
+        return None, {}
+    arr = _np.asarray([_np.asarray(c[:common], dtype=float) for c in curves], dtype=float)
+
+    with _np.errstate(invalid="ignore"):
+        mean_curve = _np.nanmean(arr, axis=0)
+    if not _np.isfinite(mean_curve).any():
+        return None, {}
+
+    w = max(1, int(smooth))
+    if w > 1 and common >= w:
+        filled = _np.where(_np.isfinite(mean_curve), mean_curve, _np.nanmax(mean_curve))
+        # Divide by the number of epochs that actually contributed, not by the window
+        # width. A plain `mode='same'` convolution zero-pads the ends, which drags the
+        # tail of the curve down and hands the argmin to the final epoch -- on a synthetic
+        # curve that plateaus at epoch 8, smoothing that way chose epoch 30.
+        kernel = _np.ones(w)
+        num = _np.convolve(filled, kernel, mode="same")
+        den = _np.convolve(_np.ones_like(filled), kernel, mode="same")
+        smoothed = num / _np.where(den > 0, den, 1.0)
+    else:
+        smoothed = mean_curve
+
+    usable = _np.where(_np.isfinite(smoothed), smoothed, _np.inf)
+    arg = int(_np.argmin(usable))
+    chosen = arg
+
+    # The standard error and the plateau are measured whatever rule is in force: they are
+    # how a caller can tell a budget that was determined from one that merely came back a
+    # number. Only the *selection* is gated on the rule.
+    n_folds = arr.shape[0]
+    se = float("nan")
+    plateau = 1
+    within = _np.asarray([arg])
+    if n_folds > 1:
+        col = arr[:, arg]
+        col = col[_np.isfinite(col)]
+        if col.size > 1:
+            se = float(_np.std(col, ddof=1) / _np.sqrt(col.size))
+            within = _np.where(usable <= usable[arg] + se)[0]
+            if within.size:
+                plateau = int(within.size)
+    if str(rule).lower() == "onese" and within.size:
+        chosen = int(within.min())
+
+    fold_args = []
+    for row in arr:
+        r = _np.where(_np.isfinite(row), row, _np.inf)
+        fold_args.append(int(_np.argmin(r)) + 1)
+
+    diag = {
+        "epochs_scanned": int(common),
+        "n_folds": int(n_folds),
+        "argmin_epoch": arg + 1,
+        "chosen_epoch": chosen + 1,
+        "rule": str(rule).lower(),
+        "smooth": w,
+        "se_at_argmin": se,
+        "plateau_epochs": plateau,
+        "fold_argmins": fold_args,
+        # Retained so the curves can be pooled across candidates afterwards, which is the
+        # only way to tell whether a target's validation curve has a shape at all or is
+        # noise all the way down.
+        "mean_curve": [None if not _np.isfinite(v) else round(float(v), 8)
+                       for v in mean_curve],
+        "fold_argmin_spread": (max(fold_args) - min(fold_args)) if fold_args else 0,
+        # The budget is "identified" only if the folds broadly agree and the plateau is a
+        # small part of the scanned range. Where they disagree between the first epoch and
+        # the scan limit, the argmin is settled by fold composition rather than by data.
+        "identified": bool(plateau <= max(2, 0.25 * common)
+                           and (max(fold_args) - min(fold_args)) <= max(2, 0.5 * common)),
+    }
+    global _LAST_CV_EPOCH_DIAG
+    _LAST_CV_EPOCH_DIAG = dict(diag)
+    return max(1, chosen + 1), diag
+
+
+def _log_cv_epoch_choice(label: str, chosen: int, diag: dict) -> None:
+    """One line naming the budget and how well the curves determined it."""
+    if not diag:
+        return
+    print(
+        "[INFO] %s CV epoch budget: %d (rule=%s, smooth=%d; argmin was %d over %d epoch(s) "
+        "on %d folds; 1-SE plateau %d epoch(s), SE %.5g; per-fold argmins %s spread %d; "
+        "%s)"
+        % (label, chosen, diag.get("rule"), diag.get("smooth"), diag.get("argmin_epoch"),
+           diag.get("epochs_scanned"), diag.get("n_folds"), diag.get("plateau_epochs"),
+           diag.get("se_at_argmin"), diag.get("fold_argmins"),
+           diag.get("fold_argmin_spread"),
+           "identified" if diag.get("identified") else "NOT IDENTIFIED")
+    )
+
 
 def _transformer_cv_estimate_epochs(
     train_samples,
@@ -900,23 +1064,24 @@ def _transformer_cv_estimate_epochs(
         )
         return median_ep
 
-    # Average over the epochs every fold reached. Taking the median of the folds'
-    # own argmins instead collapses to a small number whenever two folds happen to
-    # record their lowest validation loss early, which is what left transformer
-    # budgets at a median of 12 epochs against 250 configured.
-    common = min(len(c) for c in fold_curves)
-    mean_curve = np.mean(
-        np.asarray([c[:common] for c in fold_curves], dtype=float), axis=0
+    # Averaging the folds' curves and taking the argmin was already better than taking
+    # the median of their individual argmins, which collapsed to a small number whenever
+    # two folds happened to bottom out early. It is still not stable: on simulated curves
+    # with realistic epoch-to-epoch correlation the argmin of the averaged curve has a
+    # standard deviation of 7 epochs and sits 11 epochs beyond the true plateau. The
+    # one-standard-error rule with a smoothing window brings that to 1.8 epochs and
+    # removes most of the bias. `_choose_cv_epoch` does both and reports how wide the
+    # plateau was.
+    pooled_ep, diag = _choose_cv_epoch(
+        fold_curves,
+        rule=str(hyper_cfg.get("cv_epoch_rule", "argmin")),
+        smooth=int(hyper_cfg.get("cv_epoch_smooth", 1)),
     )
-    finite = np.isfinite(mean_curve)
-    if not finite.any():
+    if pooled_ep is None:
         return None
-    pooled_ep = int(np.argmin(np.where(finite, mean_curve, np.inf))) + 1
-    print(
-        f"[INFO] Transformer group-CV-estimated epoch budget: {pooled_ep} "
-        f"(groups={n_groups}; argmin of the {len(fold_curves)}-fold mean validation "
-        f"curve over {common} epoch(s); per-fold best_epochs were {fold_best_epochs})"
-    )
+    diag["n_groups"] = int(n_groups)
+    diag["fold_best_epochs"] = list(fold_best_epochs)
+    _log_cv_epoch_choice("Transformer group-CV", pooled_ep, diag)
     return max(1, pooled_ep)
 
 
@@ -1032,7 +1197,31 @@ def train_transformer_model(config, train_samples, test_samples):
     transformer_early_stop_source = str(hyper_cfg.get("early_stop_source", "cv")).lower()
     max_epochs_override = None
 
-    if transformer_early_stop_source == "cv":
+    # A fixed budget that does NOT go through the leaking fallback.
+    #
+    # `train_transformer` receives `testloader` as its validation loader, and it restores
+    # `best_model_state` -- the epoch that scored best on that loader -- whenever
+    # `use_fixed_budget` is false, which is to say whenever `max_epochs_override` is None.
+    # So the 'threshold' source, and the 'cv' source when estimation fails and falls back
+    # to it, select final weights using the test split. Setting `num_epochs` alone does not
+    # avoid that: it changes how long training runs, not which epoch is kept.
+    #
+    # This is not a live defect in the reported results -- all 297 transformer fits on
+    # CV22_profilerless record `checkpoint_restored=0` and `cv_epoch_budget_exhausted`, so
+    # the estimator succeeded every time and the fallback never fired -- but it means a
+    # pinned budget had no leakage-free expression, which both the budget sweep and any
+    # reproducible fixed-budget run need. `fixed_epoch_budget` supplies one: it sets the
+    # override directly, so the last epoch's weights are kept and no test metric is
+    # consulted for selection.
+    fixed_epoch_budget = hyper_cfg.get("fixed_epoch_budget")
+    if fixed_epoch_budget is not None and int(fixed_epoch_budget) > 0:
+        max_epochs_override = int(fixed_epoch_budget)
+        transformer_early_stop_source = "fixed_epoch_budget"
+        print(
+            f"[INFO] Transformer early_stop_source='fixed_epoch_budget': training for "
+            f"{max_epochs_override} epochs; last epoch kept, no test metric consulted."
+        )
+    elif transformer_early_stop_source == "cv":
         max_epochs_override = _transformer_cv_estimate_epochs(
             train_samples,
             model_config,
@@ -1074,6 +1263,9 @@ def train_transformer_model(config, train_samples, test_samples):
         hyper_cfg["corr_eps"],
         hyper_cfg["corr_clip"],
         max_epochs_override=max_epochs_override,
+        # So the recorded stop reason names the mechanism instead of labelling every
+        # fixed budget as CV-derived.
+        budget_source=transformer_early_stop_source,
     )
     
     # Save model
@@ -1104,6 +1296,10 @@ def _gp_cv_estimate_epochs(
     device,
     n_folds: int = 3,
     seed: int = 42,
+    n_repeats: int = 1,
+    group_ids: "list | None" = None,
+    scheme: str = "random",
+    min_train_fraction: float = 0.5,
 ) -> int | None:
     """Estimate optimal GP epoch count via internal k-fold CV (no test exposure).
 
@@ -1140,15 +1336,133 @@ def _gp_cv_estimate_epochs(
     # Minimum optimiser steps before a fold may conclude it has converged.
     min_epochs = max(1, min(int(hyper_cfg.get("early_stop_min_epochs", 50)), num_epochs))
 
-    # Build simple fold indices (not MC-aware since data is already flattened).
-    fold_size = n_samples // n_folds
-    indices = np.arange(n_samples)
-    rng = np.random.default_rng(seed)
-    rng.shuffle(indices)
-    folds_idx = [indices[i * fold_size:(i + 1) * fold_size] for i in range(n_folds)]
-    leftover = indices[n_folds * fold_size:]
-    for li, idx_val in enumerate(leftover):
-        folds_idx[li % n_folds] = np.append(folds_idx[li % n_folds], idx_val)
+    # Fold indices: `n_repeats` independent partitions into `n_folds` parts, not one
+    # partition into more parts.
+    #
+    # The distinction is the whole point. Raising `n_folds` shrinks each validation set --
+    # at n_train=30 five folds leaves six points per fold, and the folds then disagree
+    # completely (per-fold argmins came back [1, 111, 111, 1, 79]). Repeating the split
+    # keeps every validation set at n/n_folds and averages more curves instead: with R
+    # repeats each training point is validated R times rather than once, so the
+    # partition-level noise in the mean curve falls roughly as 1/R while each per-fold
+    # estimate stays as well-supported as before.
+    #
+    # This matters because the flat curves are not evidence that the budget is irrelevant.
+    # Held-out R2 varies by up to 1.29 across budgets from 1 to 300, so the signal exists;
+    # the curve is flat because it is noisy, which is what repetition addresses and extra
+    # folds do not.
+    # `splits` is a list of explicit (train_idx, val_idx) pairs, because the two schemes
+    # cannot both be expressed as "this fold against all the others".
+    splits: list = []
+
+    if str(scheme).lower() == "grouped" and group_ids is not None:
+        # Random folds over SEGMENTS rather than over rows, so every Monte Carlo replicate
+        # of a segment lands in the same fold. This is the one-factor change the earlier
+        # scheme comparison missed: `rolling` is also group-aware, but it changes grouping
+        # and temporal ordering at once, so it could not isolate either.
+        #
+        # `_build_group_folds` is the same helper the transformer and XGBoost estimators
+        # use, so adopting this would make all three families agree about what an
+        # independent validation row is.
+        #
+        # AVAILABLE BUT REFUTED, and not the default. Measured against `random` on all 14
+        # targets of CV22_profilerless: the one-standard-error plateau narrowed on only 3
+        # targets, was identical on 11 and wider on none, and the budget became identified
+        # on 1 target (Zinc) against 0. The plateau still spans the entire scanned range on
+        # 11 of 14. So duplicate rows leaking across folds is NOT why the curve is flat,
+        # even though the mechanism is real: grouping changed the chosen budget on 9 of 14
+        # targets, so the folds genuinely differ, and the curve stays flat anyway.
+        #
+        # The held-out shortfall, diagnostic only, also moved the wrong way -- median
+        # +0.0101 against +0.0025 and mean +0.1056 against +0.0164, with Color going from
+        # 0.0000 to +1.0543. Two independent reasons not to adopt it.
+        #
+        # This is the sixth candidate explanation for the flat curve to be refuted, after
+        # marginal-likelihood convergence, the 1-SE rule, five folds, repeated partitions
+        # and temporal folds. The flatness is not yet explained.
+        gids = [str(g) for g in group_ids]
+        if len(gids) != n_samples:
+            return None
+        for rep in range(max(1, int(n_repeats))):
+            rep_folds = _build_group_folds(gids, n_folds, int(seed) + 1000 * rep)
+            if len(rep_folds) < 2:
+                return None
+            for fi in range(len(rep_folds)):
+                val_idx = np.asarray(rep_folds[fi], dtype=int)
+                train_idx = np.asarray(
+                    [i for fj, f in enumerate(rep_folds) if fj != fi for i in f],
+                    dtype=int)
+                if train_idx.size >= 2 and val_idx.size >= 1:
+                    splits.append((train_idx, val_idx))
+        if len(splits) < 2:
+            return None
+    elif str(scheme).lower() == "rolling" and group_ids is not None:
+        # Imported here rather than at module scope: the module's `from utils.x import
+        # (...)` blocks span several lines and inserting into them is how this patch
+        # broke the file on its first attempt.
+        import re as _re
+        from utils.crossval_rolling_origin import rolling_origin_block_splits
+
+        # Temporal, expanding-window folds over the ordered segments -- the scheme the
+        # method is documented as using, and the one the reported evaluation matches.
+        #
+        # The random alternative below asks how well the fit generalises to randomly held
+        # out rows from the same period. The reported score asks how well it generalises to
+        # a later period. On an autocorrelated series those are not the same question: a
+        # randomly held-out row sits between its own training neighbours, so fold
+        # validation error barely degrades as the model overfits the period. That would
+        # explain why the fold-validation curve is flat -- unidentified for 93% of fits --
+        # while held-out R2 varies by up to 1.29 across epoch budgets, and why reducing the
+        # curve's noise by repeating the partition changed nothing.
+        #
+        # Groups are ordered by segment id, which is chronological: `common_set_segments`
+        # records `order` monotone in the segment number, and the reported test block is
+        # the highest-numbered segments.
+        gids = [str(g) for g in group_ids]
+        if len(gids) != n_samples:
+            return None
+
+        def _num(g: str) -> tuple:
+            m = _re.findall(r"(\d+)", g)
+            return (int(m[-1]) if m else 0, g)
+
+        ordered = sorted(set(gids), key=_num)
+        pos = {g: i for i, g in enumerate(ordered)}
+        by_group: dict = {}
+        for i, g in enumerate(gids):
+            by_group.setdefault(pos[g], []).append(i)
+
+        try:
+            blocks = rolling_origin_block_splits(
+                len(ordered), n_folds=max(2, int(n_folds)),
+                min_train_fraction=float(min_train_fraction))
+        except ValueError:
+            return None
+        for n_train_groups, (lo, hi) in blocks:
+            tr = [i for gp in range(n_train_groups) for i in by_group.get(gp, [])]
+            va = [i for gp in range(lo, hi) for i in by_group.get(gp, [])]
+            if len(tr) >= 2 and len(va) >= 1:
+                splits.append((np.asarray(tr, dtype=int), np.asarray(va, dtype=int)))
+        if len(splits) < 2:
+            return None
+    else:
+        fold_size = n_samples // n_folds
+        folds_idx = []
+        for rep in range(max(1, int(n_repeats))):
+            indices = np.arange(n_samples)
+            # A different partition per repeat, deterministically derived from `seed`.
+            np.random.default_rng(int(seed) + 1000 * rep).shuffle(indices)
+            rep_folds = [indices[i * fold_size:(i + 1) * fold_size] for i in range(n_folds)]
+            for li, idx_val in enumerate(indices[n_folds * fold_size:]):
+                rep_folds[li % n_folds] = np.append(rep_folds[li % n_folds], idx_val)
+            folds_idx.extend(rep_folds)
+        for fi in range(len(folds_idx)):
+            rep = fi // n_folds
+            base = rep * n_folds
+            splits.append((
+                np.concatenate([folds_idx[base + fj] for fj in range(n_folds)
+                                if base + fj != fi]),
+                folds_idx[fi]))
 
     # Build every fold first, then advance them together. Training folds one after
     # another and pooling their curves afterwards does not work: each fold stops at its
@@ -1156,9 +1470,7 @@ def _gp_cv_estimate_epochs(
     # gets pinned to that truncation point. Advancing in lockstep gives one curve, one
     # patience counter, and an argmin taken over exactly the epochs that were evaluated.
     folds = []
-    for fi in range(n_folds):
-        val_idx = folds_idx[fi]
-        train_idx = np.concatenate([folds_idx[fj] for fj in range(n_folds) if fj != fi])
+    for train_idx, val_idx in splits:
 
         X_tr_np = X_np[train_idx]
         y_tr_np = y_col[train_idx]
@@ -1220,12 +1532,15 @@ def _gp_cv_estimate_epochs(
         return None
 
     mean_curve: list[float] = []
+    # One list per fold, so the one-standard-error rule below can measure the spread
+    # across folds at each epoch. Averaging first discards exactly that.
+    fold_hist: list[list[float]] = [[] for _ in folds]
     best_mean = float("inf")
     best_ep = 0
     pat_ctr = 0
     for ep in range(num_epochs):
         fold_rmses = []
-        for st in folds:
+        for fi_idx, st in enumerate(folds):
             st["opt"].zero_grad()
             out = st["mdl"](st["X_tr"])
             loss = -st["mll"](out, st["y_tr"])
@@ -1242,6 +1557,10 @@ def _gp_cv_estimate_epochs(
             st["lh"].train()
             if math.isfinite(v_rmse):
                 fold_rmses.append(v_rmse)
+            # Retained per fold as well as pooled: the one-standard-error rule applied
+            # below needs the spread across folds at each epoch, and averaging first
+            # throws exactly that away.
+            fold_hist[fi_idx].append(v_rmse if math.isfinite(v_rmse) else float("nan"))
 
         epoch_mean = float(np.mean(fold_rmses)) if fold_rmses else float("inf")
         mean_curve.append(epoch_mean)
@@ -1261,14 +1580,20 @@ def _gp_cv_estimate_epochs(
         del st["mdl"], st["lh"], st["opt"], st["mll"]
     del folds
 
-    if best_ep <= 0:
-        return None
-    print(
-        f"[INFO] GP CV-estimated epoch budget: {best_ep} "
-        f"(argmin of the {n_folds}-fold mean validation curve over "
-        f"{len(mean_curve)} epoch(s), best mean RMSE {best_mean:.6f})"
+    chosen, diag = _choose_cv_epoch(
+        fold_hist,
+        rule=str(hyper_cfg.get("cv_epoch_rule", "argmin")),
+        smooth=int(hyper_cfg.get("cv_epoch_smooth", 1)),
     )
-    return max(1, best_ep)
+    if chosen is None:
+        # Fall back to the online argmin if the curves could not be read at all.
+        if best_ep <= 0:
+            return None
+        print(f"[WARN] GP CV epoch budget: falling back to the online argmin ({best_ep}).")
+        return max(1, best_ep)
+    diag["best_mean_rmse"] = float(best_mean)
+    _log_cv_epoch_choice("GP", chosen, diag)
+    return max(1, chosen)
 
 
 def train_gp_regressor_model(config, train_samples, test_samples):
@@ -1398,6 +1723,20 @@ def train_gp_regressor_model(config, train_samples, test_samples):
     os.makedirs(save_path, exist_ok=True)
 
     # Determine early stopping strategy.
+    # Segment identity per training row, aligned with X_train_np after the keep filter,
+    # so a temporal fold scheme can order and group by it.
+    gp_cv_group_ids = None
+    try:
+        _gids = [_base_sample_id(str(sample[2])) for sample in train_samples]
+        if "keep_idx" in dir() or "keep_idx" in locals():
+            gp_cv_group_ids = [_gids[i] for i in keep_idx]
+        else:
+            gp_cv_group_ids = _gids
+        if len(gp_cv_group_ids) != len(X_train_np):
+            gp_cv_group_ids = None
+    except Exception:
+        gp_cv_group_ids = None
+
     gp_early_stop_source = str(hyper_cfg.get("early_stop_source", "cv")).lower()
     gp_cv_epoch_budget: int | None = None
     if gp_early_stop_source == "cv":
@@ -1414,6 +1753,10 @@ def train_gp_regressor_model(config, train_samples, test_samples):
             mc_seed,
             device,
             n_folds=int(hyper_cfg.get("early_stop_cv_folds", 3)),
+            n_repeats=int(hyper_cfg.get("early_stop_cv_repeats", 1)),
+            group_ids=gp_cv_group_ids,
+            scheme=str(hyper_cfg.get("early_stop_cv_scheme", "random")),
+            min_train_fraction=float(hyper_cfg.get("early_stop_cv_min_train_fraction", 0.5)),
             seed=int(config.get("data_split", {}).get("random_state", 42)),
         )
         if gp_cv_epoch_budget is not None:
@@ -1487,6 +1830,38 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         # Override early_stop_metric when source is not "test".
         if gp_early_stop_source == "train_nll":
             early_stop_metric = "train_nll"
+        # Convergence of the marginal likelihood: implemented, measured, and NOT USED.
+        #
+        # The reasoning was that a Gaussian process's log marginal likelihood already
+        # carries an Occam factor, so training it to convergence should need no validation
+        # split and could not leak the held-out set. The supporting evidence was a budget
+        # sweep showing held-out R2 monotone non-decreasing in the epoch budget on all 14
+        # targets, which would have meant the cross-validated budget was guarding against
+        # nothing while costing real accuracy.
+        #
+        # That sweep was invalid. Its arms ran with `early_stop_source='fixed'`, which
+        # falls through to the scoring block below, and the GP default `early_stop_metric`
+        # is 'val_rmse' -- computed on X_test. Every arm was therefore selecting the epoch
+        # that scored best on the held-out set, and a longer budget merely offered more
+        # chances to find a lucky one, which manufactured the monotonicity.
+        #
+        # Repeated with the last epoch kept and no test metric consulted, the result
+        # reverses: monotone on 1 of 14 targets rather than 14, no target flat, and the
+        # overfitting is severe. Turbidity falls from +0.2504 at 30 epochs to -1.0431 at
+        # 300; Color from +0.2504 at 100 to -0.8039 at 300; Copper, E. coli, Lead and
+        # Total coliforms all score best at a single epoch. Their marginal likelihoods
+        # converge at 199, 250 and beyond, so this rule would have trained them straight
+        # off the cliff.
+        #
+        # So the cross-validated budget is doing real work, and the training objective and
+        # generalisation diverge sharply at these sample sizes. What remains true is that
+        # the budget is unidentified for 93% of final-stage GP fits -- the standard-error
+        # plateau spans the whole scanned range for 326 of 392 -- which is a live problem
+        # with the estimator, not a reason to abandon the guard. The code stays because the
+        # measurement is worth keeping; the default does not.
+        gp_mll_converge = gp_early_stop_source == "mll"
+        mll_tol = float(hyper_cfg.get("mll_rel_tol", 1e-2))
+        mll_window = int(hyper_cfg.get("mll_window", 5))
         use_cv_epoch_budget = gp_cv_epoch_budget is not None and gp_early_stop_source == "cv"
         effective_num_epochs = gp_cv_epoch_budget if use_cv_epoch_budget else int(hyper_cfg["num_epochs"])
         if early_stop_metric not in {"train_nll", "val_rmse", "mixed"}:
@@ -1544,6 +1919,33 @@ def train_gp_regressor_model(config, train_samples, test_samples):
             model.train()
             likelihood.train()
 
+            if gp_mll_converge:
+                # Keep the latest state: the objective is being driven to convergence, so
+                # the last epoch is the best estimate, not the one that happened to score
+                # lowest on a metric this rule does not consult.
+                best_loss = loss_value
+                best_val_rmse = val_rmse
+                best_epoch = int(epoch + 1)
+                best_model_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                best_likelihood_state = {
+                    k: v.detach().cpu() for k, v in likelihood.state_dict().items()}
+                finite = [v for v in losses if math.isfinite(v)]
+                total_drop = (finite[0] - min(finite)) if len(finite) > 1 else 0.0
+                if (len(losses) > mll_window and total_drop > 0
+                        and math.isfinite(losses[-1]) and math.isfinite(losses[-1 - mll_window])):
+                    recent = losses[-1 - mll_window] - losses[-1]
+                    if recent < mll_tol * total_drop:
+                        stop_reason_code = "mll_converged"
+                        stop_epoch = int(epoch + 1)
+                        stop_reason_text = (
+                            f"Marginal likelihood converged: improvement over the last "
+                            f"{mll_window} epoch(s) was {recent:.4g}, below {mll_tol:g} of the "
+                            f"total descent {total_drop:.4g}; stopped at epoch {stop_epoch}/"
+                            f"{int(hyper_cfg['num_epochs'])}."
+                        )
+                        break
+                continue
+
             # When using CV epoch budget, just save the latest state (no early stopping).
             if use_cv_epoch_budget:
                 best_loss = loss_value
@@ -1588,6 +1990,15 @@ def train_gp_regressor_model(config, train_samples, test_samples):
                     )
                     break
 
+        if gp_mll_converge and stop_reason_code == "max_epochs_exhausted":
+            # Hitting the cap under this rule means the marginal likelihood was still
+            # improving when training stopped, which is worth saying out loud: at a
+            # tolerance of 1e-3 none of the 14 targets had converged within 250 epochs.
+            print(
+                f"[WARN] GP marginal likelihood had not converged at the {int(hyper_cfg['num_epochs'])}"
+                f"-epoch cap (tolerance {mll_tol:g}). The fit is still improving; raise "
+                f"num_epochs if this target matters."
+            )
         if stop_reason_code in ("max_epochs_exhausted", "cv_epoch_budget_exhausted"):
             stop_epoch = int(len(losses))
             budget_label = ("CV-derived epoch budget" if stop_reason_code == "cv_epoch_budget_exhausted"
@@ -1780,6 +2191,15 @@ def train_gp_regressor_model(config, train_samples, test_samples):
             "stop_reason_text": overall_text,
             "stopped_early": bool(any(item["stop_reason_code"] not in {"max_epochs_exhausted", "cv_epoch_budget_exhausted"} for item in output_stop_summaries)),
             "per_output": output_stop_summaries,
+            # The per-epoch curves, which until now existed only as loss_plot.png. Any
+            # rule that decides when training has converged needs them as data: the
+            # marginal likelihood is what a Gaussian process is actually optimising, and
+            # whether it has levelled off is answerable from the training objective alone,
+            # without a validation split and so without any possibility of leakage.
+            "curves": {
+                "train_nll": [[float(v) for v in c] for c in output_train_losses],
+                "val_rmse": [[float(v) for v in c] for c in output_val_rmse_history],
+            },
             "configured": {
                 "num_epochs": int(hyper_cfg["num_epochs"]),
                 "patience": int(hyper_cfg["patience"]),
@@ -3105,6 +3525,51 @@ def _xgb_cv_estimate_n_estimators(
     two, against a tuned ``n_estimators`` of 52. Early stopping fires on a single noisy
     fold; the averaged curve does not. Boosting is monotone in training error, so the
     argmin of held-out error remains the point past which further rounds only overfit.
+
+    HAD BEEN UNREACHABLE UNDER CV TUNING; NOW CALLED EXPLICITLY BY THAT PATH.
+
+    Every final-stage config sets ``cv_tuning.enabled: true``, which routes through
+    ``_train_xgb_model_cv_tuned``. That function nulls ``early_stopping_rounds``, passes
+    ``disable_early_stopping=True`` and passes a non-None ``eval_set_override``, and each of
+    the three independently fails the gate in ``_train_xgb_model`` that calls this --
+    confirmed at the time by instrumenting this body with a call marker. So for a period
+    this function could not run at all on the path every reported fit used, and the budget
+    silently became the Optuna-tuned ``n_estimators``.
+
+    That was a regression, not a design: all 3381 stored XGBoost runs on CV22_profilerless
+    record "CV-derived budget exhausted (N rounds from internal CV estimate)", which only
+    this function emits, while carrying Optuna-tuned hyperparameters -- a combination the
+    broken arrangement could not produce. ``_train_xgb_model_cv_tuned`` now calls this
+    directly, so tuning and the round budget coexist again, and ``budget_mechanism`` in the
+    stop summary records which rule actually applied instead of leaving it to be inferred
+    from prose.
+
+    The stored artifacts are still not reproducible from their configs -- the tuning cache
+    has since been rewritten, so the hyperparameters differ -- and reproducing them is not
+    the goal. What matters is that the mechanism is back: on Cadmium the fixed path gives
+    24 rounds and pooled R2 +0.3915, against -0.8054 while the estimator was unreachable.
+
+    The budgets this rule picks are very small -- median 2 rounds across those 3381 fits,
+    tenth percentile 1, 69% at ten rounds or fewer, and pH's reported +0.3198 came from a
+    single round, which at the tuned learning rates of 0.005 to 0.03 is nearly a constant
+    predictor. That reads like the collapse the paragraph above claims to have fixed, and in
+    the sense of magnitude it is. But it is not costing accuracy here: measured against
+    constants at one operating point, this rule ruins no target and leaves two negative,
+    where the tuned budget leaves five and a constant 300 leaves six, and its median
+    shortfall is +0.0096 against a constant 300's +0.0025. On weak signal a handful of
+    rounds acts as heavy regularisation, and pH scores +0.2049 at one round against -0.4168
+    at three hundred. The small budgets are the reason to keep this rule, not to distrust it.
+
+    What the small budgets DO compromise is the feature search, which ranked 3087
+    weakly-trained candidates against one another; the separability warnings in
+    ``v4_CheckPipelineInvariants`` corroborate that.
+
+    Where it IS reached, the budget is no better determined than the GP's. Sweeping the
+    round budget to 300 over the same 5 grouped training folds, at each target's reported
+    XGB operating point, put the 1-SE plateau at 300 of 300 rounds for 11 of 14 targets and
+    at no fewer than 272 of 300 for the other three: 0 of 14 identified, with per-fold
+    argmins as scattered as [33, 294, 6, 8, 41]. The argmin is still returned, because an
+    argmin of a flat curve is still a number -- which is what the diagnostics now record.
     """
     X, y, names = _xgb_samples_to_arrays(train_samples, cast_y=cast_y)
     if len(names) < 2 * n_folds:
@@ -3157,21 +3622,61 @@ def _xgb_cv_estimate_n_estimators(
         )
         return fallback
 
-    common = min(len(c) for c in fold_curves)
-    mean_curve = np.mean(
-        np.asarray([c[:common] for c in fold_curves], dtype=float), axis=0
+    # Routed through the same selector as the two epoch budgets, for the same reason: the
+    # quantity is the argmin of a fold-averaged validation curve, and whether that curve
+    # actually resolves its own minimum is not something the returned number reveals. On
+    # the Gaussian process the one-standard-error plateau spanned the whole scanned range
+    # for 326 of 392 final-stage fits, so the budget was unidentified while still looking
+    # precise. Whether boosting rounds behave the same way is a separate question -- added
+    # rounds have a real overfitting direction, where added epochs turned out not to -- and
+    # it cannot be answered unless the diagnostic is recorded.
+    #
+    # The rule stays argmin with no smoothing, which is exactly what this computed before,
+    # so the chosen round is unchanged. Every alternative rule was measured on the GP and
+    # every one was worse; the refutations are recorded in _choose_cv_epoch.
+    best_round, diag = _choose_cv_epoch(
+        fold_curves,
+        rule=str(model_kwargs.get("cv_epoch_rule", "argmin")),
+        smooth=int(model_kwargs.get("cv_epoch_smooth", 1)),
     )
-    finite = np.isfinite(mean_curve)
-    if not finite.any():
+    if best_round is None:
         return None
-    best_round = int(np.argmin(np.where(finite, mean_curve, np.inf))) + 1
-
-    print(
-        f"[INFO] CV-estimated n_estimators: {best_round} "
-        f"(argmin of the {len(fold_curves)}-fold mean validation curve over "
-        f"{common} round(s))"
-    )
+    diag["fold_best_iters"] = list(fold_best_iters)
+    _log_cv_epoch_choice("XGBoost n_estimators", best_round, diag)
     return max(1, best_round)
+
+
+def _xgb_model_kwargs(hyper_cfg: dict) -> dict:
+    """Estimator arguments for one XGBoost fit.
+
+    Shared by the final fit and by the round estimator so that the budget is chosen for the
+    model that is actually trained. When the two built their arguments separately, the
+    estimator could be scanning a different learning rate or subsample than the fit it was
+    choosing a budget for, and nothing would have reported the mismatch.
+    """
+    kwargs = {
+        "tree_method": hyper_cfg["tree_method"],
+        "objective": hyper_cfg["objective"],
+        "n_estimators": hyper_cfg["n_estimators"],
+        "max_depth": hyper_cfg["max_depth"],
+        "subsample": hyper_cfg["subsample"],
+        "colsample_bytree": hyper_cfg["colsample_bytree"],
+        "min_child_weight": hyper_cfg["min_child_weight"],
+        "gamma": hyper_cfg["gamma"],
+        "reg_lambda": hyper_cfg["reg_lambda"],
+        "reg_alpha": hyper_cfg["reg_alpha"],
+        "learning_rate": hyper_cfg["learning_rate"],
+        "n_jobs": int(hyper_cfg.get("n_jobs", -1)),
+    }
+    # random_state was absent from this dict, so every fit used XGBoost's own default of
+    # 0 whatever the config said. subsample (0.51-0.86) and colsample_bytree (0.40-0.86)
+    # are active, so the seed does change the trees -- it simply never arrived, which is
+    # why the horizon sweep's per-replicate seeds produced bit-identical models. Only the
+    # training path takes it: the Optuna search is seeded separately and its result is
+    # cached and shared, so it must not vary per replicate.
+    if hyper_cfg.get("random_state") is not None:
+        kwargs["random_state"] = int(hyper_cfg["random_state"])
+    return kwargs
 
 
 def _train_xgb_model(
@@ -3183,8 +3688,14 @@ def _train_xgb_model(
     cast_y=None,
     eval_set_override=None,
     disable_early_stopping: bool = False,
+    budget_source: str | None = None,
 ):
-    """Shared XGBoost training implementation for regressor and classifier."""
+    """Shared XGBoost training implementation for regressor and classifier.
+
+    ``budget_source`` names whatever already decided ``n_estimators`` before this call, for
+    the benefit of the recorded provenance. The CV-tuned path chooses the budget itself, via
+    the round estimator, and passes ``"cv_round_estimator"``; nothing else sets it.
+    """
     print("\n" + "="*80)
     print(f"TRAINING {model_cls.__name__.upper()}")
     print("="*80)
@@ -3234,28 +3745,7 @@ def _train_xgb_model(
 
     metric = hyper_cfg[metric_key]
     plateau_callback, plateau_state = _build_train_loss_plateau_callback(hyper_cfg, metric)
-    model_kwargs = {
-        "tree_method": hyper_cfg["tree_method"],
-        "objective": hyper_cfg["objective"],
-        "n_estimators": hyper_cfg["n_estimators"],
-        "max_depth": hyper_cfg["max_depth"],
-        "subsample": hyper_cfg["subsample"],
-        "colsample_bytree": hyper_cfg["colsample_bytree"],
-        "min_child_weight": hyper_cfg["min_child_weight"],
-        "gamma": hyper_cfg["gamma"],
-        "reg_lambda": hyper_cfg["reg_lambda"],
-        "reg_alpha": hyper_cfg["reg_alpha"],
-        "learning_rate": hyper_cfg["learning_rate"],
-        "n_jobs": int(hyper_cfg.get("n_jobs", -1)),
-    }
-    # random_state was absent from this dict, so every fit used XGBoost's own default of
-    # 0 whatever the config said. subsample (0.51-0.86) and colsample_bytree (0.40-0.86)
-    # are active, so the seed does change the trees -- it simply never arrived, which is
-    # why the horizon sweep's per-replicate seeds produced bit-identical models. Only the
-    # training path takes it: the Optuna search above is seeded separately and its result
-    # is cached and shared, so it must not vary per replicate.
-    if hyper_cfg.get("random_state") is not None:
-        model_kwargs["random_state"] = int(hyper_cfg["random_state"])
+    model_kwargs = _xgb_model_kwargs(hyper_cfg)
     early_stop_source = str(hyper_cfg.get("early_stop_source", "cv")).lower()
     has_early_stopping = hyper_cfg.get("early_stopping_rounds") is not None
 
@@ -3430,7 +3920,7 @@ def _train_xgb_model(
             f"{float(plateau_state.get('min_relative_improvement', 0.0)):.6g}; "
             f"triggered at round {trigger_round}."
         )
-    elif cv_estimated_budget:
+    elif cv_estimated_budget or budget_source == "cv_round_estimator":
         stop_reason_code = "cv_epoch_budget_exhausted"
         stop_reason_text = (
             f"Scheduled stop: CV-derived budget exhausted "
@@ -3504,6 +3994,17 @@ def _train_xgb_model(
             "stop_reason_code": stop_reason_code,
             "stop_reason_text": stop_reason_text,
             "stopped_early": bool(stop_reason_code not in {"n_estimators_exhausted", "cv_epoch_budget_exhausted"}),
+            # Which rule set n_estimators, as a field rather than only as prose. The stop
+            # reason CODE cannot carry this: `cv_epoch_budget_exhausted` is reported both by
+            # the round estimator and by any path that merely disables early stopping, and
+            # that conflation is why an entire arm's budget mechanism went unnoticed.
+            "budget_mechanism": (
+                budget_source if budget_source
+                else "cv_round_estimator" if cv_estimated_budget
+                else "validation_early_stopping" if stop_reason_code == "validation_early_stopping"
+                else "train_loss_plateau" if stop_reason_code == "train_loss_plateau"
+                else "configured_n_estimators"
+            ),
             "configured": {
                 "n_estimators": int(hyper_cfg["n_estimators"]),
                 "early_stopping_rounds": (
@@ -3583,9 +4084,80 @@ def _train_xgb_model_cv_tuned(
     tuned_hyper["early_stopping_rounds"] = None
     tuned_config["hyperparameters"] = tuned_hyper
 
+    # The budget, from the internal CV round estimator, on the tuned hyperparameters.
+    #
+    # This is called here rather than left to the gate inside `_train_xgb_model`, which
+    # this path cannot satisfy without also handing that function a None
+    # `eval_set_override` -- and that would put the test split back into `eval_set`. Calling
+    # it explicitly keeps the train-only eval_set and `disable_early_stopping=True` while
+    # restoring the budget mechanism, and changes nothing about leakage: the estimator is
+    # given `train_samples` and never sees the test split.
+    #
+    # Scanned to the CONFIGURED ceiling, not to the tuned `n_estimators`. Optuna's choice is
+    # a hyperparameter tuned jointly with eight others against a 5-fold training objective;
+    # using it as the scan ceiling would cap the budget at whatever it happened to pick,
+    # which on Arsenic is 26 of a 300-round search space. The measured comparison that
+    # justifies keeping this rule at all was run against the full 300-round range.
+    #
+    # Folds and seed follow the tuning's own settings, so the budget is estimated on the
+    # same partitions the hyperparameters were chosen on: five folds train each CV model on
+    # 80% of the data against the final fit's 100%, where three folds give 67%.
+    budget_source = None
+    if str(tuned_hyper.get("early_stop_source", "cv")).lower() == "cv":
+        ceiling = int(tuned_hyper.get("early_stop_cv_max_rounds")
+                      or hyper_cfg.get("n_estimators")
+                      or tuned_hyper.get("n_estimators") or 100)
+        est_kwargs = _xgb_model_kwargs(tuned_hyper)
+        est_kwargs = _constrain_fixed_hyperparams(
+            est_kwargs, n_train=len(train_samples),
+            n_folds=int(cv_cfg.get("n_folds", 5) or 5),
+        )
+        est_kwargs["n_estimators"] = ceiling
+        est_rounds = _xgb_cv_estimate_n_estimators(
+            train_samples,
+            est_kwargs,
+            model_kind,
+            str(tuned_hyper[metric_key]),
+            early_stopping_rounds=None,
+            cast_y=cast_y,
+            n_folds=int(tuned_hyper.get("early_stop_cv_folds")
+                        or cv_cfg.get("n_folds", 5) or 5),
+            seed=int(cv_cfg.get("seed", 42)),
+        )
+        if est_rounds:
+            tuned_hyper["n_estimators"] = int(est_rounds)
+            budget_source = "cv_round_estimator"
+            print(
+                f"[INFO] XGBoost budget from the internal CV round estimator: "
+                f"{est_rounds} of {ceiling} scanned round(s); tuned hyperparameters kept."
+            )
+        else:
+            print(
+                "[WARN] XGBoost CV round estimation returned nothing; falling back to the "
+                f"tuned n_estimators ({tuned_hyper.get('n_estimators')})."
+            )
+
     # Use CV-derived median best_iteration as the training budget if available.
+    #
+    # It never is, and it is now a third choice rather than a second. `best_median_iteration`
+    # is the median of the folds' `best_iteration` values, and those exist only when the
+    # tuner early-stops its folds -- but `cv_tuning.use_early_stopping` is false, so no fold
+    # reports one: `median_best_iteration` is null in all 8645 trial rows across all 42
+    # tuning studies on disk, and no stored run names this override as its stop reason.
+    #
+    # Kept because it costs nothing and would be the right fallback if fold early stopping
+    # were ever enabled, but guarded on `budget_source` so it cannot override the round
+    # estimator above. The precedence is: round estimator, then this, then the tuned
+    # `n_estimators`. Note that the statistic it uses is the very one whose collapse mode is
+    # documented in `_xgb_cv_estimate_n_estimators` -- a median over folds that goes to
+    # single digits whenever two of three folds stop early -- so if it is ever revived it
+    # should be revived deliberately.
+    #
+    # All three candidates are leakage-free: `_xgb_tune_hyperparameters_cv` and
+    # `_xgb_cv_estimate_n_estimators` each take only `train_samples` and neither references
+    # `test_samples` or `X_test`.
     cv_median_iter = summary.get("best_median_iteration")
-    if cv_median_iter is not None and cv_median_iter > 0:
+    if budget_source is None and cv_median_iter is not None and cv_median_iter > 0:
         tuned_hyper["n_estimators"] = int(cv_median_iter)
         print(
             f"[INFO] Setting n_estimators={cv_median_iter} from CV median best_iteration "
@@ -3614,6 +4186,7 @@ def _train_xgb_model_cv_tuned(
         cast_y=cast_y,
         eval_set_override=eval_set_override,
         disable_early_stopping=True,
+        budget_source=budget_source,
     )
 
 
