@@ -729,6 +729,86 @@ writes to a scratch forecast name.
 **Chromium and Intestinal enterococci have no tuning cache at the resolved path**, so their
 reported XGB fits re-tuned in process and their budget is not recoverable from disk.
 
+## Identical XGBoost tuning across window representations is degeneracy, not a bug
+
+Worth recording because the signature looks exactly like a serious defect and cost three
+false alarms to settle.
+
+On Chromium the three XGBoost variants -- window representations `none`, `stats:24h` and
+`stats:6h` -- produced byte-identical tuning trials (same MD5 across three separately
+created Optuna studies) and identical tuned hyperparameters in all three caches, while the
+fits themselves demonstrably used different representations: `input_dim` 11, 44 and 44 at
+`seq_len` 167, 7 and 28. That is the signature of the bug the cache-filename fix was written
+for, where a variant inherits hyperparameters tuned on another representation.
+
+It is not that bug. Nickel, whose XGBoost is not degenerate, tunes each representation to
+genuinely different hyperparameters -- `n_estimators` 213, 158 and 126, `max_depth` 2, 3 and
+6, `learning_rate` 0.078, 0.174 and 0.029 -- so the aggregation does reach the tuning
+objective and the caches are representation-specific as intended.
+
+Chromium's identical studies follow from its degeneracy. Its XGBoost predicts a constant
+under every representation (r2 = -0.0014 in all three), so the cross-validation objective is
+flat whatever the features look like, and a study with a fixed seed returns the same trial
+from the same flat landscape. Identical tuning on a degenerate target is therefore expected;
+identical tuning on a target that is NOT degenerate would be the defect.
+
+Two smaller corrections from the same episode. The tuning caches live in
+`forecasts/feature_sweeps/`, not `forecasts/`, so a glob at the wrong level reports one cache
+where three exist. And the trials CSV is written under the run's `forecast_name`, so a script
+that redirects the forecast name will not find it at `forecasts/<model>/xgb_cv_trials.csv`.
+
+## The full pipeline, end to end on one target: what it cost and what it proved
+
+Chromium was run through the complete sweep on the new root with the settings the previous
+run recorded, plus the new seed split: `--no-improve-patience 999`, `--fit-timeout 1200`,
+`--seeds 1 --final-seeds 6`, `--stop-on-error`, everything else default. It was chosen
+because it is one of the two known-degenerate targets and therefore exercises the least
+validated additions.
+
+**Cost, measured rather than projected: 72.5 minutes for the target.** The search took 24m
+53s for 231 of 240 evaluations at 6.5 s each; the final stage, including six-seed ensembling
+of every stochastic winner, took the remaining 47 minutes. An earlier projection of two and
+a half hours was pessimistic by more than double, so six-seed ensembling costs far less than
+feared -- roughly 17 hours for 14 targets rather than 35, and close to the previous run's
+hour-per-target baseline.
+
+**The surrogate degeneracy guard did what it was written for.** All three XGBoost
+configurations and `gp_02` predict a constant on the full feature set (r2 = -0.0014 and
+-0.0012), so the pool was widened automatically to the remaining seven configurations, four
+constant predictors were excluded from the choice, and `gp_03` was selected at r2 = +0.4764.
+Under the previous behaviour the search would have been ranked by a degenerate surrogate
+that cannot separate feature subsets. The search then improved monotonically from 11
+features to 7 (0.4764, 0.4989, 0.5091, 0.5103, 0.5203) and terminated on candidate
+exhaustion rather than on patience -- the patience counter reached 3 of 999, which is the
+expected silence under the recorded settings, not a defect.
+
+**Every gate passed.** The nine invariant checks: 9 passed, 0 warnings, 0 failures, over 531
+run directories -- including 200 seed replicates with none reaching the candidate pool, 70
+of 70 metrics rows agreeing with their predictions to 1e-6, and, for the first time, "84
+XGBoost runs verifiable, 0 contradicting their config, 0 predating the budget_mechanism
+field". CV diagnostics were recorded on all 342 Gaussian process and all 84 transformer
+fits. The provenance manifest finalised with `status=completed`, `candidate_seeds=1`,
+`final_seeds=6`, and a clean working tree at commit 7e25efc, so the run is reproducible from
+its commit alone.
+
+**Reproducibility, tested rather than assumed.** Re-running six stored configurations across
+the three learned families reproduced their pooled R2 to within 2e-4 -- 0.0000 for the
+Gaussian process and transformer, -0.0002 for XGBoost, which is consistent with GPU and
+thread nondeterminism. This is the check that CV22 fails: there, re-running Cadmium's own
+configuration gives -0.8054 against a stored +0.3141.
+
+**Comparability on this target: slightly better, same winner.** On the identical 22-segment
+evaluation set, the Gaussian process improves from +0.5010 to +0.5203 with the same `gp_03`
+variant on a different subset (7 features rather than 4). XGBoost is unchanged at -0.0014
+and still degenerate. The transformer falls from +0.0573 to +0.0149, which is well inside
+its measured noise floor and does not affect the target's outcome.
+
+The most reassuring number is the one that did not move: MLR (+0.4605), naive (-1.8494),
+seasonal (+0.0484) and linear (-0.5653) are **identical to the last decimal** between the two
+roots. Those families are deterministic, so identical values across independently staged
+trees show the re-staging reproduced the data, the splits and the evaluation exactly, and
+that the differences above are model behaviour rather than a changed pipeline.
+
 ## Validation of the new root: what 42 fits across all 14 targets established
 
 One fit per target per family on the staged profiler-free root, no feature search: 42 fits,
@@ -833,7 +913,85 @@ the re-run: the Gaussian process keeps its random-fold cross-validation either w
 diagnostics now record identifiability per fit so the caveat can be quantified rather than
 asserted.
 
-## Duplicate rows leaking across GP folds: a sixth refuted explanation
+## Four fixes applied after the pipeline walkthrough
+
+**Replicate copies that carry no information are now discarded before training.** A window is
+written out ten times so measurement uncertainty can be propagated, but the perturbation only
+touches predictors carrying an uncertainty distribution, and the profiler-free set contains
+none. The check that suppressed the copies at scoring time never reached the training folder,
+so the transformer and the tree models trained on 520 rows spanning 52 windows while the
+Gaussian process and the linear regressions trained on 52 rows spanning the same 52 windows.
+
+`_drop_identical_replicates` in `e_Train` now collapses each group of copies to one
+representative **when every member is numerically identical**, rewrites `train_files.txt` and
+`test_files.txt` so the record matches what was loaded, and prints what it dropped. The test
+is absence of variance rather than the predictor list, which keeps it safe on a
+profiler-bearing run. Controlled by `data_split.drop_identical_replicates`, default true.
+
+Verified on three arms: profiler-free transformer 520 -> 52 training rows and 220 -> 22 test
+rows; profiler-free Gaussian process unchanged at 52, nothing dropped; profiler-bearing
+transformer left at 130 rows over 13 windows with nothing dropped, because there the copies
+genuinely differ.
+
+This changes results. It is a tenfold reduction in the rows the transformer and the trees
+train on, and the tree budget moves with it -- on Chromium the round estimator went from 44
+rounds to 1 once the duplicates were gone, because the fold curves are computed on different
+data. Numbers from earlier runs are not comparable across this change.
+
+**The tree-count scan range no longer depends on how the run was invoked.** The rule scanned
+300 rounds over five groups standalone and 19 rounds over three groups inside a sweep, and
+two candidate explanations were tested and refuted without isolating the cause. The ceiling
+now comes from the tuning search space's own upper bound for the number of trees
+(`param_space.n_estimators.high`), which describes the search rather than a result and so
+cannot have been overwritten by an earlier fit. Verified: the staged configuration and the
+sweep-written configuration now both report a ceiling of 300 over five groups where they
+previously disagreed. The gate inside `_train_xgb_model`, used when tuning is disabled, was
+taking its fold count from a different setting and is now aligned with it.
+
+**Every tree fit records how its budget was reached.** `budget_audit` in the training summary
+carries the tuning cache actually consulted, whether it was a hit, and the scan ceiling, fold
+count and grouping. The two cache locations are not a defect -- the sweep points
+`cv_tuning.cache_path` at its own directory and a standalone run falls back to the dataset's
+forecasts folder -- but a run that did not record which one it read could not be compared with
+another, which is why the scan-range divergence took an investigation rather than one look at
+an artifact.
+
+**The transformer's fallback no longer consults the held-back split.** If the cross-validated
+epoch estimate failed, the old fallback set the stopping source to `threshold`, which left
+`max_epochs_override` unset -- and `train_transformer` then restores the epoch that scored
+best on `testloader`, the held-back split. The fallback now pins the configured epoch ceiling
+instead, so training runs its full length and the last epoch is kept. The path was never
+taken in any run examined, which is precisely why it was worth closing.
+
+## Correction: the GP never had duplicate rows to leak
+
+An earlier entry in this file explained the Gaussian process's flat epoch curves as duplicate Monte
+Carlo copies leaking across its cross-validation folds, and recorded the grouped-fold experiment that
+refuted it. The refutation stands, but the premise was wrong, and the reason is worth stating because
+it invalidates the reasoning rather than just the conclusion.
+
+Each family's training folder is fixed in its configuration. `config_gp_*.yml` and the MLR path read
+`samples/`, the unreplicated folder; `config_transformer_*.yml` and `config_xgb_*.yml` read
+`mc_replicates/`. Verified on both CV22_profilerless and CV24_profilerless, and against the file lists
+of completed runs: a stored Gaussian process fit trained on 52 rows spanning 52 windows, while a
+transformer or tree fit on the same target trained on 520 rows spanning the same 52 windows.
+
+So the Gaussian process trains one row per window and has nothing to group. Its ungrouped random folds
+are equivalent to grouped ones, which is why adding a grouped scheme could not have improved anything
+and why the measured result -- no change in identifiability -- was the only possible outcome. The
+transformer and tree estimators, which do train on ten copies per window, already group by window.
+Every family groups exactly when its data contains duplicates, and none of the three uses a
+chronological split for choosing a training length.
+
+What survives as a real finding is narrower and different: **the neural network and the tree family
+train on ten identical copies of every window, for no added information.** The check that suppresses
+the copies governs scoring only -- every model is scored on the 22 distinct held-back windows -- and
+does not reach the choice of training folder. For the transformer this multiplies the gradient steps
+per pass by ten; for the trees it inflates the sample count seen by the range-narrowing rule and by the
+fold sizes, while that family's own settings tuning removes the copies, so the tuning and the fit
+disagree about how much data exists.
+
+## Duplicate rows leaking across GP folds: the original entry, premise now corrected
 
 The Gaussian process's epoch budget is unidentified for 93% of fits, and five explanations
 have already been refuted. A sixth was structural enough to look decisive, and it too

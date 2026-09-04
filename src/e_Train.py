@@ -493,6 +493,10 @@ DEFAULT_DATA_SPLIT_CONFIG = {
     # False where the split is pinned across runs: rebalancing would move training
     # segments into a test set that other runs are also scored on.
     "allow_rebalance": True,
+    # Discard replicate copies of a window that are numerically identical, which they
+    # are whenever the predictor set contains nothing carrying an uncertainty
+    # distribution. Set False to train on the copies as earlier runs did.
+    "drop_identical_replicates": True,
 }
 
 DEFAULT_EVALUATION_CONFIG = {
@@ -650,6 +654,82 @@ def _preferred_eval_path_for_key(key: str, data_root: Path) -> Path | None:
             return candidate.resolve()
     return None
 
+def _drop_identical_replicates(train_samples, test_samples, data_cfg, enabled=True):
+    """Discard Monte Carlo replicate copies of a window that carry no information.
+
+    A window is written out `n_mc_replicates` times so measurement uncertainty can be
+    propagated, but the perturbation only touches predictors that have an uncertainty
+    distribution attached. On a predictor set containing none of them the copies are
+    numerically identical, and training on ten identical rows costs ten times the work for
+    the information in one.
+
+    That was the situation for two of the four families. The Gaussian process and the linear
+    regressions read the unreplicated sample folder and trained on one row per window; the
+    transformer and the tree models read the replicated folder and trained on ten copies of
+    each. Measured on Chromium: 520 training rows spanning 52 windows for those two against
+    52 rows spanning 52 windows for the others. The check that suppresses the copies at
+    scoring time (`collapse_mc_replicates_for_eval`) never reached the training folder.
+
+    The test applied here is absence of variance, not the predictor list, so it is safe on a
+    profiler-bearing run: a group whose copies differ anywhere is kept whole, and only groups
+    identical throughout collapse to one representative. NaNs compare equal, since an all-NaN
+    profiler channel is a legitimate identical value.
+
+    The retained names are written back over `train_files.txt` and `test_files.txt`, so the
+    run's record of what it trained on matches what it loaded.
+    """
+    if not enabled:
+        return train_samples, test_samples
+
+    def collapse(samples):
+        groups = {}
+        order = []
+        for item in samples:
+            gid = _base_sample_id(str(item[2]))
+            if gid not in groups:
+                groups[gid] = []
+                order.append(gid)
+            groups[gid].append(item)
+        kept, dropped = [], 0
+        for gid in order:
+            members = groups[gid]
+            if len(members) > 1:
+                first = members[0]
+                same = all(
+                    np.array_equal(np.asarray(m[0]), np.asarray(first[0]), equal_nan=True)
+                    and np.array_equal(np.asarray(m[1]), np.asarray(first[1]), equal_nan=True)
+                    for m in members[1:]
+                )
+                if same:
+                    kept.append(first)
+                    dropped += len(members) - 1
+                    continue
+            kept.extend(members)
+        return kept, dropped
+
+    new_train, dropped_train = collapse(list(train_samples))
+    new_test, dropped_test = collapse(list(test_samples))
+    if not (dropped_train or dropped_test):
+        return train_samples, test_samples
+
+    print(
+        "[MC-POLICY] Dropped identical replicate copies: train %d -> %d rows, test %d -> %d "
+        "rows. The discarded copies were numerically identical, so no information was lost."
+        % (len(train_samples), len(new_train), len(test_samples), len(new_test))
+    )
+
+    try:
+        run_dir = Path(data_cfg["data_dir"], "forecasts", data_cfg["forecast_name"])
+        run_dir.mkdir(parents=True, exist_ok=True)
+        for fname, kept in (("train_files.txt", new_train), ("test_files.txt", new_test)):
+            with open(run_dir / fname, "w", encoding="utf-8") as fh:
+                fh.writelines("%s\n" % str(item[2]) for item in kept)
+    except Exception as exc:
+        print("[WARN] Could not rewrite the split file lists after dropping replicates: %s" % exc)
+
+    return new_train, new_test
+
+
 def load_and_split_data(config):
     """Load and split data according to configuration."""
     data_cfg = config["data"]
@@ -692,6 +772,11 @@ def load_and_split_data(config):
         split_cfg.get("allow_rebalance", True),
     )
     
+    train_samples, test_samples = _drop_identical_replicates(
+        train_samples, test_samples, data_cfg,
+        enabled=bool(split_cfg.get("drop_identical_replicates", True)),
+    )
+
     return train_samples, test_samples
 
 
@@ -1236,11 +1321,21 @@ def train_transformer_model(config, train_samples, test_samples):
                 f"(CV-derived budget); no test-set early stopping."
             )
         else:
+            # The old fallback set the source to 'threshold', which leaves
+            # `max_epochs_override` as None -- and `train_transformer` then restores
+            # the epoch that scored best on `testloader`, which is the held-back
+            # split. That would let held-back data choose the model, on a path
+            # reached only when the estimator fails and so easy to miss. Pin the
+            # configured ceiling instead: training runs its full length and the last
+            # epoch is kept, so nothing consults the held-back split.
+            max_epochs_override = int(hyper_cfg["num_epochs"])
+            transformer_early_stop_source = "fixed_on_cv_failure"
             print(
-                "[WARN] Transformer CV epoch estimation failed; "
-                "falling back to threshold stopping."
+                "[WARN] Transformer CV epoch estimation failed; training for the "
+                "configured %d epochs and keeping the last one. (The previous "
+                "fallback selected weights using the held-back split.)"
+                % max_epochs_override
             )
-            transformer_early_stop_source = "threshold"
     if transformer_early_stop_source == "threshold":
         print("[INFO] Transformer early_stop_source='threshold': using train combined loss threshold only.")
 
@@ -3689,6 +3784,7 @@ def _train_xgb_model(
     eval_set_override=None,
     disable_early_stopping: bool = False,
     budget_source: str | None = None,
+    budget_audit: dict | None = None,
 ):
     """Shared XGBoost training implementation for regressor and classifier.
 
@@ -3775,12 +3871,21 @@ def _train_xgb_model(
             metric,
             early_stopping_rounds=hyper_cfg["early_stopping_rounds"],
             cast_y=cast_y,
-            # Honour the same fold-count setting the GP and transformer estimators use.
-            # Three folds train each CV model on 67% of the data while the reported model
-            # gets 100%, which biases the budget low; five raises that to 80%.
-            n_folds=int(hyper_cfg.get("early_stop_cv_folds", 3)),
+            # Same fold source as the CV-tuned path, so the two cannot disagree about how
+            # the budget was estimated. The tuning's own fold count is preferred where it
+            # exists: five folds train each CV model on 80% of the data against the
+            # reported model's 100%, where three give 67% and bias the budget low.
+            n_folds=int((hyper_cfg.get("cv_tuning") or {}).get("n_folds")
+                        or hyper_cfg.get("early_stop_cv_folds", 3) or 3),
         )
         if cv_n_est is not None:
+            budget_audit = dict(budget_audit or {})
+            budget_audit.setdefault("budget_scan_ceiling", int(model_kwargs["n_estimators"]))
+            budget_audit.setdefault(
+                "budget_scan_folds",
+                int((hyper_cfg.get("cv_tuning") or {}).get("n_folds")
+                    or hyper_cfg.get("early_stop_cv_folds", 3) or 3))
+            budget_audit.setdefault("budget_scan_grouping", "by_window")
             model_kwargs["n_estimators"] = cv_n_est
             cv_estimated_budget = True
             print(
@@ -3998,6 +4103,10 @@ def _train_xgb_model(
             # reason CODE cannot carry this: `cv_epoch_budget_exhausted` is reported both by
             # the round estimator and by any path that merely disables early stopping, and
             # that conflation is why an entire arm's budget mechanism went unnoticed.
+            # How the budget was arrived at, in enough detail to compare two runs without
+            # re-deriving it: which cache was read, and over what range and how many groups
+            # the scan ran.
+            "budget_audit": dict(budget_audit or {}),
             "budget_mechanism": (
                 budget_source if budget_source
                 else "cv_round_estimator" if cv_estimated_budget
@@ -4103,14 +4212,32 @@ def _train_xgb_model_cv_tuned(
     # same partitions the hyperparameters were chosen on: five folds train each CV model on
     # 80% of the data against the final fit's 100%, where three folds give 67%.
     budget_source = None
+    budget_audit = {
+        # Which tuning cache was consulted and whether it supplied the hyperparameters.
+        # The sweep points this at its own directory through `cv_tuning.cache_path`; a
+        # standalone run falls back to the dataset's forecasts folder. Both are legitimate,
+        # but a run that does not record which one it read cannot be compared with another.
+        "tuning_cache": str(cache_path),
+        "tuning_cache_hit": bool(best_params) and not tuning_ran,
+        "tuning_ran": bool(tuning_ran),
+    }
     if str(tuned_hyper.get("early_stop_source", "cv")).lower() == "cv":
+        # The ceiling comes from the tuning search space's upper bound for the number of
+        # trees, not from any configuration value that an earlier fit could have
+        # overwritten. `param_space.n_estimators.high` describes the search rather than a
+        # result, so it is identical whether this runs standalone or inside a sweep --
+        # which the previous expression was not: it scanned 300 rounds standalone and 19
+        # inside a sweep, for reasons never isolated.
+        _space = ((cv_cfg.get("param_space") or {}).get("n_estimators") or {})
         ceiling = int(tuned_hyper.get("early_stop_cv_max_rounds")
+                      or _space.get("high")
                       or hyper_cfg.get("n_estimators")
-                      or tuned_hyper.get("n_estimators") or 100)
+                      or 100)
+        est_folds = int(tuned_hyper.get("early_stop_cv_folds")
+                        or cv_cfg.get("n_folds", 5) or 5)
         est_kwargs = _xgb_model_kwargs(tuned_hyper)
         est_kwargs = _constrain_fixed_hyperparams(
-            est_kwargs, n_train=len(train_samples),
-            n_folds=int(cv_cfg.get("n_folds", 5) or 5),
+            est_kwargs, n_train=len(train_samples), n_folds=est_folds,
         )
         est_kwargs["n_estimators"] = ceiling
         est_rounds = _xgb_cv_estimate_n_estimators(
@@ -4120,10 +4247,12 @@ def _train_xgb_model_cv_tuned(
             str(tuned_hyper[metric_key]),
             early_stopping_rounds=None,
             cast_y=cast_y,
-            n_folds=int(tuned_hyper.get("early_stop_cv_folds")
-                        or cv_cfg.get("n_folds", 5) or 5),
+            n_folds=est_folds,
             seed=int(cv_cfg.get("seed", 42)),
         )
+        budget_audit["budget_scan_ceiling"] = int(ceiling)
+        budget_audit["budget_scan_folds"] = int(est_folds)
+        budget_audit["budget_scan_grouping"] = "by_window"
         if est_rounds:
             tuned_hyper["n_estimators"] = int(est_rounds)
             budget_source = "cv_round_estimator"
@@ -4187,6 +4316,7 @@ def _train_xgb_model_cv_tuned(
         eval_set_override=eval_set_override,
         disable_early_stopping=True,
         budget_source=budget_source,
+        budget_audit=budget_audit,
     )
 
 
