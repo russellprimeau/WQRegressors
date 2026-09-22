@@ -15,9 +15,15 @@ $ErrorActionPreference = 'Stop'
 # hairlines at any density.
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$root = (Resolve-Path (Join-Path $here '..\..')).Path
-$draftDir = Join-Path $root 'docs\report\draft\figures'
 $name = 'wq_pipeline'
+
+if (-not $env:WQ_MANUSCRIPT_ROOT) {
+    throw 'WQ_MANUSCRIPT_ROOT is not set. Open wq-forecasting.code-workspace, or set it for this shell.'
+}
+$draftDir = Join-Path $env:WQ_MANUSCRIPT_ROOT 'figures'
+if (-not (Test-Path -LiteralPath $draftDir)) {
+    throw "Manuscript figures directory not found: $draftDir"
+}
 
 # Graphviz computes node positions and routes every directed edge.
 $dot = (Get-Command dot -ErrorAction SilentlyContinue).Source

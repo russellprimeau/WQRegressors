@@ -1,6 +1,7 @@
 """Shared figure styling for report-grade output.
 
-Every figure in this repository is ultimately included in ``docs/report/draft/manuscript.tex``
+Every figure in this repository is ultimately included in the manuscript's ``manuscript.tex``
+(the sibling ``forecasting-hazardous-wq-manuscript`` checkout, located via ``WQ_MANUSCRIPT_ROOT``)
 with ``\\includegraphics[width=1\\linewidth]{...}``.  The MDPI single-column body is
 ``PAGE_WIDTH_IN`` inches wide, so a figure drawn wider than that is *downscaled* by LaTeX,
 and every point of text in it shrinks by the same factor::

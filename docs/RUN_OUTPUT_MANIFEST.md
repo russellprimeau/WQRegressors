@@ -100,7 +100,10 @@ mv data/output/CV19 data/output/CV19_superseded
 # 6. Canonical results: every method on one evaluation set per target.
 .venv/Scripts/python src/z8_CommonSetMetrics.py --root data/output/CV19
 
-# 7. Manuscript outputs.
+# 7. Manuscript outputs. z6 writes into the manuscript repository, which is a
+#    sibling checkout, not a submodule: set WQ_MANUSCRIPT_ROOT first (or run from
+#    wq-forecasting.code-workspace, which sets it) or the script exits without
+#    writing.
 .venv/Scripts/python src/z6_TargetSummaryTable.py
 .venv/Scripts/python src/z9_QualityMatrix.py
 .venv/Scripts/python src/z7_StructureCompare.py --exclude-model none

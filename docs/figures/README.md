@@ -10,7 +10,20 @@ line: all of its content was linguistic and its edges carried no information.
 ### Resolution
 
 The output is `wq_pipeline.png` at **1200 dpi** (7675 px wide, ~1.2 MB), copied into
-`docs/report/draft/figures/` for the submission bundle.
+the manuscript's `figures/` directory for the submission bundle.
+
+The manuscript is a *sibling repository*, not a submodule: it lives beside this one
+as `forecasting-hazardous-wq-manuscript`, and the render scripts find it through the
+`WQ_MANUSCRIPT_ROOT` environment variable rather than a relative path. Opening
+`wq-forecasting.code-workspace` sets that variable for every integrated terminal. In
+any other shell, set it first or the scripts refuse to run:
+
+```powershell
+$env:WQ_MANUSCRIPT_ROOT = 'C:\Users\Master\Documents\GitHub\forecasting-hazardous-wq-manuscript'
+```
+
+There is deliberately no default. A guessed path that happens not to exist would be
+created by the first copy, and the paper would then cite a figure nobody updates.
 
 This figure is the hardest case for a raster: line art plus 7.5 pt type, where every
 cell border is a hairline. At low pixel density the rasteriser spreads each hairline

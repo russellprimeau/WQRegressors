@@ -46,7 +46,6 @@ from utils import evidence as ev
 from utils import run_paths as rp
 
 SUMMARY_NAME = "common_set_metrics.csv"
-TABLE_DIR = Path("docs/report/draft/tables")
 
 # Filename, LaTeX label and caption are one decision, not three. The manuscript
 # cites the label and prints the caption, so a table emitted under the wrong
@@ -303,7 +302,8 @@ def main() -> int:
     root = rp.root_of_summary(summary)
     name = args.variant or ("main" if rp.is_reporting_root(root) else "profiler")
     variant = VARIANTS[name]
-    output = args.output or (rp.REPO_ROOT / TABLE_DIR / variant["filename"])
+    output = (Path(args.output) if args.output
+              else rp.manuscript_dir("tables") / variant["filename"])
 
     df = pd.read_csv(summary)
     rows = build_rows(df, args.dataset_prefix)

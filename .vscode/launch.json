@@ -10,7 +10,13 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            "cwd": "${fileDirname}"
+            "cwd": "${fileDirname}",
+            // The manuscript is a sibling repository, so scripts that write into it
+            // (z6_TargetSummaryTable.py) refuse to run without this. Resolves only
+            // inside wq-forecasting.code-workspace.
+            "env": {
+                "WQ_MANUSCRIPT_ROOT": "${workspaceFolder:forecasting-hazardous-wq-manuscript}"
+            }
         }
     ]
 }

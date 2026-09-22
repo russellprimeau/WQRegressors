@@ -1,10 +1,17 @@
 $ErrorActionPreference = 'Stop'
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$root = (Resolve-Path (Join-Path $here '..\..')).Path
 $source = Join-Path $here 'wq_modelling_workflow.dot'
 $output = Join-Path $here 'wq_modelling_workflow.png'
-$draftOutput = Join-Path $root 'docs\report\draft\figures\wq_modelling_workflow.png'
+
+if (-not $env:WQ_MANUSCRIPT_ROOT) {
+    throw 'WQ_MANUSCRIPT_ROOT is not set. Open wq-forecasting.code-workspace, or set it for this shell.'
+}
+$draftDir = Join-Path $env:WQ_MANUSCRIPT_ROOT 'figures'
+if (-not (Test-Path -LiteralPath $draftDir)) {
+    throw "Manuscript figures directory not found: $draftDir"
+}
+$draftOutput = Join-Path $draftDir 'wq_modelling_workflow.png'
 
 # Graphviz computes node positions and routes every directed edge.
 $dot = (Get-Command dot -ErrorAction SilentlyContinue).Source

@@ -13,9 +13,16 @@ caller states otherwise, so a script can only ever write where it read.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# The manuscript is a sibling repository, not a submodule, so its location is not
+# derivable from this repo's layout and is required rather than guessed. A guessed
+# path that happens not to exist is created by the first write, and the paper then
+# cites a table nobody updates.
+MANUSCRIPT_ROOT_ENV = "WQ_MANUSCRIPT_ROOT"
 
 # The root the manuscript is built from. Declared once, here, so that changing
 # which arm the paper reports is a one-line edit rather than a shell argument
@@ -29,6 +36,34 @@ PROFILER_ROOT = Path("data/output/CV19")
 
 # The results root used when a script is invoked with no arguments at all.
 DEFAULT_ROOT = REPORTING_ROOT
+
+
+def manuscript_root() -> Path:
+    """The manuscript checkout named by ``WQ_MANUSCRIPT_ROOT``."""
+    raw = os.environ.get(MANUSCRIPT_ROOT_ENV)
+    if not raw:
+        raise SystemExit(
+            f"{MANUSCRIPT_ROOT_ENV} is not set. It must point at the "
+            "forecasting-hazardous-wq-manuscript checkout; open "
+            "wq-forecasting.code-workspace, or set it for this shell."
+        )
+    root = Path(raw).expanduser()
+    if not root.is_dir():
+        raise SystemExit(f"{MANUSCRIPT_ROOT_ENV} does not exist: {root}")
+    return root
+
+
+def manuscript_dir(sub: str) -> Path:
+    """A subdirectory of the manuscript, which must already exist.
+
+    Refusing to create it is the point: a script that writes into the paper
+    should fail loudly when the paper is not checked out, rather than leave a
+    correct-looking file in a directory nothing reads.
+    """
+    d = manuscript_root() / sub
+    if not d.is_dir():
+        raise SystemExit(f"manuscript has no {sub!r} directory: {d}")
+    return d
 
 
 def is_reporting_root(root: Path | str | None) -> bool:
