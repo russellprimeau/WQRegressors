@@ -1142,9 +1142,20 @@ def _train_single_config(
                 "fit exceeded --fit-timeout of %d s and was killed (%s)"
                 % (_FIT_TIMEOUT_S, config_path.name))
         except subprocess.CalledProcessError as exc:
-            tail = (exc.stderr or "").strip().splitlines()
-            raise RuntimeError("training subprocess failed: %s"
-                               % (tail[-1][:200] if tail else "no stderr"))
+            # stderr arrives as bytes, and the last line on its own is rarely the
+            # cause: for an exception raised inside the child it is the exception
+            # message with the traceback that names the failing file already stripped
+            # off. Decode it and keep the tail of the traceback, so a fit that fails
+            # part-way through an unattended run can be diagnosed from the log alone
+            # instead of having to be reproduced.
+            err = exc.stderr
+            if isinstance(err, (bytes, bytearray)):
+                err = err.decode("utf-8", errors="replace")
+            lines = (err or "").strip().splitlines()
+            sep = "\n         "
+            detail = sep.join(lines[-12:]) if lines else "no stderr"
+            raise RuntimeError("training subprocess failed (exit %s):%s%s"
+                               % (exc.returncode, sep, detail))
         finally:
             try:
                 staged.unlink()
