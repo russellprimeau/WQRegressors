@@ -143,6 +143,7 @@ from utils.config_utils import (
     UNCERTAINTY_DISTRIBUTION_FEATURES,
     feature_carries_uncertainty,
 )
+from utils.training import replicate_file_names
 import os
 import unicodedata
 import seaborn as sns
@@ -2311,9 +2312,11 @@ def _cv_folds_root(dataset_dir: Path, row_count: int) -> Path:
 def _cv_folds_dir(dataset_dir: Path, row_count: int, sample_subdir: str) -> Path:
     """Fold directory for one sample subdirectory.
 
-    GP and MLR train on `samples` while XGBoost and the Transformer train on
-    `mc_replicates`, so the file lists differ even though the segment boundaries do
-    not. Keeping them apart stops one family's list being handed to another.
+    The GP trains on `samples` -- it marginalises input noise inside its kernel, so
+    replicates would double-count the same uncertainty -- while MLR, XGBoost and the
+    Transformer train on `mc_replicates` where a root has them. The file lists therefore
+    differ even though the segment boundaries do not, and keeping them apart stops one
+    family's list being handed to another.
     """
     return _cv_folds_root(dataset_dir, row_count) / str(sample_subdir)
 
@@ -6288,15 +6291,59 @@ def _evaluate_selected_subsets_all_models(
                     if _mlr_to_evaluate:
                         _mlr_variant_dirs = sorted(output_dir.glob(f"*_r{k01.row_count:03d}_{mlr_full_tag}*"))
                         _mlr_split_dir = _mlr_variant_dirs[0] if _mlr_variant_dirs else _ref_vd
+                        # MLR fits on the replicated samples, as XGBoost and the
+                        # transformer do. A linear model is exactly invariant to a
+                        # constant offset applied to every window -- the intercept
+                        # absorbs it -- so while the replicates carried one global
+                        # offset there was nothing for MLR to gain from them. Once the
+                        # offsets vary per window they are errors-in-variables, which
+                        # attenuates coefficients toward zero; scoring MLR on clean
+                        # predictors while the other families see perturbed ones would
+                        # flatter it for a reason unrelated to forecasting skill.
+                        #
+                        # Feature selection above deliberately stays on `_sample_sub`:
+                        # replicates inflate n without adding independent observations,
+                        # which would distort the Spearman pre-filter's significance.
+                        _mlr_sample_sub = (
+                            "mc_replicates"
+                            if (Path(_data_dir) / "mc_replicates").is_dir()
+                            else _sample_sub
+                        )
+                        # The pinned split lists plain `segment_NNNN.csv` names, which do
+                        # not exist inside mc_replicates/. Expanding them to the replicate
+                        # file names is required, not cosmetic: load_split_samples passes
+                        # the list straight through, and with fault_tolerant=True every
+                        # name would simply be missed, leaving an empty training set and
+                        # MLR silently absent from the results.
+                        _mlr_split_override = None
+                        if _mlr_sample_sub == "mc_replicates":
+                            _mlr_split_override = {}
+                            for _sf in ("train_files.txt", "test_files.txt"):
+                                _names = eval_module._read_split_files(_mlr_split_dir, _sf)
+                                _expanded = []
+                                for _n in _names:
+                                    _expanded.extend(
+                                        replicate_file_names(_data_dir, _n, _mlr_sample_sub)
+                                    )
+                                _mlr_split_override[_sf] = _expanded
                         _load_kw_mlr = dict(
-                            data_dir=_data_dir, sample_subdir=_sample_sub,
+                            data_dir=_data_dir, sample_subdir=_mlr_sample_sub,
                             forecast_name=_ref_dcfg.get("forecast_name", ""),
                             input_columns=list(_spearman_cols), output_columns=_output_cols,
                             input_rows=slice(_in_r1, _in_r2), output_rows=_out_rows,
                             split_source_dir=_mlr_split_dir, input_aggregation=_in_agg,
                         )
-                        _tr_mlr = eval_module.load_split_samples(**_load_kw_mlr, split_file="train_files.txt", fault_tolerant=True)
-                        _te_mlr = eval_module.load_split_samples(**_load_kw_mlr, split_file="test_files.txt", fault_tolerant=True)
+                        _tr_mlr = eval_module.load_split_samples(
+                            **_load_kw_mlr, split_file="train_files.txt", fault_tolerant=True,
+                            split_files_override=(_mlr_split_override or {}).get("train_files.txt"))
+                        _te_mlr = eval_module.load_split_samples(
+                            **_load_kw_mlr, split_file="test_files.txt", fault_tolerant=True,
+                            split_files_override=(_mlr_split_override or {}).get("test_files.txt"))
+                        if _mlr_sample_sub == "mc_replicates" and not _tr_mlr:
+                            # Loud, because an empty replicate load is indistinguishable
+                            # from "MLR had nothing to fit" once it reaches the results.
+                            print(f"[WARN] MLR found no samples under {_mlr_sample_sub} for "
+                                  f"{mlr_subset_label}; the split expansion did not match any file.")
                         if len(_tr_mlr) >= 3 and len(_te_mlr) >= 1:
                             _mlr_results = _run_mlr_variants_on_existing_split(
                                 train_samples=_tr_mlr,
@@ -6366,7 +6413,13 @@ def _evaluate_selected_subsets_all_models(
                                     dataset_dir=dataset_plan.dataset_dir,
                                     subset_label=mlr_subset_label,
                                     data_dir=_data_dir,
-                                    sample_subdir=_sample_sub,
+                                    # The subdir MLR actually read. The reference variant's
+                                    # subdir is not interchangeable: the reference forecasts
+                                    # are scored against these same test rows, so reading a
+                                    # different folder than test_samples came from looks for
+                                    # replicate names under samples/ and fails -- into a
+                                    # [WARN], leaving the skill denominator silently absent.
+                                    sample_subdir=_mlr_sample_sub,
                                     input_columns=list(_spearman_cols),
                                     output_columns=_output_cols,
                                     input_row_1=_in_r1,

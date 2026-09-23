@@ -142,6 +142,55 @@ earlier as a quirk in `v3_SeedVarianceRefit.seed_changes_this_fit`, whose docstr
 the disagreement as a reason to read the fitted artifact; that remains the right test,
 because artifacts written before this fix have the spurious variance baked into them.
 
+## The Monte Carlo replicate draw was global, not per window (fixed 2026-09-23)
+
+`apply_uncertainty_perturbation` draws one calibration offset per sensor per call, and a
+call is one replicate of one window — the per-window Monte Carlo draw the method was
+designed around. But it reseeded NumPy's **global** RNG from `random_seed + k`, which
+contains no window term, so every window was handed the same state and returned the same
+offset. Verified on disk: replicate 1 applied an identical six-number offset vector to
+every segment **and every target** in CV19, CV25 and CV29.
+
+Two consequences. Statistically, ten replicates encoded one global shift rather than ten
+per-window draws, making all windows perfectly correlated. A window spans 7 days; the
+record spans 545 days with 29 calibration events, so a true calibration state covers about
+3 windows — the old behaviour overstated that persistence by ~29×, treating a sensor
+recalibrated 29 times as calibrated once. For storage, it meant the entire 8.32 GB
+replicate tree was reconstructible from K × 6 = 60 numbers that were recorded nowhere.
+
+The seed now mixes `(random_seed, segment_counter, k)` through `SeedSequence`, and the draw
+comes from a local `default_rng` so it no longer perturbs process-wide RNG state. The
+applied offsets are written to `<target>/provenance/mc_offsets.csv`, so the tree is
+reconstructible from `samples/` and is no longer the only record of itself.
+
+**Residual, deliberately not fixed:** a calibration bias is constant *between*
+recalibrations, so the faithful draw is blocked by calibration interval rather than
+independent per window. After this fix the remaining error is that factor of ~3, against
+~29× before. Deferred because it needs calibration timestamps to align events to the
+record: `Event_ID` in `offset_gain_model_results.csv` is an index with no date.
+
+## MLR now trains on the replicated samples (2026-09-23)
+
+MLR previously read `samples` while XGBoost and the transformer read `mc_replicates`, and
+while the offsets were global that was **exactly** correct: a constant offset applied to
+every window is absorbed entirely by the intercept, so a linear model is invariant to it.
+Measured: coefficient change −2.2e-16, test-prediction change 3.6e-15. Replicates could not
+have told MLR anything.
+
+Per-window draws remove that invariance — they are errors-in-variables, which attenuates
+coefficients toward zero. In the same test the coefficient on the perturbed predictor fell
+from 1.477 to 0.996, a 33% attenuation, with predictions moving by up to 2.06. Leaving MLR
+on `samples` would have scored it on clean predictors while the other families saw perturbed
+ones, flattering a reported comparator for a reason unrelated to forecasting skill.
+
+The GP still reads `samples`: it marginalises input noise analytically inside its kernel, so
+replicates would double-count the same uncertainty. MLR's feature pre-filter also still runs
+on `samples`, because replicates inflate *n* without adding independent observations and
+would distort the Spearman significance.
+
+**Expect MLR coefficients to shrink.** That is the errors-in-variables effect the replicates
+exist to propagate, not a regression.
+
 ## MLR reclassified as a predictor-driven method
 
 MLR is counted among the machine-learning methods and is no longer in the skill

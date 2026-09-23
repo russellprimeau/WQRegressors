@@ -976,15 +976,23 @@ def sample_from_distribution(
     t_df=None,
     t_loc=None,
     t_scale=None,
+    rng=None,
 ):
     """
     Sample from a distribution given mean/std or explicit Student's t parameters.
+
+    ``rng`` is a ``numpy.random.Generator``. Passing one keeps the draw local to the
+    caller instead of consuming and advancing NumPy's process-wide legacy state, which
+    any other component drawing afterwards would otherwise inherit.
     """
     if pd.isna(mean) or pd.isna(std) or std == 0:
         return np.zeros(size) if size > 1 else 0
-    
+
+    if rng is None:
+        rng = np.random.default_rng()
+
     if distribution_type == 'normal' or distribution_type == 'equivalent':
-        return np.random.normal(mean, std, size)
+        return rng.normal(mean, std, size)
     elif distribution_type == 't':
         if (
             t_df is None
@@ -998,7 +1006,7 @@ def sample_from_distribution(
             raise ValueError(
                 f"Missing/invalid Student's t params: df={t_df}, loc={t_loc}, scale={t_scale}"
             )
-        return stats.t.rvs(df=t_df, loc=t_loc, scale=t_scale, size=size)
+        return stats.t.rvs(df=t_df, loc=t_loc, scale=t_scale, size=size, random_state=rng)
     else:
         raise ValueError(f"Unsupported distribution_type={distribution_type!r}")
 
@@ -1038,19 +1046,30 @@ def normalize_uncertainty_params(params, col_name, norm_params):
 def apply_uncertainty_perturbation(segment_df, sensor_uncertainties, random_seed=None):
     """
     Apply Monte Carlo uncertainty perturbations to a segment.
-    
+
     Simple model: perturbed = measured + offset
-    
-    Where offset is drawn once per replicate from the Correction1 distribution
-    for each sensor (based on calibration event analysis).
-    
+
+    One offset is drawn per sensor **per call**, from that sensor's fitted Correction1
+    distribution. A call is one replicate of one window, so each window receives its own
+    draw and the offset is constant down the window -- a calibration bias does not vary
+    within the seven days a window spans.
+
+    ``random_seed`` must therefore vary with the window as well as the replicate index.
+    It previously did not: callers passed ``random_seed + k``, and this function reseeded
+    NumPy's global state from it, so every window was handed the same state and returned
+    the same offset. The per-window Monte Carlo draw collapsed to a single global offset
+    per replicate, which made all windows perfectly correlated and left the whole
+    replicate tree reconstructible from K x 6 numbers.
+
+    The draw is now taken from a local Generator, so it neither depends on nor disturbs
+    process-wide RNG state.
+
     sensor_uncertainties: dict mapping sensor_name -> uncertainty_summary_dict
-    
+
     Returns: perturbed DataFrame
     """
-    if random_seed is not None:
-        np.random.seed(random_seed)
-    
+    rng = np.random.default_rng(random_seed)
+
     df_perturbed = segment_df.copy()
     
     # Sensor column mappings, derived from the one definition of which predictors carry
@@ -1073,7 +1092,7 @@ def apply_uncertainty_perturbation(segment_df, sensor_uncertainties, random_seed
         
         uncertainty_info = sensor_uncertainties[sensor_key]
         
-        # Draw offset once per replicate from Offset distribution (based on Correction1)
+        # One draw per sensor for this window/replicate, from the local generator.
         offset = sample_from_distribution(
             uncertainty_info.get('Offset_Mean', 0),
             uncertainty_info.get('Offset_Std', 0),
@@ -1082,6 +1101,7 @@ def apply_uncertainty_perturbation(segment_df, sensor_uncertainties, random_seed
             t_df=uncertainty_info.get('Offset_t_df'),
             t_loc=uncertainty_info.get('Offset_t_loc'),
             t_scale=uncertainty_info.get('Offset_t_scale'),
+            rng=rng,
         )[0]
         
         mask = df_perturbed[column_name].notna()
@@ -1262,6 +1282,24 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
             directory=NORMALIZATION_OUTPUT_PATH.parent,
         )
 
+    # A replicate can only differ from its base where a predictor being written carries a
+    # measured uncertainty distribution. With none of them present every replicate is a
+    # byte-identical copy, and the readers that already collapse identical groups
+    # (e_Train._drop_identical_replicates, collapse_mc_replicates_for_eval) see exactly
+    # what they would have seen from `samples`. Writing them anyway cost six of thirteen
+    # roots their entire mc_replicates tree in pure duplication.
+    perturbable_written = [
+        col for col in predictor_cols
+        if col in df.columns and feature_carries_uncertainty(col)
+    ]
+    if use_uncertainty_perturbation and not perturbable_written:
+        if verbose:
+            print(
+                "[INFO] No predictor being written carries an uncertainty distribution; "
+                "skipping mc_replicates. The replicated families will read 'samples'."
+            )
+        use_uncertainty_perturbation = False
+
     samples_dir = os.path.join(output_dir, 'samples')
     perturbed_samples_dir = os.path.join(output_dir, 'mc_replicates')
 
@@ -1271,6 +1309,15 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
     if use_uncertainty_perturbation:
         os.makedirs(perturbed_samples_dir, exist_ok=True)  # Create directory for perturbed MC output files
         clean_directory(perturbed_samples_dir)
+    elif os.path.isdir(perturbed_samples_dir):
+        # Replicates are derived from the samples that were just rewritten, so any tree
+        # left from an earlier generation is stale by construction. Leaving it would
+        # strand hundreds of megabytes that no emitted config references, and would feed
+        # stale windows to any config elsewhere still naming the folder.
+        clean_directory(perturbed_samples_dir)
+        os.rmdir(perturbed_samples_dir)
+        if verbose:
+            print(f"[INFO] Removed stale {perturbed_samples_dir} (nothing perturbable to write).")
 
     # Load sensor uncertainty summaries if perturbation is enabled
     if use_uncertainty_perturbation:
@@ -1288,6 +1335,10 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
 
     # Initialize a counter for naming output files
     segment_counter = 1
+    # The offsets actually applied, recorded so the replicate tree is reconstructible from
+    # `samples/` alone. They were previously implicit -- recoverable only by differencing a
+    # replicate against its base -- so preserving them meant preserving the whole tree.
+    mc_offset_rows = []
     metadata_cols = [col for col in ["TIMESTAMP", "Segment", "Interpolated"] if col in df.columns]
     predictor_write_cols = [col for col in predictor_cols if col in df.columns]
     target_write_cols = [col for col in target_columns if col in df.columns]
@@ -1410,8 +1461,26 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
         segment_out.to_csv(output_file, index=False)
 
         if use_uncertainty_perturbation:
-            for k in range(1, n_mc_replicates + 1):
-                replicate_seed = random_seed + k
+            # A window whose uncertainty-bearing channels are all NaN has nothing to
+            # perturb -- about half of them, since the profiler is a periodic survey --
+            # and its replicates would all be copies of the base. Write one rather than
+            # K, which is exactly what _drop_identical_replicates leaves in memory today.
+            # One, not zero: this folder is the training set for the replicated families,
+            # so a window with no file here would silently drop out of training.
+            window_is_perturbable = any(
+                segment_out[col].notna().any()
+                for col in perturbable_written if col in segment_out.columns
+            )
+            n_written = n_mc_replicates if window_is_perturbable else 1
+
+            for k in range(1, n_written + 1):
+                # The seed must distinguish the window as well as the replicate, or every
+                # window draws the same offset and the replicates become one global shift.
+                # SeedSequence mixes the three without the collisions a sum would produce
+                # (segment 2 / replicate 1 and segment 1 / replicate 2 would share a seed).
+                replicate_seed = np.random.SeedSequence(
+                    [int(random_seed), int(segment_counter), int(k)]
+                )
                 segment_perturbed = apply_uncertainty_perturbation(
                     segment_out, sensor_uncertainties, random_seed=replicate_seed
                 )
@@ -1421,9 +1490,44 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
                 )
                 segment_perturbed.to_csv(output_file, index=False)
 
+                if window_is_perturbable:
+                    for col in perturbable_written:
+                        if col not in segment_out.columns:
+                            continue
+                        delta = (segment_perturbed[col] - segment_out[col]).dropna()
+                        if len(delta):
+                            mc_offset_rows.append({
+                                "segment": f"segment_{segment_counter:04d}",
+                                "replicate": k,
+                                "column": col,
+                                "offset_normalised": float(delta.iloc[0]),
+                            })
+
         segment_counter += 1
 
     n_samples = segment_counter - 1
+
+    # Record the applied offsets as explicit values rather than a seed rule: a seed only
+    # reproduces against a particular NumPy generator, whereas these numbers are what was
+    # actually added to the data.
+    if mc_offset_rows:
+        provenance_dir = os.path.join(output_dir, 'provenance')
+        os.makedirs(provenance_dir, exist_ok=True)
+        offsets_path = os.path.join(provenance_dir, 'mc_offsets.csv')
+        pd.DataFrame(mc_offset_rows).to_csv(offsets_path, index=False)
+        if verbose:
+            print(f"[INFO] Wrote {len(mc_offset_rows)} applied MC offsets to {offsets_path}")
+
+    # The families that consume replicates must name the folder that was actually written.
+    # f_Evaluate.get_output_dim indexes sample_files[0] with no emptiness check, so a config
+    # pointing at an absent mc_replicates/ fails on an empty listing rather than saying why.
+    replicated_subdir = 'mc_replicates' if use_uncertainty_perturbation else 'samples'
+
+    def _with_subdir(section):
+        ov = dict(training_config_defaults.get(section, {}) or {})
+        ov["data"] = dict(ov.get("data") or {})
+        ov["data"]["sample_subdir"] = replicated_subdir
+        return ov
 
     # Generate template configuration files for e_Train.py
     xgb_config_paths = generate_xgb_config_templates(
@@ -1431,7 +1535,7 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
         predictor_cols,
         target_columns,
         length,
-        overrides=training_config_defaults.get('xgb', {}),
+        overrides=_with_subdir('xgb'),
     )
     xgb_config_path = xgb_config_paths[0]
     transformer_config_paths = generate_transformer_config_templates(
@@ -1439,7 +1543,7 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
         predictor_cols,
         target_columns,
         length,
-        overrides=training_config_defaults.get('transformer', {}),
+        overrides=_with_subdir('transformer'),
     )
     transformer_config_path = transformer_config_paths[0]
     gp_config_paths = generate_gp_config_templates(

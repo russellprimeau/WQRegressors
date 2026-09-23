@@ -41,11 +41,28 @@ source. A series awaiting its superseding run is retained in full and marked `ho
 | `CV23_profiler` | `resample_diff_profiler_cv23.yml` | **hold** | Smoke run, 2/14 targets. Invariant-check evidence cited at `ASSUMPTIONS_AND_OUTSTANDING.md:515`. Held until superseded |
 | `CV24_profilerless` | `resample_diff_profilerless_cv24.yml` | **hold** | 1/14 targets. The verification pair for the `mc_replicates/` check at `ASSUMPTIONS_AND_OUTSTANDING.md:975`. Held until superseded |
 
-## Spike series
+## Spikes
 
 Alternative solution methods that were not successful, are not described in the
 manuscript, and are **not kept up to date with other project changes**. Retained for
-possible future development; do not assume they run against the current code.
+possible future development; do not assume they run against the current code. They are
+excluded from any task unless named explicitly — see `CLAUDE.md`.
+
+### Spike model variants
+
+These produce configs and run directories inside otherwise-current roots, so they are easy
+to mistake for supported families. They are not.
+
+| Variant | Trained by | Config emitted as |
+| --- | --- | --- |
+| Recurrent transformer | `src/e_TrainRecurrent.py` | `config_recurrent_transformer_01.yml` |
+| LSTM | `src/e_TrainRecurrent.py` | `config_lstm_01.yml` |
+
+The supported families are the Gaussian process, multiple linear regression, XGBoost and the
+transformer. `d_RunResample.py` emits the spike configs beside the supported ones with no
+marking, which is why this table exists.
+
+### Spike series
 
 | Series | Produced by | Notes |
 | --- | --- | --- |

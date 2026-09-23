@@ -42,6 +42,17 @@ Constraints on `feature_sweep_final_metrics.csv`:
 | `model_config.json` | yes | recording how the inputs were constructed |
 | `training_stop_summary.json` | preferred | whether the model actually trained |
 
+`mc_replicates/` holds one file per window per replicate for the families that receive input
+uncertainty as data — **MLR, XGBoost and the transformer**; the GP reads `samples` because it
+marginalises that uncertainty inside its kernel. Two rules govern what is written. A root
+whose predictors include nothing carrying a measured uncertainty distribution gets no
+`mc_replicates/` at all, and its configs read `samples` instead. Within a root that does, a
+window whose uncertainty-bearing channels are all NaN gets **one** file rather than K, since
+its replicates would be identical copies — one rather than none, because this folder is the
+training set and a window with no file here would drop out of training. The offsets actually
+applied are recorded in `<target>/provenance/mc_offsets.csv`, which makes the tree
+reconstructible from `samples/` rather than being its own only record.
+
 `gp_model.pt` is written at schema version 3. Versions 1-2 stored the per-feature input
 uncertainty twice -- once at top level and once as a persistent kernel buffer inside
 `model_state_dict` -- each copy tiled across the input window, which made 89% of every
@@ -109,6 +120,11 @@ mv data/output/CV19 data/output/CV19_superseded
 #     fail silently -- o_PredictionTimeseries turns a load error into a [WARN] and a
 #     missing figure -- so this is checked rather than assumed.
 .venv/Scripts/python src/v5_CheckArtifactRoundTrip.py --root data/output/CV19
+
+# 5c. Monte Carlo replicates. Run this on any root generated after 2026-09-23; roots
+#     written before then report "legacy replicate tree" per target, which is a
+#     statement about their age rather than a defect.
+.venv/Scripts/python src/v5_CheckArtifactRoundTrip.py --replicates --root data/output/CV19
 
 # 6. Canonical results: every method on one evaluation set per target.
 .venv/Scripts/python src/z8_CommonSetMetrics.py --root data/output/CV19

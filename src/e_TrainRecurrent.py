@@ -1,7 +1,15 @@
 """
 Standalone training script for recurrent forecasting models.
 
-Supported model types:
+SPIKE -- NOT PART OF THE REPORTED WORK.
+
+Both models here are alternative approaches that were not successful. They are not
+described in the manuscript and are **not kept up to date with other project changes**,
+so do not assume this script runs against the current code. It is retained for possible
+future development only. The supported families are the Gaussian process, multiple
+linear regression, XGBoost and the transformer; see `CLAUDE.md`.
+
+Model types trained by this script:
   recurrent_transformer  — RecurrentTransformerModel
   lstm                   — LSTMForecasterModel
 

@@ -402,6 +402,26 @@ def detect_mc_replicates(samples):
     
     return has_mc, segment_groups
 
+def replicate_file_names(dataset_dir, segment, sample_subdir):
+    """The file names for ``segment`` under the sample subdirectory a run trains on.
+
+    A pinned split lists plain ``segment_NNNN.csv`` names, which do not exist inside
+    ``mc_replicates/``. Any caller loading from there has to expand them first: the split
+    list is passed straight through to the loader, so under ``fault_tolerant=True`` an
+    unexpanded name is silently missed and the caller ends up with an empty sample set
+    rather than an error.
+
+    Returns the name unchanged for any subdirectory other than ``mc_replicates``, and the
+    replicate count may legitimately be 1 for a window with nothing to perturb.
+    """
+    if sample_subdir != "mc_replicates":
+        return [segment]
+    stem = str(segment)[:-len(".csv")] if str(segment).endswith(".csv") else str(segment)
+    return sorted(
+        p.name for p in Path(dataset_dir, sample_subdir).glob(stem + "_mc_*.csv")
+    )
+
+
 def group_samples_by_segment(samples):
     """
     Group samples by segment number to keep MC replicates together.

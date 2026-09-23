@@ -87,7 +87,6 @@ from utils.config_utils import (
     _resolve_summary_dir,
     _load_uncertainty_std_map,
     _build_feature_uncertainty_bundle,
-    _effective_sample_size,
 )
 from utils.gp_utils import (
     apply_gp_constraints_and_priors,
@@ -2908,9 +2907,15 @@ def _xgb_tune_hyperparameters_cv(
 
     param_space = cv_cfg.get("param_space") or {}
     if bool(cv_cfg.get("auto_constrain", True)) and param_space:
-        n_unique_base = raw_diagnostics.get("raw_unique_base_count", len(names))
-        n_eff = _effective_sample_size(len(names), max(1, len(names) // max(1, n_unique_base)))
-        param_space = _constrain_param_space(param_space, n_eff, verbose=True)
+        # The count of distinct base windows IS the effective sample size -- replicates of
+        # one window are not independent observations. This previously recovered it by
+        # dividing the row count by an averaged replicate factor, which is exact only while
+        # every window has the same number of replicates. It no longer does: a window with
+        # nothing to perturb is now written once rather than K times, and on a mixed tree
+        # (38 windows x1, 36 x10) that round trip returned 79 against a true 74, loosening
+        # the hyperparameter constraint by 7%.
+        n_eff = int(raw_diagnostics.get("raw_unique_base_count", len(names)))
+        param_space = _constrain_param_space(param_space, max(1, n_eff), verbose=True)
     rng = np.random.default_rng(int(cv_cfg.get("seed", 42)))
     n_trials = int(max(1, cv_cfg.get("n_trials", 10)))
 
