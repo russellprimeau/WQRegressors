@@ -43,10 +43,10 @@ CLI arguments:
                          when --output is an absolute path).
 
 Examples:
-python src/z3_Compare.py --root data/output/CV14 --root data/output/profileless
-python src/z3_Compare.py --root data/output/CV14 --label "With profiles" --root data/output/CV15profileless --label "No profiles" --stat skill_vs_best_baseline --sort --output data/output/comparisons/profile/skill_vs_best_baseline.png
-python src/z3_Compare.py --root data/output/CV14 --label "With state" --root data/output/CV16statelessless --label "No state" --stat skill_vs_best_baseline --sort --output data/output/comparisons/state/skill_vs_best_baseline.png
-python src/z4_Compare.py --root data/output/CV14 --label "With state" --root data/output/CV16stateless --label "No state" --root data/output/CV15profileless --label "No Surface" --root data/output/CV18_raw --label "No residual" --stat r2 --sort --output data/output/comparisons/all/r2.png
+python src/z4_Compare.py --root data/output/CV19 --root data/output/CV22_profilerless
+python src/z4_Compare.py --root data/output/CV19 --label "With profiles" --root data/output/CV22_profilerless --label "No profiles" --stat skill_vs_best_baseline --sort --output data/output/comparisons/profile/skill_vs_best_baseline.png
+python src/z4_Compare.py --root data/output/CV18_raw --label "With state" --root data/output/CV16stateless --label "No state" --stat skill_vs_best_baseline --sort --output data/output/comparisons/state/skill_vs_best_baseline.png
+python src/z4_Compare.py --root data/output/CV19 --label "State in, differential out" --root data/output/CV16stateless --label "No state in, absolute out" --root data/output/CV18_raw --label "State in, absolute out" --stat r2 --sort --output data/output/comparisons/all/r2.png
 """
 from __future__ import annotations
 

@@ -86,7 +86,6 @@ from utils.config_utils import (
     _canonical_feature_name,
     _resolve_summary_dir,
     _load_uncertainty_std_map,
-    _build_feature_uncertainty_variance,
     _build_feature_uncertainty_bundle,
     _effective_sample_size,
 )
@@ -95,6 +94,7 @@ from utils.gp_utils import (
     build_base_kernel,
     describe_effective_kernel,
     ExactGPRegressor,
+    GP_ARTIFACT_VERSION,
 )
 
 
@@ -2204,8 +2204,14 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         "uncertainty_source_details": uncertainty_bundle.get("source_details", []),
     }
 
+    # The uncertainty arrays are stored in their pre-tile form and re-tiled on load by
+    # utils.gp_utils.uncertainty_arrays. Uncertainty belongs to a predictor, not to a
+    # window position, so the tiled arrays this function works with are seq_len identical
+    # copies of these; writing them dense made 89% of every saved artifact two copies of
+    # one repeated array. The kernel's own buffers are non-persistent, so models_state
+    # no longer carries the second copy either.
     artifact = {
-        "artifact_version": 2,
+        "artifact_version": GP_ARTIFACT_VERSION,
         "model_type": "gp_regressor",
         "hyperparameters": dict(hyper_cfg),
         "input_mean": x_mean,
@@ -2214,8 +2220,9 @@ def train_gp_regressor_model(config, train_samples, test_samples):
         "output_dim": output_dim,
         "models": models_state,
         "kernel_metadata": kernel_metadata,
-        "input_uncertainty_var": None if input_uncertainty_var is None else input_uncertainty_var.detach().cpu().numpy(),
-        "uncertainty_noise_deltas": None if uncertainty_noise_deltas is None else uncertainty_noise_deltas.detach().cpu().numpy(),
+        "uncertainty_variance_base": uncertainty_bundle.get("feature_variances_base"),
+        "uncertainty_noise_deltas_base": uncertainty_bundle.get("noise_delta_samples_base"),
+        "uncertainty_tile_reps": uncertainty_bundle.get("tile_reps"),
     }
     torch.save(artifact, save_path / "gp_model.pt")
     print(f"\nModel saved to: {save_path / 'gp_model.pt'}")

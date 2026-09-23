@@ -56,10 +56,15 @@ from utils.config_utils import (
     _canonical_feature_name,
     _resolve_summary_dir,
     _load_uncertainty_std_map,
-    _build_feature_uncertainty_variance,
     _build_feature_uncertainty_bundle,
 )
-from utils.gp_utils import apply_gp_constraints_and_priors, build_base_kernel, ExactGPRegressor
+from utils.gp_utils import (
+    apply_gp_constraints_and_priors,
+    build_base_kernel,
+    ExactGPRegressor,
+    strip_legacy_kernel_buffers,
+    uncertainty_arrays,
+)
 from utils.limits import load_limits_records
 
 
@@ -303,8 +308,32 @@ def _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device, conf
     input_uncertainty_var = None
     uncertainty_noise_deltas = None
     if use_uncertain_kernel:
-        saved_var = artifact.get("input_uncertainty_var")
-        saved_deltas = artifact.get("uncertainty_noise_deltas")
+        # uncertainty_arrays reads either artifact schema: the pre-tile base arrays
+        # written from version 3 on, or the dense window-tiled arrays in versions 1-2,
+        # which are still on disk in every root predating the change.
+        saved_var, saved_deltas = uncertainty_arrays(artifact)
+
+        # The kernel's input-noise vector must describe the same flattened input the
+        # model was fitted on. e_Train records that a silently mis-aggregated window
+        # once got as far as a shape mismatch against this very array; that check used
+        # to happen implicitly when the buffer was loaded from the state dict, and the
+        # buffer is no longer persisted, so it is asserted here instead.
+        expected_dim = artifact.get("input_dim")
+        if saved_var is not None and expected_dim is not None:
+            if int(np.asarray(saved_var).shape[-1]) != int(expected_dim):
+                raise ValueError(
+                    f"{model_path / 'gp_model.pt'}: input uncertainty describes "
+                    f"{np.asarray(saved_var).shape[-1]} features but the model was fitted "
+                    f"on {expected_dim}. The window aggregation used for evaluation does "
+                    "not match the one used for training."
+                )
+            if saved_deltas is not None and int(np.asarray(saved_deltas).shape[-1]) != int(expected_dim):
+                raise ValueError(
+                    f"{model_path / 'gp_model.pt'}: Monte Carlo noise draws describe "
+                    f"{np.asarray(saved_deltas).shape[-1]} features but the model was "
+                    f"fitted on {expected_dim}."
+                )
+
         if saved_var is not None:
             input_uncertainty_var = torch.tensor(saved_var, dtype=torch.float32, device=device)
         if saved_deltas is not None:
@@ -343,7 +372,11 @@ def _load_gp_bundle(data_cfg, split_cfg, model_name, train_samples, device, conf
             )
         ).to(device)
         apply_gp_constraints_and_priors(model, likelihood, hyper_cfg)
-        model.load_state_dict(state["model_state_dict"])
+        # Artifacts from versions 1-2 carry the kernel's input-noise buffers inside the
+        # state dict; the kernel no longer registers them persistently, so a strict load
+        # would reject them as unexpected keys. Stripping keeps strict=True, which still
+        # catches a genuinely mismatched or truncated fit.
+        model.load_state_dict(strip_legacy_kernel_buffers(state["model_state_dict"]))
         likelihood.load_state_dict(state["likelihood_state_dict"])
         model.eval()
         likelihood.eval()

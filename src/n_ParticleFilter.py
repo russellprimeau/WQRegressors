@@ -172,7 +172,7 @@ CLI arguments
       Default: off.
 
   --cv-dir PATH
-      Path to a CV output directory (e.g. data/output/CV14).  Enables
+      Path to a CV output directory (e.g. data/output/CV22_profilerless).  Enables
       two additional outputs: per-target evaluation_summary.csv files in
       the 26-column f_Evaluate format (for direct comparison with existing
       model results), and a combined evaluation_summary_all_targets.csv.
@@ -240,8 +240,8 @@ Usage examples
   python src/z3_ParticleFilter.py --n-particles 50 --no-figure --output-dir data/output/pf_test
 
   # Full run with CV comparison — produces evaluation_summary files
-  # directly comparable to XGB/GP/Transformer results in CV14
-  python src/z3_ParticleFilter.py --run-name pf_vs_cv14 --cv-dir data/output/CV14
+  # directly comparable to the XGB/GP/Transformer results in the CV root given
+  python src/n_ParticleFilter.py --run-name pf_vs_cv22 --cv-dir data/output/CV22_profilerless
 
   # Specify a non-default input file
   python src/z3_ParticleFilter.py --input data/output/regression/Consolidated_filled.csv
@@ -3002,7 +3002,7 @@ def _plot_pf_timeseries(
 
 
 # ---------------------------------------------------------------------------
-# Clustered bar chart: PF vs. all CV14 methods (summary metrics)
+# Clustered bar chart: PF vs. all methods in the CV baseline (summary metrics)
 # ---------------------------------------------------------------------------
 
 # Model display names and colours — mirrors z1_FeaturePostProcess.py
@@ -3070,7 +3070,7 @@ def _plot_model_comparison(
     target_cols: list[str],
     output_dir: Path,
 ) -> None:
-    """Four clustered bar charts comparing PF against all CV14 model types.
+    """Four clustered bar charts comparing PF against all of the CV baseline's model types.
 
     Reads ``feature_sweep_final_metrics.csv`` from each target's dataset
     directory in cv_dir (the same source as z1_FeaturePostProcess), applies
@@ -3713,7 +3713,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cv-dir", default=None,
         metavar="PATH",
-        help="Path to a CV output directory (e.g. data/output/CV14).  "
+        help="Path to a CV output directory (e.g. data/output/CV22_profilerless).  "
              "When supplied, the script locates each target's normalization.json "
              "there and produces an evaluation_summary.csv in the run-name output "
              "directory (in the same 26-column format as f_Evaluate.py).  "
@@ -3730,7 +3730,7 @@ def build_parser() -> argparse.ArgumentParser:
              "mean and ±1σ band on top of the existing model's reconstructed "
              "timeseries, one subplot per target.  "
              "Output: Target_timeseries_pf_vs_model.png in the output directory.  "
-             "E.g. --predictions-csv data/output/CV14/summaries/predictions/"
+             "E.g. --predictions-csv data/output/CV22_profilerless/summaries/predictions/"
              "Consolidated_predictions.csv",
     )
     parser.add_argument(

@@ -16,13 +16,17 @@ And, under ``<run-dir>/`` (overwriting the files already produced by z3_Particle
   pf_comparison_{rmse,nrmse,r2,skill_vs_best}.png  -- requires --cv-dir.
 
 CLI:
-    python src/z3_ParticleFilterPostProcess.py --run-dir data/output/<pf-run>
-    python src/z3_ParticleFilterPostProcess.py --run-dir data/output/<pf-run> --cv-dir data/output/CV14
+    python src/z3_PFPostProcess.py --run-dir data/output/<pf-run>
+    python src/z3_PFPostProcess.py --run-dir data/output/<pf-run> --cv-dir data/output/CV22_profilerless
 
-Use ``z3_Compare.py`` afterwards to compare the resulting summary against other
+The original --cv-dir baseline was CV14, which was disposed of on 2026-09-23 as
+unreported and superseded. These runs were made against CV14-era samples, so the
+comparison bars against a current root are not comparable with the originals.
+
+Use ``z4_Compare.py`` afterwards to compare the resulting summary against other
 runs, e.g.::
 
-    python src/z3_Compare.py --root data/output/CV14 --root data/output/<pf-run> \
+    python src/z4_Compare.py --root data/output/CV22_profilerless --root data/output/<pf-run> \
         --stat skill_vs_best_baseline --sort
 """
 from __future__ import annotations

@@ -139,6 +139,10 @@ import e_Train as train_module
 import f_Evaluate as eval_module
 from utils.notifications import notify
 from utils import provenance
+from utils.config_utils import (
+    UNCERTAINTY_DISTRIBUTION_FEATURES,
+    feature_carries_uncertainty,
+)
 import os
 import unicodedata
 import seaborn as sns
@@ -219,20 +223,14 @@ _TRAINABLE_MODEL_TYPES = {
     "xgb_classifier",
 }
 
-# Only these predictors currently carry uncertainty distributions used to
-# generate meaningful Monte Carlo perturbation replicates.
-UNCERTAINTY_DISTRIBUTION_FEATURES = {
-    "Pfl - Sp Cond (microS_cm)",
-    "Pfl - pH",
-    "Pfl - DO (% Sat)",
-    "Pfl - Turbidity (FNU)",
-    "Pfl - fDOM (RFU)",
-    "Pfl - fDOM (QSU)",
-}
+# UNCERTAINTY_DISTRIBUTION_FEATURES is imported from utils.config_utils above and
+# re-exported here for callers that already read it from this module. It is defined in
+# exactly one place: a second literal copy is how the data-space and kernel-space
+# treatments of input uncertainty came to disagree about `SCADA - pH`.
 
 
 def _candidate_uses_uncertainty_distributions(features: tuple[str, ...]) -> bool:
-    return any(str(feat) in UNCERTAINTY_DISTRIBUTION_FEATURES for feat in features)
+    return any(feature_carries_uncertainty(feat) for feat in features)
 
 
 def _extract_required_independent_metric(model_row: dict, key: str, context: str) -> float:

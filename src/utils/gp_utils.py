@@ -5,7 +5,69 @@ and crossval utilities. Extracted to eliminate three duplicate definitions.
 
 import gpytorch
 from linear_operator import to_dense, to_linear_operator
+import numpy as np
 import torch
+
+
+# Kernel buffers that describe the *inputs* rather than the fit.
+#
+# These hold the per-feature input-noise variance and the Monte Carlo draws used to
+# marginalise over it. They are inputs to the kernel, not parameters learned by it, and
+# the saved artifact already records them at top level -- so persisting them inside
+# model_state_dict stored the same arrays a second time. Because they are tiled across
+# the input window they were large: 89% of every saved GP artifact was these arrays,
+# against under 6 KB of actual fitted parameters.
+#
+# Registering them with persistent=False keeps runtime behaviour identical while leaving
+# them out of state_dict() entirely. Artifacts written before this change still carry
+# them, which is what strip_legacy_kernel_buffers exists for.
+NON_PERSISTENT_KERNEL_BUFFERS = ("input_variance", "noise_delta_samples", "_unit_noise")
+
+# The artifact schema written by e_Train.train_gp_regressor_model.
+#   1, 2 -- dense, window-tiled uncertainty arrays; buffers present in model_state_dict
+#   3    -- pre-tile base arrays plus a repeat count; buffers absent
+GP_ARTIFACT_VERSION = 3
+
+
+def strip_legacy_kernel_buffers(state_dict):
+    """A copy of ``state_dict`` without the buffers that are no longer persisted.
+
+    Matching is by key *suffix*, never by full path. Both nestings occur in artifacts
+    on disk -- ``covar_module.base_kernel.noise_delta_samples`` and
+    ``covar_module.base_kernel.kernels.0.noise_delta_samples``, the latter when the
+    kernel is wrapped in an AdditiveKernel -- and a hard-coded path silently fails to
+    strip one of them, which then breaks a strict load.
+    """
+    return {
+        k: v for k, v in state_dict.items()
+        if not any(k.split(".")[-1] == name for name in NON_PERSISTENT_KERNEL_BUFFERS)
+    }
+
+
+def uncertainty_arrays(artifact):
+    """Dense ``(input_variance, noise_delta_samples)`` from a saved GP artifact.
+
+    Reads either schema and returns the same arrays in both cases, so callers do not
+    branch on version. Returns ``(None, None)`` when the artifact carries no input
+    uncertainty at all.
+    """
+    reps = artifact.get("uncertainty_tile_reps")
+    if reps is not None:
+        var = artifact.get("uncertainty_variance_base")
+        deltas = artifact.get("uncertainty_noise_deltas_base")
+        if var is None:
+            return None, None
+        reps = int(reps)
+        var = np.tile(np.asarray(var), reps)
+        if deltas is not None:
+            deltas = np.tile(np.asarray(deltas), (1, reps))
+        return var, deltas
+
+    var = artifact.get("input_uncertainty_var")
+    deltas = artifact.get("uncertainty_noise_deltas")
+    if var is None:
+        return None, None
+    return np.asarray(var), (None if deltas is None else np.asarray(deltas))
 
 
 class UncertainInputRBFKernel(gpytorch.kernels.Kernel):
@@ -26,7 +88,8 @@ class UncertainInputRBFKernel(gpytorch.kernels.Kernel):
 
     def __init__(self, input_variance, **kwargs):
         super().__init__(**kwargs)
-        self.register_buffer("input_variance", input_variance)
+        # Non-persistent: see NON_PERSISTENT_KERNEL_BUFFERS.
+        self.register_buffer("input_variance", input_variance, persistent=False)
 
     def forward(self, x1, x2, diag=False, **params):
         if diag:
@@ -66,7 +129,8 @@ class UncertainInputMatern52Kernel(gpytorch.kernels.Kernel):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.register_buffer("input_variance", input_variance)
+        # All three buffers are non-persistent: see NON_PERSISTENT_KERNEL_BUFFERS.
+        self.register_buffer("input_variance", input_variance, persistent=False)
 
         if noise_delta_samples is not None:
             noise_delta_samples = torch.as_tensor(noise_delta_samples, dtype=torch.float32)
@@ -74,10 +138,10 @@ class UncertainInputMatern52Kernel(gpytorch.kernels.Kernel):
                 raise ValueError(
                     f"noise_delta_samples must be 2-D [n_mc, n_features], got {tuple(noise_delta_samples.shape)}"
                 )
-            self.register_buffer("noise_delta_samples", noise_delta_samples)
+            self.register_buffer("noise_delta_samples", noise_delta_samples, persistent=False)
             self.mc_samples = int(noise_delta_samples.shape[0])
         else:
-            self.register_buffer("noise_delta_samples", None)
+            self.register_buffer("noise_delta_samples", None, persistent=False)
             self.mc_samples = max(1, int(mc_samples))
             generator = torch.Generator(device="cpu")
             generator.manual_seed(int(mc_seed))
@@ -86,7 +150,7 @@ class UncertainInputMatern52Kernel(gpytorch.kernels.Kernel):
                 generator=generator,
                 dtype=torch.float32,
             )
-            self.register_buffer("_unit_noise", unit_noise)
+            self.register_buffer("_unit_noise", unit_noise, persistent=False)
 
     def _delta_samples(self, device, dtype):
         if self.noise_delta_samples is not None:

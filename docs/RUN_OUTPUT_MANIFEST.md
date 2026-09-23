@@ -42,6 +42,14 @@ Constraints on `feature_sweep_final_metrics.csv`:
 | `model_config.json` | yes | recording how the inputs were constructed |
 | `training_stop_summary.json` | preferred | whether the model actually trained |
 
+`gp_model.pt` is written at schema version 3. Versions 1-2 stored the per-feature input
+uncertainty twice -- once at top level and once as a persistent kernel buffer inside
+`model_state_dict` -- each copy tiled across the input window, which made 89% of every
+artifact one repeated array. Version 3 stores the arrays in their pre-tile form with a
+repeat count and does not persist the buffers, which is ~97% smaller for the same fit.
+`utils.gp_utils.uncertainty_arrays` reads either schema, so older roots load unchanged;
+`v5_CheckArtifactRoundTrip.py` is the gate that keeps it that way.
+
 `predictions.csv` must carry `kind` and `sample_file`. The common evaluation set is
 built by intersecting test `sample_file`s across runs, and a segment enters it only
 if it is labelled `kind == "test"` in every run compared — which is what makes the
@@ -97,6 +105,11 @@ mv data/output/CV19 data/output/CV19_superseded
 # 5. Manifest compliance. Zero errors before anything is reported.
 .venv/Scripts/python src/validate_run_outputs.py --root data/output/CV19
 
+# 5b. Saved models reload. The GP artifact is the only one whose reconstruction can
+#     fail silently -- o_PredictionTimeseries turns a load error into a [WARN] and a
+#     missing figure -- so this is checked rather than assumed.
+.venv/Scripts/python src/v5_CheckArtifactRoundTrip.py --root data/output/CV19
+
 # 6. Canonical results: every method on one evaluation set per target.
 .venv/Scripts/python src/z8_CommonSetMetrics.py --root data/output/CV19
 
@@ -109,7 +122,7 @@ mv data/output/CV19 data/output/CV19_superseded
 .venv/Scripts/python src/z7_StructureCompare.py --exclude-model none
 ```
 
-Steps 2 and 5 are gates: if either reports errors, the results are not reportable and the
+Steps 2, 5 and 5b are gates: if any reports errors, the results are not reportable and the
 cause must be fixed before step 7. `z8_CommonSetMetrics.py` is the canonical source for the
 manuscript's numbers — `z1`'s own best-model selection is scored on configuration-specific
 evaluation sets and is retained for the sweep-level figures only.

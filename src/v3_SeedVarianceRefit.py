@@ -226,11 +226,21 @@ def seed_changes_this_fit(run_dir: "Path | None", model_type: str) -> bool:
     8.3e-17. Of 375 GP candidates on the profiler-free predictor set, 227 are in that
     position and refitting them would spend six fits each to reproduce one number.
 
-    The test is per candidate rather than per family, and it reads the fitted artifact
-    rather than intersecting the subset with `UNCERTAINTY_DISTRIBUTION_FEATURES`: that
-    constant lists only the six profiler channels, yet `SCADA - pH` carries a variance
-    of 0.0433 and is not in it, so the constant is not a reliable statement of which
-    predictors are uncertain.
+    The test is per candidate and reads the fitted artifact rather than intersecting the
+    subset with `UNCERTAINTY_DISTRIBUTION_FEATURES`. That was originally necessary
+    because the two disagreed: the constant lists only the six profiler channels, yet
+    `SCADA - pH` carried a variance of 0.0433. The cause was a name collision --
+    `_canonical_feature_name` discarded the instrument prefix, so `SCADA - pH` matched
+    the profiler's pH calibration record -- and it is fixed at source in
+    `utils.config_utils`, which now gates on `feature_carries_uncertainty` before
+    matching.
+
+    Reading the artifact is still correct, and is now the *only* correct test, because
+    artifacts written before that fix have the spurious variance baked into them. The
+    counts quoted in project notes (227 of 375 GP candidates on the profiler-free
+    predictor set being seed-insensitive) describe those older artifacts; after the fix
+    no predictor in a profiler-free subset carries uncertainty, so every such candidate
+    is seed-insensitive and the kernel reduces exactly to the plain Matern.
     """
     mt = str(model_type or '').lower()
     if mt in ('xgb_regressor', 'xgb_classifier', 'transformer'):
@@ -242,11 +252,18 @@ def seed_changes_this_fit(run_dir: "Path | None", model_type: str) -> bool:
         return False
     try:
         import torch
+        from utils.gp_utils import uncertainty_arrays
         payload = torch.load(art, map_location='cpu', weights_only=False)
-        var = np.asarray(payload.get('input_uncertainty_var'))
+        # Reads either artifact schema. Reaching for 'input_uncertainty_var' directly
+        # would see None for every artifact written from version 3 on, and silently
+        # report that no fit is seed-sensitive.
+        var, _ = uncertainty_arrays(payload)
     except Exception:
         return False
-    return bool(var is not None and var.size and (var != 0).any())
+    if var is None:
+        return False
+    var = np.asarray(var)
+    return bool(var.size and (var != 0).any())
 
 
 def find_config(root: Path, ds: str, variant: str, feature_tag: str,

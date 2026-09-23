@@ -69,7 +69,7 @@ CLI arguments:
 
 Examples:
 python src/k_RunHorizonSweep.py --resample-config data/output/sampling/resample_config.yml
-python src/k_RunHorizonSweep.py --data-root data/output/CV14 --dataset-prefix MC --resample-config data/output/sampling/resample_config.yml --horizons 0 6 12 24 48 96 168 336 --replicates 7
+python src/k_RunHorizonSweep.py --data-root data/output/CV22_profilerless --dataset-prefix MC --resample-config data/output/sampling/resample_config.yml --horizons 0 6 12 24 48 96 168 336 --replicates 7
 
 """
 

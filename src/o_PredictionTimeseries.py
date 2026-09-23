@@ -25,8 +25,8 @@ A summary CSV (``best_models_used.csv``) lists which model was selected per targ
 
 Usage examples::
 
-    python src/z2_PredictionTimeseries.py --path data/output/CV14 --sweep-namespace feature_sweeps
-    python src/z2_PredictionTimeseries.py --path data/output/CV14 --sweep-namespace Shapley_sweeps
+    python src/o_PredictionTimeseries.py --path data/output/CV22_profilerless --sweep-namespace feature_sweeps
+    python src/o_PredictionTimeseries.py --path data/output/CV22_profilerless --sweep-namespace Shapley_sweeps
 """
 
 from __future__ import annotations

@@ -13,7 +13,7 @@ The split is derived from the rep_000 test_files.txt that was written by
 k_RunHorizonSweep._run_mlr_horizon_rep.
 
 Usage:
-    python src/z2_repair_baselines.py --data-root data/output/CV14 --dataset-prefix MC
+    python src/z2_repair_baselines.py --data-root data/output/CV22_profilerless --dataset-prefix MC
 """
 from __future__ import annotations
 import argparse

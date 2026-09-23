@@ -61,8 +61,8 @@ python src/z2_HorizonPostProcess.py
 python src/z2_HorizonPostProcess.py --data-root data/output/regression
 python src/z2_HorizonPostProcess.py --ml-selection xgb
 python src/z2_HorizonPostProcess.py --treat-mlr-as-baseline
-python src/z2_HorizonPostProcess.py --data-root data/output/CV14 --dataset-prefix MC
-python src/z2_HorizonPostProcess.py --data-root data/output/CV14 --dataset-prefix MC --evaluate-all
+python src/z2_HorizonPostProcess.py --data-root data/output/CV22_profilerless --dataset-prefix MC
+python src/z2_HorizonPostProcess.py --data-root data/output/CV22_profilerless --dataset-prefix MC --evaluate-all
 """
 from __future__ import annotations
 import argparse

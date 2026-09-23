@@ -2,7 +2,7 @@
 Post-process feature-sweep predictions as threshold-based classifications.
 
 Example:
-    python src/z5_ClassificationPostProcess.py --run-dir data/output/CV14
+    python src/z5_ClassificationPostProcess.py --run-dir data/output/<run>
 
 Outputs are written under:
     <run-dir>/summaries/classification/
@@ -1738,7 +1738,7 @@ def post_process_run(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Post-process threshold-based classification metrics from feature-sweep predictions.")
-    parser.add_argument("--run-dir", required=True, help="Run directory such as data/output/CV14")
+    parser.add_argument("--run-dir", required=True, help="Run directory such as data/output/<run>")
     parser.add_argument("--summaries-subdir", default="classification", help="Subdirectory under <run-dir>/summaries for output files (default: classification).")
     parser.add_argument("--targets", nargs="*", default=None, help="Optional target directory names to limit processing.")
     parser.add_argument("--sweep-namespace", default="feature_sweeps", help="Forecast sweep subdirectory under forecasts/ (default: feature_sweeps).")

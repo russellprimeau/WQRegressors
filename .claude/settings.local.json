@@ -299,7 +299,8 @@
       "Bash(\"/c/Program Files/Graphviz/bin/dot.exe\" -Tplain docs/figures/wq_pipeline.dot)",
       "Bash(\"/c/Program Files/Graphviz/bin/dot.exe\" -Tpng:cairo -Gdpi=150 -o /tmp/wqp_preview.png docs/figures/wq_pipeline.dot)",
       "Bash(cp /tmp/wqp_preview.png \"C:/Users/Master/AppData/Local/Temp/claude/c--Users-Master-Documents-GitHub-WQRegressors/849c7b65-6a14-4ebf-9e27-4fff45eb1c7a/scratchpad/preview_a.png\")",
-      "PowerShell(git -C \"C:\\\\Users\\\\Master\\\\Documents\\\\GitHub\\\\WQRegressors\\\\docs\\\\report\\\\draft\" fetch origin; \"--- status ---\"; git -C \"C:\\\\Users\\\\Master\\\\Documents\\\\GitHub\\\\WQRegressors\\\\docs\\\\report\\\\draft\" status --short --branch; \"--- ancestor check ---\"; git -C \"C:\\\\Users\\\\Master\\\\Documents\\\\GitHub\\\\WQRegressors\\\\docs\\\\report\\\\draft\" merge-base --is-ancestor HEAD origin/main; \"exit=$LASTEXITCODE\"; \"--- superproject ---\"; git -C \"C:\\\\Users\\\\Master\\\\Documents\\\\GitHub\\\\WQRegressors\" status --short --branch)"
+      "PowerShell(git -C \"C:\\\\Users\\\\Master\\\\Documents\\\\GitHub\\\\WQRegressors\\\\docs\\\\report\\\\draft\" fetch origin; \"--- status ---\"; git -C \"C:\\\\Users\\\\Master\\\\Documents\\\\GitHub\\\\WQRegressors\\\\docs\\\\report\\\\draft\" status --short --branch; \"--- ancestor check ---\"; git -C \"C:\\\\Users\\\\Master\\\\Documents\\\\GitHub\\\\WQRegressors\\\\docs\\\\report\\\\draft\" merge-base --is-ancestor HEAD origin/main; \"exit=$LASTEXITCODE\"; \"--- superproject ---\"; git -C \"C:\\\\Users\\\\Master\\\\Documents\\\\GitHub\\\\WQRegressors\" status --short --branch)",
+      "Bash(.venv/Scripts/python \"C:/Users/Master/AppData/Local/Temp/claude/c--Users-Master-Documents-GitHub-WQRegressors/10c70b1e-5857-49b0-aab8-7dc232bd35d8/scratchpad/inventory.py\")"
     ]
   }
 }

@@ -35,7 +35,7 @@ and per run directory:
 Usage:
     python src/validate_run_outputs.py
     python src/validate_run_outputs.py --root data/output/CV19 --verbose
-    python src/validate_run_outputs.py --root data/output/SMOKE_GP --families gp
+    python src/validate_run_outputs.py --root data/output/CV23_profiler --families gp
 """
 from __future__ import annotations
 

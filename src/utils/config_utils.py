@@ -206,8 +206,54 @@ def _resolve_data_paths(data_cfg, config_dir):
     return str(data_dir_path), "samples"
 
 
+# Every predictor that may claim a measured uncertainty distribution.
+#
+# These are the six channels of the surface profiler, which is the instrument the
+# calibration logs under ``data/output/calibration`` describe. Uncertainty belongs to
+# the instrument that was calibrated, not to the quantity it measures: `SCADA - pH`
+# reports the same measurand from a different, permanently installed sensor that these
+# records say nothing about.
+#
+# This is the single definition. ``d_RunResample.py`` derives its perturbation column
+# map from it and ``h_RunMCFeatureSelectionSweep.py`` tests candidate subsets against
+# it, so the data-space and kernel-space treatments of input uncertainty cannot drift
+# apart again.
+UNCERTAINTY_DISTRIBUTION_FEATURES = (
+    "Pfl - Sp Cond (microS_cm)",
+    "Pfl - pH",
+    "Pfl - DO (% Sat)",
+    "Pfl - Turbidity (FNU)",
+    "Pfl - fDOM (RFU)",
+    "Pfl - fDOM (QSU)",
+)
+
+
+def feature_carries_uncertainty(name) -> bool:
+    """Whether ``name`` is a predictor with a measured uncertainty distribution."""
+    return str(name) in UNCERTAINTY_DISTRIBUTION_FEATURES
+
+
+def _calibration_keys(feature):
+    """Canonical keys under which ``feature``'s calibration record may be filed.
+
+    The calibration files are named for the measurand alone (``pH.csv``), so the
+    instrument prefix has to come off to match them -- but only once the feature has
+    been confirmed to belong to the calibrated instrument.
+    """
+    keys = [_canonical_feature_name(feature)]
+    if " - " in str(feature):
+        keys.append(_canonical_feature_name(str(feature).split(" - ", 1)[1]))
+    return keys
+
+
 def _canonical_feature_name(name):
-    """Normalise a sensor/feature name to a canonical lowercase form for matching."""
+    """Normalise a sensor/feature name to a canonical lowercase form for matching.
+
+    Note that this deliberately discards the instrument prefix, so it answers "which
+    measurand is this?" and never "which instrument is this?". Callers matching a
+    predictor against calibration records must gate on
+    ``feature_carries_uncertainty`` first.
+    """
     text = str(name).strip().lower().replace("µ", "u")
     text = text.replace("micro", "u")
     text = text.replace("_", " ")
@@ -272,18 +318,6 @@ def _load_uncertainty_std_map(summary_dir, verbose=True):
     return summary_map
 
 
-def _build_feature_uncertainty_variance(data_cfg, hyper_cfg, config_dir, verbose=True):
-    """
-    Compute per-feature input uncertainty variances for the GP uncertain-input kernel.
-
-    Variances are derived from sensor offset_std values in the uncertainty summary
-    directory, scaled by the normalization range when a normalization.json is present.
-    Returns a 1-D float32 array of length ``n_features * seq_len``.
-    """
-    bundle = _build_feature_uncertainty_bundle(data_cfg, hyper_cfg, config_dir, verbose=verbose)
-    return bundle["feature_variances"]
-
-
 def _build_feature_uncertainty_bundle(data_cfg, hyper_cfg, config_dir, verbose=True):
     """
     Build uncertainty information for uncertain-input GP kernels.
@@ -346,15 +380,17 @@ def _build_feature_uncertainty_bundle(data_cfg, hyper_cfg, config_dir, verbose=T
     source_details = []
 
     for feature in input_columns:
-        candidates = [_canonical_feature_name(feature)]
-        if " - " in feature:
-            candidates.append(_canonical_feature_name(feature.split(" - ", 1)[1]))
-
+        # Only the calibrated instrument may claim its own calibration record. Matching
+        # on the canonical measurand alone let `SCADA - pH` inherit the profiler's pH
+        # offsets, because _canonical_feature_name drops the instrument prefix -- which
+        # made it the most-used uncertainty-bearing predictor in the project and the
+        # sole source of input uncertainty in every profiler-free run.
         matched_key = None
-        for candidate in candidates:
-            if candidate in aggregate_offsets_map or candidate in summary_std_map:
-                matched_key = candidate
-                break
+        if feature_carries_uncertainty(feature):
+            for candidate in _calibration_keys(feature):
+                if candidate in aggregate_offsets_map or candidate in summary_std_map:
+                    matched_key = candidate
+                    break
 
         raw_std = 0.0
         sensor_source = "none"
@@ -413,6 +449,14 @@ def _build_feature_uncertainty_bundle(data_cfg, hyper_cfg, config_dir, verbose=T
     return {
         "feature_variances": np.tile(feature_variances_arr, seq_len),
         "noise_delta_samples": np.tile(feature_delta_samples, (1, seq_len)),
+        # The same arrays before they are tiled across the input window, plus the repeat
+        # count needed to rebuild them. Uncertainty is a property of a predictor, not of
+        # a window position, so the tiled forms are seq_len identical copies -- seq_len
+        # reaches 671 in these runs. Saved artifacts store the base forms and re-tile on
+        # load; see utils.gp_utils.uncertainty_arrays.
+        "feature_variances_base": feature_variances_arr,
+        "noise_delta_samples_base": feature_delta_samples,
+        "tile_reps": int(seq_len),
         "source_mode_requested": source_mode_requested,
         "source_mode_effective": source_mode_effective,
         "aggregate_csv_path": str(aggregate_csv_path) if aggregate_csv_path is not None else None,

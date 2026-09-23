@@ -21,7 +21,11 @@ import plotly.express as px
 from scipy import stats
 from pathlib import Path
 from utils.preprocessing import normalize_columns
-from utils.config_utils import load_config
+from utils.config_utils import (
+    UNCERTAINTY_DISTRIBUTION_FEATURES,
+    feature_carries_uncertainty,
+    load_config,
+)
 
 
 DEFAULT_SAMPLE_LENGTH_ROWS = 168
@@ -686,7 +690,14 @@ def generate_gp_config_template(output_dir, forecast_name, input_columns, output
             'ard_min_samples_per_dim': 1.0,
             'input_standardize': True,
             'target_standardize': True,
-            'use_uncertain_input_kernel': True,
+            # Derived, not asserted: the uncertain-input kernel is only meaningful when
+            # some predictor actually carries a measured uncertainty distribution. On a
+            # profiler-free predictor set none does, every Monte Carlo draw is the zero
+            # vector, and the kernel reduces exactly to the plain Matern -- so declaring
+            # it True there advertises a treatment the run does not receive.
+            'use_uncertain_input_kernel': any(
+                feature_carries_uncertainty(c) for c in input_columns
+            ),
             'uncertain_kernel_mc_samples': 64,
             'uncertain_kernel_mc_seed': 0,
             'uncertainty_source_mode': 'aggregate_t',
@@ -1042,14 +1053,15 @@ def apply_uncertainty_perturbation(segment_df, sensor_uncertainties, random_seed
     
     df_perturbed = segment_df.copy()
     
-    # Sensor column mappings
+    # Sensor column mappings, derived from the one definition of which predictors carry
+    # a measured uncertainty distribution. `sensor_uncertainties` is keyed by the bare
+    # measurand, as the calibration summaries are named, while the data column carries
+    # the instrument prefix -- so the mapping is just that split. Deriving it here keeps
+    # this data-space perturbation and the GP kernel's input-noise treatment describing
+    # the same set of instruments.
     sensor_column_map = {
-        'Sp Cond (microS_cm)': 'Pfl - Sp Cond (microS_cm)',
-        'pH': 'Pfl - pH',
-        'DO (% Sat)': 'Pfl - DO (% Sat)',
-        'Turbidity (FNU)': 'Pfl - Turbidity (FNU)',
-        'fDOM (RFU)': 'Pfl - fDOM (RFU)',
-        'fDOM (QSU)': 'Pfl - fDOM (QSU)',
+        column.split(' - ', 1)[1]: column
+        for column in UNCERTAINTY_DISTRIBUTION_FEATURES
     }
     
     for sensor_key, column_name in sensor_column_map.items():

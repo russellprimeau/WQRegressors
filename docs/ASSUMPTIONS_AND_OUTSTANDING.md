@@ -111,6 +111,37 @@ comparison, the retention counts and the profiler contrast are all built from th
 `data/output/CV19` remains the profiler-bearing arm behind Appendix A and Section 3.2,
 and `data/output/CV20_profilerless` is superseded and no longer feeds the paper.
 
+## Input uncertainty was attributed to the wrong instrument (fixed 2026-09-23)
+
+`_canonical_feature_name` discarded the instrument prefix before matching a predictor
+against the calibration records, so `SCADA - pH` and `Pfl - pH` both reduced to `ph` and
+the SCADA channel inherited the surface profiler's pH offset distribution. The
+calibration logs describe the profiler sonde; SCADA is a separate, permanently installed
+instrument they say nothing about.
+
+It was not a marginal case. Across 23,674 run configs, `SCADA - pH` was the most-used
+uncertainty-bearing predictor in the project -- 14,802 runs, 92% of all runs carrying any
+input uncertainty, more than any real profiler channel. **In every profiler-free root,
+including CV22_profilerless, 100% of the input uncertainty came from it alone**:
+CV22_profilerless 3,381 such runs, CV27 3,782, CV20_profilerless 2,133,
+CV24_profilerless 441, with no legitimate contribution in any of them. The profiler-bearing
+roots were contaminated rather than dominated: CV19 2,979 mixed runs, CV25 4,150.
+
+`utils.config_utils` now gates on `feature_carries_uncertainty` before matching, so only
+the six calibrated profiler channels can claim a distribution. `d_RunResample.py` was
+already correct -- it perturbs only those six -- and now derives its column map from the
+same definition, so the data-space and kernel-space treatments cannot drift apart again.
+`use_uncertain_input_kernel` is likewise derived from the predictor set rather than
+asserted, since on a profiler-free set every Monte Carlo draw is the zero vector and the
+kernel reduces exactly to the plain Matern.
+
+**Consequence for the re-run:** results move in both arms, and the profiler-free arm's
+input-uncertainty treatment does not shrink, it disappears. Numbers from the re-run are
+therefore not directly comparable with the current manuscript. The symptom was recorded
+earlier as a quirk in `v3_SeedVarianceRefit.seed_changes_this_fit`, whose docstring cited
+the disagreement as a reason to read the fitted artifact; that remains the right test,
+because artifacts written before this fix have the spurious variance baked into them.
+
 ## MLR reclassified as a predictor-driven method
 
 MLR is counted among the machine-learning methods and is no longer in the skill
