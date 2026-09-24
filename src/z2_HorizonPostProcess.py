@@ -83,8 +83,13 @@ matplotlib.use("Agg")
 # Ensure src/ is on the path so utils can be imported when the script is run
 # directly (python src/z2_...) or from the workspace root.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from utils.console import force_utf8_console
 from utils.names import clean_target_label
 from utils.plotstyle import legend_above
+
+# Before anything can print. This module's own --help carries a sigma, which aborted
+# argparse outright on a cp1252 console, and every target name it reports carries a mu.
+force_utf8_console()
 
 # Color palette matching b_ExploreData.py _safe_series_colors — avoids red/orange hues
 # so uncertainty bands (same color, lower alpha) stay visually distinct from alarm states.

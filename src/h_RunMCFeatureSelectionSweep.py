@@ -160,25 +160,12 @@ from utils.plotstyle import PAGE_WIDTH_IN, apply_paper_style, legend_above, save
 apply_paper_style()
 
 
-def _force_utf8_console() -> None:
-    """Stop a single unencodable character from aborting a stage.
+# One shared implementation, in utils/console.py, rather than a second literal copy
+# here: this module's copy was the only one in the project, so every other entry point
+# went unguarded and z2_HorizonPostProcess --help aborted on its own help text.
+from utils.console import force_utf8_console
 
-    On Windows the console encoding defaults to cp1252, which cannot represent an
-    arrow. One such character in a progress message raised UnicodeEncodeError inside a
-    broad ``except Exception``, and the whole MLR k-cluster integration was skipped
-    with nothing but a warning to show for it. Reconfiguring the streams removes the
-    failure mode rather than the characters, so a stage can no longer be lost to a
-    glyph. ``errors="replace"`` keeps output flowing on any stream that still cannot
-    represent something.
-    """
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-
-
-_force_utf8_console()
+force_utf8_console()
 
 
 SUPPORTED_CONFIG_SUFFIXES = {".yml", ".yaml", ".json"}
@@ -1411,6 +1398,7 @@ def _evaluate_mlr_with_rebalance(
     min_test_independent,
     model_name="MLR",
     use_spearman_prefilter=True,
+    force_features=None,
 ):
     """Evaluate MLR, exclude unpredictable test samples, rebalance, re-fit.
 
@@ -1446,6 +1434,7 @@ def _evaluate_mlr_with_rebalance(
             selection_config=selection_config,
             aggregation_mode=aggregation_mode,
             use_spearman_prefilter=use_spearman_prefilter,
+            force_features=force_features,
         )
         preds, targets, test_samples, n_excl = _filter_pred(preds, targets, test_samples)
         total_excluded += n_excl
@@ -1595,6 +1584,14 @@ def _write_mlr_artifacts(
                 "intercept": meta.get("intercept", None),
                 "n_train_valid": meta.get("n_train", 0),
                 "spearman_kept_columns": meta.get("spearman_kept_columns", []),
+                # The aggregation is part of the model, not a display detail: `last`,
+                # `avg12` and `avgall` give different predictor rows and so different
+                # coefficients. evaluate_mlr already returns it and this writer dropped
+                # it, leaving the run's own artifact unable to say which variant it was
+                # -- so the horizon sweep, which rebuilds the fit from that artifact,
+                # defaulted every MLR run to `last`. On Chromium the reported model is
+                # avg12 on 21 training rows and the horizon refit `last` on 20.
+                "aggregation_mode": meta.get("aggregation_mode"),
             }
         )
 
@@ -1657,6 +1654,20 @@ def _write_mlr_artifacts(
         equation_lines.append("")
     with open(mlr_dir / "mlr_equation.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(equation_lines))
+
+    # The features the model actually kept, recorded so they can be reused rather than
+    # re-derived. They were previously recoverable only by parsing the equation text
+    # above, which is why the horizon sweep re-ran selection at every horizon and so
+    # compared a different model at each one -- the horizon effect and the selection
+    # churn were not separable.
+    selected_by_target = {}
+    for target_meta in model_config["per_target_meta"]:
+        if target_meta.get("selected_features"):
+            selected_by_target[str(target_meta["target_name"])] = list(
+                target_meta["selected_features"])
+    if selected_by_target:
+        (mlr_dir / "mlr_selected_features.json").write_text(
+            json.dumps(selected_by_target, indent=2), encoding="utf-8")
 
     # Write split files from actual sample lists (which may have been rebalanced
     # after excluding unpredictable samples).
@@ -5877,15 +5888,46 @@ def _evaluate_selected_subsets_all_models(
                         "vif_threshold": 10.0,
                     }
 
+                    # MLR fits on the replicated samples here exactly as it does on the
+                    # subset path. _ksample_sub is inherited from the reference variant,
+                    # which is often a GP run and therefore says 'samples'; taking it at
+                    # face value left the k-fold MLR runs trained on the collapsed
+                    # segments while the subset runs trained on the replicates, so the
+                    # same method was fitted on different data depending on which path
+                    # produced the run and z8 could select either.
+                    _kmlr_sample_sub = (
+                        "mc_replicates"
+                        if (Path(_kdata_dir) / "mc_replicates").is_dir()
+                        else _ksample_sub
+                    )
                     _kload_kw = dict(
-                        data_dir=_kdata_dir, sample_subdir=_ksample_sub,
+                        data_dir=_kdata_dir, sample_subdir=_kmlr_sample_sub,
                         forecast_name=_kdcfg.get("forecast_name", ""),
                         input_columns=_candidate_input_cols, output_columns=_koutput_cols,
                         input_rows=slice(_kin_r1, _kin_r2), output_rows=_kout_rows,
                         split_source_dir=_vd, input_aggregation=_kin_agg,
                     )
-                    _ktr = eval_module.load_split_samples(**_kload_kw, split_file="train_files.txt", fault_tolerant=True)
-                    _kte = eval_module.load_split_samples(**_kload_kw, split_file="test_files.txt", fault_tolerant=True)
+                    # The pinned split names base windows; they do not exist under
+                    # mc_replicates, and load_split_samples passes the list straight
+                    # through, so an unexpanded name is silently missed.
+                    _koverride = {}
+                    if _kmlr_sample_sub == "mc_replicates":
+                        for _sf in ("train_files.txt", "test_files.txt"):
+                            _names = eval_module._read_split_files(_vd, _sf)
+                            _expanded = []
+                            for _n in _names:
+                                _expanded.extend(
+                                    replicate_file_names(_kdata_dir, _n, _kmlr_sample_sub))
+                            _koverride[_sf] = _expanded
+                    _ktr = eval_module.load_split_samples(
+                        **_kload_kw, split_file="train_files.txt", fault_tolerant=True,
+                        split_files_override=_koverride.get("train_files.txt"))
+                    _kte = eval_module.load_split_samples(
+                        **_kload_kw, split_file="test_files.txt", fault_tolerant=True,
+                        split_files_override=_koverride.get("test_files.txt"))
+                    if _kmlr_sample_sub == "mc_replicates" and not _ktr:
+                        print(f"[WARN] k-fold MLR found no samples under {_kmlr_sample_sub} "
+                              f"for {_vd.name}; the split expansion matched no file.")
                     if len(_ktr) >= 3 and len(_kte) >= 1:
                         for _mlr_v in _MLR_VARIANTS:
                             try:
@@ -5937,7 +5979,8 @@ def _evaluate_selected_subsets_all_models(
                                         dataset_dir=dataset_plan.dataset_dir,
                                         subset_label=f"k{rank:02d}",
                                         data_dir=_kdata_dir,
-                                        sample_subdir=_ksample_sub,
+                                        # The subdir MLR read, so the baselines it is scored against use the same rows.
+                                        sample_subdir=_kmlr_sample_sub,
                                         input_columns=_candidate_input_cols,
                                         output_columns=_koutput_cols,
                                         input_row_1=_kin_r1,

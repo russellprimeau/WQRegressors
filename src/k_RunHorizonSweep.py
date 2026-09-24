@@ -90,7 +90,13 @@ from d_RunResample import (
     _normalize_once,
     _load_and_prepare_sensor_uncertainties,
 )
+from utils.console import force_utf8_console
 from utils.config_utils import load_config
+
+# Before anything can print: every target name carries a mu, so a cp1252 console
+# raises UnicodeEncodeError from inside print(). See utils/console.py.
+force_utf8_console()
+
 # The horizon sweep scores the segments z8 selected, with z8's metric function, so
 # that horizon 0 reproduces the results table rather than resembling it.
 import z8_CommonSetMetrics as z8
@@ -579,6 +585,28 @@ def _reported_xgb_rounds(run_dir) -> int | None:
     return n if n > 0 else None
 
 
+def _recorded_fit_seed(run_dir) -> 'int | None':
+    """The seed the winning fit drew from, as that run recorded it.
+
+    e_Train writes a ``seeding`` block into ``training_stop_summary.json`` naming both
+    the global RNG seed and the seed the estimator itself used; they differ for XGBoost,
+    whose ``random_state`` argument is what decides its row and column sampling. Reading
+    it is the point of recording it -- guessing is what produced two separate horizon-0
+    regressions. Returns None for runs written before the block existed, which then fall
+    back to 0 as before.
+    """
+    path = Path(run_dir) / 'training_stop_summary.json'
+    if not path.exists():
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            seeding = (json.load(f) or {}).get('seeding') or {}
+    except Exception:
+        return None
+    seed = seeding.get('model_fit_seed')
+    return None if seed is None else int(seed)
+
+
 def _build_horizon_config(winning_config: Path, class_dir: Path, rep_dir: Path,
                           rep_name: str, rep_idx: int, split_source: Path) -> dict:
     """The winning configuration, retargeted at one horizon replicate.
@@ -661,11 +689,21 @@ def _build_horizon_config(winning_config: Path, class_dir: Path, rep_dir: Path,
         cv['enabled'] = False
         hyper['cv_tuning'] = cv
 
-    seed_field = _MODEL_KEY_TO_SEED_FIELD.get(
-        _model_name_to_key(str(cfg.get('model_type', ''))))
+    model_key = _model_name_to_key(str(cfg.get('model_type', '')))
+    seed_field = _MODEL_KEY_TO_SEED_FIELD.get(model_key)
     if seed_field:
         hyper = cfg.setdefault('hyperparameters', {})
         base_seed = hyper.get(seed_field)
+        if base_seed is None:
+            # Replicate 0 must be the winning fit itself, so the base is the seed that
+            # fit actually drew from -- read from its artifact rather than re-derived.
+            # Re-deriving it is what broke horizon 0 twice: the transformer's effective
+            # seed was 42 where this assumed 0 (Arsenic, r2 +0.055 in the table against
+            # -0.220 at horizon 0), and then assuming 42 for XGBoost substituted it for
+            # XGBoost's own default of 0 and redrew subsample/colsample_bytree (Color,
+            # the reported model a stump splitting 0.520/0.620 against a constant 0.525
+            # refit, from identical data, splits and hyperparameters).
+            base_seed = _recorded_fit_seed(split_source)
         hyper[seed_field] = (0 if base_seed is None else int(base_seed)) + rep_idx
 
     # Reference forecasts are not reported per horizon, so do not compute them.
@@ -738,6 +776,71 @@ def _score_on_common_set(predictions_csv: Path, segments: list, sigma: float) ->
 _MLR_AGG_MODE = {'mlr': 'last', 'mlr_avg12': 'avg12', 'mlr_avgall': 'avgall'}
 
 
+def _winning_mlr_aggregation(run_dir, model_key: str) -> str:
+    """The predictor aggregation the winning MLR run was fitted with.
+
+    It cannot come from ``model_type``: every MLR variant records ``mlr`` there, and the
+    variant lives in the run directory name instead. Mapping the model key therefore
+    resolved `last` for an avg12 run, and the horizon refit a different model from the
+    one the results table reports -- measured on Chromium, avg12 on 21 training rows
+    against `last` on 20, with every coefficient different.
+
+    The run's own artifact is preferred; runs written before that field existed fall
+    back to the variant in the directory name, which is how the sweep names them.
+    """
+    run_dir = Path(run_dir)
+    cfg_path = run_dir / 'model_config.json'
+    if cfg_path.exists():
+        try:
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                per_target = json.load(f).get('per_target_meta') or []
+            recorded = (per_target[0] or {}).get('aggregation_mode') if per_target else None
+            if recorded in {'last', 'avg12', 'avgall'}:
+                return str(recorded)
+        except Exception:
+            pass
+    name = run_dir.name
+    for token, mode in (('avgall', 'avgall'), ('avg12', 'avg12')):
+        if token in name:
+            print("  [INFO] MLR aggregation %r inferred from run name %s (the run predates "
+                  "the recorded field)." % (mode, name))
+            return mode
+    fallback = _MLR_AGG_MODE.get(model_key, 'last')
+    print("  [INFO] MLR aggregation %r for run %s (no recorded field, no variant token "
+          "in the name)." % (fallback, name))
+    return fallback
+
+
+
+def _winning_run_sample_subdir(run_dir) -> str:
+    """The sample subdirectory a completed run was fitted on.
+
+    Taken from the run's own ``config_evaluate_*.yml`` rather than assumed, and
+    cross-checked against its split list: a list of base names belongs to ``samples``
+    and one of replicate names to ``mc_replicates``. The split is reused verbatim at
+    every horizon, so reading the wrong tree resolves nothing and the horizon is lost.
+    """
+    run_dir = Path(run_dir)
+    subdir = None
+    for cfg_path in sorted(run_dir.glob("config_evaluate_*.yml")):
+        try:
+            cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        subdir = (cfg.get("data") or {}).get("sample_subdir")
+        break
+    split_file = run_dir / "test_files.txt"
+    if split_file.exists():
+        names = split_file.read_text(encoding="utf-8").split()
+        looks_replicated = any("_mc_" in n for n in names)
+        inferred = "mc_replicates" if looks_replicated else "samples"
+        if subdir and subdir != inferred:
+            print(f"  [WARN] {run_dir.name}: config says sample_subdir={subdir!r} but its "
+                  f"split list looks like {inferred!r}; using {inferred!r} so the reused "
+                  "split resolves.")
+        return inferred
+    return subdir or "samples"
+
 
 def _run_mlr_horizon_rep(
     *,
@@ -789,7 +892,13 @@ def _run_mlr_horizon_rep(
             fault_tolerant=True,
             reuse_split=True,
             split_source=split_source,
-            sample_subdir='samples',
+            # The subdirectory the winning run was actually fitted on, read from its own
+            # evaluation config. It cannot be assumed: MLR reaches the results table by
+            # two paths that currently disagree, so 'samples' and 'mc_replicates' both
+            # occur. Guessing either one makes the reused split unresolvable -- the split
+            # lists name whichever tree the run read, and a base name does not exist under
+            # mc_replicates nor a replicate name under samples.
+            sample_subdir=_winning_run_sample_subdir(split_source),
             input_aggregation='none',   # MLR applies its own aggregation internally
             min_test_independent=5,
         )
@@ -802,19 +911,42 @@ def _run_mlr_horizon_rep(
               f"(train={len(train_samples)}, test={len(test_samples)})")
         return None
 
-    aggregation_mode = _MLR_AGG_MODE.get(model_key, 'last')
+    aggregation_mode = _winning_mlr_aggregation(split_source, model_key)
+
+    # Reuse the winning run's selected features at every horizon rather than selecting
+    # again per horizon. Re-selecting compares a different model at each horizon, so the
+    # curve mixes the horizon effect with selection churn -- and it made horizon 0 fail to
+    # reproduce the results table it is defined against.
+    mlr_features = None
+    sel_path = Path(split_source) / "mlr_selected_features.json"
+    if sel_path.exists():
+        try:
+            recorded = json.loads(sel_path.read_text(encoding="utf-8"))
+            if isinstance(recorded, dict) and recorded:
+                # One target per MLR run directory.
+                mlr_features = list(next(iter(recorded.values())))
+        except Exception as exc:
+            print(f"  [WARN] could not read {sel_path.name}: {exc}")
+    if not mlr_features:
+        print(f"  [WARN] {rep_name}: no recorded MLR feature set in {Path(split_source).name}; "
+              "falling back to re-selection, so this horizon is not comparable with the "
+              "results table. Re-run the sweep to record it.")
 
     try:
         preds, targets, train_samples, test_samples, meta, _ = \
             _h._evaluate_mlr_with_rebalance(
                 train_samples=train_samples,
                 test_samples=test_samples,
+                # feature_names must stay the full column list: it labels the sample's
+                # columns in order. The pinned set goes through force_features, which
+                # resolves it by name.
                 feature_names=input_columns,
                 selection_config=None,
                 aggregation_mode=aggregation_mode,
                 min_test_independent=5,
                 model_name=f'MLR {rep_name}',
-                use_spearman_prefilter=True,
+                use_spearman_prefilter=mlr_features is None,
+                force_features=mlr_features,
             )
     except Exception as exc:
         print(f"  [ERROR] MLR evaluation failed for {rep_name}: {exc}")
@@ -915,6 +1047,7 @@ def _run_mlr_horizon_rep(
                 'coefficients': m.get('coefficients', []),
                 'intercept': m.get('intercept', None),
                 'n_train_valid': m.get('n_train', 0),
+                'aggregation_mode': m.get('aggregation_mode'),
             }
             for i, m in enumerate(meta)
         ],

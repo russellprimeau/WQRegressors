@@ -71,6 +71,12 @@ try:
     import gpytorch
 except ImportError:
     gpytorch = None
+from utils.console import force_utf8_console
+
+# Before anything can print: every target name carries a mu, so a cp1252 console
+# raises UnicodeEncodeError from inside print(). See utils/console.py.
+force_utf8_console()
+
 from utils.training import (write_config, splitter, _base_sample_id, load_samples,
                             reduced_window_shape, parse_input_aggregation,
                             aggregation_slug)
@@ -872,6 +878,53 @@ def _to_json_safe(value):
     return value
 
 
+def _seeding_record(config: dict) -> dict:
+    """What actually seeded this fit, so the fit can be reproduced from the artifact.
+
+    The seed was never in doubt -- it is derived deterministically from the config -- but
+    it was only ever printed, so a later reader could not tell which seed produced a
+    given model without re-deriving it from code that may since have changed. The horizon
+    sweep had to guess, guessed 0 where the effective seed was 42, and silently refit a
+    different transformer at horizon 0.
+
+    Two seeds are recorded because they are not the same thing. ``global_rng_seed`` is
+    what ``_seed_model_rng`` fed to random/numpy/torch. ``model_fit_seed`` is the seed the
+    estimator actually draws from, which for XGBoost is its own ``random_state``
+    argument and is left at XGBoost's default of 0 when the config sets none -- the
+    global seed does not reach it.
+    """
+    hyper_cfg = config.get("hyperparameters", {}) or {}
+    model_type = str(config.get("model_type", ""))
+    model_key = ("xgb" if model_type.startswith("xgb")
+                 else "gp" if model_type.startswith("gp")
+                 else "transformer" if model_type.startswith("transformer")
+                 else "")
+    record = {
+        "global_rng_seed": hyper_cfg.get("effective_random_state"),
+        "global_rng_seed_source": hyper_cfg.get("effective_random_state_source"),
+    }
+    if model_key == "xgb":
+        configured = hyper_cfg.get("random_state")
+        record["model_fit_seed"] = 0 if configured is None else int(configured)
+        record["model_fit_seed_source"] = (
+            "hyperparameters.random_state" if configured is not None
+            else "xgboost default (config sets none; the global seed does not reach it)"
+        )
+    elif model_key == "transformer":
+        record["model_fit_seed"] = record["global_rng_seed"]
+        record["model_fit_seed_source"] = (
+            "torch global generator, seeded from %s" % record["global_rng_seed_source"]
+        )
+    elif model_key == "gp":
+        mc_seed = hyper_cfg.get("uncertain_kernel_mc_seed")
+        record["model_fit_seed"] = mc_seed
+        record["model_fit_seed_source"] = (
+            "hyperparameters.uncertain_kernel_mc_seed" if mc_seed is not None
+            else "none: the fit is deterministic given its data"
+        )
+    return record
+
+
 def _write_training_stop_summary(config: dict, summary: dict) -> Path:
     """Persist a standardized training stop-reason artifact next to model files."""
     data_cfg = config["data"]
@@ -884,6 +937,7 @@ def _write_training_stop_summary(config: dict, summary: dict) -> Path:
         "forecast_name": str(data_cfg.get("forecast_name", "")),
     }
     payload.update(_to_json_safe(summary or {}))
+    payload["seeding"] = _to_json_safe(_seeding_record(config))
     global _LAST_CV_EPOCH_DIAG
     if _LAST_CV_EPOCH_DIAG:
         # An epoch budget of 3 drawn from a curve whose one-standard-error plateau spans
@@ -1169,6 +1223,11 @@ def _transformer_cv_estimate_epochs(
     return max(1, pooled_ep)
 
 
+# The model seed used when a config sets none. 0 is XGBoost's own default, so every
+# family's unseeded fit and the seed ensemble's member 0 agree on what "seed 0" means.
+_DEFAULT_MODEL_SEED = 0
+
+
 def _seed_model_rng(config: dict, label: str) -> int | None:
     """Seed the RNGs a fit actually draws from, and say which seed was used.
 
@@ -1182,26 +1241,48 @@ def _seed_model_rng(config: dict, label: str) -> int | None:
 
     Seeding here makes a fit a function of its config, which is the precondition for
     measuring seed variance deliberately (vary the seed, hold everything else) rather
-    than inheriting it by accident. XGBoost is seeded through its own ``random_state``
-    argument and the Gaussian process is deterministic given its data, so this matters
-    most for the transformer -- but it is applied uniformly, because "which families
-    happen to be deterministic today" is not a property worth relying on.
+    than inheriting it by accident.
+
+    Called by the transformer and the Gaussian process only, *not* by XGBoost -- an
+    earlier version of this docstring claimed it was "applied uniformly", which was
+    never true and is misleading in a way that matters. XGBoost's sampling is driven by
+    the ``random_state`` it is constructed with (see ``_xgb_estimator_kwargs``), and
+    nothing in its path reads any of the globals seeded here: measured on xgboost 3.2.0
+    with subsample=0.5 and colsample_bytree=0.6 active, NumPy's global state does not
+    advance across ``fit`` and the predictions are identical across global seeds, and
+    the Optuna tuning stage behaves the same way because its sampler is constructed with
+    an explicit seed. Adding a call here for XGBoost would therefore change nothing
+    while implying control over a fit it does not have.
     """
     hyper_cfg = config.get("hyperparameters", {}) or {}
-    split_cfg = config.get("data_split", {}) or {}
-    # hyperparameters.random_state is the model seed and is what a multi-seed sweep should
-    # vary. Transformer configs carry no such key -- their only random_state lives under
-    # data_split and governs the split, not the fit -- so it is used as a fallback purely
-    # so that an unmodified config is reproducible. A sweep that wants to vary the model
-    # seed must set hyperparameters.random_state, which leaves the split untouched.
+    # hyperparameters.random_state is the model seed and is what a multi-seed sweep
+    # varies. A config that sets none falls back to _DEFAULT_MODEL_SEED, not to
+    # data_split.random_state.
+    #
+    # It used to fall back to the split seed, which made the model seed an alias of a
+    # parameter that has nothing to do with the fit. Two things followed. Every
+    # transformer in the sweep initialised from 42 -- not a seed anyone chose, just the
+    # split seed leaking through -- so studying split sensitivity would silently have
+    # re-initialised every model at the same time, confounding the two effects. And the
+    # seed ensemble's member 0 is the primary run, whose seed is this fallback: with
+    # --seed-base 0 that made the transformer ensemble {42, 1, 2, ...} while XGBoost's
+    # was {0, 1, 2, ...}, so --seed-base did not mean the same thing across families.
+    # Defaulting to 0 is XGBoost's own default, so member 0 is seed 0 for every family
+    # and an unmodified config stays reproducible.
     seed = hyper_cfg.get("random_state")
     source = "hyperparameters.random_state"
     if seed is None:
-        seed = split_cfg.get("random_state")
-        source = "data_split.random_state (fallback)"
-    if seed is None:
-        return None
+        seed = _DEFAULT_MODEL_SEED
+        source = "default (config sets no model seed)"
     seed = int(seed)
+    # Record the seed the fit actually drew from, on the config itself so it reaches the
+    # saved artifact. It was previously only printed, which put it in a terminal buffer
+    # rather than anywhere a later reader could find it -- so "which seed produced this
+    # model?" was unanswerable from the run, and a consumer that needed to reproduce the
+    # fit had to guess. The horizon sweep guessed 0 where the effective seed was 42, and
+    # refit a different model at horizon 0 without anything flagging it.
+    config.setdefault("hyperparameters", {})["effective_random_state"] = seed
+    config["hyperparameters"]["effective_random_state_source"] = source
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)

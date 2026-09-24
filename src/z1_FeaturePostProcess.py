@@ -73,7 +73,13 @@ import seaborn as sns
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
+from utils.console import force_utf8_console
 from utils.training import load_samples, group_samples_by_segment, _filter_samples_by_nan_tolerance
+
+# Before anything can print: every target name carries a mu, so a cp1252 console
+# raises UnicodeEncodeError from inside print(). See utils/console.py.
+force_utf8_console()
+
 from utils.plotstyle import (
     PAGE_WIDTH_IN,
     apply_paper_style,

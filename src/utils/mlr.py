@@ -470,6 +470,7 @@ def fit_and_predict(
     feature_names=None,
     verbose=False,
     selection_config=None,
+    features_are_pinned=False,
 ):
     """Feature-select, fit MLR on training data, predict on test data.
 
@@ -488,12 +489,23 @@ def fit_and_predict(
         feature_names = [f"f{i}" for i in range(X_train.shape[1])]
 
     selection_config = dict(selection_config or {})
-    sel_idx, sel_names = select_features(
-        X_train,
-        y_train,
-        feature_names,
-        **selection_config,
-    )
+    if features_are_pinned:
+        # The caller has already decided the feature set -- it is replaying a set
+        # selected on another fit -- so selection must not run again. select_features
+        # has no "off" switch: disabling mutual information and Lasso through
+        # selection_config still leaves the constant drop, the duplicate merge and the
+        # VIF loop, any of which can quietly return a different set from the one that
+        # was pinned. Measured on the Chromium horizon sweep, replaying the reported
+        # run's 10 features and re-selecting on top of them is not the reported model.
+        sel_idx = list(range(X_train.shape[1]))
+        sel_names = list(feature_names)
+    else:
+        sel_idx, sel_names = select_features(
+            X_train,
+            y_train,
+            feature_names,
+            **selection_config,
+        )
 
     predictions = np.full(X_test.shape[0], np.nan)
     meta = {
@@ -594,6 +606,7 @@ def evaluate_mlr(
     selection_config=None,
     aggregation_mode="last",
     use_spearman_prefilter=True,
+    force_features=None,
 ):
     """Multiple Linear Regression with independent feature selection.
 
@@ -631,9 +644,34 @@ def evaluate_mlr(
     # Base feature names (one per input column)
     base_names = feature_names if feature_names is not None else [f"f{i}" for i in range(n_cols)]
 
+    if force_features is not None:
+        # ``feature_names`` names every column of the sample, in column order; it is a
+        # label list, not a column selection. Passing a *subset* of it as feature_names
+        # does not subset the data -- the columns are still taken positionally below, so
+        # a caller replaying a selected set got the first k columns wearing the selected
+        # set's names. On Chromium that fitted input columns 0-9 while labelling them as
+        # the selection at columns 1,3,4,6,7,8,10,12,13,15. Named columns are resolved
+        # here instead, and an unknown name is an error rather than a silent reindex.
+        missing = [f for f in force_features if f not in base_names]
+        if missing:
+            raise ValueError(
+                "force_features names %d column(s) absent from feature_names: %s"
+                % (len(missing), missing[:5])
+            )
+        name_to_col = {n: i for i, n in enumerate(base_names)}
+        forced_cols = [name_to_col[f] for f in force_features]
+
     for j in range(n_outputs):
         # --- Step 0: Spearman pre-filter on base columns ---
-        if use_spearman_prefilter:
+        if force_features is not None:
+            keep_cols = list(forced_cols)
+            spearman_results = {}
+            if verbose:
+                print(
+                    f"[MLR] Feature set pinned by caller: {len(keep_cols)} of "
+                    f"{len(base_names)} columns, selection and pre-filter both skipped"
+                )
+        elif use_spearman_prefilter:
             keep_cols, spearman_results = _prefilter_by_spearman(
                 train_samples, j, base_names,
                 aggregation_mode=aggregation_mode,
@@ -670,6 +708,7 @@ def evaluate_mlr(
             feature_names=filtered_names,
             verbose=verbose,
             selection_config=selection_config,
+            features_are_pinned=force_features is not None,
         )
         predictions[:, j] = pred_j
 

@@ -38,7 +38,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from utils.console import force_utf8_console
 from utils import evidence as ev
+
+# Before anything can print: every target name carries a mu, so a cp1252 console
+# raises UnicodeEncodeError from inside print(). See utils/console.py.
+force_utf8_console()
+
 from utils import run_paths as rp
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

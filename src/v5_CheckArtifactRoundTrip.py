@@ -42,7 +42,13 @@ from pathlib import Path
 import numpy as np
 import yaml
 
+from utils.console import force_utf8_console
 from utils import run_paths as rp
+
+# Before anything can print: every target name carries a mu, so a cp1252 console
+# raises UnicodeEncodeError from inside print(). See utils/console.py.
+force_utf8_console()
+
 from utils.config_utils import UNCERTAINTY_DISTRIBUTION_FEATURES
 from utils.gp_utils import (
     GP_ARTIFACT_VERSION,

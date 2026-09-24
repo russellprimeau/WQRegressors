@@ -20,7 +20,13 @@ import matplotlib.pyplot as plt
 import plotly.express as px
 from scipy import stats
 from pathlib import Path
+from utils.console import force_utf8_console
 from utils.preprocessing import normalize_columns
+
+# Before anything can print: every target name carries a mu, so a cp1252 console
+# raises UnicodeEncodeError from inside print(). See utils/console.py.
+force_utf8_console()
+
 from utils.config_utils import (
     UNCERTAINTY_DISTRIBUTION_FEATURES,
     feature_carries_uncertainty,

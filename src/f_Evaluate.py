@@ -34,6 +34,12 @@ try:
 except ImportError:
     gpytorch = None
 
+from utils.console import force_utf8_console
+
+# Before anything can print: every target name carries a mu, so a cp1252 console
+# raises UnicodeEncodeError from inside print(). See utils/console.py.
+force_utf8_console()
+
 from utils.training import (
     load_samples,
     require_row_name_alignment,
