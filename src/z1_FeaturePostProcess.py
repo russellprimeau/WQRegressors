@@ -2032,12 +2032,9 @@ def _model_sample_policy(model_type: str, split_cfg: dict) -> tuple[bool, float 
     return False, None
 
 
-def _sample_names_from_loaded_samples(samples) -> list[str]:
-    names: list[str] = []
-    for sample in samples:
-        if isinstance(sample, (tuple, list)) and len(sample) >= 3:
-            names.append(Path(str(sample[2])).name)
-    return names
+# Defined once in utils.training; see the note there on why a split file list is not a
+# valid source of names.
+from utils.training import sample_names_from_loaded_samples as _sample_names_from_loaded_samples  # noqa: E402
 
 
 def _find_best_variant_eval_config(plan: DatasetPlan, row: "pd.Series") -> "tuple[Path | None, Path | None, str]":

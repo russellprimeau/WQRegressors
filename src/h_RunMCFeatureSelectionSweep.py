@@ -1326,8 +1326,6 @@ def _append_mlr_baseline_outputs(
             output_columns,
             int(eval_cfg_merged.get("window_hours", 340)),
         )
-        deduped_split_files = eval_module._dedupe_split_files_by_base_sample(test_split_files)
-
         preds_naive, targets_naive = eval_module.evaluate_naive(
             test_samples,
             historic,
@@ -1373,7 +1371,11 @@ def _append_mlr_baseline_outputs(
         (preds_linear, targets_linear),
     ]
     baseline_labels = ["Naive", "Seasonal", "Linear"]
-    baseline_split_files = [deduped_split_files] * len(baseline_pairs)
+    # One name per prediction row. The baselines are evaluated over test_samples, so
+    # their arrays are replicate-length; the collapse to one point per window happens
+    # downstream in _collapse_errors_by_base_sample, which groups by base id and needs
+    # the full list. Deduplicating here left 9 names against 90 rows.
+    baseline_split_files = [list(test_split_files)] * len(baseline_pairs)
 
     for (preds, targets), label in zip(baseline_pairs, baseline_labels):
         summary_rows.append(
@@ -7219,12 +7221,71 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
                 if args.stop_on_error:
                     raise
 
+    # Did every family actually produce scored predictions?
+    #
+    # `failed` counts dataset-level exceptions only. A per-config evaluation failure is
+    # caught, recorded as a failure_reason on the row, and the sweep carries on -- so a
+    # run in which every GP and transformer config failed still reported
+    # "Datasets failed: 0" and exited 0. A broken import did exactly that, and the run
+    # looked clean. The question that decides whether a sweep is usable is not whether it
+    # raised, it is whether real predictions came back for each family.
+    SUPPORTED_FAMILIES = ("gp", "mlr", "xgb", "transformer")
+    barren: list[str] = []
+    reasons: dict[str, int] = {}
+    family_rows: dict[str, int] = {f: 0 for f in SUPPORTED_FAMILIES}
+    for plan in plans:
+        metrics_path = (_forecast_sweeps_dir(plan.dataset_dir)
+                        / "feature_sweep_final_metrics.csv")
+        if not metrics_path.exists():
+            barren.append(f"{plan.dataset_dir.name}: no feature_sweep_final_metrics.csv")
+            continue
+        try:
+            mdf = pd.read_csv(metrics_path)
+        except Exception as exc:
+            barren.append(f"{plan.dataset_dir.name}: unreadable metrics ({exc})")
+            continue
+        if "failure_reason" in mdf.columns:
+            for r in mdf["failure_reason"].dropna().astype(str):
+                reasons[r[:70]] = reasons.get(r[:70], 0) + 1
+        mcol = next((c for c in ("model", "model_name", "label") if c in mdf.columns), None)
+        if mcol is None or "r2" not in mdf.columns:
+            continue
+        fam = mdf[mcol].astype(str).str.split("_").str[0].str.lower()
+        scored = mdf["r2"].notna()
+        for f in SUPPORTED_FAMILIES:
+            n = int((fam.eq(f) & scored).sum())
+            family_rows[f] += n
+            if n == 0:
+                barren.append(f"{plan.dataset_dir.name}: {f} produced no scored row")
+
     print("\nRun summary")
     print("-" * 100)
     print(f"Datasets completed: {len(plans) - failed}")
     print(f"Datasets failed   : {failed}")
+    print("Scored rows by family: "
+          + ", ".join(f"{f}={family_rows[f]}" for f in SUPPORTED_FAMILIES))
+    if reasons:
+        print(f"Configs recording a failure_reason: {sum(reasons.values())}")
+        for reason, n in sorted(reasons.items(), key=lambda kv: -kv[1])[:5]:
+            print(f"    [{n:>4}x] {reason}")
+    # A family that scored nothing *anywhere* is a systemic failure -- a broken import, a
+    # bad config -- and the run is not usable. A family missing on a particular target is
+    # a local gap: the transformer genuinely fits nothing on some short-window targets,
+    # which validate_run_outputs already reports. Both are printed; only the first fails
+    # the run, so a non-zero exit keeps meaning something.
+    systemic = [f for f in SUPPORTED_FAMILIES if family_rows[f] == 0]
+    if barren:
+        print(f"\nGaps ({len(barren)}):")
+        for b in barren[:12]:
+            print(f"    {b}")
+        if len(barren) > 12:
+            print(f"    ... and {len(barren) - 12} more")
+    if systemic:
+        print(f"\nFAMILY PRODUCED NO SCORED PREDICTIONS ANYWHERE: {', '.join(systemic)}")
+        print("This is a systemic failure, not a data gap. These results are not usable, "
+              "whatever the dataset counts above say.")
 
-    rc = 0 if failed == 0 else 2
+    rc = 0 if (failed == 0 and not systemic) else 2
     if getattr(args, "notify", False):
         status = "Complete" if rc == 0 else f"Failed ({failed} dataset(s))"
         notify(

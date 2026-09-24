@@ -57,6 +57,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import f_Evaluate as eval_module
+from utils.training import sample_names_from_loaded_samples
 from utils.config_utils import _resolve_data_paths, _resolve_path_from_config, load_config, select_best_model_row
 from utils.limits import limit_exceedance_mask, load_limits_records, map_limits_to_columns
 from utils.names import clean_target_label
@@ -787,6 +788,9 @@ def _load_eval_context(artifact_dir: Path, evaluation_scope: str) -> dict:
         fault_tolerant=split_fault_tolerant,
         input_aggregation=input_aggregation,
     )
+    # The split list selected which files to load; it does not describe what was loaded.
+    # See utils.training.sample_names_from_loaded_samples.
+    test_split_files = sample_names_from_loaded_samples(test_samples) or test_split_files
 
     train_split_files = []
     train_samples = []
@@ -808,6 +812,7 @@ def _load_eval_context(artifact_dir: Path, evaluation_scope: str) -> dict:
             fault_tolerant=split_fault_tolerant,
             input_aggregation=input_aggregation,
         )
+        train_split_files = sample_names_from_loaded_samples(train_samples) or train_split_files
 
     if evaluation_scope == "combined":
         eval_samples = list(train_samples) + list(test_samples)

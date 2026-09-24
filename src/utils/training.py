@@ -422,6 +422,47 @@ def replicate_file_names(dataset_dir, segment, sample_subdir):
     )
 
 
+def sample_names_from_loaded_samples(samples) -> list[str]:
+    """The filenames of the samples that were actually loaded, in their loaded order.
+
+    This is the only correct source of names for anything that pairs a prediction row
+    with the window it came from. A split file list is not: `load_samples` iterates
+    `sorted(os.listdir(...))` rather than the list's order, and drops any sample it
+    cannot use, so the list and the loaded rows agree only by coincidence. Indexing the
+    list by row position then attributes every prediction to the wrong window, silently
+    and plausibly -- which is exactly what happened to `predictions.csv`.
+
+    Each sample carries its filename as element [2], so the truth is always available.
+    """
+    names: list[str] = []
+    for sample in samples:
+        if isinstance(sample, (tuple, list)) and len(sample) >= 3:
+            names.append(Path(str(sample[2])).name)
+    return names
+
+
+def require_row_name_alignment(n_rows: int, names, context: str) -> int:
+    """Assert that prediction rows and sample names correspond one-to-one.
+
+    Callers used to absorb a mismatch with ``min(n_rows, len(names))``, which silently
+    relabels every row past the first divergence and, where several rows share a window,
+    silently regroups the metrics too. A length disagreement means the names no longer
+    describe the rows, and there is no correct way to continue from that.
+
+    ``names`` of None or empty is not a mismatch -- it means the caller has no names to
+    pair and will fall back to positional identifiers.
+    """
+    if not names:
+        return n_rows
+    if len(names) != n_rows:
+        raise ValueError(
+            f"{context}: {n_rows} prediction row(s) but {len(names)} sample name(s). "
+            "These must correspond one-to-one; names must come from the loaded samples "
+            "(see sample_names_from_loaded_samples), not from a split file list."
+        )
+    return n_rows
+
+
 def group_samples_by_segment(samples):
     """
     Group samples by segment number to keep MC replicates together.

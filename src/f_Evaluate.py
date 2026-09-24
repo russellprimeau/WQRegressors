@@ -34,7 +34,11 @@ try:
 except ImportError:
     gpytorch = None
 
-from utils.training import load_samples
+from utils.training import (
+    load_samples,
+    require_row_name_alignment,
+    sample_names_from_loaded_samples,
+)
 from utils.transformer import TimeSeriesTargetDataset, TimeSeriesTransformer
 from utils.evaluation import (
     load_secondary,
@@ -623,7 +627,7 @@ def _aggregate_by_independent_sample(
         # No filename mapping available: treat each row as an independent sample.
         return pred_arr.copy(), target_arr.copy(), int(n_rows), int(n_rows)
 
-    aligned_rows = min(n_rows, len(split_files))
+    aligned_rows = require_row_name_alignment(n_rows, split_files, "_aggregate_by_independent_sample")
     if aligned_rows <= 0:
         return pred_arr[:0], target_arr[:0], 0, 0
 
@@ -692,7 +696,7 @@ def _build_replicate_groups(preds, targets, split_files, row_limit=None):
 
     if split_files is None:
         split_files = []
-    n_rows = min(n_rows, len(split_files))
+    n_rows = require_row_name_alignment(n_rows, split_files, "_build_replicate_groups")
     if n_rows == 0:
         return [], {}, {}, 0
 
@@ -858,7 +862,7 @@ def _has_mc_replicate_distribution_for_uncertainty_plot(
         if n_rows <= 0 or n_cols <= 0:
             continue
 
-        aligned_rows = min(n_rows, len(split_files))
+        aligned_rows = require_row_name_alignment(n_rows, split_files, "_has_mc_replicate_distribution_for_uncertainty_plot")
         if aligned_rows <= 1:
             continue
 
@@ -1154,7 +1158,7 @@ def _group_independent_prediction_stats(preds, targets, split_files):
         return [], 0
 
     if split_files:
-        n_rows = min(n_rows, len(split_files))
+        n_rows = require_row_name_alignment(n_rows, split_files, "_group_independent_prediction_stats")
         split_names = [Path(str(s)).name for s in split_files[:n_rows]]
     else:
         split_names = [f"sample_{i:06d}.csv" for i in range(n_rows)]
@@ -1243,7 +1247,7 @@ def _group_gp_var_by_sample(gp_var, split_files, n_outputs):
     if n_rows == 0:
         return None
     if split_files:
-        n_rows = min(n_rows, len(split_files))
+        n_rows = require_row_name_alignment(n_rows, split_files, "_group_gp_var_by_sample")
         split_names = [Path(str(s)).name for s in split_files[:n_rows]]
     else:
         split_names = [f"sample_{i:06d}.csv" for i in range(n_rows)]
@@ -1683,6 +1687,12 @@ def evaluate_single_config(config_path, save_plots_override=None):
             "[MC-POLICY] collapse_mc_replicates_for_eval=True "
             f"(test split unique samples: {len(model_split_files)})"
         )
+    # From here on the split list is a *selection*, not a set of labels. Everything that
+    # pairs a prediction row with a window must use the names of the samples that were
+    # actually loaded: load_samples returns them in sorted directory order, not the
+    # list's order, and omits any it could not use. Indexing the list by row position
+    # instead labelled each prediction with the wrong window -- plausibly, and silently.
+    model_split_files = sample_names_from_loaded_samples(test_samples) or model_split_files
     test_dataset = TimeSeriesTargetDataset(test_samples)
     train_samples = None
     train_split_files = None
@@ -1706,9 +1716,9 @@ def evaluate_single_config(config_path, save_plots_override=None):
             input_aggregation=input_aggregation,
             drop_report=train_drop_report,
         )
-        train_split_files = _read_split_files(split_base_dir, "train_files.txt")
-        if collapse_mc_for_eval:
-            train_split_files = _dedupe_split_files_by_base_sample(train_split_files)
+        # Names of the samples actually loaded, not the selection list -- see the note
+        # on model_split_files above.
+        train_split_files = sample_names_from_loaded_samples(train_samples)
     elif model_type in ("xgb_regressor", "transformer", "xgb_classifier"):
         # For these, optionally load train samples if evaluate_all is set
         if eval_cfg.get("evaluate_all", False):
@@ -1731,9 +1741,7 @@ def evaluate_single_config(config_path, save_plots_override=None):
                 input_aggregation=input_aggregation,
                 drop_report=train_drop_report,
             )
-            train_split_files = _read_split_files(split_base_dir, "train_files.txt")
-            if collapse_mc_for_eval:
-                train_split_files = _dedupe_split_files_by_base_sample(train_split_files)
+            train_split_files = sample_names_from_loaded_samples(train_samples)
 
     # If evaluate_all is true, combine train and test samples for evaluation, but keep track of which is which
     if eval_cfg.get("evaluate_all", False) and train_samples is not None:
@@ -1978,9 +1986,13 @@ def evaluate_single_config(config_path, save_plots_override=None):
             (preds_linear, targets_linear),
         ]
         baseline_labels = ["Naive", "Seasonal", "Linear"]
-        # Baselines are deterministic per independent sample; collapse MC replicates for plotting.
-        baseline_plot_split_files = _dedupe_split_files_by_base_sample(eval_split_files)
-        baseline_split_files = [baseline_plot_split_files] * 3
+        # Baselines are deterministic per independent sample, so their errors are collapsed
+        # to one point per window for plotting -- but that collapse happens downstream, in
+        # _collapse_errors_by_base_sample, which groups by base id and therefore needs one
+        # name per prediction row. Deduplicating the names here instead left 27 names against
+        # 108 rows; the pairing then silently truncated to the first 27, so the baseline
+        # boxplots were drawn from a quarter of the evaluation set.
+        baseline_split_files = [list(eval_split_files)] * 3
         baseline_kind = "combined" if (eval_cfg.get("evaluate_all", False) and train_samples is not None) else "test"
         # Add baseline metrics to summary_rows
         for (preds, targets), label in zip(baseline_pairs, baseline_labels):

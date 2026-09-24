@@ -61,6 +61,9 @@ REFERENCE_COLUMNS = ("Naive", "Seasonal", "Linear")
 TARGET_SUPPORT = (0.0, 1.0)
 SUPPORT_TOLERANCE = 1e-6
 
+# Collapses a Monte Carlo replicate filename to its base window.
+_MC_SUFFIX_RE = re.compile(r"_mc_\d+(?=\.csv$)")
+
 
 @dataclass
 class Findings:
@@ -233,6 +236,31 @@ def check_target(dataset_dir: Path, families: tuple[str, ...], found: Findings,
                                 "evaluation set cannot be constructed")
         if any(c in preds.columns for c in REFERENCE_COLUMNS):
             ref_seen = True
+
+        # Were these rows labelled with the windows they were actually scored on?
+        #
+        # Names used to be taken by indexing the split file list with the prediction row
+        # index. That list selects which files to load; it does not describe what was
+        # loaded, because load_samples returns samples in sorted directory order and
+        # omits any it cannot use. Every row past the first omission was then attributed
+        # to the wrong window -- plausibly enough to reach the common evaluation set,
+        # where sample_file is the join key.
+        #
+        # The signature is exact: the scored set is the leading slice of the listed set.
+        # It held in all 1,728 affected runs measured across CV25 and CV23_profiler.
+        if "kind" in preds.columns and "sample_file" in preds.columns:
+            test_file = run / "test_files.txt"
+            if test_file.exists():
+                listed = sorted({_MC_SUFFIX_RE.sub("", Path(n).name)
+                                 for n in test_file.read_text(encoding="utf-8").split()})
+                scored = {_MC_SUFFIX_RE.sub("", str(n))
+                          for n in preds[preds["kind"].astype(str) == "test"]["sample_file"]}
+                if scored and len(scored) < len(listed) and scored == set(listed[:len(scored)]):
+                    found.error(
+                        rl,
+                        f"predictions are labelled with the first {len(scored)} of "
+                        f"{len(listed)} listed test windows, the signature of positional "
+                        "mislabelling; re-run this configuration to relabel it")
 
         # Predictions must lie in the target's normalized support. One
         # extrapolation is enough to dominate a squared-error metric.

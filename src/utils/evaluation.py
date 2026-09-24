@@ -14,6 +14,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score, accuracy_score, precision_score,
                              recall_score, f1_score, confusion_matrix, roc_curve, precision_recall_curve, auc)
 from .preprocessing import normalize_columns
+from .training import require_row_name_alignment
 
 
 EUROFINS_SUMMARY_DEFAULT_PATH = (
@@ -177,6 +178,15 @@ def evaluate_naive(dataset, historic, output_columns, data_dir, output_rows=-1, 
 
         output_times = _get_output_times(data_dir, filename, output_rows, sample_subdir=sample_subdir)
         if len(output_times) == 0:
+            # Emit a NaN row rather than skipping. Dropping the sample here shortens
+            # this baseline's array independently of the model's, so every later row
+            # pairs with the wrong window -- the same positional slip that mislabelled
+            # predictions.csv. Keeping the length equal to len(dataset) makes the
+            # alignment a property of the contract instead of a coincidence; the NaN
+            # is already excluded by the finite-count metrics.
+            _y_flat = np.asarray(y).reshape(-1)
+            predictions.append(np.full(_y_flat.shape, np.nan))
+            targets.append(_y_flat)
             continue
 
         cutoff_time = output_times[0] - pd.Timedelta(hours=gap_hours)
@@ -219,6 +229,15 @@ def evaluate_linear(data_dir, forecast_name, dataset, historic, output_columns, 
 
         output_times = _get_output_times(data_dir, filename, output_rows, sample_subdir=sample_subdir)
         if len(output_times) == 0:
+            # Emit a NaN row rather than skipping. Dropping the sample here shortens
+            # this baseline's array independently of the model's, so every later row
+            # pairs with the wrong window -- the same positional slip that mislabelled
+            # predictions.csv. Keeping the length equal to len(dataset) makes the
+            # alignment a property of the contract instead of a coincidence; the NaN
+            # is already excluded by the finite-count metrics.
+            _y_flat = np.asarray(y).reshape(-1)
+            predictions.append(np.full(_y_flat.shape, np.nan))
+            targets.append(_y_flat)
             continue
 
         forecast_start = output_times[0]
@@ -357,6 +376,15 @@ def evaluate_seasonal(dataset, historic, output_columns, data_dir, output_rows=-
         _, y, filename = dataset[i]
         output_times = _get_output_times(data_dir, filename, output_rows, sample_subdir=sample_subdir)
         if len(output_times) == 0:
+            # Emit a NaN row rather than skipping. Dropping the sample here shortens
+            # this baseline's array independently of the model's, so every later row
+            # pairs with the wrong window -- the same positional slip that mislabelled
+            # predictions.csv. Keeping the length equal to len(dataset) makes the
+            # alignment a property of the contract instead of a coincidence; the NaN
+            # is already excluded by the finite-count metrics.
+            _y_flat = np.asarray(y).reshape(-1)
+            predictions.append(np.full(_y_flat.shape, np.nan))
+            targets.append(_y_flat)
             continue
 
         pred_matrix = np.zeros((len(output_times), len(output_columns)))
@@ -593,7 +621,7 @@ def visualizer(
         if not split_files:
             return np.array([], dtype=float)
 
-        aligned_rows = min(n_rows, len(split_files))
+        aligned_rows = require_row_name_alignment(n_rows, split_files, "evaluation split pairing")
         if aligned_rows <= 0:
             return np.array([], dtype=float)
 
@@ -700,7 +728,7 @@ def visualizer(
             return [], {}, {}, {}
 
         sample_entries = list(split_files) if split_files else []
-        row_count = min(n_rows, len(sample_entries)) if sample_entries else n_rows
+        row_count = require_row_name_alignment(n_rows, sample_entries, "sample-entry pairing")
         if row_count <= 0:
             return [], {}, {}, {}
 

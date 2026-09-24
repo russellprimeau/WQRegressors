@@ -169,6 +169,54 @@ independent per window. After this fix the remaining error is that factor of ~3,
 ~29× before. Deferred because it needs calibration timestamps to align events to the
 record: `Event_ID` in `offset_gain_model_results.csv` is an index with no date.
 
+## Predictions were labelled with the wrong windows (fixed 2026-09-23)
+
+`predictions.csv` named each row by indexing the **split file list** with the prediction
+row index. That list selects which files to load; it does not describe what was loaded.
+`load_samples` returns samples in sorted directory order rather than the list's order, and
+drops any it cannot use — five `continue` paths, including the `fault_tolerant=False` case
+where a predictor is entirely NaN across a window. Every row after the first omission was
+therefore attributed to the wrong window.
+
+Confirmed on disk: a GP run in CV26/Chromium evaluated `segment_0067`–`0074` (the windows
+where the profiler recorded anything) and labelled those predictions `segment_0048`–`0055`,
+the first eight entries of the 27-entry pinned list. The prediction *values* were correct
+throughout; only the attribution was wrong, which is why nothing looked amiss.
+
+**This was not only a labelling fault.** `_aggregate_by_independent_sample` indexed the same
+way and produces `mae`, `rmse`, `r2` and `n_test_independent`, so wherever several rows share
+a window — any replicate-backed XGB or transformer run — the grouping, and hence the metrics,
+were wrong too.
+
+**Scope.** Exposure requires both a pinned split and a predictor with gappy coverage:
+
+| Root | Pinned split | Sparse predictor | Runs affected |
+| --- | --- | --- | --- |
+| CV19 | no | yes | 0 — predates pinning |
+| CV22_profilerless | yes | no | 0 — nothing is ever dropped |
+| CV25 | yes | yes | 3,194 |
+| CV23_profiler | yes | yes | ~350 |
+
+**Neither manuscript root is affected**, so no published number moves. The pinned split did
+not cause the defect; it exposed a latent one, by design — it lists *all* segments on each
+side so a subset able to use a window the full set cannot still receives it.
+
+Names now come from the loaded samples (`utils.training.sample_names_from_loaded_samples`),
+and the seven sites that used to absorb a mismatch with `min(n_rows, len(split_files))` now
+raise through `utils.training.require_row_name_alignment`. `validate_run_outputs.py` detects
+already-written runs by their signature — the scored set being the leading slice of the
+listed set — so an affected tree is diagnosed without re-running it. Affected runs must be
+re-run to be relabelled; nothing repairs them in place.
+
+## Baselines emit a NaN row instead of skipping (2026-09-23)
+
+`evaluate_naive`, `evaluate_linear` and `evaluate_seasonal` used to `continue` past a sample
+with no usable output window, shortening their arrays independently of the model's and
+reintroducing the same positional slip one layer down. They now append a NaN row, so the
+returned length always equals the number of samples given. **This moves baseline numbers**
+wherever a sample was previously skipped: that window now enters the row count as NaN rather
+than vanishing, and the finite-count metrics exclude it explicitly.
+
 ## MLR now trains on the replicated samples (2026-09-23)
 
 MLR previously read `samples` while XGBoost and the transformer read `mc_replicates`, and
