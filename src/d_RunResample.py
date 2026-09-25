@@ -28,6 +28,7 @@ from utils.preprocessing import normalize_columns
 force_utf8_console()
 
 from utils.config_utils import (
+    PERTURBATION_BOUNDS,
     UNCERTAINTY_DISTRIBUTION_FEATURES,
     feature_carries_uncertainty,
     load_config,
@@ -141,6 +142,20 @@ def _default_aggregate_offset_csv():
     return None
 
 
+# Calibration records excluded from the uncertainty fits, keyed by (sensor, Event_ID) with
+# the offset that key is expected to carry. A record belongs here only when it is physically
+# impossible, not merely extreme: the fitted Student's t is meant to describe how far a real
+# sensor drifts, and a reading the instrument cannot produce is not evidence about that.
+#
+#   Turbidity, Event_ID 8 -- 2021-06-03 12:07:46, sensor 19G100122. Pre-calibration readings
+#   of -236.91 FNU against the 0.00 FNU standard and -50.93 FNU against the 12.40 FNU
+#   standard. Turbidity cannot be negative. The preceding attempt that day, 11:51:50, is the
+#   only record in the log with a QC score of "Bad".
+EXCLUDED_CALIBRATION_EVENTS = {
+    ("Turbidity (FNU)", 8): -236.91,
+}
+
+
 def _fit_offset_t_params_from_aggregate(sensor_names):
     """Fit per-sensor Student's t parameters from aggregate offset data."""
     agg_csv = _default_aggregate_offset_csv()
@@ -162,6 +177,26 @@ def _fit_offset_t_params_from_aggregate(sensor_names):
     agg_df = agg_df.copy()
     agg_df["Sensor_Normalized"] = agg_df["Sensor"].map(_normalize_sensor_name)
     agg_df["Offset"] = pd.to_numeric(agg_df["Offset"], errors='coerce')
+
+    # Remove the excluded records before anything is fitted. Verifying the offset each key
+    # is expected to carry means a renumbered or revised export stops the run instead of
+    # changing the fits without saying so.
+    for (sensor, event_id), expected in EXCLUDED_CALIBRATION_EVENTS.items():
+        hit = (agg_df["Sensor_Normalized"] == sensor) & (agg_df["Event_ID"] == event_id)
+        if hit.sum() != 1:
+            raise ValueError(
+                "Excluded calibration record %s/Event_ID %s matched %d rows in %s; the "
+                "export has changed and the exclusion list needs review."
+                % (sensor, event_id, int(hit.sum()), agg_csv)
+            )
+        found = float(agg_df.loc[hit, "Offset"].iloc[0])
+        if not np.isclose(found, expected, rtol=0, atol=1e-6):
+            raise ValueError(
+                "Excluded calibration record %s/Event_ID %s carries offset %r, expected %r; "
+                "the export has changed and the exclusion list needs review."
+                % (sensor, event_id, found, expected)
+            )
+        agg_df = agg_df.loc[~hit].copy()
 
     out = {}
     for sensor_name in sensor_names:
@@ -1077,6 +1112,9 @@ def apply_uncertainty_perturbation(segment_df, sensor_uncertainties, random_seed
     rng = np.random.default_rng(random_seed)
 
     df_perturbed = segment_df.copy()
+    # The offsets as drawn, before clipping. These are what make the replicate tree
+    # reconstructible: one scalar per column, with the clip applied on rebuild.
+    drawn_offsets = {}
     
     # Sensor column mappings, derived from the one definition of which predictors carry
     # a measured uncertainty distribution. `sensor_uncertainties` is keyed by the bare
@@ -1112,9 +1150,19 @@ def apply_uncertainty_perturbation(segment_df, sensor_uncertainties, random_seed
         
         mask = df_perturbed[column_name].notna()
         if mask.any():
-            df_perturbed.loc[mask, column_name] = df_perturbed.loc[mask, column_name] + offset
-    
-    return df_perturbed
+            drawn_offsets[column_name] = float(offset)
+            shifted = df_perturbed.loc[mask, column_name] + offset
+            # The draw is unbounded and the fitted tails are extremely heavy --
+            # turbidity's t has df = 0.407, so it has no defined mean and about one
+            # draw in 140 lands outside the variable's entire observed range. A
+            # calibration error displaces a reading; it does not turn it into
+            # something the instrument could never report, so the perturbed value is
+            # held inside the range the data actually occupies. Normalisation is
+            # min-max over the whole record, so that range is [0, 1].
+            df_perturbed.loc[mask, column_name] = shifted.clip(
+                lower=PERTURBATION_BOUNDS[0], upper=PERTURBATION_BOUNDS[1])
+
+    return df_perturbed, drawn_offsets
 
 
 def analyze_valid(df, targets, predictors, span, valid, name="FaultTolerantSampleSize"):
@@ -1487,7 +1535,7 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
                 replicate_seed = np.random.SeedSequence(
                     [int(random_seed), int(segment_counter), int(k)]
                 )
-                segment_perturbed = apply_uncertainty_perturbation(
+                segment_perturbed, drawn_offsets = apply_uncertainty_perturbation(
                     segment_out, sensor_uncertainties, random_seed=replicate_seed
                 )
                 output_file = os.path.join(
@@ -1500,13 +1548,15 @@ def split(df, output_dir, target_columns=['01-Farge', '04-Turbiditet', '06-E.col
                     for col in perturbable_written:
                         if col not in segment_out.columns:
                             continue
-                        delta = (segment_perturbed[col] - segment_out[col]).dropna()
-                        if len(delta):
+                        if col in drawn_offsets:
+                            # The offset as drawn, not the difference after clipping: a clip
+                            # acts per row, so the realised difference is not one number and
+                            # could not rebuild the window.
                             mc_offset_rows.append({
                                 "segment": f"segment_{segment_counter:04d}",
                                 "replicate": k,
                                 "column": col,
-                                "offset_normalised": float(delta.iloc[0]),
+                                "offset_normalised": drawn_offsets[col],
                             })
 
         segment_counter += 1

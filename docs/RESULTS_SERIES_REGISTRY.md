@@ -31,12 +31,16 @@ source. A series awaiting its superseding run is retained in full and marked `ho
 | `CV19` | `resample_diff.yml`, `resample_diff_copper.yml` | **manuscript source** | `run_paths.PROFILER_ROOT`. Appendix A table (`z6` variant `profiler`), the profiler-bearing arm of `z13` (Fig. 8), and the differential arm of `z7` (Fig. 5) |
 | `CV16stateless` | `resample_stateless.yml` | **manuscript source** | "No state in, absolute out" arm of `z7_StructureCompare.py:49` (Fig. 5) |
 | `CV18_raw` | `resample_raw.yml` | **manuscript source** | "State in, absolute out" arm of `z7_StructureCompare.py:50` (Fig. 5) |
-| `CV25` | `resample_cv25_profiler_state.yml` | active | Profiler x state design, cell: profiler + state (state averaged). Sweep partial, 9/14 targets |
-| `CV26` | `resample_cv26_profiler_stateless.yml` | active | Cell: profiler, stateless. Staged, sweep not run |
-| `CV27` | `resample_cv27_profilerless_state.yml` | active | Cell: no profiler + state (state averaged). Sweep complete, 14/14 |
-| `CV28` | `resample_cv28_profilerless_stateless.yml` | active | Cell: no profiler, stateless. Staged, sweep not run |
-| `CV29` | **generator missing** (see gaps) | active | CV25 re-staged after the `_state` aggregation fix. Samples are a byte-for-byte copy of CV25. Sweep not run |
-| `CV30` | **generator missing** (see gaps) | active | CV27 re-staged after the `_state` aggregation fix. Samples are a byte-for-byte copy of CV27. Sweep not run |
+| `CV31` | `resample_cv31.yml` | active | Profiler x target-structure design, cell: profiler + differential target. State offered as a candidate predictor; feature selection decides |
+| `CV32` | `resample_cv32.yml` | active | Cell: no profiler + differential target. Evaluates on the full held-out record, so it leads the run order |
+| `CV33` | `resample_cv33.yml` | active | Cell: profiler + absolute target |
+| `CV34` | `resample_cv34.yml` | active | Cell: no profiler + absolute target |
+| `CV25` | `resample_cv25_profiler_state.yml` | **superseded** | Profiler x state design, cell: profiler + state. Sweep partial, 9/14. Superseded by CV31: the state dimension is a feature-selection question, and these samples predate the MC replicate seeding fix (`7a4e3ea`), the state-aggregation fix, the perturbation clip and the excluded turbidity calibration record. Retained as the only record of the pre-fix behaviour |
+| `CV26` | `resample_cv26_profiler_stateless.yml` | **superseded** | Cell: profiler, stateless. Never run. The stateless dimension no longer exists |
+| `CV27` | `resample_cv27_profilerless_state.yml` | **superseded** | Cell: no profiler + state. Sweep complete, 14/14. Superseded by CV32 for the same reasons as CV25. The most complete pre-fix run and the reference for what changed |
+| `CV28` | `resample_cv28_profilerless_stateless.yml` | **superseded** | Cell: no profiler, stateless. Never run beyond one stray target |
+| `CV29` | **generator missing** | **superseded** | Was a byte-for-byte copy of CV25 restaged after the `_state` aggregation fix. Never run; replaced by CV31, which is generated rather than copied |
+| `CV30` | **generator missing** | **superseded** | Was a byte-for-byte copy of CV27. Never run; replaced by CV32 |
 | `CV20_profilerless` | **no surviving config** (see gaps) | **hold** | Superseded as a reporting basis by CV22_profilerless (`ASSUMPTIONS_AND_OUTSTANDING.md:112`), but still the hard default of `z14_SelectionStability.py:29`. Held for comparison until a superseding run completes |
 | `CV23_profiler` | `resample_diff_profiler_cv23.yml` | **hold** | Smoke run, 2/14 targets. Invariant-check evidence cited at `ASSUMPTIONS_AND_OUTSTANDING.md:515`. Held until superseded |
 | `CV24_profilerless` | `resample_diff_profilerless_cv24.yml` | **hold** | 1/14 targets. The verification pair for the `mc_replicates/` check at `ASSUMPTIONS_AND_OUTSTANDING.md:975`. Held until superseded |
@@ -117,10 +121,8 @@ of how those runs were made, and are cheap.
    writes to it; it was most likely produced by an earlier revision of
    `resample_diff_profilerless.yml` before that file was repointed at CV22_profilerless.
    Its settings are not reconstructible from the repo.
-2. **CV29 and CV30 name a generator that does not exist.** Both READMEs cite
-   `scratchpad/stage_cv29_30.py`; there is no such file anywhere in the repo. The staging
-   of two roots in the planned re-run is therefore not reproducible. Recover or rewrite
-   that script before relying on those roots.
+2. **CV29 and CV30 named a generator that does not exist.** Resolved by retiring them: both were copies rather than generated roots, neither was ever run, and CV31 and CV32 replace them with series generated from a recorded config.
+
 3. **`resample_SCADA.yml:11` targets `../../output/SCADA`**, a directory that has never
    existed. Either the run was never made or its output was discarded untracked.
 4. **Ten scripts default `--data-root` to `data/output/regression`**, which holds

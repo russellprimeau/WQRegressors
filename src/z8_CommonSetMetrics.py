@@ -35,6 +35,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml
 import numpy as np
 import pandas as pd
 
@@ -249,6 +250,34 @@ def load_runs(sweeps: Path) -> list[RunRecord]:
     return records
 
 
+def _configured_target_column(dataset_dir: Path, header) -> str | None:
+    """The column a run of this dataset predicts, read from its own configuration.
+
+    Matching a suffix cannot work across target parameterisations: a differential target ends
+    in ``_diff`` and an absolute one ends in nothing, so a suffix test either misses the
+    absolute case or, worse, matches some other column. The configs state the target outright.
+
+    ``config_lstm_*`` and ``config_recurrent_transformer_*`` are skipped. Those are spikes and
+    they predict the ``_state`` column rather than the run's target, so reading one would
+    return the wrong series and quietly rescale every NRMSE in the root.
+    """
+    for cfg in sorted(Path(dataset_dir).glob("config_*.yml")):
+        if cfg.name.startswith(("config_lstm", "config_recurrent")):
+            continue
+        try:
+            with open(cfg, "r", encoding="utf-8") as fh:
+                data = (yaml.safe_load(fh) or {}).get("data") or {}
+            cols = data.get("output_columns") or []
+        except Exception:
+            continue
+        for c in cols:
+            if c in header:
+                return str(c)
+    # Legacy roots may predate the configs; fall back to the old suffix heuristic.
+    legacy = [c for c in header if str(c).endswith(("_diff", "_res"))]
+    return legacy[0] if legacy else None
+
+
 def _record_sigma(dataset_dir: Path) -> float:
     """Target standard deviation over the complete record, for NRMSE.
 
@@ -268,10 +297,9 @@ def _record_sigma(dataset_dir: Path) -> float:
                              encoding_errors="replace").columns
     except Exception:
         return float("nan")
-    target_cols = [c for c in header if c.endswith(("_diff", "_res"))]
-    if not target_cols:
+    col = _configured_target_column(dataset_dir, header)
+    if col is None:
         return float("nan")
-    col = target_cols[0]
     values: list[float] = []
     for f in files:
         try:

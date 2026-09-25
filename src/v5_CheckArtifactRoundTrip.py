@@ -49,7 +49,8 @@ from utils import run_paths as rp
 # raises UnicodeEncodeError from inside print(). See utils/console.py.
 force_utf8_console()
 
-from utils.config_utils import UNCERTAINTY_DISTRIBUTION_FEATURES
+from utils.config_utils import (PERTURBATION_BOUNDS,
+                                UNCERTAINTY_DISTRIBUTION_FEATURES)
 from utils.gp_utils import (
     GP_ARTIFACT_VERSION,
     NON_PERSISTENT_KERNEL_BUFFERS,
@@ -216,7 +217,11 @@ def check_replicates(root: Path) -> list[str]:
             recon = base.copy()
             for _, r in grp.iterrows():
                 m = recon[r["column"]].notna()
-                recon.loc[m, r["column"]] = recon.loc[m, r["column"]] + r["offset_normalised"]
+                # The recorded offset is the draw; the writer clipped the result to
+                # the observed range, so rebuilding must apply the same bound.
+                recon.loc[m, r["column"]] = (
+                    recon.loc[m, r["column"]] + r["offset_normalised"]
+                ).clip(lower=PERTURBATION_BOUNDS[0], upper=PERTURBATION_BOUNDS[1])
             if not np.allclose(recon.select_dtypes(float).to_numpy(),
                                rp.select_dtypes(float).to_numpy(),
                                equal_nan=True, rtol=0, atol=1e-9):
@@ -239,17 +244,25 @@ def main() -> int:
     if args.replicates:
         roots = [rp.resolve_root(r) for r in (args.root or DEFAULT_ROOTS)]
         all_problems: list[str] = []
+        checked = 0
         for root in roots:
             if not root.is_dir():
                 print("%-34s SKIP (not found)" % root.name)
                 continue
             problems = check_replicates(root)
             all_problems += problems
+            checked += 1
             print("%-34s %d problem(s)" % (root.name, len(problems)))
         if all_problems:
             print("\nFAILURES: %d" % len(all_problems))
             for p in all_problems[:30]:
                 print("  %s" % p)
+        if not checked:
+            # An empty problem list means "nothing was wrong", which is not the same as
+            # "nothing was read". Reporting the tree sound here would let a mistyped or
+            # missing root pass a gate that is supposed to prove the replicates exist.
+            print("\nVERDICT: NOTHING CHECKED - no roots found among those given")
+            return 1
         print("\nVERDICT:", "replicate trees are sound" if not all_problems
               else "REPLICATE TREE BROKEN (%d problem(s))" % len(all_problems))
         return 0 if not all_problems else 1

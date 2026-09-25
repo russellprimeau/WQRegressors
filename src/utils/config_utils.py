@@ -218,6 +218,13 @@ def _resolve_data_paths(data_cfg, config_dir):
 # map from it and ``h_RunMCFeatureSelectionSweep.py`` tests candidate subsets against
 # it, so the data-space and kernel-space treatments of input uncertainty cannot drift
 # apart again.
+# The normalised support of every predictor. Windows are min-max scaled over the
+# whole record before they are written, so a value outside this range is not one the
+# instrument produced -- it is an artifact of an unbounded perturbation draw. The
+# Monte Carlo perturbation is held inside it, and the replicate check reconstructs
+# with the same bounds, so both read this one definition.
+PERTURBATION_BOUNDS = (0.0, 1.0)
+
 UNCERTAINTY_DISTRIBUTION_FEATURES = (
     "Pfl - Sp Cond (microS_cm)",
     "Pfl - pH",

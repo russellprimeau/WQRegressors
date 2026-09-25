@@ -1289,6 +1289,108 @@ The archived numbers were real when written, but they are not reproducible from 
 tree and they do not reflect the re-run. `z8` has to be regenerated with an explicit
 `--root` before Table 3 is rebuilt, and doing so will change those two rows.
 
+## The Monte Carlo perturbation is bounded, and one calibration record is excluded
+
+Found while regenerating CV31-CV34, after the replicate seeding fix (`7a4e3ea`) made the
+problem visible. Two changes, both in `src/d_RunResample.py`.
+
+### The perturbation is clipped to the observed range
+
+Each replicate shifts a profiler channel by an offset drawn from a Student's t fitted to that
+sensor's calibration errors. Three of the six fits have a degrees-of-freedom below 1.25, which
+means infinite variance, and turbidity's is 0.407, which has no defined mean at all -- a tail
+heavier than Cauchy. Nothing bounded the draw, so replicate files held normalised values as
+large as 359.8 on a scale whose entire observed range is [0, 1]: a turbidity reading moved 360
+times outside everything the instrument has ever recorded. Measured across CV31 and CV33 before
+the change, 414 of 73,140 offsets exceeded the full data range, 58 exceeded it a hundredfold,
+and every one of the 28 target-roots was affected.
+
+This was not a regression. The seeding fix raised the number of independent draws roughly
+thirty-threefold -- one per window and replicate, rather than one per replicate -- so a tail
+that had been sampled about ten times per target was now sampled about three hundred times. The
+fix exposed a defect in the fitted distributions rather than creating one.
+
+`apply_uncertainty_perturbation` now clips the perturbed value to `PERTURBATION_BOUNDS`,
+`(0.0, 1.0)`. Those are the observed range: normalisation is min-max over the whole record
+before windows are written, verified across 600 sample files to lie in [0, 1] exactly. The
+constraint is physical rather than statistical -- a calibration error displaces a reading, but
+the reading stays something the instrument can report -- which is why it was preferred over
+constraining the fitted degrees of freedom, a choice the calibration data do not support.
+
+After the change: 13,293 replicate files, maximum absolute value exactly 1.000000, no value
+outside the range, and 1.29 per cent of profiler values resting on a bound.
+
+### The clip forced a change to how offsets are recorded
+
+`provenance/mc_offsets.csv` originally stored perturbed minus base, read from the first row
+of the window. That was exact while the offset was constant down the column, and wrong the
+moment clipping was introduced: a clip acts per row, so the realised difference is no longer
+one number and cannot rebuild the window. `v5 --replicates` caught it immediately -- 40
+problems on CV31, "offsets do not reproduce the replicate".
+
+The file now stores the offset **as drawn**, which is genuinely a scalar, and the clip is part
+of the reconstruction rather than part of the record:
+
+    replicate = clip(base + offset, PERTURBATION_BOUNDS)
+
+`PERTURBATION_BOUNDS` lives in `utils/config_utils.py` beside
+`UNCERTAINTY_DISTRIBUTION_FEATURES`, so the code that applies the clip and the code that
+verifies it read one definition and cannot drift. After the fix all four roots reconstruct
+exactly: 40 problems to 0.
+
+### A validator that passed without reading anything
+
+Found in the same pass. `v5 --replicates` printed "VERDICT: replicate trees are sound" and
+exited 0 for a root that does not exist, having skipped it: an empty problem list was read as
+"nothing was wrong" when it meant "nothing was read". The artifact mode of the same script
+already reported NOTHING CHECKED and exited 1, so the intended convention was not in doubt.
+It now matches. This mattered because the replicate check is a blocking gate in the run
+driver, so a mistyped or moved root would have passed it -- and it was concealing the
+provenance breakage above.
+
+### One turbidity calibration record is excluded
+
+Turbidity's fitted tail was set by a single record. It sits 282 interquartile ranges from the
+median, where the next most extreme point sits at 5.7.
+
+    2021-06-03 12:07:46, sensor 19G100122
+        -236.91 FNU against the 0.00 FNU standard
+         -50.93 FNU against the 12.40 FNU standard
+
+Turbidity cannot be negative, so neither reading is physically possible. It is the second
+attempt that day; the first, at 11:51:50, read 17.55 FNU against the zero standard and is the
+only record in the turbidity log carrying a QC score of "Bad". The aggregate `Offset` is the
+negation of `Correction1` in the log, so the record is found there as `Correction1 = 236.91`.
+
+`EXCLUDED_CALIBRATION_EVENTS` drops it before anything is fitted, keyed on (sensor, `Event_ID`)
+and cross-checked against the offset that key is expected to carry. A refreshed export that
+renumbers events or revises the value fails loudly rather than dropping a different record or
+silently dropping none.
+
+Effect on the fit, and its limit:
+
+| | with the record | without |
+|---|---|---|
+| degrees of freedom | 0.407 | 0.504 |
+| P(draw exceeds the full data range) | 1.652% | 0.721% |
+| mean defined (df > 1) | no | no |
+| variance defined (df > 2) | no | no |
+
+The exclusion is justified on its own merits but does not make the distribution usable by
+itself: the remaining 28 offsets are themselves heavy-tailed, spanning -4.96 to 0 against an
+interquartile range of 0.77, and about one draw in 140 still leaves the observed range. The
+clip is what bounds that. The two changes are complementary, not alternatives.
+
+Three other turbidity calibrations are poor but physically possible and were kept: 2022-04-22
+(71.62 against the 12.40 standard), 2021-03-24 (41.04), 2024-04-19 (26.58).
+
+### What was deliberately not done
+
+Sp Cond's tail is the next heaviest (df 1.25), but its two most extreme offsets are comparable
+-- 7.4 and 7.0 interquartile ranges -- so it is a cluster rather than an outlier, and excluding
+one would leave the other. Its heavy tail is a property of the calibration data and is left
+alone.
+
 ## Outstanding
 
 - **Decide what `--replicates` is for on the profiler-free arm.** Section 3.4 states
