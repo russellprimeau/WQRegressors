@@ -111,7 +111,11 @@ mv data/output/CV19 data/output/CV19_superseded
 
 # 4. Post-processing: one sigma per target, NRMSE, evidence statistics.
 .venv/Scripts/python src/z1_FeaturePostProcess.py \
-    --data-root data/output/CV19 --all-datasets --treat-mlr-as-baseline
+    --data-root data/output/CV19 --all-datasets
+#    MLR is a machine-learning family, not a reference forecast: it reads the
+#    predictors, where naive, seasonal and linear read only the target history.
+#    Passing --treat-mlr-as-baseline moves it to the reference set and drops its
+#    variants from the ML comparison figure.
 
 # 5. Manifest compliance. Zero errors before anything is reported.
 .venv/Scripts/python src/validate_run_outputs.py --root data/output/CV19
@@ -129,6 +133,26 @@ mv data/output/CV19 data/output/CV19_superseded
 # 6. Canonical results: every method on one evaluation set per target.
 .venv/Scripts/python src/z8_CommonSetMetrics.py --root data/output/CV19
 
+# 6b. Seed robustness. REQUIRED, not optional: steps 1-6 fit one seed per model, and
+#     the measured seed spread reaches 0.44 R^2 on XGBoost and 0.42 on the transformer.
+#     Three of five CV22 XGBoost wins did not survive seed averaging, so this decides
+#     which model is reported, not merely how precisely.
+#
+#     Run the revert FIRST on any root that has been post-processed before. It restores
+#     each run's predictions_seed0.csv and is a no-op otherwise. Skipping it on a
+#     re-run does not fail: z8 reads the already-ensembled vector as the single-seed
+#     baseline, v3 then finds seed 0 does not reproduce it and marks the candidate
+#     non-reproducing, and z17 skips every such candidate. The root ends up reported as
+#     seed-ensembled while still carrying single-seed numbers.
+.venv/Scripts/python src/z17_ApplySeedEnsembles.py --root data/output/CV19 --revert
+.venv/Scripts/python src/v3_SeedVarianceRefit.py   --root data/output/CV19 --seeds 6
+.venv/Scripts/python src/z17_ApplySeedEnsembles.py --root data/output/CV19 --seeds 6
+.venv/Scripts/python src/z8_CommonSetMetrics.py    --root data/output/CV19
+#     v3 refits only candidates within a band measured from each family's own seed
+#     spread, and reuses any seed fit already on disk, so an interrupted refit resumes
+#     rather than restarting. z17 installs each candidate's mean prediction vector; the
+#     second z8 is what makes the reported score come from that vector.
+
 # 7. Manuscript outputs. z6 writes into the manuscript repository, which is a
 #    sibling checkout, not a submodule: set WQ_MANUSCRIPT_ROOT first (or run from
 #    wq-forecasting.code-workspace, which sets it) or the script exits without
@@ -139,6 +163,7 @@ mv data/output/CV19 data/output/CV19_superseded
 ```
 
 Steps 2, 5 and 5b are gates: if any reports errors, the results are not reportable and the
-cause must be fixed before step 7. `z8_CommonSetMetrics.py` is the canonical source for the
+cause must be fixed before step 7. Step 6b is required before step 7 for the same reason:
+skipping it reports one draw of a stochastic fit as though it were the model's performance. `z8_CommonSetMetrics.py` is the canonical source for the
 manuscript's numbers — `z1`'s own best-model selection is scored on configuration-specific
 evaluation sets and is retained for the sweep-level figures only.

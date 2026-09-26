@@ -96,6 +96,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -392,6 +393,23 @@ def score(preds_csv: Path, segments: list, sigma: float) -> float:
                              sigma)['r2'])
 
 
+def _write_refit_csv(rows: list, root: "Path") -> None:
+    """Write the refit table, replacing it atomically.
+
+    Called after every candidate rather than once at the end, so an interruption leaves the
+    rows completed so far rather than nothing at all. The write goes to a temporary file in
+    the same directory and is then moved into place, so a kill during the write cannot leave
+    a truncated CSV that later steps would read as authoritative.
+    """
+    if not rows:
+        return
+    out = root / 'summaries' / 'seed_refit.csv'
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix('.csv.partial')
+    pd.DataFrame(rows).to_csv(tmp, index=False)
+    os.replace(tmp, out)
+
+
 def refit_one(root: Path, c, args, z, segs_all, idx: int, total: int):
     """Refit one candidate at `args.seeds` seeds; return its record or None."""
     ds = c['dataset']
@@ -408,9 +426,24 @@ def refit_one(root: Path, c, args, z, segs_all, idx: int, total: int):
     print('[%3d/%3d] %-38s %s' % (idx, total, ds.replace('MC_', '')[:37], run_id[:34]))
 
     vals = []
+    reused = 0
     for k in range(int(args.seeds)):
         seed = int(args.base_seed) + k
         name = '%s/%s_s%02d' % (REFIT_SUBDIR, run_id, seed)
+        # A seed already fitted is not refitted. The fits are the expensive part and they
+        # persist, so reusing them is what lets an interrupted refit resume instead of
+        # starting over. Scoring is attempted first: a directory left half-written by a
+        # kill fails to score and falls through to a clean refit.
+        done_preds = root / ds / 'forecasts' / name / 'predictions.csv'
+        if done_preds.is_file():
+            try:
+                prior = score(done_preds, segments, sigma)
+            except Exception:
+                prior = float('nan')
+            if np.isfinite(prior):
+                vals.append(prior)
+                reused += 1
+                continue
         cfg = _stage_seed_config(
             base, cfg_path,
             root / ds / 'forecasts' / 'feature_sweeps' / run_id, seed, name)
@@ -428,7 +461,7 @@ def refit_one(root: Path, c, args, z, segs_all, idx: int, total: int):
                             str(ev if ev.exists() else staged)],
                            check=True, timeout=FIT_TIMEOUT_S,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            preds = next(out_dir.rglob('predictions.csv'), None)
+            preds = next(out_dir.glob('predictions.csv'), None)
             vals.append(score(preds, segments, sigma) if preds else float('nan'))
         except subprocess.TimeoutExpired:
             print('          seed %d timed out after %d s' % (seed, FIT_TIMEOUT_S))
@@ -439,6 +472,8 @@ def refit_one(root: Path, c, args, z, segs_all, idx: int, total: int):
             print('          seed %d failed: %s' % (seed, tail[-1][:100] if tail else ''))
             vals.append(float('nan'))
 
+    if reused:
+        print('          reused %d seed fit(s) already on disk' % reused)
     v = np.array([x for x in vals if np.isfinite(x)], dtype=float)
     rec = dict(c)
     rec.update(run=run_id, n_ok=int(v.size),
@@ -582,6 +617,7 @@ def main() -> int:
                     rec['family_best'] = fam_best
                     rec['margin'] = margin
                     out_rows.append(rec)
+                    _write_refit_csv(out_rows, root)
             got = [r for r in out_rows
                    if r['dataset'] == ds and r['family'] == fam
                    and r.get('reproduces') and np.isfinite(r.get('r2_sd', np.nan))]
@@ -608,7 +644,7 @@ def main() -> int:
 
     df = pd.DataFrame(out_rows)
     out = root / 'summaries' / 'seed_refit.csv'
-    df.to_csv(out, index=False)
+    _write_refit_csv(out_rows, root)
     print()
     print('[INFO] Wrote %s' % out)
     if 'reproduces' in df.columns and len(df):

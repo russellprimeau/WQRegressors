@@ -103,7 +103,7 @@ def main() -> int:
         vecs, frame = [], None
         for k in range(int(args.seeds)):
             d = root / ds / 'forecasts' / 'seed_refit' / ('%s_s%02d' % (run, k))
-            p = next(d.rglob('predictions.csv'), None) if d.is_dir() else None
+            p = next(d.glob('predictions.csv'), None) if d.is_dir() else None
             if p is None:
                 continue
             t = pd.read_csv(p, encoding='utf-8', encoding_errors='replace')

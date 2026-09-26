@@ -5630,9 +5630,19 @@ def _evaluate_selected_subsets_all_models(
                                     kinds = summary_df["kind"].astype(str).str.lower().str.strip()
                                     for preferred_kind in ("test", "combined", "train"):
                                         hit = summary_df[kinds == preferred_kind]
-                                        if not hit.empty:
-                                            primary_model_row = hit.iloc[0].to_dict()
-                                            break
+                                        if hit.empty:
+                                            continue
+                                        # Exclude reference forecasts before taking a row. The fallback below
+                                        # already does this; taking the first row of the kind does not, so a
+                                        # summary that ever carried a baseline beside the model would credit
+                                        # the baseline as the primary fit.
+                                        _not_ref = hit[[
+                                            _normalize_baseline_label(_l) is None
+                                            for _l in hit.get("label", pd.Series([""] * len(hit)))
+                                        ]]
+                                        _use = _not_ref if not _not_ref.empty else hit
+                                        primary_model_row = _use.iloc[0].to_dict()
+                                        break
 
                                 if primary_model_row is None:
                                     for _, _row in summary_df.iterrows():
@@ -6169,9 +6179,19 @@ def _evaluate_selected_subsets_all_models(
                                         kinds = summary_df["kind"].astype(str).str.lower().str.strip()
                                         for preferred_kind in ("test", "combined", "train"):
                                             hit = summary_df[kinds == preferred_kind]
-                                            if not hit.empty:
-                                                primary_model_row = hit.iloc[0].to_dict()
-                                                break
+                                            if hit.empty:
+                                                continue
+                                            # Exclude reference forecasts before taking a row. The fallback below
+                                            # already does this; taking the first row of the kind does not, so a
+                                            # summary that ever carried a baseline beside the model would credit
+                                            # the baseline as the primary fit.
+                                            _not_ref = hit[[
+                                                _normalize_baseline_label(_l) is None
+                                                for _l in hit.get("label", pd.Series([""] * len(hit)))
+                                            ]]
+                                            _use = _not_ref if not _not_ref.empty else hit
+                                            primary_model_row = _use.iloc[0].to_dict()
+                                            break
                                     if primary_model_row is None:
                                         for _, _row in summary_df.iterrows():
                                             if _normalize_baseline_label(_row.get("label", "")) is None:
@@ -7276,6 +7296,11 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
     barren: list[str] = []
     reasons: dict[str, int] = {}
     family_rows: dict[str, int] = {f: 0 for f in SUPPORTED_FAMILIES}
+    # Candidates a family produced that were not scored, and how many of those recorded a
+    # compliance refusal. A family absent for a stated reason is a gap; one absent for no
+    # reason is a fault.
+    family_candidates: dict[str, int] = {f: 0 for f in SUPPORTED_FAMILIES}
+    family_declined: dict[str, int] = {f: 0 for f in SUPPORTED_FAMILIES}
     for plan in plans:
         metrics_path = (_forecast_sweeps_dir(plan.dataset_dir)
                         / "feature_sweep_final_metrics.csv")
@@ -7293,12 +7318,27 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
         mcol = next((c for c in ("model", "model_name", "label") if c in mdf.columns), None)
         if mcol is None or "r2" not in mdf.columns:
             continue
-        fam = mdf[mcol].astype(str).str.split("_").str[0].str.lower()
+        fam = mdf[mcol].map(_family_of_metric_row)
         scored = mdf["r2"].notna()
+        why = (mdf["failure_reason"].astype(str) if "failure_reason" in mdf.columns
+               else pd.Series("", index=mdf.index))
         for f in SUPPORTED_FAMILIES:
-            n = int((fam.eq(f) & scored).sum())
+            here = fam.eq(f)
+            n = int((here & scored).sum())
             family_rows[f] += n
-            if n == 0:
+            if n:
+                continue
+            # No scored row for this family on this dataset. Whether that is a fault
+            # depends on what the unscored candidates say about themselves.
+            unscored = mdf[here & ~scored]
+            declined = int(why[here & ~scored].str.startswith("compliance:").sum())
+            family_candidates[f] += len(unscored)
+            family_declined[f] += declined
+            if len(unscored) and declined == len(unscored):
+                reason = (why[here & ~scored].iloc[0].split("compliance:", 1)[-1])
+                barren.append(f"{plan.dataset_dir.name}: {f} produced no scored row; "
+                              f"all {declined} candidates declined ({reason})")
+            else:
                 barren.append(f"{plan.dataset_dir.name}: {f} produced no scored row")
 
     print("\nRun summary")
@@ -7311,20 +7351,35 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
         print(f"Configs recording a failure_reason: {sum(reasons.values())}")
         for reason, n in sorted(reasons.items(), key=lambda kv: -kv[1])[:5]:
             print(f"    [{n:>4}x] {reason}")
-    # A family that scored nothing *anywhere* is a systemic failure -- a broken import, a
-    # bad config -- and the run is not usable. A family missing on a particular target is
-    # a local gap: the transformer genuinely fits nothing on some short-window targets,
-    # which validate_run_outputs already reports. Both are printed; only the first fails
-    # the run, so a non-zero exit keeps meaning something.
-    systemic = [f for f in SUPPORTED_FAMILIES if family_rows[f] == 0]
+    # A family that scored nothing and cannot say why is a systemic failure -- a broken
+    # import, a bad config -- and the run is not usable. A family whose every candidate was
+    # declined for a recorded compliance reason is a data gap: it was reached, configured
+    # and refused on a stated ground, which validate_run_outputs also reports. Both are
+    # printed; only the first fails the run, so a non-zero exit keeps meaning something.
+    #
+    # The test used to be whether the family scored anywhere in the invocation. That only
+    # separates the two cases when a run covers several datasets, and the design driver
+    # passes --limit-datasets 1, which made every local gap look systemic.
+    systemic = [f for f in SUPPORTED_FAMILIES
+                if family_rows[f] == 0
+                and not (family_candidates[f] and family_declined[f] == family_candidates[f])]
+    declined_only = [f for f in SUPPORTED_FAMILIES
+                     if family_rows[f] == 0 and f not in systemic]
     if barren:
         print(f"\nGaps ({len(barren)}):")
         for b in barren[:12]:
             print(f"    {b}")
         if len(barren) > 12:
             print(f"    ... and {len(barren) - 12} more")
+    if declined_only:
+        for f in declined_only:
+            print(f"\nFAMILY PRODUCED NO SCORED PREDICTIONS: {f}, and every one of its "
+                  f"{family_candidates[f]} candidates recorded a compliance refusal.")
+        print("Accounted for, so the run is usable; the family is simply absent from these "
+              "targets and every comparison involving it has a hole. Do not read that "
+              "absence as evidence about the family.")
     if systemic:
-        print(f"\nFAMILY PRODUCED NO SCORED PREDICTIONS ANYWHERE: {', '.join(systemic)}")
+        print(f"\nFAMILY PRODUCED NO SCORED PREDICTIONS AND NO REASON: {', '.join(systemic)}")
         print("This is a systemic failure, not a data gap. These results are not usable, "
               "whatever the dataset counts above say.")
 
@@ -7340,6 +7395,30 @@ def run_feature_selection_sweep(args: argparse.Namespace) -> int:
             ),
         )
     return rc
+
+
+def _family_of_metric_row(model_value: str) -> str | None:
+    """The supported family a metrics row belongs to, or None.
+
+    Two naming conventions reach this column. A scored row is labelled from the evaluation
+    summary and carries the bare family (`transformer`, `gp`, `mlr`); a row recording a
+    failure is labelled from the variant config's `model_name` and carries the variant
+    (`model_transformer_01`, `model_gp_01`). Splitting on the first underscore resolves the
+    first and silently mis-files the second, so both spellings are handled here.
+
+    Returns None for the reference forecasts, and for the recurrent transformer and the LSTM:
+    those are spikes, and the recurrent transformer in particular must not be read as the
+    transformer family merely because its name contains the word.
+    """
+    name = str(model_value).strip().lower()
+    if name.startswith("model_"):
+        name = name[len("model_"):]
+    if name.startswith(("recurrent_transformer", "lstm")):
+        return None
+    for family in ("transformer", "xgb", "mlr", "gp"):
+        if name == family or name.startswith(family + "_"):
+            return family
+    return None
 
 
 def build_parser() -> argparse.ArgumentParser:

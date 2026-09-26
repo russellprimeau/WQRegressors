@@ -61,6 +61,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yaml
+from utils.config_utils import feature_carries_uncertainty
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -142,16 +143,41 @@ def _match_row_to_dir(sweeps: Path, row: pd.Series) -> "Path | None":
     return hits[0] if len(hits) == 1 else None
 
 
+# Artifacts that only exist once a fit has actually run. A directory holding any of them
+# but no predictions has lost something; a directory holding none of them never produced
+# anything to lose.
+_FIT_ARTIFACTS = ("model_config.json", "evaluation_summary.csv", "training_stop_summary.json",
+                  "gp_model.pt", "xgboost_model.json", "transformer_model.pt")
+
+
+def _was_fitted(run_dir: Path) -> bool:
+    return any((run_dir / name).is_file() for name in _FIT_ARTIFACTS)
+
+
 def check_run_integrity(root: Path) -> Result:
     r = Result("run integrity: every run directory has predictions")
-    total = missing = 0
+    total = missing = refused = 0
+    refused_by_target: dict[str, int] = {}
     for ds, sw in _sweeps(root):
         for p in _run_dirs(sw):
             total += 1
-            if not (p / "predictions.csv").exists():
-                missing += 1
+            if (p / "predictions.csv").exists():
+                continue
+            missing += 1
+            if _was_fitted(p):
+                # Something was fitted here and its predictions are gone. That is the
+                # condition this check is for.
                 r.fails.append("%s/%s has no predictions.csv" % (ds.name, p.name))
-    r.notes.append("%d run directories, %d without predictions" % (total, missing))
+            else:
+                # Nothing was ever fitted: the split was pinned and the run then declined,
+                # which the sweep records as a compliance refusal. Expected on a target
+                # whose coverage leaves too few independent test segments to score.
+                refused += 1
+                refused_by_target[ds.name] = refused_by_target.get(ds.name, 0) + 1
+    r.notes.append("%d run directories, %d without predictions (%d refused before fitting)"
+                   % (total, missing, refused))
+    for name, n in sorted(refused_by_target.items(), key=lambda kv: -kv[1]):
+        r.notes.append("   %s: %d candidate(s) declined, no fit attempted" % (name, n))
     return r
 
 
@@ -443,6 +469,102 @@ def check_config_explains_run(root: Path) -> Result:
     return r
 
 
+def _fitted_predictors(run_dir: Path, pool: list) -> tuple[list, bool]:
+    """The predictors a run actually fitted on, and whether that is known exactly.
+
+    For most families the configured input columns are the fitted set. MLR is handed a pool
+    and selects within it, recording the result, so for MLR the recording is authoritative
+    and the pool would overstate what the model saw.
+    """
+    cfg = run_dir / "model_config.json"
+    if cfg.is_file():
+        try:
+            j = json.loads(cfg.read_text(encoding="utf-8"))
+        except Exception:
+            j = {}
+        if str(j.get("model_type", "")).startswith("mlr"):
+            picked = list(j.get("spearman_kept_columns") or [])
+            for meta in (j.get("per_target_meta") or []):
+                picked += list(meta.get("selected_features") or [])
+            if picked:
+                return picked, True
+            sel = run_dir / "mlr_selected_features.json"
+            if sel.is_file():
+                try:
+                    k = json.loads(sel.read_text(encoding="utf-8"))
+                except Exception:
+                    k = None
+                if isinstance(k, list) and k:
+                    return list(k), True
+                if isinstance(k, dict):
+                    flat: list = []
+                    for v in k.values():
+                        if isinstance(v, list):
+                            flat += v
+                    if flat:
+                        return flat, True
+            return list(pool), False
+    return list(pool), True
+
+
+def check_uncertainty_reaches_the_fit(root: Path) -> Result:
+    """Every run that selected an uncertain predictor was fitted on the perturbed windows.
+
+    Input uncertainty reaches a model one of two ways: analytically, inside the Gaussian
+    process kernel, which reads the unperturbed windows by design; or in the data, as ten
+    perturbed copies of each window under `mc_replicates/`. A non-GP run that selected a
+    predictor carrying a calibration record and read `samples/` received neither.
+    """
+    r = Result("input uncertainty reaches the fit that selected it")
+    checked = missing = idle = unknown = 0
+    by_dataset: dict[str, int] = {}
+    for ds, sw in _sweeps(root):
+        for run in _run_dirs(sw):
+            cfg_path = next(iter(sorted(run.glob("config_evaluate_*.yml"))), None)
+            if cfg_path is None:
+                continue
+            try:
+                data = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))["data"]
+            except Exception:
+                continue
+            cols = list(data.get("input_columns", []) or [])
+            if not cols:
+                continue
+            checked += 1
+            fitted, exact = _fitted_predictors(run, cols)
+            if not exact:
+                unknown += 1
+            carries = any(feature_carries_uncertainty(c) for c in fitted)
+            reads_replicates = str(data.get("sample_subdir", "samples")) == "mc_replicates"
+            # _family_of returns display names (GP, MLR, Transformer, XGB), so this
+            # comparison has to be case-folded; matching "gp" literally excluded nothing
+            # and reported all 621 GP runs, which read the originals by design.
+            family = str(z8._family_of(run.name) or "").strip().lower()
+            if carries and not reads_replicates and family != "gp":
+                # Selected a predictor with a measured uncertainty distribution and was
+                # then fitted on the single unperturbed copy.
+                missing += 1
+                by_dataset[ds.name] = by_dataset.get(ds.name, 0) + 1
+                r.fails.append("%s/%s fitted on %d predictor(s) carrying an uncertainty "
+                               "distribution but read %s"
+                               % (ds.name, run.name,
+                                  sum(1 for c in fitted if feature_carries_uncertainty(c)),
+                                  data.get("sample_subdir", "samples")))
+            elif reads_replicates and not carries:
+                # Harmless: the copies are identical in the columns this run uses and are
+                # collapsed before fitting. Worth counting because it is wasted reading.
+                idle += 1
+    r.notes.append("%d run(s) with a resolvable predictor list; %d fitted without the "
+                   "uncertainty they selected; %d read replicates with nothing to perturb"
+                   % (checked, missing, idle))
+    if unknown:
+        r.notes.append("   %d MLR run(s) did not record their selection; judged on the "
+                       "pool they were offered, which can only over-report" % unknown)
+    for name, n in sorted(by_dataset.items(), key=lambda kv: -kv[1]):
+        r.notes.append("   %s: %d" % (name, n))
+    return r
+
+
 CHECKS = (
     check_run_integrity,
     check_scored_every_fit,
@@ -453,6 +575,7 @@ CHECKS = (
     check_ensemble_provenance,
     check_output_containment,
     check_config_explains_run,
+    check_uncertainty_reaches_the_fit,
 )
 
 

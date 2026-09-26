@@ -707,7 +707,18 @@ def build_selection_record(plan: DatasetPlan, df: "pd.DataFrame", args: argparse
     if df is None or df.empty or "model" not in df.columns:
         return None
     target_name = _derive_target_name(plan.dataset_dir.name, args.dataset_prefix)
-    target_df = df[df["target"].astype(str) == target_name].copy() if "target" in df.columns else df.copy()
+    if "target" in df.columns:
+        # Keep rows that name this target, and rows that name no target at all. The
+        # reference forecasts are written without a target label -- 21 of 21 in every
+        # dataset measured -- so matching on the label alone removes every reference and
+        # leaves nothing to measure skill against. This file is written per dataset, so a
+        # row with no label cannot belong to another target; only a row naming a different
+        # one is genuinely foreign.
+        labels = df["target"]
+        unlabelled = labels.isna() | labels.astype(str).str.strip().isin(("", "nan", "None"))
+        target_df = df[unlabelled | (labels.astype(str) == target_name)].copy()
+    else:
+        target_df = df.copy()
     if target_df.empty:
         target_df = df.copy()
         print(f"[WARN] No rows match target_name={target_name!r} for {plan.dataset_dir.name}; using all rows for selection.")
@@ -1420,6 +1431,62 @@ def _append_mlr_to_final_metrics(
     return df
 
 
+_AGGREGATION_PHRASE = {
+    "none": "flattened window",
+    "mean": "window mean",
+    "stats:24h": "daily blocks",
+    "stats:6h": "6-hourly blocks",
+}
+
+# The MLR variants differ in how many rows they average rather than in an aggregation
+# string, and the comparison legend already spells them out this way.
+_MLR_PHRASE = {
+    "mlr": "latest row",
+    "mlr_avg12": "mean of 12 rows",
+    "mlr_avgall": "mean of window",
+}
+
+
+def _variant_phrase(run_dir: object) -> str:
+    """What distinguishes this run's configuration, in words rather than an index.
+
+    Read from the run's own ``model_config.json`` so the description always matches the fit.
+    An index like ``gp_03`` means nothing without the resample configuration to hand, and a
+    hard-coded index-to-meaning table would silently go stale the first time the variants are
+    renumbered.
+
+    Returns an empty string when the configuration cannot be read, so a caller falls back to
+    the family name rather than printing a guess.
+    """
+    name = str(run_dir or "").replace("\\", "/").rstrip("/").split("/")[-1]
+    if not name:
+        return ""
+
+    base = name.split("_r")[0] if "_r" in name else name
+    for token, phrase in _MLR_PHRASE.items():
+        if base == token or base.startswith(token + "_"):
+            return phrase
+
+    cfg_path = Path(str(run_dir)) / "model_config.json"
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except Exception:
+        return ""
+
+    agg = str(cfg.get("input_aggregation", "") or "").strip().lower()
+    phrase = _AGGREGATION_PHRASE.get(agg)
+    if phrase is None and agg.startswith("lag:"):
+        phrase = "%s h steps" % agg.split(":", 1)[1]
+    if phrase is None:
+        phrase = agg or ""
+
+    kernel = str(cfg.get("effective_kernel", cfg.get("kernel", "")) or "").lower()
+    if "linear" in kernel:
+        phrase = ("%s, + linear" % phrase) if phrase else "+ linear"
+    return phrase
+
+
 def _normalize_ml_model_display(val: str) -> str:
     """Map raw model string to ML_COMPARISON_MODEL_TYPES display key."""
     key = str(val).strip().lower()
@@ -2069,6 +2136,34 @@ def _find_best_variant_eval_config(plan: DatasetPlan, row: "pd.Series") -> "tupl
     exact_match: tuple[Path, Path] | None = None
     substring_match: tuple[Path, Path] | None = None
     label_fallback: tuple[Path, Path] | None = None
+    # The variant the row was actually scored on. Matching on model_type alone cannot
+    # distinguish gp_01 from gp_03 -- both record `gp_regressor` -- so the alphabetically
+    # first directory used to win, and the evidence statistics then described a different
+    # fit from the accuracy reported beside them.
+    row_variant = str(row.get("variant", "")).strip().lower()
+    variant_match: tuple[Path, Path] | None = None
+    if row_variant:
+        # A pass of its own, deliberately not filtered by subset_label: the scored run
+        # frequently carries no subset suffix, so filtering first discards exactly the
+        # directory being looked for. A label match is preferred where one exists, because
+        # one variant can appear under several subset routes with the same feature tag.
+        tag = feature_tag.lower()
+        labelled: "tuple[Path, Path] | None" = None
+        unlabelled: "tuple[Path, Path] | None" = None
+        for eval_cfg in sorted(output_dir.glob("*/config_evaluate_*.yml")):
+            variant_dir = eval_cfg.parent
+            dir_name = variant_dir.name.lower()
+            if not (dir_name == row_variant or dir_name.startswith(row_variant + "_")):
+                continue
+            if tag and tag not in dir_name:
+                continue
+            if subset_label and dir_name.endswith(f"_{subset_label}"):
+                labelled = (variant_dir, eval_cfg)
+                break
+            if unlabelled is None:
+                unlabelled = (variant_dir, eval_cfg)
+        variant_match = labelled or unlabelled
+
     for eval_cfg in sorted(output_dir.glob("*/config_evaluate_*.yml")):
         variant_dir = eval_cfg.parent
         # Quick filter: the subset_label must appear at the end of the dir name.
@@ -2091,8 +2186,12 @@ def _find_best_variant_eval_config(plan: DatasetPlan, row: "pd.Series") -> "tupl
         if label_fallback is None:
             label_fallback = (variant_dir, eval_cfg)
 
+    if variant_match is not None:
+        return variant_match[0], variant_match[1], "exact_match"
     if exact_match is not None:
-        return exact_match[0], exact_match[1], "exact_match"
+        # Right family, but the variant could not be pinned: this is the first
+        # directory of that family, not necessarily the one that was scored.
+        return exact_match[0], exact_match[1], "family_only"
     if substring_match is not None:
         return substring_match[0], substring_match[1], "exact_match"
     if label_fallback is not None:
@@ -3654,7 +3753,30 @@ def _compile_removal_sensitivity_heatmap(
         for col_idx, feature in enumerate(external_features, start=1):
             matrix[row_idx, col_idx] = sensitivities.get(feature, np.nan)
 
-    finite_values = np.abs(matrix[np.isfinite(matrix)])
+    # Standardise within target before colouring. The raw objective is
+    # (1 - R2) + lambda*drop_rate, and R2 has no lower bound, so a target whose models fail
+    # badly swamps a shared scale -- Lead reaches 69.9 where the next target reaches 2.29 and
+    # E. coli 0.0199. The companion bar figure in the sweep already standardises this way, and
+    # the accompanying text tells the reader to compare within a row rather than across rows,
+    # which a shared raw scale does not support. A row with fewer than two finite values, or
+    # with no spread, is left as it is rather than divided by zero.
+    display_matrix = np.full_like(matrix, np.nan, dtype=float)
+    for _r in range(matrix.shape[0]):
+        _row = matrix[_r, :]
+        _ok = np.isfinite(_row)
+        if not np.any(_ok):
+            continue
+        _vals = _row[_ok]
+        if _vals.size < 2:
+            display_matrix[_r, _ok] = 0.0
+            continue
+        _sd = float(np.std(_vals, ddof=0))
+        if not np.isfinite(_sd) or _sd <= 0.0:
+            display_matrix[_r, _ok] = 0.0
+            continue
+        display_matrix[_r, _ok] = (_vals - float(np.mean(_vals))) / _sd
+
+    finite_values = np.abs(display_matrix[np.isfinite(display_matrix)])
     color_limit = float(np.nanmax(finite_values)) if finite_values.size else 1.0
     color_limit = max(color_limit, np.finfo(float).eps)
     heat_font = 7
@@ -3665,14 +3787,14 @@ def _compile_removal_sensitivity_heatmap(
     cmap = plt.get_cmap("RdBu_r").copy()
     cmap.set_bad("#f2f2f2")
     sns.heatmap(
-        matrix,
+        display_matrix,
         ax=ax,
         cmap=cmap,
         vmin=-color_limit,
         vmax=color_limit,
         center=0,
-        mask=~np.isfinite(matrix),
-        cbar_kws={"label": "Mean objective increase on removal", "pad": 0.01},
+        mask=~np.isfinite(display_matrix),
+        cbar_kws={"label": "Removal sensitivity\n(within-target z-score)", "pad": 0.01},
         xticklabels=[_feature_display(feature) for feature in all_features],
         yticklabels=yticklabels,
         linewidths=0.35,
@@ -4200,7 +4322,10 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
             print(f"[INFO] Wrote summary CSV: {summary_csv}")
 
             x = np.arange(len(perf_df))
-            labels = perf_df['dataset']
+            # Registry labels, not directory names: everything else in this file routes
+            # through clean_target_label, and these feed every figure in this block.
+            labels = [clean_target_label(str(_d), args.dataset_prefix)
+                      for _d in perf_df['dataset'].astype(str).tolist()]
             model_series_label = 'Best Model'
             methods = ['Best Model', 'Best Baseline']
             colors = ['tab:blue', 'tab:orange']
@@ -4215,6 +4340,16 @@ def post(plans: list[DatasetPlan], args: argparse.Namespace) -> int:
                 pd.to_numeric(perf_df['best_baseline_r2'], errors='coerce'),
             ]
             best_model_labels = perf_df.get("best_model_label", perf_df.get("model", pd.Series(["Model"] * len(perf_df)))).astype(str).tolist()
+            # Say which variant won, not only which family. A family name alone cannot
+            # distinguish a selected configuration from a default, and they do differ: over
+            # these targets the Gaussian process wins with all four of its variants and
+            # XGBoost with all three of its. The run directory names the variant.
+            _variant_dirs = perf_df.get("evidence_variant_dir", pd.Series([""] * len(perf_df)))
+            best_model_labels = [
+                ("%s (%s)" % (_lab, _v)) if _v else _lab
+                for _lab, _v in zip(best_model_labels,
+                                    [_variant_phrase(_d) for _d in _variant_dirs.astype(str).tolist()])
+            ]
             best_baseline_labels = perf_df.get("best_baseline_label", pd.Series(["Baseline"] * len(perf_df))).astype(str).tolist()
             skill_data = [pd.to_numeric(perf_df['skill_vs_best_baseline'], errors='coerce')]
             skill_methods = ['Best Model vs Best Baseline']

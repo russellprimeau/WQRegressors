@@ -485,10 +485,60 @@ def select_best_model_row(df: "pd.DataFrame") -> "pd.Series":
     non-finite r2, and any minimum-sample-count requirements should be
     removed before calling this function.
     """
+    def _collapse_identical_fits(frame: "pd.DataFrame") -> "pd.DataFrame":
+        """One row per distinct fit.
+
+        The same model on the same feature set is reached by several subset routes -- the
+        seed-variance refit measures this at 21% of the candidate pool -- and each route
+        writes its own row carrying a bit-identical score. Those rows are one candidate, not
+        several, and collapsing them is what stops a tie from arising in the first place.
+
+        Grouping includes ``r2`` deliberately: two rows that disagree about the score are
+        never merged, so a real difference survives instead of being hidden by the grouping.
+
+        Which row of a group survives carries no meaning, the fits being identical. It is made
+        deterministic only so that the same analysis returns the same answer twice.
+        """
+        keys = [c for c in ("variant", "feature_tag", "r2") if c in frame.columns]
+        if len(keys) < 2:
+            return frame
+        order = [c for c in ("feature_tag", "subset_label", "variant") if c in frame.columns]
+        ordered = frame.sort_values(order, kind="mergesort") if order else frame
+        return ordered.drop_duplicates(subset=keys, keep="first")
+
+    def _best_row(frame: "pd.DataFrame", vals: "pd.Series") -> "pd.Series":
+        """The highest-scoring candidate, resolved without relying on row order.
+
+        ``idxmax`` returns whichever tied row comes first in the frame, which is an artifact
+        of the order the files were read in. Identical fits are collapsed first; a tie that
+        survives that is between genuinely different configurations, which happens when a
+        family is degenerate and each of its variants predicts the same constant.
+
+        Parsimony decides that case -- among configurations that score the same, the one
+        using fewer predictors is preferable on its own merits. Anything still tied after
+        that is arbitrary, and is ordered only for reproducibility.
+        """
+        collapsed = _collapse_identical_fits(frame)
+        c_vals = vals.reindex(collapsed.index)
+        top = c_vals.max()
+        tied = collapsed.loc[c_vals[c_vals == top].index]
+        if len(tied) <= 1:
+            return collapsed.loc[c_vals.idxmax()]
+        if "n_features" in tied.columns:
+            n_feat = pd.to_numeric(tied["n_features"], errors="coerce")
+            if n_feat.notna().any():
+                tied = tied.loc[n_feat[n_feat == n_feat.min()].index]
+                if len(tied) == 1:
+                    return tied.iloc[0]
+        # Arbitrary among equals: ordered so the choice is repeatable, not because any
+        # ordering of these makes one of them right.
+        order = [c for c in ("variant", "feature_tag", "subset_label") if c in tied.columns]
+        return (tied.sort_values(order, kind="mergesort") if order else tied).iloc[0]
+
     r2_vals = pd.to_numeric(df["r2"], errors="coerce")
     if "min_skill_rmse" in df.columns:
         skill_vals = pd.to_numeric(df["min_skill_rmse"], errors="coerce")
         valid_mask = (skill_vals > 0) & (r2_vals > 0)
         if valid_mask.any():
-            return df.loc[r2_vals[valid_mask].idxmax()]
-    return df.loc[r2_vals.idxmax()]
+            return _best_row(df.loc[valid_mask], r2_vals[valid_mask])
+    return _best_row(df, r2_vals)

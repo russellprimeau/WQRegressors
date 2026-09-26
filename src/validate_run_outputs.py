@@ -29,6 +29,8 @@ and per run directory:
   splits         train_files.txt and test_files.txt exist and are non-empty
   summary        evaluation_summary.csv exists
   train_size     n_train_samples is populated, and agrees with train_files.txt
+  labels         every prediction carries the target its named window holds, so the
+                 common evaluation set joins predictions to the right observations
   attribution    a run reporting dropped test samples also names the predictors
   support        no prediction lies outside the target's normalized support
 
@@ -46,6 +48,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import yaml
 from utils.console import force_utf8_console
 from utils import run_paths as rp
 
@@ -87,6 +90,92 @@ class Findings:
     @property
     def ok(self) -> bool:
         return not self.errors
+
+
+def _window_target(sample_dir: Path, name: str, column: str, row: int,
+                   cache: dict) -> float:
+    """The target value a stored window holds at the output row, NaN if unreadable.
+
+    Cached across runs: a target's sweep holds hundreds of run directories scored on the
+    same few dozen windows, so without this the same files are re-read hundreds of times.
+    """
+    key = (str(sample_dir), name, column, row)
+    if key not in cache:
+        value = float("nan")
+        frame = _read_csv(sample_dir / name)
+        if frame is not None and column in frame.columns and -len(frame) <= row < len(frame):
+            held = pd.to_numeric(frame[column], errors="coerce").iloc[row]
+            value = float(held) if pd.notna(held) else float("nan")
+        cache[key] = value
+    return cache[key]
+
+
+def _check_prediction_labels(run: Path, preds: pd.DataFrame, found: Findings,
+                             label: str, cache: dict) -> None:
+    """Confirm each prediction row names the window it was actually scored on.
+
+    Names were once taken by indexing the split file list with the prediction row index.
+    That list selects which files to load; it does not describe what was loaded, because
+    load_samples returns samples in sorted order and omits any it cannot use. Every row past
+    the first omission was then attributed to the wrong window -- plausibly enough to reach
+    the common evaluation set, where sample_file is the join key.
+
+    The row carries the target it was scored against, so it is labelled correctly exactly
+    when that value is the one its named window holds. Nothing circumstantial is involved:
+    a slipped label reads a different window's target and fails on the first row past the
+    omission.
+    """
+    if "target" not in preds.columns:
+        return
+    test = preds[preds["kind"].astype(str) == "test"]
+    if test.empty:
+        return
+
+    cfg_path = next(iter(sorted(run.glob("config_evaluate_*.yml"))), None)
+    if cfg_path is None:
+        found.warn(label, "no evaluation config; prediction labels cannot be checked "
+                          "against the windows they name")
+        return
+    try:
+        data = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))["data"]
+        column = str(data["output_columns"][0])
+        row = data["output_rows"]
+        row = int(row[0] if isinstance(row, (list, tuple)) else row)
+    except Exception as exc:
+        found.warn(label, "evaluation config does not name a target column and output row "
+                          "(%s); prediction labels cannot be checked" % exc)
+        return
+
+    # run/ is <dataset>/forecasts/feature_sweeps/<run>.
+    sample_dir = run.parents[2] / "samples"
+    if not sample_dir.is_dir():
+        found.warn(label, "no samples directory beside the forecasts; prediction labels "
+                          "cannot be checked against the windows they name")
+        return
+
+    mismatched = unreadable = 0
+    first = None
+    stored_vals = pd.to_numeric(test["target"], errors="coerce")
+    for name, stored in zip(test["sample_file"].astype(str), stored_vals):
+        held = _window_target(sample_dir, _MC_SUFFIX_RE.sub("", Path(name).name),
+                              column, row, cache)
+        if not np.isfinite(held):
+            unreadable += 1
+            continue
+        if not np.isfinite(stored) or abs(float(stored) - held) > 1e-9 * max(1.0, abs(held)):
+            mismatched += 1
+            if first is None:
+                first = (name, float(stored), held)
+    if mismatched:
+        found.error(label, "%d of %d predictions carry a target the window they name does "
+                           "not hold, the signature of positional mislabelling; re-run this "
+                           "configuration to relabel it (first: %s is scored against %.10g "
+                           "while that window holds %.10g)"
+                           % (mismatched, len(test), first[0], first[1], first[2]))
+    elif unreadable:
+        found.warn(label, "%d of %d predictions name a window whose stored target could not "
+                          "be read; those labels are unverified"
+                          % (unreadable, len(test)))
 
 
 def _family_of(run_dir_name: str) -> str | None:
@@ -222,6 +311,7 @@ def check_target(dataset_dir: Path, families: tuple[str, ...], found: Findings,
         return
 
     ref_seen = False
+    window_cache: dict = {}
     for run in run_dirs:
         rl = f"{label}/{run.name}"
         preds_path = run / "predictions.csv"
@@ -245,28 +335,15 @@ def check_target(dataset_dir: Path, families: tuple[str, ...], found: Findings,
 
         # Were these rows labelled with the windows they were actually scored on?
         #
-        # Names used to be taken by indexing the split file list with the prediction row
-        # index. That list selects which files to load; it does not describe what was
-        # loaded, because load_samples returns samples in sorted directory order and
-        # omits any it cannot use. Every row past the first omission was then attributed
-        # to the wrong window -- plausibly enough to reach the common evaluation set,
-        # where sample_file is the join key.
-        #
-        # The signature is exact: the scored set is the leading slice of the listed set.
-        # It held in all 1,728 affected runs measured across CV25 and CV23_profiler.
+        # Checked directly, against the target each named window holds. An earlier version
+        # instead flagged any run whose scored windows were the leading slice of the listed
+        # ones. That shape is not evidence of anything: a predictor that stops part-way
+        # through the record -- the profiler, which is not operated year-round -- leaves the
+        # trailing windows unusable, and a chronological split then makes the survivors a
+        # leading slice for entirely correct reasons. It reported 1,361 runs on CV31, all of
+        # them correctly labelled, and none on the otherwise identical profiler-free CV32.
         if "kind" in preds.columns and "sample_file" in preds.columns:
-            test_file = run / "test_files.txt"
-            if test_file.exists():
-                listed = sorted({_MC_SUFFIX_RE.sub("", Path(n).name)
-                                 for n in test_file.read_text(encoding="utf-8").split()})
-                scored = {_MC_SUFFIX_RE.sub("", str(n))
-                          for n in preds[preds["kind"].astype(str) == "test"]["sample_file"]}
-                if scored and len(scored) < len(listed) and scored == set(listed[:len(scored)]):
-                    found.error(
-                        rl,
-                        f"predictions are labelled with the first {len(scored)} of "
-                        f"{len(listed)} listed test windows, the signature of positional "
-                        "mislabelling; re-run this configuration to relabel it")
+            _check_prediction_labels(run, preds, found, rl, window_cache)
 
         # Predictions must lie in the target's normalized support. One
         # extrapolation is enough to dominate a squared-error metric.

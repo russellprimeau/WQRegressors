@@ -245,6 +245,12 @@ def generate_figure(
         if "subset_rank" in df.columns:
             df = df.sort_values("subset_rank").groupby("dataset", as_index=False).first()
         else:
+            # No subset_rank to order by, so order by something stated rather than by
+            # whatever order the rows were read in.
+            _keys = [c for c in ("variant", "feature_tag", "subset_label", "model")
+                     if c in df.columns]
+            if _keys:
+                df = df.sort_values(_keys, kind="mergesort")
             df = df.groupby("dataset", as_index=False).first()
 
         mapping: dict[str, float] = {}
