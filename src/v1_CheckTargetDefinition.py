@@ -134,9 +134,18 @@ def main(argv=None) -> int:
     print("windows matching neither                           : %d"
           % sum(r.get("neither", 0) for r in rows))
     print()
-    print("VERDICT:", "fixed-row-offset definition confirmed" if bad == 0
-          else "MIXED OR SUPERSEDED DEFINITION PRESENT (%d windows)" % bad)
-    return 0 if bad == 0 else 1
+    if bad:
+        print("VERDICT: MIXED OR SUPERSEDED DEFINITION PRESENT (%d windows)" % bad)
+        return 1
+    if tot_disc == 0:
+        # Nothing was compared. Expected on an absolute root, where there is no difference
+        # to check; a surprise anywhere else, and saying "confirmed" here would hide it.
+        print("VERDICT: NOTHING CHECKED -- no target carried a difference column, so the "
+              "definition was neither confirmed nor contradicted")
+        return 0
+    print("VERDICT: fixed-row-offset definition confirmed (%d discriminating window(s))"
+          % tot_disc)
+    return 0
 
 
 if __name__ == "__main__":
